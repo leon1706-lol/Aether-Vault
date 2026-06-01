@@ -1,0 +1,95 @@
+import os
+import requests
+from pathlib import Path
+from typing import Iterator
+
+class VaultClient:
+    def __init__(self, server_url: str = 'http://localhost:8000'):
+        self.server_url = server_url.rstrip('/')
+        self.session = requests.Session()
+
+    def upload_object(self, file_path: Path, sha256_hash: str) -> bool:
+        url = f"{self.server_url}/api/objects/{sha256_hash}"
+        try:
+            head_resp = self.session.head(url)
+            if head_resp.status_code == 200:
+                return True # Already exists
+            
+            def file_reader(path: Path) -> Iterator[bytes]:
+                with open(path, 'rb') as f:
+                    while chunk := f.read(8 * 1024 * 1024):
+                        yield chunk
+
+            resp = self.session.post(url, data=file_reader(file_path))
+            return resp.status_code == 201
+        except requests.exceptions.RequestException as e:
+            print(f"Error uploading object: {e}")
+            return False
+
+    def download_object(self, sha256_hash: str, dest_path: Path) -> bool:
+        url = f"{self.server_url}/api/objects/{sha256_hash}"
+        try:
+            with self.session.get(url, stream=True) as resp:
+                if resp.status_code == 200:
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(dest_path, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                            f.write(chunk)
+                    return True
+                return False
+        except requests.exceptions.RequestException as e:
+            print(f"Error downloading object: {e}")
+            return False
+
+    def object_exists(self, sha256_hash: str) -> bool:
+        url = f"{self.server_url}/api/objects/{sha256_hash}"
+        try:
+            resp = self.session.head(url)
+            return resp.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+
+    def push_commit(self, commit_data: dict) -> bool:
+        url = f"{self.server_url}/api/commits"
+        try:
+            resp = self.session.post(url, json=commit_data)
+            return resp.status_code == 201
+        except requests.exceptions.RequestException as e:
+            print(f"Error pushing commit: {e}")
+            return False
+
+    def get_commit(self, commit_hash: str) -> dict | None:
+        url = f"{self.server_url}/api/commits/{commit_hash}"
+        try:
+            resp = self.session.get(url)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except requests.exceptions.RequestException:
+            return None
+
+    def update_ref(self, ref_name: str, commit_hash: str) -> bool:
+        url = f"{self.server_url}/api/refs/{ref_name}"
+        try:
+            resp = self.session.put(url, json={"commit_hash": commit_hash})
+            return resp.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+
+    def get_ref(self, ref_name: str) -> str | None:
+        url = f"{self.server_url}/api/refs/{ref_name}"
+        try:
+            resp = self.session.get(url)
+            if resp.status_code == 200:
+                return resp.json().get("commit_hash")
+            return None
+        except requests.exceptions.RequestException:
+            return None
+
+    def server_available(self) -> bool:
+        url = f"{self.server_url}/api/health"
+        try:
+            resp = self.session.get(url, timeout=2)
+            return resp.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
