@@ -48,7 +48,9 @@ std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 
             
             file.seekg(offset);
             std::vector<char> buffer(to_read);
-            file.read(buffer.data(), to_read);
+            if (!file.read(buffer.data(), to_read) && file.gcount() != to_read) {
+                throw std::runtime_error("Failed to read chunk at offset " + std::to_string(offset));
+            }
             
             SHA256 sha;
             sha.update(reinterpret_cast<const uint8_t*>(buffer.data()), to_read);

@@ -19,5 +19,6 @@ private:
     uint32_t datalen;
     unsigned long long bitlen;
     uint32_t state[8];
+    uint8_t m_hash[32];
     void transform();
 };

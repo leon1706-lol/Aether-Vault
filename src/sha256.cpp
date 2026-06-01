@@ -71,7 +71,6 @@ void SHA256::update(const std::string &data) {
 }
 
 uint8_t* SHA256::digest() {
-    static uint8_t hash[32];
     uint32_t i = datalen;
     if (datalen < 56) {
         data[i++] = 0x80;
@@ -87,16 +86,16 @@ uint8_t* SHA256::digest() {
     data[59] = bitlen >> 32; data[58] = bitlen >> 40; data[57] = bitlen >> 48; data[56] = bitlen >> 56;
     transform();
     for (i = 0; i < 4; ++i) {
-        hash[i]      = (state[0] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 4]  = (state[1] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 8]  = (state[2] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 12] = (state[3] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 16] = (state[4] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 20] = (state[5] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 24] = (state[6] >> (24 - i * 8)) & 0x000000ff;
-        hash[i + 28] = (state[7] >> (24 - i * 8)) & 0x000000ff;
+        m_hash[i]      = (state[0] >> (24 - i * 8)) & 0x000000ff;
+        m_hash[i + 4]  = (state[1] >> (24 - i * 8)) & 0x000000ff;
+        m_hash[i + 8]  = (state[2] >> (24 - i * 8)) & 0x000000ff;
+        m_hash[i + 12] = (state[3] >> (24 - i * 8)) & 0x000000ff;
+        m_hash[i + 16] = (state[4] >> (24 - i * 8)) & 0x000000ff;
+        m_hash[i + 20] = (state[5] >> (24 - i * 8)) & 0x000000ff;
+        m_hash[i + 24] = (state[6] >> (24 - i * 8)) & 0x000000ff;
+        m_hash[i + 28] = (state[7] >> (24 - i * 8)) & 0x000000ff;
     }
-    return hash;
+    return m_hash;
 }
 
 std::string SHA256::toString(const uint8_t * digest) {
