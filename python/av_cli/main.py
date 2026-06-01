@@ -35,7 +35,7 @@ def load_config(repo_root: Path) -> dict:
         try:
             with open(config_path, 'r') as f:
                 return json.load(f)
-        except:
+        except Exception:
             pass
     return {"lfs_threshold_mb": 50, "remote_url": "http://localhost:8000"}
 
@@ -49,7 +49,7 @@ def hash_file_safe(path: str) -> str:
     if aether_core:
         try:
             return aether_core.hash_file(path)
-        except:
+        except Exception:
             pass
     sha256 = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -61,7 +61,7 @@ def get_file_meta_safe(path: str) -> dict:
     if aether_core:
         try:
             return aether_core.get_file_metadata(path)
-        except:
+        except Exception:
             pass
     p = Path(path)
     if not p.exists():
@@ -73,7 +73,7 @@ def compare_meta_safe(path: str, exp_size: int, exp_mtime: int) -> bool:
     if aether_core:
         try:
             return aether_core.compare_metadata(path, exp_size, exp_mtime)
-        except:
+        except Exception:
             pass
     meta = get_file_meta_safe(path)
     return meta["exists"] and meta["size"] == exp_size and meta["mtime_ns"] == exp_mtime
@@ -380,13 +380,15 @@ def checkout(target):
     
     tree = commit_data.get("tree", {"code": {}, "artifacts": {}})
     for rel_path, h in tree.get("code", {}).items():
-        idx.add_entry(rel_path, h, 0, 0, "code")
+        idx.add_entry(rel_path, h, 0, 0, "code", auto_save=False)
         
     for rel_path, artifact in tree.get("artifacts", {}).items():
         h = artifact["hash"]
         size = artifact["size"]
         pointer = artifact.get("pointer")
-        idx.add_entry(rel_path, h, size, 0, "artifact", pointer)
+        idx.add_entry(rel_path, h, size, 0, "artifact", pointer, auto_save=False)
+        
+    idx.save()
         
         if pointer:
             obj_path = repo_root / '.av' / 'objects' / h[:2] / h[2:]

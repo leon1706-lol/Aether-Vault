@@ -15,12 +15,8 @@ class VaultClient:
             if head_resp.status_code == 200:
                 return True # Already exists
             
-            def file_reader(path: Path) -> Iterator[bytes]:
-                with open(path, 'rb') as f:
-                    while chunk := f.read(8 * 1024 * 1024):
-                        yield chunk
-
-            resp = self.session.post(url, data=file_reader(file_path))
+            with open(file_path, 'rb') as f:
+                resp = self.session.post(url, data=f)
             return resp.status_code == 201
         except requests.exceptions.RequestException as e:
             print(f"Error uploading object: {e}")
@@ -32,9 +28,11 @@ class VaultClient:
             with self.session.get(url, stream=True) as resp:
                 if resp.status_code == 200:
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(dest_path, 'wb') as f:
+                    tmp_path = dest_path.with_suffix('.tmp')
+                    with open(tmp_path, 'wb') as f:
                         for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
                             f.write(chunk)
+                    tmp_path.replace(dest_path)
                     return True
                 return False
         except requests.exceptions.RequestException as e:

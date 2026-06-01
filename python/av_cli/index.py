@@ -24,7 +24,7 @@ class Index:
         with open(self.index_path, 'w', encoding='utf-8') as f:
             json.dump({"entries": self.entries}, f, indent=2)
 
-    def add_entry(self, rel_path: str, hash: str, size: int, mtime_ns: int, file_type: str, pointer: str | None = None) -> None:
+    def add_entry(self, rel_path: str, hash: str, size: int, mtime_ns: int, file_type: str, pointer: str | None = None, auto_save: bool = True) -> None:
         self.entries[rel_path] = {
             "hash": hash,
             "size": size,
@@ -33,7 +33,8 @@ class Index:
             "staged": True,
             "pointer": pointer
         }
-        self.save()
+        if auto_save:
+            self.save()
 
     def remove_entry(self, rel_path: str) -> None:
         if rel_path in self.entries:

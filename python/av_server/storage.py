@@ -25,7 +25,8 @@ class CASStorage:
             return target_path
             
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = target_path.with_suffix('.tmp')
+        import uuid
+        temp_path = target_path.with_name(target_path.name + f".tmp.{uuid.uuid4().hex}")
         
         sha256 = hashlib.sha256()
         with open(temp_path, 'wb') as f:

@@ -16,9 +16,14 @@ def parse_pointer(content: str) -> dict | None:
             if key == "hash-sha256":
                 res["hash"] = val
             elif key == "size":
-                res["size"] = int(val)
+                try:
+                    res["size"] = int(val)
+                except ValueError:
+                    return None
             elif key == "original-path":
                 res["original_path"] = val
+    if "hash" not in res or "size" not in res:
+        return None
     return res
 
 def is_pointer_file(file_path: Path) -> bool:
