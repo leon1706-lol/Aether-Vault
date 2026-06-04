@@ -1,7 +1,7 @@
 import os
+import uuid
 import requests
 from pathlib import Path
-from typing import Iterator
 
 class VaultClient:
     def __init__(self, server_url: str = 'http://localhost:8000'):
@@ -24,11 +24,12 @@ class VaultClient:
 
     def download_object(self, sha256_hash: str, dest_path: Path) -> bool:
         url = f"{self.server_url}/api/objects/{sha256_hash}"
+        tmp_path = None
         try:
             with self.session.get(url, stream=True) as resp:
                 if resp.status_code == 200:
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    tmp_path = dest_path.with_suffix('.tmp')
+                    tmp_path = dest_path.with_name(dest_path.name + f".tmp.{uuid.uuid4().hex}")
                     with open(tmp_path, 'wb') as f:
                         for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
                             f.write(chunk)
@@ -38,6 +39,9 @@ class VaultClient:
         except requests.exceptions.RequestException as e:
             print(f"Error downloading object: {e}")
             return False
+        finally:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink()
 
     def object_exists(self, sha256_hash: str) -> bool:
         url = f"{self.server_url}/api/objects/{sha256_hash}"

@@ -35,8 +35,9 @@ def load_config(repo_root: Path) -> dict:
         try:
             with open(config_path, 'r') as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            import sys
+            print(f"Warning: Failed to load config, using defaults: {e}", file=sys.stderr)
     return {"lfs_threshold_mb": 50, "remote_url": "http://localhost:8000"}
 
 def save_config(repo_root: Path, config: dict) -> None:
@@ -49,8 +50,9 @@ def hash_file_safe(path: str) -> str:
     if aether_core:
         try:
             return aether_core.hash_file(path)
-        except Exception:
-            pass
+        except Exception as e:
+            import sys
+            print(f"Warning: aether_core.hash_file failed, using Python fallback: {e}", file=sys.stderr)
     sha256 = hashlib.sha256()
     with open(path, 'rb') as f:
         while chunk := f.read(8 * 1024 * 1024):
@@ -61,8 +63,9 @@ def get_file_meta_safe(path: str) -> dict:
     if aether_core:
         try:
             return aether_core.get_file_metadata(path)
-        except Exception:
-            pass
+        except Exception as e:
+            import sys
+            print(f"Warning: aether_core.get_file_metadata failed, using Python fallback: {e}", file=sys.stderr)
     p = Path(path)
     if not p.exists():
         return {"exists": False, "size": 0, "mtime_ns": 0}
@@ -73,8 +76,9 @@ def compare_meta_safe(path: str, exp_size: int, exp_mtime: int) -> bool:
     if aether_core:
         try:
             return aether_core.compare_metadata(path, exp_size, exp_mtime)
-        except Exception:
-            pass
+        except Exception as e:
+            import sys
+            print(f"Warning: aether_core.compare_metadata failed, using Python fallback: {e}", file=sys.stderr)
     meta = get_file_meta_safe(path)
     return meta["exists"] and meta["size"] == exp_size and meta["mtime_ns"] == exp_mtime
 
@@ -388,8 +392,6 @@ def checkout(target):
         pointer = artifact.get("pointer")
         idx.add_entry(rel_path, h, size, 0, "artifact", pointer, auto_save=False)
         
-    idx.save()
-        
         if pointer:
             obj_path = repo_root / '.av' / 'objects' / h[:2] / h[2:]
             dest = repo_root / rel_path
@@ -401,6 +403,8 @@ def checkout(target):
                 if client.download_object(h, dest):
                     obj_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(dest, obj_path)
+                    
+    idx.save()
             
     head_path = repo_root / '.av' / 'HEAD'
     with open(head_path, 'w') as f:

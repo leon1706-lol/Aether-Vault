@@ -1,7 +1,14 @@
 import os
+import re
 from pathlib import Path
 
 def create_pointer(file_path: Path, sha256_hash: str, file_size: int) -> str:
+    if not re.match(r'^[a-f0-9]{64}$', sha256_hash):
+        raise ValueError(f"Invalid SHA256 hash: {sha256_hash}")
+    if file_size < 0:
+        raise ValueError(f"Invalid file size: {file_size}")
+    if '\n' in str(file_path.name):
+        raise ValueError(f"Invalid filename (contains newline): {file_path.name}")
     return f"version aether-vault-pointer v1\nhash-sha256 {sha256_hash}\nsize {file_size}\noriginal-path {file_path.name}\n"
 
 def parse_pointer(content: str) -> dict | None:

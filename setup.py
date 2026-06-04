@@ -14,7 +14,7 @@ ext_modules = [
         ["src/core.cpp", "src/sha256.cpp"],
         include_dirs=["src/"],
         cxx_std=17,
-        extra_compile_args=["-O2"] if sys.platform == "win32" else ["-O3"],
+        extra_compile_args=["/O2"] if sys.platform == "win32" else ["-O3"],
     ),
 ]
 

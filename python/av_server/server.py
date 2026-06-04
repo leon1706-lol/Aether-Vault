@@ -6,13 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any
 
+import re
 from .storage import CASStorage
 
 app = FastAPI(title="Aether-Vault Server")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=["http://localhost", "https://localhost"],
+    allow_methods=["GET", "POST", "PUT"],
     allow_headers=["*"],
 )
 
@@ -26,8 +27,11 @@ class RefUpdate(BaseModel):
 def health_check():
     return {"status": "ok", "version": "1.0.0"}
 
+
 @app.post("/api/objects/{hash}")
 async def upload_object(hash: str, request: Request):
+    if not re.match(r'^[a-f0-9]{64}$', hash):
+        raise HTTPException(status_code=400, detail="Invalid hash format")
     if storage.object_exists(hash):
         return Response(status_code=409, content="Object already exists")
     
@@ -41,19 +45,26 @@ async def upload_object(hash: str, request: Request):
 
 @app.get("/api/objects/{hash}")
 def download_object(hash: str):
+    if not re.match(r'^[a-f0-9]{64}$', hash):
+        raise HTTPException(status_code=400, detail="Invalid hash format")
     obj_path = storage.get_object_path(hash)
     if not obj_path:
         raise HTTPException(status_code=404, detail="Object not found")
         
     def iterfile():
-        with open(obj_path, mode="rb") as file_like:
-            while chunk := file_like.read(8 * 1024 * 1024):
-                yield chunk
+        try:
+            with open(obj_path, mode="rb") as file_like:
+                while chunk := file_like.read(8 * 1024 * 1024):
+                    yield chunk
+        finally:
+            pass
                 
     return StreamingResponse(iterfile(), media_type="application/octet-stream")
 
 @app.head("/api/objects/{hash}")
 def head_object(hash: str):
+    if not re.match(r'^[a-f0-9]{64}$', hash):
+        raise HTTPException(status_code=400, detail="Invalid hash format")
     size = storage.get_object_size(hash)
     if size is None:
         return Response(status_code=404)
@@ -64,12 +75,16 @@ def push_commit(commit_data: Dict[str, Any]):
     required = ["hash", "parents", "message", "tree", "timestamp"]
     if not all(k in commit_data for k in required):
         raise HTTPException(status_code=400, detail="Missing required commit fields")
+    if not re.match(r'^[a-f0-9]{64}$', commit_data["hash"]):
+        raise HTTPException(status_code=400, detail="Invalid commit hash format")
         
     storage.store_commit(commit_data["hash"], commit_data)
     return Response(status_code=201)
 
 @app.get("/api/commits/{hash}")
 def get_commit(hash: str):
+    if not re.match(r'^[a-f0-9]{64}$', hash):
+        raise HTTPException(status_code=400, detail="Invalid hash format")
     commit = storage.get_commit(hash)
     if not commit:
         raise HTTPException(status_code=404, detail="Commit not found")

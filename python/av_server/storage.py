@@ -29,18 +29,23 @@ class CASStorage:
         temp_path = target_path.with_name(target_path.name + f".tmp.{uuid.uuid4().hex}")
         
         sha256 = hashlib.sha256()
-        with open(temp_path, 'wb') as f:
-            async for chunk in data_stream:
-                f.write(chunk)
-                sha256.update(chunk)
+        try:
+            with open(temp_path, 'wb') as f:
+                async for chunk in data_stream:
+                    f.write(chunk)
+                    sha256.update(chunk)
+                    
+            actual_hash = sha256.hexdigest()
+            if actual_hash != sha256_hash:
+                raise ValueError(f"Hash mismatch. Expected {sha256_hash}, got {actual_hash}")
                 
-        actual_hash = sha256.hexdigest()
-        if actual_hash != sha256_hash:
-            temp_path.unlink()
-            raise ValueError(f"Hash mismatch. Expected {sha256_hash}, got {actual_hash}")
-            
-        shutil.move(temp_path, target_path)
-        return target_path
+            shutil.move(temp_path, target_path)
+            return target_path
+        except Exception:
+            # Clean up temp file only on error — never after successful move
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
 
     def object_exists(self, sha256_hash: str) -> bool:
         return self._object_path(sha256_hash).exists()
