@@ -1,6 +1,7 @@
 import os
 import re
 from pathlib import Path
+from datetime import datetime
 from typing import Dict, Any, List
 from fastapi import FastAPI, Request, HTTPException, Response, Depends
 from fastapi.responses import StreamingResponse
@@ -174,16 +175,24 @@ async def get_commit(hash: str, db: AsyncSession = Depends(get_session)):
 
 @app.put("/api/refs/{ref_name:path}")
 async def update_ref(ref_name: str, payload: RefUpdate, db: AsyncSession = Depends(get_session)):
-    result = await db.execute(select(DBRef).where(DBRef.name == ref_name))
+    # Use SELECT ... FOR UPDATE to lock the row for this transaction
+    # This prevents race conditions when multiple researchers commit to the same branch
+    stmt = select(DBRef).where(DBRef.name == ref_name).with_for_update()
+    result = await db.execute(stmt)
     ref = result.scalar_one_or_none()
     
     if ref:
+        # Check for fast-forward or concurrent update (optional logic could be added here)
         ref.commit_hash = payload.commit_hash
     else:
         db.add(DBRef(name=ref_name, commit_hash=payload.commit_hash))
     
-    await db.commit()
-    return {"status": "updated"}
+    try:
+        await db.commit()
+        return {"status": "updated", "ref": ref_name, "new_hash": payload.commit_hash}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update ref: {str(e)}")
 
 @app.get("/api/refs/{ref_name:path}")
 async def get_ref(ref_name: str, db: AsyncSession = Depends(get_session)):
@@ -198,3 +207,41 @@ async def list_refs(db: AsyncSession = Depends(get_session)):
     result = await db.execute(select(DBRef))
     refs = result.scalars().all()
     return {r.name: r.commit_hash for r in refs}
+
+@app.get("/api/sync/refs")
+async def sync_refs(db: AsyncSession = Depends(get_session)):
+    """Endpoint for remote teams to pull all current branch references."""
+    result = await db.execute(select(DBRef))
+    refs = result.scalars().all()
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "refs": {r.name: r.commit_hash for r in refs}
+    }
+
+@app.post("/api/sync/batch-objects")
+async def check_objects_batch(hashes: List[str], db: AsyncSession = Depends(get_session)):
+    """Check existence of multiple objects at once for faster synchronization."""
+    # Check cache first
+    missing = []
+    found = []
+    
+    for h in hashes:
+        if await cache.get_object_exists(h):
+            found.append(h)
+        else:
+            missing.append(h)
+            
+    if not missing:
+        return {"found": found, "missing": []}
+        
+    # Check DB for missing ones
+    result = await db.execute(select(DBObject.hash).where(DBObject.hash.in_(missing)))
+    db_found = [r for r in result.scalars().all()]
+    
+    for h in db_found:
+        await cache.set_object_exists(h)
+        
+    return {
+        "found": found + db_found,
+        "missing": [h for h in missing if h not in db_found]
+    }
