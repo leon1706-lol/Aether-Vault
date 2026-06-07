@@ -87,8 +87,12 @@ async def push_commit(commit_data: Dict[str, Any], db: AsyncSession = Depends(ge
     try:
         root_tree_hash = await build_merkle_tree(db, commit_data["tree"])
         new_commit = DBCommit(
-            hash=commit_hash, message=commit_data["message"], author=commit_data.get("author", "unknown"),
-            metrics=commit_data.get("metrics", {}), parent_hash=commit_data.get("parents", [None])[0] if commit_data.get("parents") else None,
+            hash=commit_hash, 
+            message=commit_data["message"], 
+            author=commit_data.get("author", "unknown"),
+            tags=commit_data.get("tags", []),
+            metrics=commit_data.get("metrics", {}), 
+            parent_hash=commit_data.get("parents", [None])[0] if commit_data.get("parents") else None,
             root_tree_hash=root_tree_hash
         )
         db.add(new_commit)
@@ -100,30 +104,41 @@ async def push_commit(commit_data: Dict[str, Any], db: AsyncSession = Depends(ge
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "version": "1.3.0 (Bloom-Filter Enabled)"}
+    return {"status": "ok", "version": "1.4.0 (Dynamic Metadata Enabled)"}
+
+@app.get("/api/commits/{hash}")
+async def get_commit(hash: str, db: AsyncSession = Depends(get_session)):
+    result = await db.execute(select(DBCommit).where(DBCommit.hash == hash))
+    commit = result.scalar_one_or_none()
+    if not commit:
+        raise HTTPException(status_code=404, detail="Commit not found")
+    
+    return {
+        "hash": commit.hash,
+        "message": commit.message,
+        "author": commit.author,
+        "tags": commit.tags,
+        "metrics": commit.metrics,
+        "timestamp": commit.timestamp.isoformat(),
+        "root_tree_hash": commit.root_tree_hash
+    }
 
 @app.post("/api/objects/{hash}")
 async def upload_object(hash: str, request: Request, db: AsyncSession = Depends(get_session)):
     if not re.match(r'^[a-f0-9]{64}$', hash):
         raise HTTPException(status_code=400, detail="Invalid hash format")
     
-    # 1. Check Bloom Filter (Fast)
     might_exist = await cache.check_hash_exists(hash)
-    
     if might_exist:
-        # 2. Potential False Positive or real hit -> Check PostgreSQL
         result = await db.execute(select(DBObject).where(DBObject.hash == hash))
         if result.scalar_one_or_none():
             return Response(status_code=409, content="Object already exists")
     
-    # 3. Request Upload
     try:
         path = await storage.store_object(hash, request.stream())
         size = path.stat().st_size
         db.add(DBObject(hash=hash, size=size))
         await db.commit()
-        
-        # 4. Update Bloom Filter
         await cache.add_hash(hash)
         return Response(status_code=201)
     except Exception as e:
@@ -160,79 +175,43 @@ async def list_refs(db: AsyncSession = Depends(get_session)):
     return {r.name: r.commit_hash for r in refs}
 
 async def get_all_referenced_hashes(db: AsyncSession, tree_hash: str, visited_trees: set, alive_hashes: set):
-    """Recursively collects all object hashes from a Merkle Tree."""
-    if tree_hash in visited_trees:
-        return
+    if tree_hash in visited_trees: return
     visited_trees.add(tree_hash)
-    
     result = await db.execute(select(DBTree).where(DBTree.tree_hash == tree_hash))
     entries = result.scalars().all()
-    
     for entry in entries:
-        if entry.child_tree_hash:
-            await get_all_referenced_hashes(db, entry.child_tree_hash, visited_trees, alive_hashes)
-        if entry.object_hash:
-            alive_hashes.add(entry.object_hash)
+        if entry.child_tree_hash: await get_all_referenced_hashes(db, entry.child_tree_hash, visited_trees, alive_hashes)
+        if entry.object_hash: alive_hashes.add(entry.object_hash)
 
 @app.post("/api/admin/gc")
 async def run_garbage_collection(db: AsyncSession = Depends(get_session)):
-    """
-    Performs Mark-and-Sweep Garbage Collection.
-    1. Mark: Find all hashes referenced by any commit.
-    2. Sweep: Delete objects from disk and DB that are not referenced.
-    3. Redis: Rebuild Bloom Filter.
-    """
     try:
-        # 1. MARK PHASE
-        alive_hashes = set()
-        visited_trees = set()
-        
-        # Get all commits
+        alive_hashes, visited_trees = set(), set()
         result = await db.execute(select(DBCommit))
         commits = result.scalars().all()
+        for commit in commits: await get_all_referenced_hashes(db, commit.root_tree_hash, visited_trees, alive_hashes)
         
-        for commit in commits:
-            await get_all_referenced_hashes(db, commit.root_tree_hash, visited_trees, alive_hashes)
-        
-        # 2. SWEEP PHASE (DB)
-        # Find all objects in DB
         result = await db.execute(select(DBObject.hash))
         all_db_hashes = set(result.scalars().all())
-        
         dead_hashes = all_db_hashes - alive_hashes
         
-        # Delete dead objects from DB
         if dead_hashes:
             await db.execute(delete(DBObject).where(DBObject.hash.in_(list(dead_hashes))))
-            # Note: We also need to cleanup DBTree entries that are no longer reachable
-            # For simplicity in this PR, we focus on the large object shards
             await db.execute(delete(DBTree).where(DBTree.tree_hash.notin_(list(visited_trees))))
         
-        # 3. SWEEP PHASE (DISK)
-        # Scan physical storage
         deleted_count = 0
         for obj_path in storage.data_dir.glob("objects/*/*"):
             if obj_path.is_file():
-                # Reconstruct hash from path: objects/ab/cdef... -> abcdef...
                 h = obj_path.parent.name + obj_path.name
                 if h not in alive_hashes:
                     obj_path.unlink()
                     deleted_count += 1
         
-        # 4. REDIS REBUILD
         await cache.reset_filter()
         await cache.init_filter()
-        for h in alive_hashes:
-            await cache.add_hash(h)
-            
+        for h in alive_hashes: await cache.add_hash(h)
         await db.commit()
-        return {
-            "status": "success",
-            "alive_objects": len(alive_hashes),
-            "deleted_objects": deleted_count,
-            "reused_trees": len(visited_trees)
-        }
+        return {"status": "success", "alive_objects": len(alive_hashes), "deleted_objects": deleted_count, "reused_trees": len(visited_trees)}
     except Exception as e:
         await db.rollback()
-        logger.error(f"GC failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

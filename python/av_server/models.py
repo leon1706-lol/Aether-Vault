@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, JSON, DateTime, ForeignKey, Table, Boolean
+from sqlalchemy import Column, String, Integer, JSON, DateTime, ForeignKey, Table, Boolean, ARRAY
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
 
@@ -30,7 +30,8 @@ class DBCommit(Base):
     message = Column(String)
     author = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    metrics = Column(JSON)
+    tags = Column(ARRAY(String), default=[])
+    metrics = Column(JSON, default={}) # Using JSON which maps to JSONB in PG
     parent_hash = Column(String, ForeignKey('commits.hash'), nullable=True)
     
     # Root of the Merkle Tree
