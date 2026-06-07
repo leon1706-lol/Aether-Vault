@@ -68,7 +68,6 @@ def hash_file_safe(path: str) -> str:
             return aether_core.hash_file(path)
         except Exception as e:
             logger.debug(f"aether_core.hash_file failed, using Python fallback: {e}")
-    
     sha256 = hashlib.sha256()
     try:
         with open(path, 'rb') as f:
@@ -93,23 +92,17 @@ def init():
     if av_dir.exists():
         click.secho(f"Repository already initialized at {av_dir}", fg='yellow')
         return
-
     try:
         (av_dir / 'objects').mkdir(parents=True, exist_ok=True)
         (av_dir / 'refs' / 'heads').mkdir(parents=True, exist_ok=True)
         (av_dir / 'commits').mkdir(parents=True, exist_ok=True)
-        
         save_config(repo_root, {"lfs_threshold_mb": 50, "remote_url": "http://localhost:8000"})
-        
         idx = Index(repo_root)
         idx.save()
-        
         with open(av_dir / 'HEAD', 'w') as f:
             f.write('ref: refs/heads/main\n')
-            
         with open(av_dir / 'refs' / 'heads' / 'main', 'w') as f:
             f.write('')
-            
         click.secho(f"Initialized empty Aether-Vault repository in {av_dir}", fg='green')
     except OSError as e:
         raise StorageError(f"Failed to initialize repository: {e}")
@@ -132,7 +125,6 @@ def add(paths):
     idx = Index(repo_root)
     cfg = load_config(repo_root)
     threshold_bytes = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
-    
     files_to_process = []
     for p in paths:
         path_obj = Path(p).resolve()
@@ -140,27 +132,19 @@ def add(paths):
             files_to_process.append(path_obj)
         elif path_obj.is_dir():
             for root, _, files in os.walk(path_obj):
-                if '.av' in root or '.git' in root or '__pycache__' in root:
-                    continue
+                if '.av' in root or '.git' in root or '__pycache__' in root: continue
                 for f in files:
-                    if not f.endswith('.pyc'):
-                        files_to_process.append(Path(root) / f)
-                        
+                    if not f.endswith('.pyc'): files_to_process.append(Path(root) / f)
     for fpath in files_to_process:
         try:
             rel_path = str(fpath.relative_to(repo_root)).replace('\\', '/')
-            if is_pointer_file(fpath):
-                continue
-                
+            if is_pointer_file(fpath): continue
             file_hash = hash_file_safe(str(fpath))
             stat = fpath.stat()
             file_type = idx.classify_file(rel_path)
-            
             pointer_rel_path = None
-            
             if file_type == 'artifact' and stat.st_size > threshold_bytes:
                 layers = []
-                # Safetensors Layer-Splitting
                 if rel_path.endswith('.safetensors') and aether_core:
                     logger.info(f"Processing Safetensors layers for {rel_path}...")
                     layer_results = aether_core.split_and_hash_safetensors(str(fpath))
@@ -168,38 +152,25 @@ def add(paths):
                         l_hash = lr["hash"]
                         l_size = lr["size"]
                         l_offset = lr["offset"]
-                        
-                        # Store layer shard in CAS
                         l_obj_dir = repo_root / '.av' / 'objects' / l_hash[:2]
                         l_obj_dir.mkdir(parents=True, exist_ok=True)
                         l_obj_path = l_obj_dir / l_hash[2:]
-                        
                         if not l_obj_path.exists():
-                            # Extract shard from original file
                             with open(fpath, 'rb') as src_f:
                                 src_f.seek(l_offset)
                                 with open(l_obj_path, 'wb') as dest_f:
                                     dest_f.write(src_f.read(l_size))
-                        
                         layers.append({"name": lr["name"], "hash": l_hash, "size": l_size})
-                
                 obj_dir = repo_root / '.av' / 'objects' / file_hash[:2]
                 obj_dir.mkdir(parents=True, exist_ok=True)
                 obj_path = obj_dir / file_hash[2:]
-                
-                if not obj_path.exists():
-                    shutil.copy2(fpath, obj_path)
-                    
+                if not obj_path.exists(): shutil.copy2(fpath, obj_path)
                 ptr_path = get_pointer_path(fpath)
                 ptr_content = create_pointer(fpath, file_hash, stat.st_size)
-                with open(ptr_path, 'w') as ptr_f:
-                    ptr_f.write(ptr_content)
-                    
+                with open(ptr_path, 'w') as ptr_f: ptr_f.write(ptr_content)
                 pointer_rel_path = rel_path + ".av-pointer"
                 idx.add_entry(rel_path, file_hash, stat.st_size, stat.st_mtime_ns, file_type, pointer_rel_path)
-                # Store layers in index entry for commit
-                if layers:
-                    idx.entries[rel_path]["layers"] = layers
+                if layers: idx.entries[rel_path]["layers"] = layers
                 logger.info(f"Staged [ARTIFACT] {rel_path} (LFS) with {len(layers)} layers")
             else:
                 idx.add_entry(rel_path, file_hash, stat.st_size, stat.st_mtime_ns, file_type, None)
@@ -212,44 +183,30 @@ def status():
     """Show working tree status"""
     repo_root = ensure_repo()
     idx = Index(repo_root)
-    
     head_path = repo_root / '.av' / 'HEAD'
     branch = "detached"
     if head_path.exists():
         head_content = head_path.read_text().strip()
         if head_content.startswith("ref: refs/heads/"):
             branch = head_content.split("/")[-1]
-            
     click.secho(f"On branch {branch}\n", bold=True)
-    
-    staged = []
-    modified = []
-    deleted = []
-    untracked = []
-    
+    staged, modified, deleted, untracked = [], [], [], []
     disk_files = set()
     for root, _, files in os.walk(repo_root):
-        if '.av' in root or '.git' in root or '__pycache__' in root:
-            continue
+        if '.av' in root or '.git' in root or '__pycache__' in root: continue
         for f in files:
             if not f.endswith('.pyc') and not f.endswith('.av-pointer'):
                 disk_files.add(str((Path(root) / f).relative_to(repo_root)).replace('\\', '/'))
-                
     for rel_path, entry in idx.entries.items():
-        if rel_path not in disk_files:
-            deleted.append(rel_path)
+        if rel_path not in disk_files: deleted.append(rel_path)
         else:
-            if entry.get("staged"):
-                staged.append(rel_path)
+            if entry.get("staged"): staged.append(rel_path)
             else:
                 stat = (repo_root / rel_path).stat()
                 if stat.st_size != entry["size"] or stat.st_mtime_ns != entry["mtime_ns"]:
                     modified.append(rel_path)
-                
     for rel_path in disk_files:
-        if rel_path not in idx.entries:
-            untracked.append(rel_path)
-            
+        if rel_path not in idx.entries: untracked.append(rel_path)
     if staged:
         click.secho("Changes to be committed:", fg='green')
         for f in staged: click.echo(f"  modified: {f}")
@@ -266,97 +223,76 @@ def status():
         click.secho("Untracked files:", fg='red')
         for f in untracked: click.echo(f"  {f}")
         click.echo("")
-        
-    if not staged and not modified and not deleted and not untracked:
+    if not any([staged, modified, deleted, untracked]):
         click.secho("Nothing to commit, working tree clean", fg='green')
 
 @cli.command()
 @click.option('-m', '--message', required=True, help="Commit message")
 @click.option('--metric-sharpe', type=float, help="Sharpe ratio")
 @click.option('--metric-drawdown', type=float, help="Max drawdown")
-def commit(message, metric_sharpe, metric_drawdown):
+@click.pass_context
+def commit(ctx, message, metric_sharpe, metric_drawdown):
     """Record changes to the repository"""
     repo_root = ensure_repo()
     idx = Index(repo_root)
     cfg = load_config(repo_root)
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
-    
     staged = idx.get_staged_entries()
     if not staged:
         click.secho("Nothing to commit", fg='yellow')
         return
-        
-    tree = {}
-    for rel_path, e in idx.entries.items():
-        tree[rel_path] = {
-            "hash": e["hash"], 
-            "size": e["size"], 
-            "type": e["type"],
-            "layers": e.get("layers", [])
-        }
-            
+    tree = {p: {"hash": e["hash"], "size": e["size"], "type": e["type"], "layers": e.get("layers", [])} for p, e in idx.entries.items()}
     head_path = repo_root / '.av' / 'HEAD'
-    parents = []
-    ref_path = None
+    parents, ref_path = [], None
     if head_path.exists():
         head_content = head_path.read_text().strip()
         if head_content.startswith("ref: "):
             ref_path = repo_root / '.av' / head_content.split(": ", 1)[1]
-            if ref_path.exists() and ref_path.read_text().strip():
-                parents.append(ref_path.read_text().strip())
-        else:
-            parents.append(head_content)
-            
-    commit_data = {
-        "parents": parents,
-        "author": os.environ.get("AV_AUTHOR", "anonymous"),
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "message": message,
-        "tree": tree,
-        "metrics": {}
-    }
+            if ref_path.exists() and ref_path.read_text().strip(): parents.append(ref_path.read_text().strip())
+        else: parents.append(head_content)
+    commit_data = {"parents": parents, "author": os.environ.get("AV_AUTHOR", "anonymous"), "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(), "message": message, "tree": tree, "metrics": {}}
     if metric_sharpe is not None: commit_data["metrics"]["sharpe"] = metric_sharpe
     if metric_drawdown is not None: commit_data["metrics"]["drawdown"] = metric_drawdown
-    
-    commit_str = json.dumps(commit_data, sort_keys=True)
-    commit_hash = hashlib.sha256(commit_str.encode()).hexdigest()
+    commit_hash = hashlib.sha256(json.dumps(commit_data, sort_keys=True).encode()).hexdigest()
     commit_data["hash"] = commit_hash
-    
     try:
-        with open(repo_root / '.av' / 'commits' / f"{commit_hash}.json", 'w') as f:
-            json.dump(commit_data, f, indent=2)
-            
+        with open(repo_root / '.av' / 'commits' / f"{commit_hash}.json", 'w') as f: json.dump(commit_data, f, indent=2)
         if ref_path:
-            with open(ref_path, 'w') as f:
-                f.write(commit_hash)
+            with open(ref_path, 'w') as f: f.write(commit_hash)
         else:
-            with open(head_path, 'w') as f:
-                f.write(commit_hash)
-                
+            with open(head_path, 'w') as f: f.write(commit_hash)
         idx.clear_staged()
         click.secho(f"[{commit_hash[:7]}] {message}", fg='green')
-        
         if client.server_available():
             client.push_commit(commit_data)
-            if ref_path:
-                client.update_ref(ref_path.name, commit_hash)
-                
+            if ref_path: client.update_ref(ref_path.name, commit_hash)
             for rel_path, info in tree.items():
                 if info["type"] == "artifact":
-                    # Upload individual layers if they exist
                     if info.get("layers"):
                         for layer in info["layers"]:
                             l_hash = layer["hash"]
                             l_obj_file = repo_root / '.av' / 'objects' / l_hash[:2] / l_hash[2:]
-                            if l_obj_file.exists():
-                                client.upload_object(l_obj_file, l_hash)
-                    
-                    # Also upload the full file object (or pointer reference)
+                            if l_obj_file.exists(): client.upload_object(l_obj_file, l_hash)
                     obj_file = repo_root / '.av' / 'objects' / info["hash"][:2] / info["hash"][2:]
-                    if obj_file.exists():
-                        client.upload_object(obj_file, info["hash"])
-    except Exception as e:
-        raise StorageError(f"Commit failed: {e}")
+                    if obj_file.exists(): client.upload_object(obj_file, info["hash"])
+    except Exception as e: raise StorageError(f"Commit failed: {e}")
+
+@cli.command()
+@click.pass_context
+def gc(ctx):
+    """Run garbage collection to remove orphaned shards."""
+    repo_root = ensure_repo()
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    if not client.server_available(): raise NetworkError("Server not available for GC")
+    click.echo("Running Garbage Collection on server...")
+    result = client.run_gc()
+    if result and result.get("status") == "success":
+        click.secho(f"GC Success!", fg='green')
+        click.echo(f"  Alive objects: {result['alive_objects']}")
+        click.echo(f"  Deleted orphaned objects: {result['deleted_objects']}")
+        click.echo(f"  Reused trees: {result['reused_trees']}")
+    else: click.secho("GC failed or returned no result", fg='red')
 
 if __name__ == '__main__':
     cli()

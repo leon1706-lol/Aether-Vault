@@ -95,3 +95,14 @@ class VaultClient:
             return resp.status_code == 200
         except requests.exceptions.RequestException:
             return False
+
+    def run_gc(self) -> dict | None:
+        url = f"{self.server_url}/api/admin/gc"
+        try:
+            resp = self.session.post(url)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"Error running GC: {e}")
+            return None

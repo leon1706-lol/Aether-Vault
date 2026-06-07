@@ -33,6 +33,14 @@ class RedisCache:
         except Exception as e:
             logger.error(f"Failed to add hash to Bloom Filter: {e}")
 
+    async def reset_filter(self):
+        """Deletes the existing Bloom Filter."""
+        try:
+            await self.client.delete(FILTER_NAME)
+            logger.info("Reset Bloom Filter")
+        except Exception as e:
+            logger.error(f"Failed to reset Bloom Filter: {e}")
+
     async def check_hash_exists(self, sha256_hash: str) -> bool:
         """
         Checks if a hash exists in the Bloom Filter.
