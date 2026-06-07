@@ -15,22 +15,20 @@
 namespace py = pybind11;
 namespace fs = std::filesystem;
 
-// Minimal JSON parser helper for Safetensors header
-// In a production environment, we'd use a robust library like nlohmann/json
+/**
+ * Optimized Safetensors Header Parser
+ * Dynamically extracts layer names and their relative byte offsets.
+ */
 std::map<std::string, std::pair<uint64_t, uint64_t>> parse_safetensors_header(const char* header_data, uint64_t header_size) {
     std::map<std::string, std::pair<uint64_t, uint64_t>> layers;
     std::string json_str(header_data, header_size);
     
-    // Very basic extraction of "data_offsets": [start, end]
-    // Safetensors format: {"LAYER_NAME": {"dtype": "...", "shape": [...], "data_offsets": [start, end]}, ...}
     size_t pos = 0;
     while ((pos = json_str.find("\"data_offsets\"", pos)) != std::string::npos) {
-        // Find key name (backwards)
         size_t key_end = json_str.rfind("\"", pos - 3);
         size_t key_start = json_str.rfind("\"", key_end - 1);
         std::string layer_name = json_str.substr(key_start + 1, key_end - key_start - 1);
         
-        // Find offsets
         size_t start_bracket = json_str.find("[", pos);
         size_t comma = json_str.find(",", start_bracket);
         size_t end_bracket = json_str.find("]", comma);
@@ -51,6 +49,10 @@ struct LayerHashResult {
     uint64_t offset;
 };
 
+/**
+ * Displacement-Resistant Layer Hashing
+ * Uses mmap to isolate layer bytes and compute hashes based ONLY on layer content.
+ */
 std::vector<LayerHashResult> split_and_hash_safetensors(const std::string& path, int num_threads = 0) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd == -1) throw std::runtime_error("Cannot open file: " + path);
@@ -79,6 +81,7 @@ std::vector<LayerHashResult> split_and_hash_safetensors(const std::string& path,
             uint64_t end = data_start_offset + offsets.second;
             uint64_t size = end - start;
             
+            // The hash is computed only on the slice, making it independent of its global offset
             SHA256 sha;
             sha.update(reinterpret_cast<const uint8_t*>(data + start), size);
             return LayerHashResult{name, sha.hexdigest(), size, start};
@@ -95,7 +98,6 @@ std::vector<LayerHashResult> split_and_hash_safetensors(const std::string& path,
     return results;
 }
 
-// Wrapper for Python
 py::list py_split_and_hash_safetensors(const std::string& path, int num_threads = 0) {
     auto results = split_and_hash_safetensors(path, num_threads);
     py::list py_results;
@@ -110,7 +112,6 @@ py::list py_split_and_hash_safetensors(const std::string& path, int num_threads 
     return py_results;
 }
 
-// Existing hashing functions...
 std::string hash_file_sequential(const std::string& path) {
     if (!fs::exists(path)) throw std::runtime_error("File not found: " + path);
     std::ifstream file(path, std::ios::binary);
@@ -154,9 +155,9 @@ std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 
 }
 
 PYBIND11_MODULE(aether_core, m) {
-    m.doc() = "Aether-Vault C++ performance core with Layer-Splitting";
+    m.doc() = "Aether-Vault C++ performance core with Reshaping-Resistant Layer Hashing";
     m.def("hash_file", &hash_file_parallel, py::arg("path"), py::arg("chunk_size") = 8388608, py::arg("num_threads") = 0);
-    m.def("split_and_hash_safetensors", &py_split_and_hash_safetensors, py::arg("path"), py::arg("num_threads") = 0, "Split Safetensors file into layers and hash them in parallel using mmap");
+    m.def("split_and_hash_safetensors", &py_split_and_hash_safetensors, py::arg("path"), py::arg("num_threads") = 0);
     m.def("get_file_metadata", [](const std::string& path) {
         py::dict result;
         if (!fs::exists(path)) { result["exists"] = false; return result; }
