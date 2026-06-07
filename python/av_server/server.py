@@ -142,14 +142,42 @@ async def push_commit(commit_data: Dict[str, Any], db: AsyncSession = Depends(ge
             
             # Add to many-to-many table via raw insert for efficiency or use relationship
             # Here we'll use the association table directly
-            stmt = commit_objects.insert().values(
-                commit_hash=commit_hash,
-                object_hash=obj_hash,
-                path=path,
-                size=info.get("size", 0),
-                type=info.get("type", "unknown")
-            )
-            await db.execute(stmt)
+            # Check if this is a layer-aware artifact (Safetensors)
+            layers = info.get("layers", [])
+            
+            if layers:
+                for layer in layers:
+                    l_hash = layer["hash"]
+                    l_name = layer["name"]
+                    l_size = layer["size"]
+                    
+                    # Ensure layer object exists in DB
+                    l_obj_result = await db.execute(select(DBObject).where(DBObject.hash == l_hash))
+                    if not l_obj_result.scalar_one_or_none():
+                        db.add(DBObject(hash=l_hash, size=l_size))
+                    
+                    # Link layer to commit
+                    l_stmt = commit_objects.insert().values(
+                        commit_hash=commit_hash,
+                        object_hash=l_hash,
+                        path=path,
+                        size=l_size,
+                        type="layer",
+                        is_layer=True,
+                        layer_name=l_name
+                    )
+                    await db.execute(l_stmt)
+            else:
+                # Standard file handling
+                stmt = commit_objects.insert().values(
+                    commit_hash=commit_hash,
+                    object_hash=obj_hash,
+                    path=path,
+                    size=info.get("size", 0),
+                    type=info.get("type", "unknown"),
+                    is_layer=False
+                )
+                await db.execute(stmt)
             
         await db.commit()
         return Response(status_code=201)

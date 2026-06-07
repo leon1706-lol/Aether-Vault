@@ -159,6 +159,30 @@ def add(paths):
             pointer_rel_path = None
             
             if file_type == 'artifact' and stat.st_size > threshold_bytes:
+                layers = []
+                # Safetensors Layer-Splitting
+                if rel_path.endswith('.safetensors') and aether_core:
+                    logger.info(f"Processing Safetensors layers for {rel_path}...")
+                    layer_results = aether_core.split_and_hash_safetensors(str(fpath))
+                    for lr in layer_results:
+                        l_hash = lr["hash"]
+                        l_size = lr["size"]
+                        l_offset = lr["offset"]
+                        
+                        # Store layer shard in CAS
+                        l_obj_dir = repo_root / '.av' / 'objects' / l_hash[:2]
+                        l_obj_dir.mkdir(parents=True, exist_ok=True)
+                        l_obj_path = l_obj_dir / l_hash[2:]
+                        
+                        if not l_obj_path.exists():
+                            # Extract shard from original file
+                            with open(fpath, 'rb') as src_f:
+                                src_f.seek(l_offset)
+                                with open(l_obj_path, 'wb') as dest_f:
+                                    dest_f.write(src_f.read(l_size))
+                        
+                        layers.append({"name": lr["name"], "hash": l_hash, "size": l_size})
+                
                 obj_dir = repo_root / '.av' / 'objects' / file_hash[:2]
                 obj_dir.mkdir(parents=True, exist_ok=True)
                 obj_path = obj_dir / file_hash[2:]
@@ -173,7 +197,10 @@ def add(paths):
                     
                 pointer_rel_path = rel_path + ".av-pointer"
                 idx.add_entry(rel_path, file_hash, stat.st_size, stat.st_mtime_ns, file_type, pointer_rel_path)
-                logger.info(f"Staged [ARTIFACT] {rel_path} (LFS)")
+                # Store layers in index entry for commit
+                if layers:
+                    idx.entries[rel_path]["layers"] = layers
+                logger.info(f"Staged [ARTIFACT] {rel_path} (LFS) with {len(layers)} layers")
             else:
                 idx.add_entry(rel_path, file_hash, stat.st_size, stat.st_mtime_ns, file_type, None)
                 logger.info(f"Staged [{file_type.upper()}] {rel_path}")
@@ -261,7 +288,12 @@ def commit(message, metric_sharpe, metric_drawdown):
         
     tree = {}
     for rel_path, e in idx.entries.items():
-        tree[rel_path] = {"hash": e["hash"], "size": e["size"], "type": e["type"]}
+        tree[rel_path] = {
+            "hash": e["hash"], 
+            "size": e["size"], 
+            "type": e["type"],
+            "layers": e.get("layers", [])
+        }
             
     head_path = repo_root / '.av' / 'HEAD'
     parents = []
@@ -311,6 +343,15 @@ def commit(message, metric_sharpe, metric_drawdown):
                 
             for rel_path, info in tree.items():
                 if info["type"] == "artifact":
+                    # Upload individual layers if they exist
+                    if info.get("layers"):
+                        for layer in info["layers"]:
+                            l_hash = layer["hash"]
+                            l_obj_file = repo_root / '.av' / 'objects' / l_hash[:2] / l_hash[2:]
+                            if l_obj_file.exists():
+                                client.upload_object(l_obj_file, l_hash)
+                    
+                    # Also upload the full file object (or pointer reference)
                     obj_file = repo_root / '.av' / 'objects' / info["hash"][:2] / info["hash"][2:]
                     if obj_file.exists():
                         client.upload_object(obj_file, info["hash"])

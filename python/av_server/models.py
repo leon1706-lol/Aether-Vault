@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, JSON, DateTime, ForeignKey, Table
+from sqlalchemy import Column, String, Integer, JSON, DateTime, ForeignKey, Table, Boolean
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
 
@@ -12,7 +12,9 @@ commit_objects = Table(
     Column('object_hash', String, ForeignKey('objects.hash'), primary_key=True),
     Column('path', String, primary_key=True),
     Column('size', Integer),
-    Column('type', String)
+    Column('type', String),
+    Column('is_layer', Boolean, default=False),
+    Column('layer_name', String, nullable=True)
 )
 
 class DBObject(Base):
