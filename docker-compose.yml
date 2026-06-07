@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   aether-vault-server:
     build: .
@@ -9,6 +10,13 @@ services:
       - vault_data:/data
     environment:
       - AV_DATA_DIR=/data
+      - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db:5432/aether_vault
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8000/api/health").read()']
@@ -16,6 +24,42 @@ services:
       timeout: 10s
       retries: 3
 
+  db:
+    image: postgres:15-alpine
+    container_name: aether-vault-db
+    environment:
+      POSTGRES_USER: av_user
+      POSTGRES_PASSWORD: av_password
+      POSTGRES_DB: aether_vault
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U av_user -d aether_vault"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: aether-vault-redis
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
 volumes:
   vault_data:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
     driver: local
