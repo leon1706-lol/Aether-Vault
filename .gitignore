@@ -48,3 +48,6 @@ venv.bak/
 .vscode/
 .idea/
 .DS_Store
+
+# context for agents:
+Aether-vault-Obsidian-Vault/
