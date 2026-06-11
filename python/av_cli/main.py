@@ -542,27 +542,49 @@ def checkout(target: str) -> None:
     idx = Index(repo_root)
     idx.entries.clear()
 
-    tree = commit_data.get("tree", {"code": {}, "artifacts": {}})
-    for rel_path, h in tree.get("code", {}).items():
-        idx.add_entry(rel_path, h, 0, 0, "code", auto_save=False)
+    tree = commit_data.get("tree", {})
+    if "code" in tree or "artifacts" in tree:
+        for rel_path, h in tree.get("code", {}).items():
+            idx.add_entry(rel_path, h, 0, 0, "code", auto_save=False)
+        for rel_path, artifact in tree.get("artifacts", {}).items():
+            h = artifact["hash"]
+            size = artifact["size"]
+            pointer = artifact.get("pointer")
+            idx.add_entry(rel_path, h, size, 0, "artifact", pointer, auto_save=False)
+            if pointer:
+                obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
+                dest = repo_root / rel_path
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if obj_path.exists():
+                    shutil.copy2(obj_path, dest)
+                elif client.server_available():
+                    click.echo(f"Downloading {rel_path}...")
+                    if client.download_object(h, dest):
+                        obj_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(dest, obj_path)
+    else:
+        for rel_path, info in tree.items():
+            h = info["hash"]
+            size = info.get("size", 0)
+            file_type = info.get("type", "file")
+            layers = info.get("layers", [])
+            pointer = rel_path + ".av-pointer" if file_type == "artifact" else None
 
-    for rel_path, artifact in tree.get("artifacts", {}).items():
-        h = artifact["hash"]
-        size = artifact["size"]
-        pointer = artifact.get("pointer")
-        idx.add_entry(rel_path, h, size, 0, "artifact", pointer, auto_save=False)
+            idx.add_entry(rel_path, h, size, 0, file_type, pointer, auto_save=False)
+            if layers:
+                idx.entries[rel_path]["layers"] = layers
 
-        if pointer:
-            obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
-            dest = repo_root / rel_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if obj_path.exists():
-                shutil.copy2(obj_path, dest)
-            elif client.server_available():
-                click.echo(f"Downloading {rel_path}...")
-                if client.download_object(h, dest):
-                    obj_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(dest, obj_path)
+            if file_type == "artifact":
+                obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
+                dest = repo_root / rel_path
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if obj_path.exists():
+                    shutil.copy2(obj_path, dest)
+                elif client.server_available():
+                    click.echo(f"Downloading {rel_path}...")
+                    if client.download_object(h, dest):
+                        obj_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(dest, obj_path)
 
     idx.save()
 

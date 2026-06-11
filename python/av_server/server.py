@@ -260,6 +260,25 @@ async def get_commit(
         if local:
             return local
         raise HTTPException(status_code=404, detail="Commit not found")
+    # Rebuild the tree from the DB Merkle Tree
+    async def resolve_tree(tree_hash: str, current_path: str = "") -> dict:
+        tree_data = {}
+        result = await db.execute(select(DBTree).where(DBTree.tree_hash == tree_hash))
+        for entry in result.scalars().all():
+            full_path = f"{current_path}/{entry.path_name}" if current_path else entry.path_name
+            if entry.child_tree_hash:
+                tree_data.update(await resolve_tree(entry.child_tree_hash, full_path))
+            else:
+                tree_data[full_path] = {
+                    "hash": entry.object_hash,
+                    "size": entry.size,
+                    "type": entry.type,
+                    "layers": entry.layers or [],
+                }
+        return tree_data
+
+    tree_data = await resolve_tree(commit.root_tree_hash) if commit.root_tree_hash else {}
+
     return {
         "hash": commit.hash,
         "message": commit.message,
@@ -269,6 +288,7 @@ async def get_commit(
         "root_tree_hash": commit.root_tree_hash,
         "tags": commit.tags or [],
         "metrics": commit.metrics or {},
+        "tree": tree_data,
     }
 
 
