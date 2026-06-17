@@ -5,6 +5,9 @@
 #include <iostream>
 #include "sha256.h"
 #include "thread_pool.h"
+#include "json.hpp"
+
+using json = nlohmann::json;
 
 namespace py = pybind11;
 namespace fs = std::filesystem;
@@ -98,6 +101,95 @@ py::dict get_file_metadata(const std::string& path) {
     return result;
 }
 
+struct LayerResult {
+    std::string name;
+    std::string hash;
+    uint64_t size;
+    uint64_t offset;
+};
+
+py::list split_and_hash_safetensors(const std::string& path) {
+    if (!fs::exists(path)) throw std::runtime_error("File not found: " + path);
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("Cannot open file: " + path);
+
+    uint64_t header_size = 0;
+    file.read(reinterpret_cast<char*>(&header_size), 8);
+    if (file.gcount() != 8) throw std::runtime_error("Failed to read header size");
+
+    std::vector<char> header_buf(header_size);
+    file.read(header_buf.data(), header_size);
+    if (file.gcount() != header_size) throw std::runtime_error("Failed to read JSON header");
+
+    std::string header_str(header_buf.begin(), header_buf.end());
+    json header = json::parse(header_str);
+
+    uint64_t base_offset = 8 + header_size;
+    
+    struct LayerSpec {
+        std::string name;
+        uint64_t start_offset;
+        uint64_t end_offset;
+    };
+    std::vector<LayerSpec> layers;
+    for (auto& el : header.items()) {
+        if (el.key() == "__metadata__") continue;
+        auto& val = el.value();
+        if (val.contains("data_offsets")) {
+            auto offsets = val["data_offsets"];
+            if (offsets.size() == 2) {
+                layers.push_back({el.key(), offsets[0].get<uint64_t>(), offsets[1].get<uint64_t>()});
+            }
+        }
+    }
+
+    size_t threads_to_use = std::thread::hardware_concurrency();
+    ThreadPool pool(threads_to_use);
+    std::vector<std::future<LayerResult>> futures;
+
+    for (const auto& layer : layers) {
+        futures.push_back(pool.enqueue([path, layer, base_offset]() {
+            std::ifstream f(path, std::ios::binary);
+            uint64_t absolute_offset = base_offset + layer.start_offset;
+            uint64_t size = layer.end_offset - layer.start_offset;
+            f.seekg(absolute_offset);
+            
+            SHA256 sha;
+            const size_t chunk_size = 8 * 1024 * 1024;
+            std::vector<char> buffer(chunk_size);
+            uint64_t remaining = size;
+            
+            while (remaining > 0) {
+                size_t to_read = std::min(static_cast<uint64_t>(chunk_size), remaining);
+                f.read(buffer.data(), to_read);
+                if (f.gcount() == 0) break;
+                sha.update(reinterpret_cast<const uint8_t*>(buffer.data()), f.gcount());
+                remaining -= f.gcount();
+            }
+            
+            LayerResult lr;
+            lr.name = layer.name;
+            lr.hash = sha.hexdigest();
+            lr.size = size;
+            lr.offset = absolute_offset;
+            return lr;
+        }));
+    }
+
+    py::list results;
+    for (auto& fut : futures) {
+        auto lr = fut.get();
+        py::dict d;
+        d["name"] = lr.name;
+        d["hash"] = lr.hash;
+        d["size"] = lr.size;
+        d["offset"] = lr.offset;
+        results.append(d);
+    }
+    return results;
+}
+
+
 PYBIND11_MODULE(aether_core, m) {
     m.doc() = "Aether-Vault C++ performance core";
     m.def("hash_file", &hash_file_parallel, py::arg("path"), py::arg("chunk_size") = 8388608, py::arg("num_threads") = 0, "Compute parallel chunked SHA-256 tree hash of a file");
@@ -105,4 +197,5 @@ PYBIND11_MODULE(aether_core, m) {
     m.def("hash_bytes", &hash_bytes, py::arg("data"), "Compute SHA-256 hash of byte string");
     m.def("compare_metadata", &compare_metadata, py::arg("path"), py::arg("expected_size"), py::arg("expected_mtime_ns"), "Fast comparison of file size and modification time");
     m.def("get_file_metadata", &get_file_metadata, py::arg("path"), "Get file size and modification time (nanoseconds)");
+    m.def("split_and_hash_safetensors", &split_and_hash_safetensors, py::arg("path"), "Parse and hash Safetensors layers");
 }
