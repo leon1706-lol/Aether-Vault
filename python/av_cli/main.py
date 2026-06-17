@@ -644,5 +644,32 @@ def gc() -> None:
         click.secho("GC request failed. Check server logs.", fg="red")
 
 
+@cli.command()
+@click.option("--update", is_flag=True, help="Regenerate and update the markdown vault.")
+def graph(update: bool) -> None:
+    """Generate or update a markdown vault of code dependencies for Obsidian."""
+    repo_root = ensure_repo()
+    vault_dir = repo_root / "Aether-Graph"
+    
+    if update or not vault_dir.exists():
+        click.echo(f"Generating graph vault at {vault_dir}...")
+        vault_dir.mkdir(exist_ok=True)
+        from .graph import generate_full_graph
+        generate_full_graph(repo_root, vault_dir)
+        click.secho("Graph vault updated successfully.", fg="green")
+    
+    if not update:
+        click.secho(f"To visualize, open the following folder as a vault in Obsidian:\n  {vault_dir.resolve()}", fg="cyan")
+        import webbrowser
+        import urllib.parse
+        encoded_path = urllib.parse.quote(str(vault_dir.resolve()))
+        obsidian_uri = f"obsidian://open?path={encoded_path}"
+        try:
+            webbrowser.open(obsidian_uri)
+            click.echo("Attempted to launch Obsidian.")
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     cli()

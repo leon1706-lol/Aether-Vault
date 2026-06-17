@@ -116,6 +116,16 @@ View all registered tracking tags and metric keys used in the repository history
 av list-meta
 ```
 
+### Visualize Codebase Dependencies
+Automatically parse your repository's Python AST to generate an interactive Markdown-based call graph of all functions, classes, and dependencies, ready to be viewed in Obsidian.
+```bash
+# Generate the vault and attempt to launch Obsidian
+av graph
+
+# Quietly update/regenerate the graph notes after making code changes
+av graph --update
+```
+
 ### Run Garbage Collection (Admin)
 Trigger a mark-and-sweep cleanup on the remote server to delete orphaned storage shards and rebuild the cache.
 ```bash
@@ -154,6 +164,9 @@ Aether-Vault was designed and constructed in multiple distinct phases, bridging 
 
 ### Phase 7: ML Experiment Tracking
 * **Dynamic Metadata**: Bound directly into the atomic commits, `--tag` and `--metric` flags allow users to attach arbitrary data (like training loss, accuracy, or Sharpe ratio) to versioned model checkpoints.
+
+### Phase 8: Native Codebase Visualization
+* **AST Parsing & Graph Generation**: Integrated Python Abstract Syntax Tree (AST) parsing directly into the CLI via `av graph`. It dynamically maps internal module calls, external library dependencies, and docstrings, exporting them into an Obsidian-compatible Markdown vault for real-time visual dependency tracking.
 
 ---
 
