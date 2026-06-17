@@ -40,11 +40,16 @@ std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 
     
     size_t num_chunks = (file_size + chunk_size - 1) / chunk_size;
     std::vector<std::future<std::string>> futures;
+    auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
     
     for (size_t i = 0; i < num_chunks; ++i) {
-        futures.push_back(pool.enqueue([path, i, chunk_size, file_size]() {
+        futures.push_back(pool.enqueue([path, i, chunk_size, file_size, cancel_flag]() {
+            if (cancel_flag->load()) return std::string("");
             std::ifstream file(path, std::ios::binary);
-            if (!file) throw std::runtime_error("Cannot open file: " + path);
+            if (!file) {
+                cancel_flag->store(true);
+                throw std::runtime_error("Cannot open file: " + path);
+            }
             
             size_t offset = i * chunk_size;
             size_t to_read = std::min(chunk_size, static_cast<size_t>(file_size - offset));
@@ -52,6 +57,7 @@ std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 
             file.seekg(offset);
             std::vector<char> buffer(to_read);
             if (!file.read(buffer.data(), to_read) && file.gcount() != to_read) {
+                cancel_flag->store(true);
                 throw std::runtime_error("Failed to read chunk at offset " + std::to_string(offset));
             }
             
@@ -63,7 +69,12 @@ std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 
     
     std::string concatenated_hashes = "";
     for (auto& fut : futures) {
-        concatenated_hashes += fut.get();
+        try {
+            concatenated_hashes += fut.get();
+        } catch (...) {
+            cancel_flag->store(true);
+            throw;
+        }
     }
     
     SHA256 final_sha;
@@ -128,17 +139,22 @@ py::list split_and_hash_safetensors(const std::string& path) {
     
     struct LayerSpec {
         std::string name;
-        uint64_t start_offset;
-        uint64_t end_offset;
+        uint64_t abs_start;
+        uint64_t size;
     };
     std::vector<LayerSpec> layers;
+    // Layer 1: the 8-byte length prefix + JSON header itself
+    layers.push_back({"__header__", 0, base_offset});
+
     for (auto& el : header.items()) {
         if (el.key() == "__metadata__") continue;
         auto& val = el.value();
         if (val.contains("data_offsets")) {
             auto offsets = val["data_offsets"];
             if (offsets.size() == 2) {
-                layers.push_back({el.key(), offsets[0].get<uint64_t>(), offsets[1].get<uint64_t>()});
+                uint64_t start = offsets[0].get<uint64_t>();
+                uint64_t end = offsets[1].get<uint64_t>();
+                layers.push_back({el.key(), base_offset + start, end - start});
             }
         }
     }
@@ -146,12 +162,18 @@ py::list split_and_hash_safetensors(const std::string& path) {
     size_t threads_to_use = std::thread::hardware_concurrency();
     ThreadPool pool(threads_to_use);
     std::vector<std::future<LayerResult>> futures;
+    auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
 
     for (const auto& layer : layers) {
-        futures.push_back(pool.enqueue([path, layer, base_offset]() {
+        futures.push_back(pool.enqueue([path, layer, cancel_flag]() {
+            if (cancel_flag->load()) return LayerResult{};
             std::ifstream f(path, std::ios::binary);
-            uint64_t absolute_offset = base_offset + layer.start_offset;
-            uint64_t size = layer.end_offset - layer.start_offset;
+            if (!f) {
+                cancel_flag->store(true);
+                throw std::runtime_error("Cannot open file: " + path);
+            }
+            uint64_t absolute_offset = layer.abs_start;
+            uint64_t size = layer.size;
             f.seekg(absolute_offset);
             
             SHA256 sha;
@@ -178,13 +200,18 @@ py::list split_and_hash_safetensors(const std::string& path) {
 
     py::list results;
     for (auto& fut : futures) {
-        auto lr = fut.get();
-        py::dict d;
-        d["name"] = lr.name;
-        d["hash"] = lr.hash;
-        d["size"] = lr.size;
-        d["offset"] = lr.offset;
-        results.append(d);
+        try {
+            auto lr = fut.get();
+            py::dict d;
+            d["name"] = lr.name;
+            d["hash"] = lr.hash;
+            d["size"] = lr.size;
+            d["offset"] = lr.offset;
+            results.append(d);
+        } catch (...) {
+            cancel_flag->store(true);
+            throw;
+        }
     }
     return results;
 }

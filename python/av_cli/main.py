@@ -464,10 +464,11 @@ def commit(
                     l_obj = repo_root / ".av" / "objects" / l_hash[:2] / l_hash[2:]
                     if l_obj.exists():
                         client.upload_object(l_obj, l_hash)
-                # Upload the whole-file object
-                obj_file = repo_root / ".av" / "objects" / info["hash"][:2] / info["hash"][2:]
-                if obj_file.exists():
-                    client.upload_object(obj_file, info["hash"])
+                # Upload the whole-file object only if layers weren't successfully chunked
+                if not info.get("layers"):
+                    obj_file = repo_root / ".av" / "objects" / info["hash"][:2] / info["hash"][2:]
+                    if obj_file.exists():
+                        client.upload_object(obj_file, info["hash"])
 
 
 @cli.command()
@@ -578,13 +579,31 @@ def checkout(target: str) -> None:
                 obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
                 dest = repo_root / rel_path
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                if obj_path.exists():
-                    shutil.copy2(obj_path, dest)
-                elif client.server_available():
-                    click.echo(f"Downloading {rel_path}...")
-                    if client.download_object(h, dest):
-                        obj_path.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(dest, obj_path)
+                
+                if layers and not obj_path.exists():
+                    click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
+                    with open(dest, "wb") as f_out:
+                        for layer in layers:
+                            lh = layer["hash"]
+                            l_obj = repo_root / ".av" / "objects" / lh[:2] / lh[2:]
+                            if not l_obj.exists() and client.server_available():
+                                client.download_object(lh, l_obj)
+                            if l_obj.exists():
+                                with open(l_obj, "rb") as f_in:
+                                    shutil.copyfileobj(f_in, f_out)
+                            else:
+                                click.secho(f"Missing layer {lh} for {rel_path}", fg="red")
+                    
+                    obj_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(dest, obj_path)
+                else:
+                    if obj_path.exists():
+                        shutil.copy2(obj_path, dest)
+                    elif client.server_available():
+                        click.echo(f"Downloading {rel_path}...")
+                        if client.download_object(h, dest):
+                            obj_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(dest, obj_path)
 
     idx.save()
 

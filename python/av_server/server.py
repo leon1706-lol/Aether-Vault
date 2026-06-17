@@ -396,14 +396,21 @@ async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dic
                 delete(DBTree).where(DBTree.tree_hash.notin_(list(visited_trees)))
             )
 
-        # Delete orphaned physical shard files
-        deleted_count = 0
-        for obj_path in storage.data_dir.glob("objects/*/*"):
-            if obj_path.is_file():
-                h = obj_path.parent.name + obj_path.name
-                if h not in alive_hashes:
-                    obj_path.unlink()
-                    deleted_count += 1
+        # Delete orphaned physical shard files asynchronously
+        import asyncio
+        loop = asyncio.get_running_loop()
+        
+        def purge_orphans():
+            count = 0
+            for obj_path in storage.data_dir.glob("objects/*/*"):
+                if obj_path.is_file():
+                    h = obj_path.parent.name + obj_path.name
+                    if h not in alive_hashes:
+                        obj_path.unlink()
+                        count += 1
+            return count
+
+        deleted_count = await loop.run_in_executor(None, purge_orphans)
 
         # Rebuild Bloom Filter
         await cache.reset_filter()
@@ -423,13 +430,14 @@ async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dic
         raise HTTPException(status_code=500, detail=str(exc))
 
 @app.get("/api/sync/refs")
-async def sync_refs(db: AsyncSession = Depends(get_session)):
-    """Endpoint for remote teams to pull all current branch references."""
-    result = await db.execute(select(DBRef))
+async def sync_refs(limit: int = 1000, offset: int = 0, db: AsyncSession = Depends(get_session)):
+    """Endpoint for remote teams to pull branch references with pagination."""
+    result = await db.execute(select(DBRef).limit(limit).offset(offset))
     refs = result.scalars().all()
     return {
         "timestamp": datetime.utcnow().isoformat(),
-        "refs": {r.name: r.commit_hash for r in refs}
+        "refs": {r.name: r.commit_hash for r in refs},
+        "next_offset": offset + limit if len(refs) == limit else None
     }
 
 @app.post("/api/sync/batch-objects")
