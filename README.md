@@ -13,9 +13,38 @@ It solves the major challenge of versioning the **"Holy Trinity"** of Machine Le
 
 Aether-Vault achieves outstanding speed by bridging Python and C++:
 
-- **C++ Performance Core (`aether_core`)**: Reads multi-gigabyte files in chunks and hashes them in parallel using a C++11 ThreadPool. It bypasses expensive re-hashing by instantly verifying metadata (file sizes & modification times) against the index.
+- **C++ Performance Core (`aether_core`)**: Reads multi-gigabyte files in chunks and hashes them in parallel using a C++11 ThreadPool. Layer-aware parsing splits massive models for deduplication.
 - **Python CLI (`av_cli`)**: Provides the familiar Git-like user experience (`av add`, `av commit`, `av status`). Large artifacts (>50MB) are automatically replaced by Git-LFS style pointer files.
-- **FastAPI CAS Server (`av_server`)**: A centralized, Docker-backed Content-Addressable Storage (CAS) backend where massive models and datasets are streamed, securely deduplicated, and persistently stored.
+- **FastAPI CAS Server (`av_server`)**: A centralized, Docker-backed Content-Addressable Storage (CAS) backend backed by PostgreSQL and RedisBloom for massive scale.
+
+### System Diagram
+
+```mermaid
+graph TD
+    %% Local Environment
+    subgraph Local [User Machine / Training Node]
+        CLI("🖥️ av_cli<br>(Git-like Interface: av add, av commit)")
+        CPP("⚙️ aether_core (C++)<br>(Splits Safetensors & Computes SHA-256 Hashes in Parallel)")
+        LocalDAG("📁 .av/ <br>(Stores Local Commits, Merkle Tree indices, & LFS Pointer Files)")
+        
+        CLI -- "1. Reads & Hashes Files" --> CPP
+        CLI -- "2. Updates Staging & Pointers" --> LocalDAG
+    end
+
+    %% Remote Environment
+    subgraph Remote [Dockerized Remote Registry]
+        FastAPI("🌐 FastAPI Server<br>(Handles REST Uploads/Downloads & Sync)")
+        Redis("⚡ RedisBloom Cache<br>(O(1) Existence Checks - Prevents DB Overload)")
+        DB("🐘 PostgreSQL Database<br>(Stores Hierarchical Merkle Trees, Branches, & Metadata/Metrics)")
+        Storage("💾 Persistent File Volume<br>(Stores deduplicated model & dataset chunks)")
+        
+        FastAPI -- "3. Checks if Object Exists" --> Redis
+        FastAPI -- "4. Writes Trees & Commits" --> DB
+        FastAPI -- "5. Streams Large Chunks" --> Storage
+    end
+
+    CLI -- "Syncs Data via REST API" --> FastAPI
+```
 
 ---
 
@@ -58,22 +87,20 @@ av config 100
 ```
 
 ### Stage Files
-Add your python code, datasets, and compiled weights to the staging index:
+Just like Git, you can stage individual files, folders, or everything at once. Add your python code, datasets, and compiled weights to the staging index:
 ```bash
+# Stage specific files
 av add src/train.py data/features.parquet weights/epoch_50.safetensors
-```
-*Aether-Vault will instantly hash your files and flag the `.safetensors` and `.parquet` as LFS Artifacts.*
 
-### Check Workspace Status
-Check for modified, staged, or untracked files instantly:
-```bash
-av status
+# Or stage ALL changes in the current directory recursively
+av add .
 ```
+*Aether-Vault will instantly hash your files, split `.safetensors` into layers, and flag large files as LFS Artifacts.*
 
 ### Atomic Commit with Metrics
-Commit your "Holy Trinity" securely into the local `.av` Directed Acyclic Graph (DAG) and push it to the remote FastAPI registry. You can attach trading metrics (like Sharpe Ratio or Drawdown) directly to the commit!
+Commit your "Holy Trinity" securely into the local `.av` Directed Acyclic Graph (DAG) and push it to the remote FastAPI registry. You can attach tracking metrics directly to the commit!
 ```bash
-av commit -m "LSTM tuned on Q2 data" --metric-sharpe 2.45 --metric-drawdown 0.12
+av commit -m "LSTM tuned on Q2 data" --tag production --metric sharpe=2.45
 ```
 
 ### Branching & Checkout
@@ -81,72 +108,72 @@ Easily switch between different experiments and branches. Aether-Vault will auto
 ```bash
 av branch feature-transformers
 av checkout feature-transformers
-
-# Or checkout a specific model snapshot:
-av checkout a1b2c3d4...
 ```
 
----
+### List Metadata Registry
+View all registered tracking tags and metric keys used in the repository history.
+```bash
+av list-meta
+```
 
-## 🤝 Contributing
-Contributions are welcome! Please ensure that you have C++17 compiler tools installed to test changes to the `aether_core` hashing engine.
+### Run Garbage Collection (Admin)
+Trigger a mark-and-sweep cleanup on the remote server to delete orphaned storage shards and rebuild the cache.
+```bash
+av gc
+```
 
 ---
 
 ## 🗺️ Build Phases & Development Walkthrough
 
-Aether-Vault was designed and constructed in four distinct phases, bridging high-performance C++ systems programming with a clean Python developer experience:
+Aether-Vault was designed and constructed in multiple distinct phases, bridging high-performance C++ systems programming with a clean Python developer experience:
 
-### Phase 1: High-Performance C++ Hashing Core (`aether_core`)
-* **Objective**: Overcome Python's performance limitations (GIL, slow single-threaded I/O) when hashing multi-gigabyte datasets and models.
-* **Key Components**:
-  - **Custom SHA-256 Engine** ([sha256.h](src/sha256.h), [sha256.cpp](src/sha256.cpp)): A pure C++17, FIPS 180-4 compliant, thread-safe cryptographic hashing engine.
-  - **Header-only ThreadPool** ([thread_pool.h](src/thread_pool.h)): A lock-based worker queue managing thread dispatching.
-  - **Parallel Tree-Hashing** ([core.cpp](src/core.cpp)): Divides large files into 8MB chunks, hashes them concurrently across all CPU cores, and hashes the concatenated chunk hashes to compute a final tree hash.
-  - **Metadata Cache Validation**: Exposes standard file metadata stats to avoid computing hashes unless file modification times or sizes actually change.
-  - **Python Bindings**: Integrated via `pybind11` to expose high-speed functions to Python with zero-overhead type conversion.
+### Phase 1: High-Performance C++ Hashing Core
+* **Custom SHA-256 Engine**: Thread-safe cryptographic hashing engine.
+* **Parallel Tree-Hashing**: Divides large files into 8MB chunks, hashing them concurrently across all CPU cores.
 
-### Phase 2: Staging, Pointer Files & CLI CLI Framework (`av_cli`)
-* **Objective**: Create the local database model and Git-like CLI commands for staging files and committing the "Holy Trinity".
-* **Key Components**:
-  - **Staging Index Manager** ([index.py](python/av_cli/index.py)): Manages `.av/index` (JSON format) mapping paths to hashes, sizes, types (`code` vs `artifact`), and staged states.
-  - **LFS-Style Pointer Manager** ([pointer.py](python/av_cli/pointer.py)): Automatically detects large files exceeding the threshold, duplicates them to local object storage, and replaces them with an `.av-pointer` text file.
-  - **FastAPI Client Session Handler** ([client.py](python/av_cli/client.py)): Handles connection-pooled REST requests to push/pull CAS objects and commits.
-  - **Click CLI Entry Point** ([main.py](python/av_cli/main.py)): Builds CLI commands (`init`, `config`, `add`, `status`, `commit`, `branch`, `checkout`) with rich, user-friendly, ANSI-colored output.
+### Phase 2: CLI Framework & LFS Pointers
+* **Staging Index Manager**: Manages local `.av/index`.
+* **LFS-Style Pointers**: Automatically detects large files, duplicates them to object storage, and replaces them with an `.av-pointer`.
 
-### Phase 3: Content-Addressable Storage (CAS) FastAPI Registry (`av_server`)
-* **Objective**: Implement the remote registry that acts as the single source of truth for ML weights and code tracking.
-* **Key Components**:
-  - **Robust CAS Manager** ([storage.py](python/av_server/storage.py)): Automatically deduplicates uploaded files by storing them at paths mapped by their SHA-256 hashes (`/data/objects/xx/xxxxxxxx...`). Implements atomic writes via temporary files to prevent data corruption.
-  - **FastAPI REST Endpoints** ([server.py](python/av_server/server.py)): Handles high-concurrency streaming uploads, downloads, commit registration, reference updates, and server telemetry.
+### Phase 3: Content-Addressable Storage (CAS)
+* **Robust CAS Manager**: Deduplicates files by SHA-256 hashes, with atomic writes to prevent corruption.
+* **FastAPI Endpoints**: Handles high-concurrency streaming uploads, downloads, and branch management.
 
-### Phase 4: Integration, Testing & Concurrency Stabilization
-* **Objective**: Ensure absolute robustness against race conditions, memory leaks, and edge-cases.
-* **Key Components**:
-  - **Thread-Safety & Leak Fixes**: Audited and eliminated static state bottlenecks in C++ hashing, fixed memory leaks in thread-pool callbacks, and added thread locks to server uploads.
-  - **Comprehensive Test Suite** ([test_vault.py](tests/test_vault.py)): End-to-end integration tests using `pytest` mock client sessions, verifying indices, pointer creation, DAG integrity, and local/remote staging flows.
-  - **Multi-Stage Docker Setup** ([Dockerfile](Dockerfile)): Compiles the C++ wheels in a builder image and keeps the runtime image clean and lightweight.
+### Phase 4: Database & Cache Integration
+* **PostgreSQL Schema**: Migrated the registry to SQL for structured DAG representation, commits, and refs.
+* **Redis Integration**: Connected `redis-stack-server` for high-performance in-memory caching.
+
+### Phase 5: Safetensors & Merkle Trees
+* **C++ Layer-Splitting**: Natively parses `.safetensors` JSON headers to extract and independently hash individual model layers, saving up to 99% of storage when only specific layers (like classifier heads) change.
+* **Merkle Tree DAG**: Structured PostgreSQL tables to perfectly represent the directory and file hierarchy as a content-addressed Merkle Tree.
+
+### Phase 6: Scalability & Garbage Collection
+* **RedisBloom Filter**: Implemented a Bloom Filter for O(1) hash existence checks, radically reducing Postgres load and saving RAM.
+* **Mark-and-Sweep GC**: Automated garbage collection traversing the Merkle Trees to purge orphaned data shards.
+
+### Phase 7: ML Experiment Tracking
+* **Dynamic Metadata**: Bound directly into the atomic commits, `--tag` and `--metric` flags allow users to attach arbitrary data (like training loss, accuracy, or Sharpe ratio) to versioned model checkpoints.
 
 ---
 
-## Development Roadmap
+## 🚀 Open Source Project Roadmap
 
-This roadmap outlines planned phases to migrate the platform to a database-backed, multi-user environment suitable for small-to-medium research teams:
+This open-source repository serves as the core showcase for what Aether-Vault can do. Planned improvements include:
 
-### Phase 1: Database and Cache Configuration
-- [ ] Add PostgreSQL container to `docker-compose.yml` with persistent volume mount configurations.
-- [ ] Add Redis container to `docker-compose.yml` to serve as a fast metadata access layer.
-- [ ] Incorporate database drivers (`sqlalchemy`, `asyncpg`, and `redis-py`) into the server package configuration requirements.
+- [ ] **Web UI Dashboard**: A native browser interface to visualize the commit graph, compare branches, and plot ML metrics over time.
+- [ ] **Weight Diffing**: Advanced tooling to visualize parameter changes and drifts between two `.safetensors` model checkpoints.
+- [ ] **Framework Plugins**: Direct integrations and callbacks for PyTorch Lightning and HuggingFace Transformers.
+- [ ] **S3 Support**: Support for Amazon S3 as an alternative backend storage adapter.
 
-### Phase 2: Database Schema and Cache Integration
-- [ ] Implement SQL schemas for the commits table, references table, and file catalog index.
-- [ ] Refactor the server module to write and read commits directly from PostgreSQL databases instead of local JSON file systems.
-- [ ] Integrate a write-through Redis caching pattern to store active object lists, bypassing local disk lookups during file verification checks.
+---
 
-### Phase 3: CLI Exception and Logging Refactoring
-- [ ] Replace traceback printing in the Click CLI with structured custom exceptions (`AetherVaultException`) to ensure user-friendly error output.
-- [ ] Add configurable logging levels (`--verbose` and `--silent` flags) to the standard command interface.
+## 🏢 Enterprise Roadmap (Commercial Variant)
 
-### Phase 4: Reference Synchronization and Collaboration
-- [ ] Build endpoints to push, pull, and synchronize branch references directly between remote team environments.
-- [ ] Implement row-level PostgreSQL locks on branch tables to handle concurrent commits from multiple researchers safely.
+For enterprise research teams and institutional algorithmic trading firms, an extended Enterprise variant is planned with the following capabilities:
+
+- [ ] **Role-Based Access Control (RBAC)**: Fine-grained read/write permissions for teams, users, and specific repositories.
+- [ ] **Single Sign-On (SSO)**: Integration with OAuth2, SAML, and Active Directory.
+- [ ] **Compliance & Audit Logging**: Immutable, cryptographically signed audit logs for regulatory compliance (e.g., in financial or medical ML applications).
+- [ ] **High Availability & Clustering**: Multi-node horizontal scaling for the FastAPI CAS registry and distributed Postgres/Redis clusters.
+- [ ] **Enterprise Cloud Connectors**: Deep integration with AWS IAM, GCP Cloud Storage, Azure Blob Storage, and automated cold-storage tiering.
