@@ -107,3 +107,25 @@ class VaultClient:
         except requests.exceptions.RequestException as e:
             print(f"Error running GC: {e}")
             return None
+
+    def fetch_all_refs(self) -> dict:
+        url = f"{self.server_url}/api/sync/refs"
+        refs = {}
+        offset = 0
+        limit = 1000
+        while True:
+            try:
+                resp = self.session.get(url, params={"limit": limit, "offset": offset})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    refs.update(data.get("refs", {}))
+                    next_offset = data.get("next_offset")
+                    if next_offset is None:
+                        break
+                    offset = next_offset
+                else:
+                    break
+            except requests.exceptions.RequestException as e:
+                print(f"Error syncing refs: {e}")
+                break
+        return refs

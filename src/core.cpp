@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 #include "sha256.h"
 #include "thread_pool.h"
 #include "json.hpp"
@@ -158,6 +159,10 @@ py::list split_and_hash_safetensors(const std::string& path) {
             }
         }
     }
+
+    std::sort(layers.begin(), layers.end(), [](const LayerSpec& a, const LayerSpec& b) {
+        return a.abs_start < b.abs_start;
+    });
 
     size_t threads_to_use = std::thread::hardware_concurrency();
     ThreadPool pool(threads_to_use);
