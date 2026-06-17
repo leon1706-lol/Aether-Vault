@@ -541,6 +541,7 @@ def checkout(target: str) -> None:
         return
 
     idx = Index(repo_root)
+    old_entries = dict(idx.entries)
     idx.entries.clear()
 
     tree = commit_data.get("tree", {})
@@ -604,6 +605,25 @@ def checkout(target: str) -> None:
                         if client.download_object(h, dest):
                             obj_path.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(dest, obj_path)
+
+    for rel_path in old_entries:
+        if rel_path not in idx.entries:
+            file_path = repo_root / rel_path
+            if file_path.exists() and file_path.is_file():
+                file_path.unlink()
+                try:
+                    for parent in file_path.parents:
+                        if parent == repo_root or parent.name == '.av':
+                            break
+                        if not any(parent.iterdir()):
+                            parent.rmdir()
+                        else:
+                            break
+                except Exception:
+                    pass
+            ptr_path = repo_root / (rel_path + ".av-pointer")
+            if ptr_path.exists() and ptr_path.is_file():
+                ptr_path.unlink()
 
     idx.save()
 
