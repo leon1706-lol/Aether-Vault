@@ -470,3 +470,86 @@ async def check_objects_batch(hashes: List[str], db: AsyncSession = Depends(get_
         "missing": actually_missing
     }
 
+
+# ---------------------------------------------------------------------------
+# Web UI Dashboard Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/commits")
+async def list_commits(
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_session)
+) -> dict:
+    """Paginated commit list for the Web UI dashboard, newest first."""
+    result = await db.execute(
+        select(DBCommit)
+        .order_by(DBCommit.timestamp.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    commits = result.scalars().all()
+    total_result = await db.execute(select(DBCommit))
+    total = len(total_result.scalars().all())
+
+    return {
+        "commits": [
+            {
+                "hash": c.hash,
+                "message": c.message,
+                "author": c.author,
+                "timestamp": c.timestamp.isoformat() if c.timestamp else None,
+                "parent_hash": c.parent_hash,
+                "root_tree_hash": c.root_tree_hash,
+                "tags": c.tags or [],
+                "metrics": c.metrics or {},
+            }
+            for c in commits
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": offset + limit if offset + limit < total else None,
+    }
+
+
+@app.get("/api/dashboard/summary")
+async def dashboard_summary(db: AsyncSession = Depends(get_session)) -> dict:
+    """Unified summary endpoint for the Web UI dashboard home page."""
+    # Commits
+    commit_result = await db.execute(
+        select(DBCommit).order_by(DBCommit.timestamp.desc()).limit(50)
+    )
+    commits = commit_result.scalars().all()
+
+    # Refs
+    ref_result = await db.execute(select(DBRef))
+    refs = ref_result.scalars().all()
+
+    # Objects count
+    obj_result = await db.execute(select(DBObject))
+    objects = obj_result.scalars().all()
+
+    total_size = sum(o.size for o in objects)
+
+    return {
+        "server_version": "1.4.0",
+        "total_commits": len(commits),
+        "total_branches": len(refs),
+        "total_objects": len(objects),
+        "total_size_bytes": total_size,
+        "refs": {r.name: r.commit_hash for r in refs},
+        "recent_commits": [
+            {
+                "hash": c.hash,
+                "message": c.message,
+                "author": c.author,
+                "timestamp": c.timestamp.isoformat() if c.timestamp else None,
+                "parent_hash": c.parent_hash,
+                "root_tree_hash": c.root_tree_hash,
+                "tags": c.tags or [],
+                "metrics": c.metrics or {},
+            }
+            for c in commits[:20]
+        ],
+    }

@@ -710,5 +710,102 @@ def graph(update: bool) -> None:
             pass
 
 
+@cli.command("webui")
+def webui_cmd() -> None:
+    """Start the Aether-Vault Web UI dashboard and open it in the browser.
+
+    \b
+    1. Checks that Docker is running
+    2. Starts the aether-vault-webui container (+ deps) via docker-compose
+    3. Waits for the UI to become ready
+    4. Opens http://localhost:3000 in the default browser
+    """
+    import subprocess
+    import time
+    import webbrowser
+    import urllib.request
+    import urllib.error
+
+    repo_root = Path(__file__).parents[2]  # av_cli/ → python/ → aether-vault/
+    compose_file = repo_root / "docker-compose.yml"
+
+    # ── 1. Check Docker ──────────────────────────────────────────────────────
+    click.secho("🔍 Checking Docker…", fg="cyan")
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=8,
+        )
+        if result.returncode != 0:
+            click.secho(
+                "✗ Docker is not running. Please start Docker Desktop and try again.",
+                fg="red",
+            )
+            return
+    except FileNotFoundError:
+        click.secho("✗ Docker not found. Install Docker Desktop from https://docker.com", fg="red")
+        return
+    except subprocess.TimeoutExpired:
+        click.secho("✗ Docker daemon timed out. Is Docker Desktop running?", fg="red")
+        return
+
+    click.secho("  ✓ Docker is running", fg="green")
+
+    # ── 2. Start containers ──────────────────────────────────────────────────
+    click.secho("🚀 Starting Web UI container…", fg="cyan")
+
+    if not compose_file.exists():
+        click.secho(f"✗ docker-compose.yml not found at {compose_file}", fg="red")
+        return
+
+    try:
+        proc = subprocess.run(
+            [
+                "docker", "compose",
+                "-f", str(compose_file),
+                "up", "-d", "--build",
+                "aether-vault-webui",
+            ],
+            capture_output=False,
+            timeout=300,
+        )
+        if proc.returncode != 0:
+            click.secho("✗ Failed to start containers. Check docker compose logs for details.", fg="red")
+            return
+    except subprocess.TimeoutExpired:
+        click.secho("✗ Container startup timed out.", fg="red")
+        return
+
+    # ── 3. Wait for UI to be ready ───────────────────────────────────────────
+    url = "http://localhost:3000"
+    click.secho(f"⏳ Waiting for Web UI at {url}…", fg="cyan")
+
+    for attempt in range(30):
+        time.sleep(2)
+        try:
+            urllib.request.urlopen(url, timeout=3)
+            break
+        except (urllib.error.URLError, OSError):
+            click.echo(f"  … waiting ({attempt + 1}/30)")
+    else:
+        click.secho("⚠ Web UI did not respond in time — opening browser anyway.", fg="yellow")
+
+    # ── 4. Open browser ──────────────────────────────────────────────────────
+    click.secho(f"🌐 Opening {url} in your browser…", fg="green")
+    try:
+        webbrowser.open(url)
+    except Exception as exc:
+        click.secho(f"  Could not open browser automatically: {exc}", fg="yellow")
+
+    click.secho(
+        f"\n✅ Aether-Vault Web UI is running at {url}\n"
+        "   Press Ctrl+C or run 'docker compose down' to stop.",
+        fg="green",
+        bold=True,
+    )
+
+
 if __name__ == "__main__":
     cli()
+

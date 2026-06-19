@@ -126,6 +126,14 @@ av graph
 av graph --update
 ```
 
+### Launch the Web UI Dashboard
+Start a local web server with a full browser-based dashboard showing the commit graph, branches, and ML metrics charts.
+```bash
+# Requires Docker to be running
+av webui
+# → Checks Docker, starts the web UI container, opens http://localhost:3000
+```
+
 ### Run Garbage Collection (Admin)
 Trigger a mark-and-sweep cleanup on the remote server to delete orphaned storage shards and rebuild the cache.
 ```bash
@@ -174,7 +182,7 @@ Aether-Vault was designed and constructed in multiple distinct phases, bridging 
 
 This open-source repository serves as the core showcase for what Aether-Vault can do. Planned improvements include:
 
-- [ ] **Web UI Dashboard**: A native browser interface to visualize the commit graph, compare branches, and plot ML metrics over time.
+- [x] **Web UI Dashboard**: A native browser interface to visualize the commit graph, compare branches, and plot ML metrics over time. Run with `av webui`.
 - [ ] **Weight Diffing**: Advanced tooling to visualize parameter changes and drifts between two `.safetensors` model checkpoints.
 - [ ] **Framework Plugins**: Direct integrations and callbacks for PyTorch Lightning and HuggingFace Transformers.
 - [ ] **S3 Support**: Support for Amazon S3 as an alternative backend storage adapter.

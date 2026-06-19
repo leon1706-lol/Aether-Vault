@@ -24,6 +24,25 @@ services:
       timeout: 10s
       retries: 3
 
+  # ── Web UI Dashboard ──────────────────────────────────────────────────────
+  aether-vault-webui:
+    build: ./webui
+    container_name: aether-vault-webui
+    ports:
+      - '3000:3000'
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=production
+    depends_on:
+      aether-vault-server:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3000/ || exit 1']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   db:
     image: postgres:15-alpine
     container_name: aether-vault-db
