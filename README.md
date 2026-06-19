@@ -1,21 +1,25 @@
 # 🌌 Aether-Vault
 
-**Aether-Vault** is a high-performance, modular, Dockerized, Git-like version control and registry system specifically designed for algorithmic trading and machine learning frameworks.
+> **High-performance, Git-like version control and registry for Machine Learning models, datasets, and code — in a single atomic commit.**
 
-It solves the major challenge of versioning the **"Holy Trinity"** of Machine Learning in a single atomic commit:
-1. **Code**: Python training, validation, and pipeline scripts.
-2. **Model Weights**: Deep learning weights (e.g., `.pt`, `.safetensors`).
-3. **Datasets**: Large input data files (e.g., `.csv`, `.parquet`, `.h5`).
+Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
+
+| | Type | Examples |
+|---|---|---|
+| 1 | **Code** | Python training scripts, pipelines, validators |
+| 2 | **Model Weights** | `.pt`, `.safetensors`, `.onnx` |
+| 3 | **Datasets** | `.csv`, `.parquet`, `.h5`, `.arrow` |
 
 ---
 
 ## ⚡ Architecture
 
-Aether-Vault achieves outstanding speed by bridging Python and C++:
+Aether-Vault bridges Python and C++ for maximum throughput:
 
-- **C++ Performance Core (`aether_core`)**: Reads multi-gigabyte files in chunks and hashes them in parallel using a C++11 ThreadPool. Layer-aware parsing splits massive models for deduplication.
-- **Python CLI (`av_cli`)**: Provides the familiar Git-like user experience (`av add`, `av commit`, `av status`). Large artifacts (>50MB) are automatically replaced by Git-LFS style pointer files.
-- **FastAPI CAS Server (`av_server`)**: A centralized, Docker-backed Content-Addressable Storage (CAS) backend backed by PostgreSQL and RedisBloom for massive scale.
+- **C++ Performance Core (`aether_core`)** — Reads multi-gigabyte files in 8MB chunks, hashing them in parallel with a C++11 ThreadPool. Layer-aware `.safetensors` parsing enables per-layer deduplication.
+- **Python CLI (`av_cli`)** — Familiar Git-like interface (`av add`, `av commit`, `av checkout`). Files above the LFS threshold are automatically replaced by lightweight pointer files.
+- **FastAPI CAS Server (`av_server`)** — Dockerized Content-Addressable Storage backend, backed by PostgreSQL (Merkle Tree DAG) and RedisBloom (O(1) existence checks).
+- **Next.js Web UI (`webui`)** — Browser-based dashboard for visualizing the commit graph, branches, and ML metrics. Launched with `av webui`.
 
 ### System Diagram
 
@@ -23,24 +27,27 @@ Aether-Vault achieves outstanding speed by bridging Python and C++:
 graph TD
     %% Local Environment
     subgraph Local [User Machine / Training Node]
-        CLI("🖥️ av_cli<br>(Git-like Interface: av add, av commit)")
-        CPP("⚙️ aether_core (C++)<br>(Splits Safetensors & Computes SHA-256 Hashes in Parallel)")
-        LocalDAG("📁 .av/ <br>(Stores Local Commits, Merkle Tree indices, & LFS Pointer Files)")
-        
+        CLI("🖥️ av_cli<br>(av add · av commit · av webui)")
+        CPP("⚙️ aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
+        LocalDAG("📁 .av/<br>(Commits · Merkle Indices · LFS Pointers)")
+        WebUI("🌐 Web UI<br>(Next.js Dashboard · localhost:3000)")
+
         CLI -- "1. Reads & Hashes Files" --> CPP
         CLI -- "2. Updates Staging & Pointers" --> LocalDAG
+        CLI -- "3. Starts Container & Opens Browser" --> WebUI
     end
 
     %% Remote Environment
     subgraph Remote [Dockerized Remote Registry]
-        FastAPI("🌐 FastAPI Server<br>(Handles REST Uploads/Downloads & Sync)")
-        Redis("⚡ RedisBloom Cache<br>(O(1) Existence Checks - Prevents DB Overload)")
-        DB("🐘 PostgreSQL Database<br>(Stores Hierarchical Merkle Trees, Branches, & Metadata/Metrics)")
-        Storage("💾 Persistent File Volume<br>(Stores deduplicated model & dataset chunks)")
-        
-        FastAPI -- "3. Checks if Object Exists" --> Redis
-        FastAPI -- "4. Writes Trees & Commits" --> DB
-        FastAPI -- "5. Streams Large Chunks" --> Storage
+        FastAPI("🚀 FastAPI Server<br>(REST Uploads / Downloads / Dashboard API)")
+        Redis("⚡ RedisBloom Cache<br>(O(1) Existence Checks)")
+        DB("🐘 PostgreSQL<br>(Merkle Trees · Branches · Metrics)")
+        Storage("💾 Persistent Volume<br>(Deduplicated Model & Dataset Chunks)")
+
+        FastAPI -- "Checks if Object Exists" --> Redis
+        FastAPI -- "Writes Trees & Commits" --> DB
+        FastAPI -- "Streams Large Chunks" --> Storage
+        WebUI -- "Fetches Commits, Refs & Metrics" --> FastAPI
     end
 
     CLI -- "Syncs Data via REST API" --> FastAPI
@@ -50,92 +57,116 @@ graph TD
 
 ## 🛠️ Installation
 
-### 1. Start the Remote Registry (Docker)
-Ensure Docker and Docker-Compose are installed on your system.
+### Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| **Docker & Docker Compose** | Required for the registry and Web UI |
+| **Python ≥ 3.10** | For the `av` CLI |
+| **C++ Build Tools** | Visual Studio Build Tools (Windows) · GCC/Clang (Linux/macOS) |
+| **CMake** | For building the C++ hashing core |
+
+### 1. Start the Registry (Docker)
+
 ```bash
-# Clone the repository and navigate to it
+git clone https://github.com/leon1706/aether-vault
 cd aether-vault
 
-# Start the registry backend and persistent storage
-docker-compose up --build -d
+# Start the full backend stack (API server, PostgreSQL, Redis)
+docker compose up --build -d
 ```
-*The server will be available at `http://localhost:8000`. Your data is safely stored in a persistent local Docker volume.*
 
-### 2. Install the CLI Tool (Locally)
-To use the `av` command on your machine, you need to compile the C++ performance core.
-*(Note for Windows users: You must have Visual Studio C++ Build Tools installed).*
+The FastAPI server will be available at `http://localhost:8000`.  
+Interactive API docs: `http://localhost:8000/docs`
+
+### 2. Install the CLI
+
 ```bash
+# Compiles the C++ core and installs the `av` command
 pip install -e .
 ```
 
 ---
 
-## 📖 CLI Usage Guide
+## 📖 CLI Reference
 
-Using Aether-Vault is just like using Git!
-
-### Initialize a Repository
-Navigate to your PyTorch/Machine Learning project and initialize Aether-Vault:
+### `av init`
+Initialize an Aether-Vault repository in the current directory.
 ```bash
 av init
 ```
 
-### Configure LFS (Large File) Threshold
-Set the file size limit (in Megabytes) above which files are automatically streamed to the remote server and replaced by lightweight pointers locally.
+### `av config`
+Set the LFS size threshold (in MB). Files larger than this are automatically streamed to the remote and replaced by pointer files.
 ```bash
-av config 100
+av config 100   # 100 MB threshold
 ```
 
-### Stage Files
-Just like Git, you can stage individual files, folders, or everything at once. Add your python code, datasets, and compiled weights to the staging index:
+### `av add`
+Stage files or entire directories for the next commit. Supports `.safetensors` layer-splitting automatically.
 ```bash
-# Stage specific files
 av add src/train.py data/features.parquet weights/epoch_50.safetensors
 
-# Or stage ALL changes in the current directory recursively
+# Stage everything recursively
 av add .
 ```
-*Aether-Vault will instantly hash your files, split `.safetensors` into layers, and flag large files as LFS Artifacts.*
 
-### Atomic Commit with Metrics
-Commit your "Holy Trinity" securely into the local `.av` Directed Acyclic Graph (DAG) and push it to the remote FastAPI registry. You can attach tracking metrics directly to the commit!
+### `av status`
+Show staged, modified, deleted, and untracked files.
 ```bash
-av commit -m "LSTM tuned on Q2 data" --tag production --metric sharpe=2.45
+av status
 ```
 
-### Branching & Checkout
-Easily switch between different experiments and branches. Aether-Vault will automatically download any missing model weights from the remote Docker server!
+### `av commit`
+Record a snapshot of the staged files into the local DAG and push to the remote registry. Attach arbitrary ML metrics and labels directly to the commit.
+```bash
+av commit -m "LSTM tuned on Q2 data" \
+  --tag production \
+  --metric sharpe=2.45 \
+  --metric drawdown=0.12 \
+  --metric val_loss=0.034
+```
+
+### `av branch` / `av checkout`
+Create and switch between experiment branches. Missing model weights are automatically downloaded from the remote.
 ```bash
 av branch feature-transformers
 av checkout feature-transformers
+av checkout main
 ```
 
-### List Metadata Registry
-View all registered tracking tags and metric keys used in the repository history.
+### `av list-meta`
+Display all registered tag labels and metric keys across the repository history.
 ```bash
 av list-meta
 ```
 
-### Visualize Codebase Dependencies
-Automatically parse your repository's Python AST to generate an interactive Markdown-based call graph of all functions, classes, and dependencies, ready to be viewed in Obsidian.
+### `av graph`
+Parse the repository's Python AST and generate an Obsidian-compatible Markdown vault of the full function call graph and dependency map.
 ```bash
-# Generate the vault and attempt to launch Obsidian
-av graph
-
-# Quietly update/regenerate the graph notes after making code changes
-av graph --update
+av graph            # Generate and attempt to launch Obsidian
+av graph --update   # Silently regenerate after code changes
 ```
 
-### Launch the Web UI Dashboard
-Start a local web server with a full browser-based dashboard showing the commit graph, branches, and ML metrics charts.
+### `av webui` 🆕
+Launch the browser-based Web UI dashboard. Checks that Docker is running, starts the `aether-vault-webui` container, and opens `http://localhost:3000` automatically.
 ```bash
-# Requires Docker to be running
 av webui
-# → Checks Docker, starts the web UI container, opens http://localhost:3000
+# 1. Checks Docker is running
+# 2. Starts the Next.js Web UI container
+# 3. Waits for the service to be ready
+# 4. Opens http://localhost:3000 in your browser
 ```
 
-### Run Garbage Collection (Admin)
-Trigger a mark-and-sweep cleanup on the remote server to delete orphaned storage shards and rebuild the cache.
+**Dashboard panels:**
+- **Experiment Graph** — SVG commit DAG with coloured branch lanes
+- **Commit Log** — Full history with authors, timestamps, tags & metrics pills
+- **Branch List** — All refs with tip commit details
+- **ML Metrics Chart** — Line chart plotting all numeric metrics over commits
+- **Stats Bar** — Live counts for commits, branches, CAS objects, and storage size
+
+### `av gc`
+Trigger a mark-and-sweep garbage collection on the remote server to purge orphaned storage shards and rebuild the Redis Bloom Filter.
 ```bash
 av gc
 ```
@@ -144,57 +175,81 @@ av gc
 
 ## 🗺️ Build Phases & Development Walkthrough
 
-Aether-Vault was designed and constructed in multiple distinct phases, bridging high-performance C++ systems programming with a clean Python developer experience:
+Aether-Vault was built in eight distinct phases:
 
-### Phase 1: High-Performance C++ Hashing Core
-* **Custom SHA-256 Engine**: Thread-safe cryptographic hashing engine.
-* **Parallel Tree-Hashing**: Divides large files into 8MB chunks, hashing them concurrently across all CPU cores.
+### Phase 1 — High-Performance C++ Hashing Core
+- **Custom SHA-256 Engine**: Thread-safe cryptographic hashing.
+- **Parallel Tree-Hashing**: Splits files into 8MB chunks, hashes concurrently across all CPU cores.
 
-### Phase 2: CLI Framework & LFS Pointers
-* **Staging Index Manager**: Manages local `.av/index`.
-* **LFS-Style Pointers**: Automatically detects large files, duplicates them to object storage, and replaces them with an `.av-pointer`.
+### Phase 2 — CLI Framework & LFS Pointers
+- **Staging Index Manager**: Manages the local `.av/index`.
+- **LFS-Style Pointers**: Detects large files, copies them to object storage, and replaces them with `.av-pointer` files.
 
-### Phase 3: Content-Addressable Storage (CAS)
-* **Robust CAS Manager**: Deduplicates files by SHA-256 hashes, with atomic writes to prevent corruption.
-* **FastAPI Endpoints**: Handles high-concurrency streaming uploads, downloads, and branch management.
+### Phase 3 — Content-Addressable Storage (CAS)
+- **Robust CAS Manager**: Deduplicates by SHA-256 hash with atomic writes.
+- **FastAPI Endpoints**: High-concurrency streaming uploads, downloads, and branch management.
 
-### Phase 4: Database & Cache Integration
-* **PostgreSQL Schema**: Migrated the registry to SQL for structured DAG representation, commits, and refs.
-* **Redis Integration**: Connected `redis-stack-server` for high-performance in-memory caching.
+### Phase 4 — Database & Cache Integration
+- **PostgreSQL Schema**: Structured SQL representation of the commit DAG, branches, and metadata.
+- **Redis Integration**: `redis-stack-server` for high-performance in-memory caching.
 
-### Phase 5: Safetensors & Merkle Trees
-* **C++ Layer-Splitting**: Natively parses `.safetensors` JSON headers to extract and independently hash individual model layers, saving up to 99% of storage when only specific layers (like classifier heads) change.
-* **Merkle Tree DAG**: Structured PostgreSQL tables to perfectly represent the directory and file hierarchy as a content-addressed Merkle Tree.
+### Phase 5 — Safetensors & Merkle Trees
+- **C++ Layer-Splitting**: Parses `.safetensors` JSON headers to independently hash individual model layers — saving up to **99% storage** when only classifier heads change.
+- **Merkle Tree DAG**: PostgreSQL tables modelling the full directory hierarchy as a content-addressed tree.
 
-### Phase 6: Scalability & Garbage Collection
-* **RedisBloom Filter**: Implemented a Bloom Filter for O(1) hash existence checks, radically reducing Postgres load and saving RAM.
-* **Mark-and-Sweep GC**: Automated garbage collection traversing the Merkle Trees to purge orphaned data shards.
+### Phase 6 — Scalability & Garbage Collection
+- **RedisBloom Filter**: O(1) hash existence checks, dramatically reducing Postgres load.
+- **Mark-and-Sweep GC**: Traverses all Merkle Trees to purge orphaned data shards.
 
-### Phase 7: ML Experiment Tracking
-* **Dynamic Metadata**: Bound directly into the atomic commits, `--tag` and `--metric` flags allow users to attach arbitrary data (like training loss, accuracy, or Sharpe ratio) to versioned model checkpoints.
+### Phase 7 — ML Experiment Tracking
+- **Dynamic Metadata**: `--tag` and `--metric` flags bind arbitrary tracking data (Sharpe ratio, loss, accuracy, drawdown) directly into atomic commits.
 
-### Phase 8: Native Codebase Visualization
-* **AST Parsing & Graph Generation**: Integrated Python Abstract Syntax Tree (AST) parsing directly into the CLI via `av graph`. It dynamically maps internal module calls, external library dependencies, and docstrings, exporting them into an Obsidian-compatible Markdown vault for real-time visual dependency tracking.
+### Phase 8 — Native Codebase Visualization
+- **AST Parsing & Graph Generation**: `av graph` dynamically maps function calls, external library dependencies, and docstrings into an Obsidian-compatible Markdown vault.
+
+### Phase 9 — Web UI Dashboard ✅
+- **Next.js Frontend**: Dark glassmorphism dashboard at `http://localhost:3000`.
+- **SVG Commit Graph**: DAG visualizer with coloured branch lanes and bezier edges.
+- **Recharts Metrics**: Line charts plotting all numeric ML metrics over time.
+- **Live API**: `GET /api/commits`, `GET /api/dashboard/summary` — auto-refreshes every 15 seconds.
+- **Docker Service**: `aether-vault-webui` added to `docker-compose.yml`, launched via `av webui`.
 
 ---
 
-## 🚀 Open Source Project Roadmap
+## 🚀 Open Source Roadmap
 
-This open-source repository serves as the core showcase for what Aether-Vault can do. Planned improvements include:
-
-- [x] **Web UI Dashboard**: A native browser interface to visualize the commit graph, compare branches, and plot ML metrics over time. Run with `av webui`.
-- [ ] **Weight Diffing**: Advanced tooling to visualize parameter changes and drifts between two `.safetensors` model checkpoints.
-- [ ] **Framework Plugins**: Direct integrations and callbacks for PyTorch Lightning and HuggingFace Transformers.
-- [ ] **S3 Support**: Support for Amazon S3 as an alternative backend storage adapter.
+| Status | Feature |
+|---|---|
+| ✅ | **Web UI Dashboard** — Browser interface for commit graph, branches & ML metrics (`av webui`) |
+| 🔲 | **Weight Diffing** — Visualize parameter changes between two `.safetensors` checkpoints |
+| 🔲 | **Framework Plugins** — Native callbacks for PyTorch Lightning & HuggingFace Transformers |
+| 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
 
 ---
 
 ## 🏢 Enterprise Roadmap (Commercial Variant)
 
-For enterprise research teams and institutional algorithmic trading firms, an extended Enterprise variant is planned with the following capabilities:
+For enterprise research teams and institutional algorithmic trading firms:
 
-- [ ] **Role-Based Access Control (RBAC)**: Fine-grained read/write permissions for teams, users, and specific repositories.
-- [ ] **Single Sign-On (SSO)**: Integration with OAuth2, SAML, and Active Directory.
-- [ ] **Compliance & Audit Logging**: Immutable, cryptographically signed audit logs for regulatory compliance (e.g., in financial or medical ML applications).
-- [ ] **High Availability & Clustering**: Multi-node horizontal scaling for the FastAPI CAS registry and distributed Postgres/Redis clusters.
-- [ ] **Enterprise Cloud Connectors**: Deep integration with AWS IAM, GCP Cloud Storage, Azure Blob Storage, and automated cold-storage tiering.
+| Feature | Description |
+|---|---|
+| **RBAC** | Fine-grained read/write permissions for teams, users, and repositories |
+| **SSO** | OAuth2, SAML, and Active Directory integration |
+| **Audit Logging** | Immutable, cryptographically signed logs for regulatory compliance |
+| **High Availability** | Multi-node horizontal scaling for the FastAPI registry and distributed Postgres/Redis |
+| **Cloud Connectors** | AWS IAM, GCP Cloud Storage, Azure Blob Storage with automated cold-storage tiering |
+
+---
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/my-feature`
+3. Commit your changes following the phase structure above
+4. Open a Pull Request
+
+---
+
+<div align="center">
+  <sub>Built with ⚙️ C++11 · 🐍 Python · 🚀 FastAPI · 🌐 Next.js · 🐘 PostgreSQL · ⚡ Redis</sub>
+</div>
