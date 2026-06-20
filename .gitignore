@@ -10,7 +10,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+/lib/
 lib64/
 parts/
 sdist/
@@ -43,6 +43,10 @@ env/
 ENV/
 env.bak/
 venv.bak/
+
+# Web UI
+webui/node_modules/
+webui/.next/
 
 # IDEs / OS
 .vscode/

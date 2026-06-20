@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   aether-vault-server:
     build: .
@@ -26,7 +24,10 @@ services:
 
   # ── Web UI Dashboard ──────────────────────────────────────────────────────
   aether-vault-webui:
-    build: ./webui
+    build:
+      context: ./webui
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
     container_name: aether-vault-webui
     ports:
       - '3000:3000'
