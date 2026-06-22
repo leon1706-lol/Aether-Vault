@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import get_session, init_db
@@ -402,7 +402,7 @@ async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dic
         
         def purge_orphans():
             count = 0
-            for obj_path in storage.data_dir.glob("objects/*/*"):
+            for obj_path in storage.objects_dir.glob("*/*"):
                 if obj_path.is_file():
                     h = obj_path.parent.name + obj_path.name
                     if h not in alive_hashes:
@@ -489,8 +489,8 @@ async def list_commits(
         .offset(offset)
     )
     commits = result.scalars().all()
-    total_result = await db.execute(select(DBCommit))
-    total = len(total_result.scalars().all())
+    total_result = await db.execute(select(func.count(DBCommit.hash)))
+    total = total_result.scalar_one()
 
     return {
         "commits": [
@@ -522,21 +522,25 @@ async def dashboard_summary(db: AsyncSession = Depends(get_session)) -> dict:
     )
     commits = commit_result.scalars().all()
 
+    total_commits_result = await db.execute(select(func.count(DBCommit.hash)))
+    total_commits = total_commits_result.scalar_one()
+
     # Refs
     ref_result = await db.execute(select(DBRef))
     refs = ref_result.scalars().all()
 
-    # Objects count
-    obj_result = await db.execute(select(DBObject))
-    objects = obj_result.scalars().all()
-
-    total_size = sum(o.size for o in objects)
+    # Objects count and size
+    total_objects_result = await db.execute(select(func.count(DBObject.hash)))
+    total_objects = total_objects_result.scalar_one()
+    
+    total_size_result = await db.execute(select(func.sum(DBObject.size)))
+    total_size = total_size_result.scalar_one() or 0
 
     return {
         "server_version": "1.4.0",
-        "total_commits": len(commits),
+        "total_commits": total_commits,
         "total_branches": len(refs),
-        "total_objects": len(objects),
+        "total_objects": total_objects,
         "total_size_bytes": total_size,
         "refs": {r.name: r.commit_hash for r in refs},
         "recent_commits": [

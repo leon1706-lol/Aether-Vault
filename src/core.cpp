@@ -57,7 +57,7 @@ std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 
             
             file.seekg(offset);
             std::vector<char> buffer(to_read);
-            if (!file.read(buffer.data(), to_read) && file.gcount() != to_read) {
+            if (!file.read(buffer.data(), to_read) || file.gcount() != to_read) {
                 cancel_flag->store(true);
                 throw std::runtime_error("Failed to read chunk at offset " + std::to_string(offset));
             }
@@ -193,7 +193,11 @@ py::list split_and_hash_safetensors(const std::string& path) {
                 sha.update(reinterpret_cast<const uint8_t*>(buffer.data()), f.gcount());
                 remaining -= f.gcount();
             }
-            
+            if (remaining > 0) {
+                cancel_flag->store(true);
+                throw std::runtime_error("Truncated read for layer '" + layer.name + "' in " + path);
+            }
+
             LayerResult lr;
             lr.name = layer.name;
             lr.hash = sha.hexdigest();

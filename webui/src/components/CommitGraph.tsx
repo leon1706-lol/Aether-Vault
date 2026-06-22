@@ -218,6 +218,19 @@ export function CommitGraph({ commits, loading }: Props) {
           ))}
         </div>
       </div>
+
+      {commits.length > displayCommits.length && (
+        <div
+          style={{
+            padding: "8px 12px",
+            fontSize: 12,
+            color: "var(--text-muted)",
+            borderTop: "1px solid var(--border)",
+          }}
+        >
+          Showing newest {displayCommits.length} of {commits.length} commits
+        </div>
+      )}
     </div>
   );
 }

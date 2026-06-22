@@ -14,6 +14,13 @@ try:
 except ImportError:
     aether_core = None
 
+# Windows consoles default to a legacy codepage (e.g. cp1252) that can't
+# encode the emoji/symbols used in CLI output below, crashing with a
+# UnicodeEncodeError before the command logic even runs.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 from .client import VaultClient
 from .exceptions import AetherVaultException, NetworkError, StorageError, ValidationError
 from .index import Index
@@ -583,18 +590,23 @@ def checkout(target: str) -> None:
                 
                 if layers and not obj_path.exists():
                     click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
-                    with open(dest, "wb") as f_out:
-                        for layer in layers:
-                            lh = layer["hash"]
-                            l_obj = repo_root / ".av" / "objects" / lh[:2] / lh[2:]
-                            if not l_obj.exists() and client.server_available():
-                                client.download_object(lh, l_obj)
-                            if l_obj.exists():
+                    try:
+                        with open(dest, "wb") as f_out:
+                            for layer in layers:
+                                lh = layer["hash"]
+                                l_obj = repo_root / ".av" / "objects" / lh[:2] / lh[2:]
+                                if not l_obj.exists() and client.server_available():
+                                    client.download_object(lh, l_obj)
+                                if not l_obj.exists():
+                                    raise click.ClickException(
+                                        f"Missing layer {lh} for {rel_path}; checkout aborted to avoid a corrupt artifact"
+                                    )
                                 with open(l_obj, "rb") as f_in:
                                     shutil.copyfileobj(f_in, f_out)
-                            else:
-                                click.secho(f"Missing layer {lh} for {rel_path}", fg="red")
-                    
+                    except click.ClickException:
+                        dest.unlink(missing_ok=True)
+                        raise
+
                     obj_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(dest, obj_path)
                 else:
@@ -735,7 +747,7 @@ def webui_cmd() -> None:
         result = subprocess.run(
             ["docker", "info"],
             capture_output=True,
-            timeout=8,
+            timeout=30,
         )
         if result.returncode != 0:
             click.secho(
@@ -768,7 +780,7 @@ def webui_cmd() -> None:
                 "aether-vault-webui",
             ],
             capture_output=False,
-            timeout=300,
+            timeout=1200,
         )
         if proc.returncode != 0:
             click.secho("✗ Failed to start containers. Check docker compose logs for details.", fg="red")
