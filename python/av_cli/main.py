@@ -805,6 +805,70 @@ def graph(update: bool) -> None:
             pass
 
 
+@cli.group(invoke_without_command=True)
+@click.option("--update", is_flag=True, help="Update the existing handoff.avh with the latest repo state.")
+@click.option("--note", default=None, help="Freeform agent instruction text.")
+@click.option("--instructions-file", type=click.Path(exists=True), default=None, help="Read agent instructions from a file.")
+@click.option("--diff-weights", is_flag=True, help="Include a per-layer weight-diff against the parent commit.")
+@click.option("--since", default=None, help="Diff weights/metrics against this commit hash instead of the direct parent.")
+@click.pass_context
+def handoff(ctx: click.Context, update: bool, note: str | None, instructions_file: str | None, diff_weights: bool, since: str | None) -> None:
+    """Generate (or update) a .avh agent handoff snapshot and a Markdown log entry in Aether-Handoff/."""
+    if ctx.invoked_subcommand is not None:
+        return
+
+    repo_root = ensure_repo()
+    from .handoff import generate_handoff
+    note_text = Path(instructions_file).read_text() if instructions_file else note
+    avh_path, md_path = generate_handoff(
+        repo_root, update=update, agent_instructions=note_text, diff_weights=diff_weights, since=since
+    )
+    click.secho(f"Handoff snapshot written: {avh_path.relative_to(repo_root)}", fg="green")
+    click.secho(f"Markdown log entry: {md_path.relative_to(repo_root)}", fg="cyan")
+
+
+@handoff.command("init")
+def handoff_init() -> None:
+    """Create the Aether-Handoff/ folder structure without generating a snapshot."""
+    repo_root = ensure_repo()
+    from .handoff import init_handoff_dir
+    vault_dir = init_handoff_dir(repo_root)
+    click.secho(f"{vault_dir.relative_to(repo_root)}/ initialized.", fg="green")
+
+
+@handoff.command("log")
+def handoff_log() -> None:
+    """List all handoff snapshots in chronological order."""
+    repo_root = ensure_repo()
+    snapshots_dir = repo_root / "Aether-Handoff" / "snapshots"
+    if not snapshots_dir.exists():
+        click.secho("No handoff snapshots yet. Run `av handoff` first.", fg="yellow")
+        return
+
+    entries = sorted(snapshots_dir.glob("*.md"))
+    if not entries:
+        click.secho("No handoff snapshots yet. Run `av handoff` first.", fg="yellow")
+        return
+
+    for entry in entries:
+        click.echo(entry.stem)
+
+
+@handoff.command("show")
+@click.argument("snapshot_id")
+def handoff_show(snapshot_id: str) -> None:
+    """Print a previously generated handoff Markdown note."""
+    repo_root = ensure_repo()
+    snapshots_dir = repo_root / "Aether-Handoff" / "snapshots"
+    matches = sorted(snapshots_dir.glob(f"{snapshot_id}*.md")) if snapshots_dir.exists() else []
+
+    if not matches:
+        click.secho(f"No snapshot found matching '{snapshot_id}'.", fg="red")
+        return
+
+    click.echo(matches[-1].read_text(encoding="utf-8"))
+
+
 @cli.command("webui")
 def webui_cmd() -> None:
     """Start the Aether-Vault Web UI dashboard and open it in the browser.

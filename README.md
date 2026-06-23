@@ -157,7 +157,7 @@ av graph            # Generate and attempt to launch Obsidian
 av graph --update   # Silently regenerate after code changes
 ```
 
-### `av webui` 🆕
+### `av webui` 
 Launch the browser-based Web UI dashboard. Checks that Docker is running, starts the `aether-vault-webui` container, and opens `http://localhost:3000` automatically.
 ```bash
 av webui
@@ -179,6 +179,32 @@ Trigger a mark-and-sweep garbage collection on the remote server to purge orphan
 ```bash
 av gc
 ```
+
+### `av handoff` 🆕 — Agent Context Export
+While most ML tracking tools (MLflow, DVC, W&B) record experiments for humans to read, `av handoff` generates a structured, machine-readable context snapshot for **AI agents** picking up the work — branch, commit, tags, metrics, model/dataset lineage, and an optional freeform instruction note, in an open `.avh` (Aether Vault Handoff) JSON format. Every invocation also writes a human-readable Markdown note into `Aether-Handoff/`, indexed chronologically by a central hub file.
+
+```bash
+av handoff                              # write handoff.avh + a new Aether-Handoff/ snapshot
+av handoff --update                     # refresh handoff.avh with the latest repo state
+av handoff --note "fine-tune lr=0.001"  # attach freeform instructions for the next agent
+av handoff --instructions-file task.md  # read instructions from a file instead
+av handoff --diff-weights               # add a per-layer weight-diff vs. the parent commit
+av handoff --since <commit-or-tag>      # diff against an arbitrary earlier commit/tag
+av handoff init                         # create the Aether-Handoff/ folder structure only
+av handoff log                          # list all snapshots taken so far
+av handoff show <snapshot-id>           # print a previous snapshot's Markdown note
+```
+
+```
+Aether-Handoff/
+├── Handoff-Hub.md                # chronological index of every snapshot
+├── snapshots/
+│   ├── 2026-06-23T120000Z_abc123d.avh
+│   └── 2026-06-23T120000Z_abc123d.md
+└── latest.avh                    # always-overwritten copy of the most recent snapshot
+```
+
+`--diff-weights` reuses the per-layer safetensors hashes already produced during `av add` (see Phase 5 below) to report exactly which model layers changed since the parent commit — a focused slice of the "Weight Diffing" roadmap item.
 
 ---
 
@@ -216,12 +242,23 @@ Aether-Vault was built in eight distinct phases:
 ### Phase 8 — Native Codebase Visualization
 - **AST Parsing & Graph Generation**: `av graph` dynamically maps function calls, external library dependencies, and docstrings into an Obsidian-compatible Markdown vault.
 
-### Phase 9 — Web UI Dashboard ✅
+### Phase 9 — Web UI Dashboard 
 - **Next.js Frontend**: Dark glassmorphism dashboard at `http://localhost:3000`.
 - **SVG Commit Graph**: DAG visualizer with coloured branch lanes and bezier edges.
 - **Recharts Metrics**: Line charts plotting all numeric ML metrics over time.
 - **Live API**: `GET /api/commits`, `GET /api/dashboard/summary` — auto-refreshes every 15 seconds.
 - **Docker Service**: `aether-vault-webui` added to `docker-compose.yml`, launched via `av webui`.
+
+### Phase 10 — Commit Integrity & Offline Resilience
+- **Change-Aware Staging**: `av add` only re-stages a file when its content hash actually changed, so re-running `av add .` after a commit no longer produces an empty duplicate commit.
+- **Pending-Push Queue**: Commits made while the remote registry is unreachable are saved locally and queued in `.av/pending_push` instead of silently failing to reach the Web UI dashboard.
+- **`av push`**: Retries syncing queued commits to the remote registry on demand; every `av commit` also auto-retries the queue when the server is back up.
+
+### Phase 11 — Agent Context Handoff
+- **`.avh` Open Format**: A JSON snapshot of branch, commit, tags, metrics, model/dataset lineage, and freeform agent instructions — designed to be read by another AI agent picking up the work.
+- **`av handoff`**: Generates/updates `handoff.avh` plus a human-readable Markdown note logged chronologically into `Aether-Handoff/`, indexed by a central `Handoff-Hub.md`.
+- **Per-Layer Weight Diffing**: `av handoff --diff-weights` reuses the Phase 5 safetensors layer hashes to report exactly which model layers changed since the parent commit, without re-hashing the file.
+- **`av handoff log` / `show`**: Browse and inspect the chronological snapshot history directly from the terminal.
 
 ---
 
@@ -230,7 +267,9 @@ Aether-Vault was built in eight distinct phases:
 | Status | Feature |
 |---|---|
 | ✅ | **Web UI Dashboard** — Browser interface for commit graph, branches & ML metrics (`av webui`) |
-| 🔲 | **Weight Diffing** — Visualize parameter changes between two `.safetensors` checkpoints |
+| ✅ | **Offline-Resilient Commits** — Change-aware staging + `.av/pending_push` queue + `av push`, so no commit is lost or dashboard-invisible due to a down registry |
+| ✅ | **Agent Context Handoff** — Open `.avh` format + `av handoff` snapshots for AI-agent-to-agent ML pipeline handoff, including per-layer weight-diffing |
+| 🔲 | **Weight Diffing (Visual)** — A full visual diff UI between two `.safetensors` checkpoints in the Web UI (the per-layer hash comparison itself now ships via `av handoff --diff-weights`) |
 | 🔲 | **Framework Plugins** — Native callbacks for PyTorch Lightning & HuggingFace Transformers |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
 
