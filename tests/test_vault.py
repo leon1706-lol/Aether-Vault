@@ -10,13 +10,16 @@ from python.av_cli.handoff import classify_lineage, diff_model_weights, generate
 def test_create_and_parse_pointer(tmp_path):
     p = tmp_path / "model.pt"
     p.write_text("dummy content")
-    
-    ptr_content = create_pointer(p, "fakehash123", 1024)
-    assert "fakehash123" in ptr_content
+
+    # create_pointer enforces a canonical 64-char hex SHA-256 (content-addressing
+    # invariant), so the fixture must use a valid digest, not a placeholder string.
+    valid_hash = "a" * 64
+    ptr_content = create_pointer(p, valid_hash, 1024)
+    assert valid_hash in ptr_content
     assert "1024" in ptr_content
-    
+
     parsed = parse_pointer(ptr_content)
-    assert parsed["hash"] == "fakehash123"
+    assert parsed["hash"] == valid_hash
     assert parsed["size"] == 1024
     assert parsed["original_path"] == "model.pt"
 

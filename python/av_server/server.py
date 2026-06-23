@@ -3,7 +3,8 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,10 +13,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import get_session, init_db
-from .models import DBCommit, DBObject, DBRef, DBTree
+from .models import DBCommit, DBObject, DBRef, DBTree, utcnow_naive
 from .redis_cache import cache
 from .storage import CASStorage
 
@@ -25,7 +27,15 @@ logger = logging.getLogger("av_server")
 # App setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Aether-Vault Server", version="1.4.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Replaces the deprecated @app.on_event("startup") hook.
+    await init_db()
+    await cache.init_filter()
+    yield
+
+
+app = FastAPI(title="Aether-Vault Server", version="1.4.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,19 +46,35 @@ app.add_middleware(
 DATA_DIR = Path(os.environ.get("AV_DATA_DIR", "/data"))
 storage = CASStorage(DATA_DIR)
 
+# --- Request size guards for push_commit (reject hostile/oversized payloads early) ---
+MAX_TREE_ENTRIES = 100_000
+MAX_METRICS = 1_000
+MAX_TAGS = 200
+MAX_MESSAGE_LEN = 20_000
+MAX_TAG_LEN = 200
+
 
 class RefUpdate(BaseModel):
     commit_hash: str
 
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
+# Ref names end up as filesystem paths in the legacy CASStorage fallback
+# (refs_dir / ref_name). Because the route uses {ref_name:path}, a raw value like
+# "../../etc/passwd" would otherwise escape the data directory (path traversal / LFI).
+# Allow only safe, relative, slash-delimited names.
+_REF_NAME_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    await init_db()
-    await cache.init_filter()
+
+def validate_ref_name(ref_name: str) -> str:
+    if (
+        not ref_name
+        or not _REF_NAME_RE.match(ref_name)
+        or ref_name.startswith("/")
+        or "\\" in ref_name
+        or ".." in ref_name.split("/")
+    ):
+        raise HTTPException(status_code=400, detail="Invalid ref name")
+    return ref_name
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +182,12 @@ async def upload_object(
         return Response(status_code=201)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except IntegrityError:
+        # A concurrent upload of the same hash inserted the row first. CAS is idempotent
+        # (identical content), so treat the duplicate as success rather than a 500.
+        await db.rollback()
+        await cache.add_hash(hash)
+        return Response(status_code=409, content="Object already exists")
     except Exception as exc:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
@@ -215,8 +247,24 @@ async def push_commit(
     if result.scalar_one_or_none():
         return Response(status_code=409, content="Commit already exists")
 
-    # Support both new flat-tree and legacy {code:{}, artifacts:{}} formats
+    # Reject oversized/abusive payloads before doing any DB work (the endpoint is otherwise
+    # unauthenticated; without bounds a single request could store an unbounded tree/metrics
+    # blob). These limits are generous for real ML repos but cap pathological input.
     raw_tree = commit_data.get("tree", {})
+    if not isinstance(raw_tree, dict) or len(raw_tree) > MAX_TREE_ENTRIES:
+        raise HTTPException(status_code=422, detail="Commit tree too large or malformed")
+    metrics = commit_data.get("metrics", {})
+    if not isinstance(metrics, dict) or len(metrics) > MAX_METRICS:
+        raise HTTPException(status_code=422, detail="Too many metrics or malformed")
+    tags = commit_data.get("tags", [])
+    if not isinstance(tags, list) or len(tags) > MAX_TAGS or any(
+        not isinstance(t, str) or len(t) > MAX_TAG_LEN for t in tags
+    ):
+        raise HTTPException(status_code=422, detail="Too many/oversized tags or malformed")
+    if len(commit_data.get("message", "") or "") > MAX_MESSAGE_LEN:
+        raise HTTPException(status_code=422, detail="Commit message too long")
+
+    # Support both new flat-tree and legacy {code:{}, artifacts:{}} formats
     if "code" in raw_tree or "artifacts" in raw_tree:
         # Flatten legacy format into unified dict
         flat_tree: Dict[str, Any] = {}
@@ -225,6 +273,19 @@ async def push_commit(
         for path, info in raw_tree.get("artifacts", {}).items():
             flat_tree[path] = info
         raw_tree = flat_tree
+
+    # Persist the author-supplied commit time rather than the insert time, otherwise
+    # commits flushed late from the client's pending-push queue would sort as "newest"
+    # in the dashboard despite being authored earlier. Fall back to now() if absent/invalid.
+    commit_ts = None
+    raw_ts = commit_data.get("timestamp")
+    if raw_ts:
+        try:
+            parsed = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            # Store naive UTC to stay consistent with the model's utcnow() default column.
+            commit_ts = parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+        except (ValueError, TypeError):
+            commit_ts = None
 
     try:
         root_tree_hash = await build_merkle_tree(db, raw_tree)
@@ -235,12 +296,18 @@ async def push_commit(
             author=commit_data.get("author", "anonymous"),
             parent_hash=parents[0] if parents else None,
             root_tree_hash=root_tree_hash,
-            tags=commit_data.get("tags", []),
-            metrics=commit_data.get("metrics", {}),
+            tags=tags,
+            metrics=metrics,
         )
+        if commit_ts is not None:
+            new_commit.timestamp = commit_ts
         db.add(new_commit)
         await db.commit()
         return Response(status_code=201)
+    except IntegrityError:
+        # Concurrent push of the same commit hash raced us to the insert — idempotent success.
+        await db.rollback()
+        return Response(status_code=409, content="Commit already exists")
     except Exception as exc:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
@@ -260,21 +327,42 @@ async def get_commit(
         if local:
             return local
         raise HTTPException(status_code=404, detail="Commit not found")
-    # Rebuild the tree from the DB Merkle Tree
-    async def resolve_tree(tree_hash: str, current_path: str = "") -> dict:
-        tree_data = {}
-        result = await db.execute(select(DBTree).where(DBTree.tree_hash == tree_hash))
-        for entry in result.scalars().all():
-            full_path = f"{current_path}/{entry.path_name}" if current_path else entry.path_name
-            if entry.child_tree_hash:
-                tree_data.update(await resolve_tree(entry.child_tree_hash, full_path))
-            else:
-                tree_data[full_path] = {
-                    "hash": entry.object_hash,
-                    "size": entry.size,
-                    "type": entry.type,
-                    "layers": entry.layers or [],
-                }
+    # Rebuild the tree from the DB Merkle Tree.
+    # Level-order traversal with one batched query per depth level (was one query per node,
+    # i.e. N+1). Because identical subtrees are deduplicated, the same tree_hash can appear
+    # under several paths, so we carry a list of path prefixes per hash for each level.
+    async def resolve_tree(root_hash: str) -> dict:
+        tree_data: dict = {}
+        frontier: list[tuple[str, str]] = [(root_hash, "")]  # (tree_hash, path_prefix)
+        while frontier:
+            prefixes_by_hash: Dict[str, List[str]] = {}
+            for th, prefix in frontier:
+                prefixes_by_hash.setdefault(th, []).append(prefix)
+
+            rows = (
+                await db.execute(
+                    select(DBTree).where(DBTree.tree_hash.in_(list(prefixes_by_hash.keys())))
+                )
+            ).scalars().all()
+            rows_by_hash: Dict[str, list] = {}
+            for r in rows:
+                rows_by_hash.setdefault(r.tree_hash, []).append(r)
+
+            next_frontier: list[tuple[str, str]] = []
+            for th, prefixes in prefixes_by_hash.items():
+                for prefix in prefixes:
+                    for entry in rows_by_hash.get(th, []):
+                        full_path = f"{prefix}/{entry.path_name}" if prefix else entry.path_name
+                        if entry.child_tree_hash:
+                            next_frontier.append((entry.child_tree_hash, full_path))
+                        else:
+                            tree_data[full_path] = {
+                                "hash": entry.object_hash,
+                                "size": entry.size,
+                                "type": entry.type,
+                                "layers": entry.layers or [],
+                            }
+            frontier = next_frontier
         return tree_data
 
     tree_data = await resolve_tree(commit.root_tree_hash) if commit.root_tree_hash else {}
@@ -300,6 +388,7 @@ async def get_commit(
 async def update_ref(
     ref_name: str, payload: RefUpdate, db: AsyncSession = Depends(get_session)
 ) -> dict:
+    ref_name = validate_ref_name(ref_name)
     stmt = select(DBRef).where(DBRef.name == ref_name).with_for_update()
     result = await db.execute(stmt)
     ref = result.scalar_one_or_none()
@@ -315,6 +404,7 @@ async def update_ref(
 async def get_ref(
     ref_name: str, db: AsyncSession = Depends(get_session)
 ) -> dict:
+    ref_name = validate_ref_name(ref_name)
     result = await db.execute(select(DBRef).where(DBRef.name == ref_name))
     ref = result.scalar_one_or_none()
     if not ref:
@@ -341,31 +431,62 @@ async def list_refs(db: AsyncSession = Depends(get_session)) -> dict:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/stats")
-def get_stats() -> dict:
-    return storage.get_storage_stats()
+async def get_stats(db: AsyncSession = Depends(get_session)) -> dict:
+    # Previously this walked the entire CAS objects directory and stat()ed every shard on
+    # every call — and the Web UI polls it every ~15s. Use indexed DB aggregates instead;
+    # fall back to the filesystem only when the DB has no objects yet (legacy/empty state).
+    total_objects = (await db.execute(select(func.count(DBObject.hash)))).scalar_one()
+    if total_objects == 0:
+        return storage.get_storage_stats()
+
+    total_size = (await db.execute(select(func.sum(DBObject.size)))).scalar_one() or 0
+    total_commits = (await db.execute(select(func.count(DBCommit.hash)))).scalar_one()
+    total_refs = (await db.execute(select(func.count(DBRef.name)))).scalar_one()
+    return {
+        "total_objects": total_objects,
+        "total_commits": total_commits,
+        "total_refs": total_refs,
+        "total_size_bytes": total_size,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Garbage Collection
 # ---------------------------------------------------------------------------
 
-async def _collect_alive_hashes(
-    db: AsyncSession, tree_hash: str, visited: set, alive: set
+# Objects newer than this many seconds are never collected, even if no commit references
+# them yet. A client uploads object shards first and pushes the commit afterwards, so a GC
+# running inside that window would otherwise delete a live object whose commit is still
+# in-flight. This grace period closes that race without needing a global GC/upload lock.
+GC_GRACE_SECONDS = 3600
+
+# Delete in batches to stay well under driver bind-parameter limits (asyncpg ~32k).
+_GC_DELETE_BATCH = 500
+
+
+def _collect_alive_in_memory(
+    root_hash: Optional[str], tree_map: Dict[str, list], visited: set, alive: set
 ) -> None:
-    """Recursively mark all object hashes reachable from a tree node as alive."""
-    if tree_hash in visited:
-        return
-    visited.add(tree_hash)
-    result = await db.execute(select(DBTree).where(DBTree.tree_hash == tree_hash))
-    for entry in result.scalars().all():
-        if entry.child_tree_hash:
-            await _collect_alive_hashes(db, entry.child_tree_hash, visited, alive)
-        if entry.object_hash:
-            alive.add(entry.object_hash)
-        if entry.layers:
-            for layer in entry.layers:
-                if "hash" in layer:
-                    alive.add(layer["hash"])
+    """Iteratively mark every object/layer hash reachable from a root tree as alive.
+
+    Operates over a pre-loaded {tree_hash: [entries]} map, so the whole GC mark phase costs
+    a single DBTree query instead of one query per tree node (was N+1 and recursive).
+    """
+    stack = [root_hash]
+    while stack:
+        th = stack.pop()
+        if not th or th in visited:
+            continue
+        visited.add(th)
+        for entry in tree_map.get(th, []):
+            if entry.child_tree_hash:
+                stack.append(entry.child_tree_hash)
+            if entry.object_hash:
+                alive.add(entry.object_hash)
+            if entry.layers:
+                for layer in entry.layers:
+                    if isinstance(layer, dict) and "hash" in layer:
+                        alive.add(layer["hash"])
 
 
 @app.post("/api/admin/gc")
@@ -373,46 +494,68 @@ async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dic
     """
     Mark-and-sweep GC:
     1. Walk every commit's Merkle Tree to collect live hashes.
-    2. Delete orphaned DBObject rows and physical shard files.
+    2. Delete orphaned DBObject rows and physical shard files (respecting a grace period
+       so concurrently-uploaded-but-not-yet-committed objects are not reaped).
     3. Delete DBTree rows for trees no longer referenced.
     4. Rebuild the Redis Bloom Filter from surviving hashes.
     """
+    import asyncio
+    from datetime import timedelta
+
     try:
+        gc_cutoff = utcnow_naive() - timedelta(seconds=GC_GRACE_SECONDS)
+
+        # --- Mark phase: load all trees once, traverse in memory (no N+1) ---
+        all_trees = (await db.execute(select(DBTree))).scalars().all()
+        tree_map: Dict[str, list] = {}
+        for entry in all_trees:
+            tree_map.setdefault(entry.tree_hash, []).append(entry)
+
         alive_hashes: set = set()
         visited_trees: set = set()
+        for commit in (await db.execute(select(DBCommit))).scalars().all():
+            _collect_alive_in_memory(commit.root_tree_hash, tree_map, visited_trees, alive_hashes)
 
-        result = await db.execute(select(DBCommit))
-        for commit in result.scalars().all():
-            await _collect_alive_hashes(db, commit.root_tree_hash, visited_trees, alive_hashes)
+        # --- Sweep DB objects (protect recently-created rows via grace period) ---
+        obj_rows = (await db.execute(select(DBObject.hash, DBObject.created_at))).all()
+        dead_hashes = {
+            h for (h, created_at) in obj_rows
+            if h not in alive_hashes and (created_at is None or created_at < gc_cutoff)
+        }
 
-        result = await db.execute(select(DBObject.hash))
-        all_db_hashes = set(result.scalars().all())
-        dead_hashes = all_db_hashes - alive_hashes
+        dead_list = list(dead_hashes)
+        for i in range(0, len(dead_list), _GC_DELETE_BATCH):
+            batch = dead_list[i : i + _GC_DELETE_BATCH]
+            await db.execute(delete(DBObject).where(DBObject.hash.in_(batch)))
 
-        if dead_hashes:
-            await db.execute(delete(DBObject).where(DBObject.hash.in_(list(dead_hashes))))
         if visited_trees:
-            await db.execute(
-                delete(DBTree).where(DBTree.tree_hash.notin_(list(visited_trees)))
-            )
+            dead_trees = [th for th in tree_map if th not in visited_trees]
+            for i in range(0, len(dead_trees), _GC_DELETE_BATCH):
+                batch = dead_trees[i : i + _GC_DELETE_BATCH]
+                await db.execute(delete(DBTree).where(DBTree.tree_hash.in_(batch)))
 
-        # Delete orphaned physical shard files asynchronously
-        import asyncio
+        # --- Sweep physical shard files (skip alive + recently-written, off the event loop) ---
         loop = asyncio.get_running_loop()
-        
+        grace_ts = gc_cutoff.timestamp()
+
         def purge_orphans():
             count = 0
             for obj_path in storage.objects_dir.glob("*/*"):
                 if obj_path.is_file():
                     h = obj_path.parent.name + obj_path.name
-                    if h not in alive_hashes:
-                        obj_path.unlink()
-                        count += 1
+                    if h in alive_hashes:
+                        continue
+                    # Never delete a shard written during/after the grace window — its
+                    # commit may still be on its way from the client.
+                    if obj_path.stat().st_mtime >= grace_ts:
+                        continue
+                    obj_path.unlink()
+                    count += 1
             return count
 
         deleted_count = await loop.run_in_executor(None, purge_orphans)
 
-        # Rebuild Bloom Filter
+        # Rebuild Bloom Filter from the surviving set
         await cache.reset_filter()
         await cache.init_filter()
         for h in alive_hashes:
@@ -435,7 +578,7 @@ async def sync_refs(limit: int = 1000, offset: int = 0, db: AsyncSession = Depen
     result = await db.execute(select(DBRef).limit(limit).offset(offset))
     refs = result.scalars().all()
     return {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow_naive().isoformat(),
         "refs": {r.name: r.commit_hash for r in refs},
         "next_offset": offset + limit if len(refs) == limit else None
     }

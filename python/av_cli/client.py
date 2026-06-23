@@ -8,6 +8,24 @@ class VaultClient:
         self.server_url = server_url.rstrip('/')
         self.session = requests.Session()
 
+    def close(self) -> None:
+        """Release the pooled HTTP connections held by the underlying Session."""
+        self.session.close()
+
+    def __enter__(self) -> "VaultClient":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Defensive cleanup for callers that don't use the context manager. Guarded because
+        # __del__ can run during interpreter shutdown when attributes may already be gone.
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
     def upload_object(self, file_path: Path, sha256_hash: str) -> bool:
         url = f"{self.server_url}/api/objects/{sha256_hash}"
         try:

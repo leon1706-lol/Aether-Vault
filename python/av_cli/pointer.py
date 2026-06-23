@@ -33,13 +33,19 @@ def parse_pointer(content: str) -> dict | None:
         return None
     return res
 
+_POINTER_MAGIC = b"version aether-vault-pointer"
+
+
 def is_pointer_file(file_path: Path) -> bool:
+    # Read only the fixed-length magic prefix in *binary* mode. The previous text-mode
+    # readline() could read an unbounded amount of a large binary artifact that happened to
+    # contain no early newline, and would also decode-fail on arbitrary bytes. This is called
+    # for every file during `av add`, so it must be cheap and safe on multi-GB inputs.
     if not file_path.exists() or not file_path.is_file():
         return False
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            first_line = f.readline()
-            return first_line.startswith("version aether-vault-pointer")
+        with open(file_path, 'rb') as f:
+            return f.read(len(_POINTER_MAGIC)) == _POINTER_MAGIC
     except Exception:
         return False
 

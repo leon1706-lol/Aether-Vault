@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import sys
+import uuid
 from pathlib import Path
 
 import click
@@ -49,6 +50,27 @@ def setup_logging(verbose: bool, silent: bool) -> None:
 # Repo helpers
 # ---------------------------------------------------------------------------
 
+# Directories that must never be walked when collecting working-tree files.
+# NOTE: matched per *path component* — a substring test (e.g. `".av" in root`) would
+# wrongly skip legitimate folders like `data.average`, and failing to prune means
+# os.walk descends into `.av/objects` (potentially tens of thousands of CAS shards)
+# on every `add`/`status`.
+_IGNORED_DIRS = {".av", ".git", "__pycache__"}
+
+
+def iter_working_files(root: Path):
+    """Yield every working-tree file path under `root`, skipping ignored dirs and noise.
+
+    Prunes ignored directories in-place so the CAS object store is never traversed.
+    """
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
+        for f in files:
+            if f.endswith(".pyc") or f.endswith(".av-pointer"):
+                continue
+            yield Path(dirpath) / f
+
+
 def find_repo_root() -> Path | None:
     cwd = Path.cwd().resolve()
     for parent in [cwd] + list(cwd.parents):
@@ -80,8 +102,34 @@ def load_config(repo_root: Path) -> dict:
 def save_config(repo_root: Path, config: dict) -> None:
     config_path = repo_root / ".av" / "config"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+    atomic_write_text(config_path, json.dumps(config, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Atomic write helpers
+# ---------------------------------------------------------------------------
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write text to `path` atomically (write to a temp file in the same dir, then replace).
+
+    Prevents a crash mid-write from leaving a truncated/corrupt file: readers always see
+    either the old or the new complete content. os.replace is atomic on POSIX and Windows.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def atomic_write_json(path: Path, data) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +153,7 @@ def update_registry(repo_root: Path, tags: list[str], metrics: dict) -> None:
     reg = load_registry(repo_root)
     reg["tags"] = sorted(set(reg["tags"]) | set(tags))
     reg["metrics"] = sorted(set(reg["metrics"]) | set(metrics.keys()))
-    with open(repo_root / ".av" / "registry.json", "w") as f:
-        json.dump(reg, f, indent=2)
+    atomic_write_json(repo_root / ".av" / "registry.json", reg)
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +178,7 @@ def save_pending_push(repo_root: Path, pending: list[dict]) -> None:
     if not pending:
         path.unlink(missing_ok=True)
         return
-    with open(path, "w") as f:
-        json.dump(pending, f, indent=2)
+    atomic_write_json(path, pending)
 
 
 def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) -> None:
@@ -185,15 +231,15 @@ def hash_file_safe(path: str) -> str:
     return sha256.hexdigest()
 
 
+# IMPORTANT — single source of truth for file metadata (Unix epoch).
+# These deliberately do NOT use the C++ core: std::filesystem::last_write_time has an
+# implementation-defined clock epoch (e.g. 1601 on Windows / 100ns ticks) that does not
+# match Python's Unix-epoch st_mtime_ns. Routing some calls through C++ and others through
+# Python (e.g. after an aether_core fallback) would store one epoch and compare against the
+# other, exact-equality change detection would then flag unchanged files as "modified".
+# os.stat is a single cheap syscall, so there is no meaningful speed loss in keeping all
+# size/mtime handling in Python and reserving the C++ core for hashing only.
 def get_file_meta_safe(path: str) -> dict:
-    if aether_core:
-        try:
-            return aether_core.get_file_metadata(path)
-        except Exception as exc:
-            print(
-                f"Warning: aether_core.get_file_metadata failed, using Python fallback: {exc}",
-                file=sys.stderr,
-            )
     p = Path(path)
     if not p.exists():
         return {"exists": False, "size": 0, "mtime_ns": 0}
@@ -202,14 +248,8 @@ def get_file_meta_safe(path: str) -> dict:
 
 
 def compare_meta_safe(path: str, exp_size: int, exp_mtime: int) -> bool:
-    if aether_core:
-        try:
-            return aether_core.compare_metadata(path, exp_size, exp_mtime)
-        except Exception as exc:
-            print(
-                f"Warning: aether_core.compare_metadata failed, using Python fallback: {exc}",
-                file=sys.stderr,
-            )
+    # Mirrors get_file_meta_safe exactly (same Unix-epoch source) so a freshly captured
+    # entry always compares equal to itself.
     meta = get_file_meta_safe(path)
     return meta["exists"] and meta["size"] == exp_size and meta["mtime_ns"] == exp_mtime
 
@@ -285,12 +325,7 @@ def add(paths: tuple) -> None:
         if path_obj.is_file():
             files_to_process.append(path_obj)
         elif path_obj.is_dir():
-            for root, _, files in os.walk(path_obj):
-                if ".av" in root or ".git" in root or "__pycache__" in root:
-                    continue
-                for f in files:
-                    if not f.endswith(".pyc"):
-                        files_to_process.append(Path(root) / f)
+            files_to_process.extend(iter_working_files(path_obj))
 
     for fpath in files_to_process:
         rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
@@ -298,6 +333,14 @@ def add(paths: tuple) -> None:
             continue
 
         meta = get_file_meta_safe(str(fpath))
+
+        # Skip the expensive full-file re-hash when the file is unchanged since it was last
+        # indexed (same size + mtime). Without this, `av add .` re-reads every tracked file
+        # (potentially many GB of artifacts) just to discover nothing changed.
+        existing = idx.get_entry(rel_path)
+        if existing and compare_meta_safe(str(fpath), existing["size"], existing["mtime_ns"]):
+            continue
+
         file_hash = hash_file_safe(str(fpath))
         file_type = idx.classify_file(rel_path)
         pointer_rel_path = None
@@ -318,10 +361,19 @@ def add(paths: tuple) -> None:
                         l_obj_dir.mkdir(parents=True, exist_ok=True)
                         l_obj_path = l_obj_dir / l_hash[2:]
                         if not l_obj_path.exists():
+                            # Copy the layer byte-range in 8 MB chunks. Reading the whole
+                            # layer with src_f.read(l_size) would spike memory by a full
+                            # layer's size (hundreds of MB / GB for large tensors).
                             with open(fpath, "rb") as src_f:
                                 src_f.seek(l_offset)
                                 with open(l_obj_path, "wb") as dst_f:
-                                    dst_f.write(src_f.read(l_size))
+                                    remaining = l_size
+                                    while remaining > 0:
+                                        chunk = src_f.read(min(8 * 1024 * 1024, remaining))
+                                        if not chunk:
+                                            break
+                                        dst_f.write(chunk)
+                                        remaining -= len(chunk)
                         layers.append({"name": lr["name"], "hash": l_hash, "size": l_size})
                 except Exception as exc:
                     logger.warning(f"Layer splitting failed for {rel_path}, falling back to whole-file: {exc}")
@@ -365,14 +417,8 @@ def status() -> None:
     staged, modified, deleted, untracked = [], [], [], []
 
     disk_files: set[str] = set()
-    for root, _, files in os.walk(repo_root):
-        if ".av" in root or ".git" in root or "__pycache__" in root:
-            continue
-        for f in files:
-            if not f.endswith(".pyc") and not f.endswith(".av-pointer"):
-                disk_files.add(
-                    str((Path(root) / f).relative_to(repo_root)).replace("\\", "/")
-                )
+    for fpath in iter_working_files(repo_root):
+        disk_files.add(str(fpath.relative_to(repo_root)).replace("\\", "/"))
 
     for rel_path, entry in idx.entries.items():
         if rel_path not in disk_files:
@@ -495,16 +541,15 @@ def commit(
     commit_hash = hashlib.sha256(commit_str.encode()).hexdigest()
     commit_data["hash"] = commit_hash
 
-    # --- Persist locally ---
-    with open(repo_root / ".av" / "commits" / f"{commit_hash}.json", "w") as f:
-        json.dump(commit_data, f, indent=2)
+    # --- Persist locally (atomically: write the commit object before moving the ref, and
+    # write each file via temp+replace so a crash can't leave a ref pointing at a half-written
+    # or missing commit) ---
+    atomic_write_json(repo_root / ".av" / "commits" / f"{commit_hash}.json", commit_data)
 
     if ref_path:
-        with open(ref_path, "w") as f:
-            f.write(commit_hash)
+        atomic_write_text(ref_path, commit_hash)
     else:
-        with open(head_path, "w") as f:
-            f.write(commit_hash)
+        atomic_write_text(head_path, commit_hash)
 
     idx.clear_staged()
     click.secho(f"[{commit_hash[:7]}] {message}", fg="green")
@@ -576,7 +621,9 @@ def branch(name: str | None) -> None:
 
 @cli.command()
 @click.argument("target")
-def checkout(target: str) -> None:
+@click.option("--force", "-f", is_flag=True, default=False,
+              help="Discard uncommitted local changes instead of aborting.")
+def checkout(target: str, force: bool) -> None:
     """Checkout a branch or a specific commit hash."""
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
@@ -607,6 +654,32 @@ def checkout(target: str) -> None:
         return
 
     idx = Index(repo_root)
+
+    # Guard against silent data loss: checkout overwrites/deletes tracked working files.
+    # Refuse to proceed if there are uncommitted changes (modified/deleted tracked files
+    # or staged-but-uncommitted edits) unless the user explicitly passes --force.
+    if not force:
+        dirty: list[str] = []
+        for rel_path, entry in idx.entries.items():
+            fpath = repo_root / rel_path
+            if not fpath.exists():
+                dirty.append(rel_path)
+            elif entry.get("staged") or not compare_meta_safe(
+                str(fpath), entry["size"], entry["mtime_ns"]
+            ):
+                dirty.append(rel_path)
+        if dirty:
+            click.secho(
+                "Error: You have uncommitted changes that would be overwritten by checkout:",
+                fg="red",
+            )
+            for d in dirty[:20]:
+                click.echo(f"  {d}")
+            if len(dirty) > 20:
+                click.echo(f"  … and {len(dirty) - 20} more")
+            click.secho("Commit them, or re-run with --force to discard.", fg="yellow")
+            return
+
     old_entries = dict(idx.entries)
     idx.entries.clear()
 
@@ -695,6 +768,18 @@ def checkout(target: str) -> None:
             ptr_path = repo_root / (rel_path + ".av-pointer")
             if ptr_path.exists() and ptr_path.is_file():
                 ptr_path.unlink()
+
+    # Record the real on-disk size/mtime for every materialized file and clear the staged
+    # flag, so `av status` reports a clean tree right after checkout. Previously entries were
+    # written with mtime_ns=0 (and re-adding into a cleared index marked them staged), which
+    # made every file appear "modified"/"to be committed" immediately after a checkout.
+    for rel_path, entry in idx.entries.items():
+        fpath = repo_root / rel_path
+        if fpath.exists():
+            m = get_file_meta_safe(str(fpath))
+            entry["size"] = m["size"]
+            entry["mtime_ns"] = m["mtime_ns"]
+        entry["staged"] = False
 
     idx.save()
 

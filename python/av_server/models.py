@@ -1,10 +1,20 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String
+from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, JSON, String
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
+
+
+def utcnow_naive() -> datetime:
+    """Timezone-aware UTC 'now', returned as a naive datetime.
+
+    Replaces the deprecated datetime.utcnow(). We strip tzinfo so the value stays
+    compatible with the naive DateTime columns used throughout the schema (mixing naive
+    and aware datetimes in comparisons raises TypeError).
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class DBObject(Base):
@@ -12,8 +22,9 @@ class DBObject(Base):
     __tablename__ = "objects"
 
     hash = Column(String, primary_key=True)
-    size = Column(Integer, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # BigInteger, not Integer: ML weights/datasets routinely exceed the 2.1 GB INT4 ceiling.
+    size = Column(BigInteger, nullable=False)
+    created_at = Column(DateTime, default=utcnow_naive)
 
 
 class DBTree(Base):
@@ -28,7 +39,7 @@ class DBTree(Base):
     path_name = Column(String, primary_key=True)
     child_tree_hash = Column(String, nullable=True)
     object_hash = Column(String, ForeignKey("objects.hash"), nullable=True)
-    size = Column(Integer, nullable=True)
+    size = Column(BigInteger, nullable=True)  # see DBObject.size — multi-GB artifacts
     type = Column(String)  # 'tree' | 'file' | 'artifact'
     layers = Column(JSON, default=list)
 
@@ -44,8 +55,12 @@ class DBCommit(Base):
     hash = Column(String, primary_key=True)
     message = Column(String, nullable=False)
     author = Column(String, default="anonymous")
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    parent_hash = Column(String, ForeignKey("commits.hash"), nullable=True)
+    timestamp = Column(DateTime, default=utcnow_naive)
+    # No ForeignKey on parent_hash: commits can be pushed shallow / out-of-order (e.g. from
+    # the offline pending-push queue, or a clone that never received older history), and a
+    # missing parent must not raise an IntegrityError → HTTP 500. Integrity of the DAG is
+    # still anchored by the content-addressed hashes themselves.
+    parent_hash = Column(String, nullable=True, index=True)
     root_tree_hash = Column(String, nullable=False)
     tags = Column(ARRAY(String), default=list)
     metrics = Column(JSON, default=dict)
@@ -57,4 +72,4 @@ class DBRef(Base):
 
     name = Column(String, primary_key=True)
     commit_hash = Column(String, ForeignKey("commits.hash"), nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)

@@ -19,6 +19,18 @@ class CASStorage:
     def _object_path(self, sha256_hash: str) -> Path:
         return self.objects_dir / sha256_hash[:2] / sha256_hash[2:]
 
+    def _safe_ref_path(self, ref_name: str) -> Path:
+        """Resolve a ref name under refs_dir, rejecting any path-traversal escape.
+
+        Defence in depth: even though callers validate ref names, never let a crafted
+        name resolve outside the refs directory (arbitrary file read/write).
+        """
+        p = (self.refs_dir / ref_name).resolve()
+        refs_root = self.refs_dir.resolve()
+        if refs_root != p and refs_root not in p.parents:
+            raise ValueError(f"Ref name escapes refs directory: {ref_name}")
+        return p
+
     async def store_object(self, sha256_hash: str, data_stream: AsyncIterator[bytes]) -> Path:
         target_path = self._object_path(sha256_hash)
         if target_path.exists():
@@ -73,7 +85,7 @@ class CASStorage:
             return json.load(f)
 
     def update_ref(self, ref_name: str, commit_hash: str) -> None:
-        p = self.refs_dir / ref_name
+        p = self._safe_ref_path(ref_name)
         p.parent.mkdir(parents=True, exist_ok=True)
         temp_p = p.with_name(p.name + ".tmp")
         with open(temp_p, 'w') as f:
@@ -81,7 +93,7 @@ class CASStorage:
         shutil.move(temp_p, p)
 
     def get_ref(self, ref_name: str) -> str | None:
-        p = self.refs_dir / ref_name
+        p = self._safe_ref_path(ref_name)
         if not p.exists():
             return None
         return p.read_text().strip()

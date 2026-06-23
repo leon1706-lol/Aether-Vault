@@ -70,51 +70,31 @@ export async function fetchStats(): Promise<StorageStats> {
   return fetchJSON<StorageStats>("/api/stats");
 }
 
-export async function fetchCommitsForBranches(
-  refs: Ref,
-  limit = 40
-): Promise<Commit[]> {
-  const visited = new Set<string>();
-  const commits: Commit[] = [];
+interface CommitListResponse {
+  commits: Commit[];
+  total: number;
+  limit: number;
+  offset: number;
+  next_offset: number | null;
+}
 
-  // Walk each branch tip through the parent chain
-  const queue: string[] = Object.values(refs).filter(Boolean);
-
-  while (queue.length > 0 && commits.length < limit) {
-    const hash = queue.shift()!;
-    if (!hash || visited.has(hash)) continue;
-    visited.add(hash);
-    try {
-      const c = await fetchCommit(hash);
-      commits.push(c);
-      if (c.parent_hash) queue.push(c.parent_hash);
-    } catch {
-      // commit may not exist locally yet
-    }
-  }
-
-  // Sort by timestamp descending
-  commits.sort((a, b) => {
-    const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
-    const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
-    return tb - ta;
-  });
-
-  return commits;
+// Fetch the most recent commits in a SINGLE request. The server already returns them
+// newest-first with parent_hash for graph edges, so there is no need to walk the parent
+// chain one commit at a time (the previous fetchCommitsForBranches did N sequential
+// round-trips — a request waterfall that scaled with history length).
+export async function fetchCommits(limit = 40): Promise<Commit[]> {
+  const data = await fetchJSON<CommitListResponse>(`/api/commits?limit=${limit}`);
+  return data.commits ?? [];
 }
 
 export async function fetchDashboardData(): Promise<DashboardData> {
   try {
-    const [health, refs, stats] = await Promise.all([
+    const [health, refs, stats, commits] = await Promise.all([
       fetchHealth().catch(() => null),
       fetchRefs().catch(() => ({})),
       fetchStats().catch(() => null),
+      fetchCommits(40).catch(() => []),
     ]);
-
-    let commits: Commit[] = [];
-    if (refs && Object.keys(refs).length > 0) {
-      commits = await fetchCommitsForBranches(refs, 40);
-    }
 
     return { health, refs, commits, stats, error: null };
   } catch (err) {
