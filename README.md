@@ -27,19 +27,24 @@ Aether-Vault bridges Python and C++ for maximum throughput:
 graph TD
     %% Local Environment
     subgraph Local [User Machine / Training Node]
-        CLI("🖥️ av_cli<br>(av add · av commit · av webui)")
+        CLI("🖥️ av_cli<br>(add · status · commit · branch ·<br>checkout · push · gc · webui)")
         CPP("⚙️ aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
-        LocalDAG("📁 .av/<br>(Commits · Merkle Indices · LFS Pointers)")
+        LocalDAG("📁 .av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
+        PendingQ("⏳ pending_push queue<br>(.av/pending_push — offline-resilient commits)")
         WebUI("🌐 Web UI<br>(Next.js Dashboard · localhost:3000)")
+        Vault("🗒️ Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
 
         CLI -- "1. Reads & Hashes Files" --> CPP
         CLI -- "2. Updates Staging & Pointers" --> LocalDAG
-        CLI -- "3. Starts Container & Opens Browser" --> WebUI
+        CLI -- "3. Reconstructs Files on Checkout" --> LocalDAG
+        CLI -- "4. Queues Commit if Server Unreachable" --> PendingQ
+        CLI -- "5. Starts Container & Opens Browser" --> WebUI
+        CLI -- "6. Generates Code Graph / Handoff Snapshot" --> Vault
     end
 
     %% Remote Environment
     subgraph Remote [Dockerized Remote Registry]
-        FastAPI("🚀 FastAPI Server<br>(REST Uploads / Downloads / Dashboard API)")
+        FastAPI("🚀 FastAPI Server<br>(Upload/Download · Commit & Ref Sync ·<br>Dashboard API · Admin GC)")
         Redis("⚡ RedisBloom Cache<br>(O(1) Existence Checks)")
         DB("🐘 PostgreSQL<br>(Merkle Trees · Branches · Metrics)")
         Storage("💾 Persistent Volume<br>(Deduplicated Model & Dataset Chunks)")
@@ -47,10 +52,14 @@ graph TD
         FastAPI -- "Checks if Object Exists" --> Redis
         FastAPI -- "Writes Trees & Commits" --> DB
         FastAPI -- "Streams Large Chunks" --> Storage
+        FastAPI -- "Mark-and-Sweep Sweep" --> Storage
         WebUI -- "Fetches Commits, Refs & Metrics" --> FastAPI
     end
 
-    CLI -- "Syncs Data via REST API" --> FastAPI
+    CLI -- "Push: Uploads Objects, Trees & Refs" --> FastAPI
+    CLI -- "Checkout: Downloads Missing Objects" --> FastAPI
+    PendingQ -- "Retried by av push" --> FastAPI
+    CLI -- "gc: Triggers Remote Garbage Collection" --> FastAPI
 ```
 
 ---
