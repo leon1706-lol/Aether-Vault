@@ -110,6 +110,62 @@ def update_registry(repo_root: Path, tags: list[str], metrics: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pending-push queue: commits made while the remote server was unreachable
+# ---------------------------------------------------------------------------
+
+def load_pending_push(repo_root: Path) -> list[dict]:
+    """Load the queue of commits not yet pushed to the remote server."""
+    path = repo_root / ".av" / "pending_push"
+    if path.exists():
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def save_pending_push(repo_root: Path, pending: list[dict]) -> None:
+    """Persist the pending-push queue, removing the file once it's empty."""
+    path = repo_root / ".av" / "pending_push"
+    if not pending:
+        path.unlink(missing_ok=True)
+        return
+    with open(path, "w") as f:
+        json.dump(pending, f, indent=2)
+
+
+def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) -> None:
+    """Append a commit/ref pair to the pending-push queue."""
+    pending = load_pending_push(repo_root)
+    pending.append({"commit_hash": commit_hash, "ref_name": ref_name})
+    save_pending_push(repo_root, pending)
+
+
+def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
+    """Retry pushing queued commits to the remote server. Returns the entries still pending."""
+    pending = load_pending_push(repo_root)
+    if not pending or not client.server_available():
+        return pending
+
+    still_pending: list[dict] = []
+    for entry in pending:
+        commit_path = repo_root / ".av" / "commits" / f"{entry['commit_hash']}.json"
+        if not commit_path.exists():
+            continue
+        with open(commit_path, "r") as f:
+            commit_data = json.load(f)
+        if client.push_commit(commit_data):
+            if entry.get("ref_name"):
+                client.update_ref(entry["ref_name"], entry["commit_hash"])
+        else:
+            still_pending.append(entry)
+
+    save_pending_push(repo_root, still_pending)
+    return still_pending
+
+
+# ---------------------------------------------------------------------------
 # File hashing / metadata helpers (wraps aether_core with Python fallback)
 # ---------------------------------------------------------------------------
 
@@ -458,8 +514,8 @@ def commit(
         click.secho(f"  Metrics: {metrics}", fg="cyan")
 
     # --- Push to remote if available ---
-    if client.server_available():
-        client.push_commit(commit_data)
+    flush_pending_push(repo_root, client)
+    if client.server_available() and client.push_commit(commit_data):
         if ref_path:
             client.update_ref(ref_path.name, commit_hash)
 
@@ -476,6 +532,9 @@ def commit(
                     obj_file = repo_root / ".av" / "objects" / info["hash"][:2] / info["hash"][2:]
                     if obj_file.exists():
                         client.upload_object(obj_file, info["hash"])
+    else:
+        queue_pending_push(repo_root, commit_hash, ref_path.name if ref_path else None)
+        click.secho("  Server unreachable — commit queued for push (run `av push` later)", fg="yellow")
 
 
 @cli.command()
@@ -670,6 +729,30 @@ def list_meta() -> None:
             click.echo(f"    • {m}")
     else:
         click.echo("\n  Metric Keys: (none)")
+
+
+@cli.command()
+def push() -> None:
+    """Retry pushing locally committed but not-yet-synced commits to the remote server."""
+    repo_root = ensure_repo()
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+
+    pending_before = load_pending_push(repo_root)
+    if not pending_before:
+        click.secho("Nothing pending — all commits are synced.", fg="green")
+        return
+
+    if not client.server_available():
+        click.secho("Error: Remote server is not reachable.", fg="red")
+        return
+
+    still_pending = flush_pending_push(repo_root, client)
+    pushed = len(pending_before) - len(still_pending)
+    if pushed:
+        click.secho(f"✓ Pushed {pushed} commit(s) to the remote server", fg="green")
+    if still_pending:
+        click.secho(f"  {len(still_pending)} commit(s) still pending", fg="yellow")
 
 
 @cli.command()

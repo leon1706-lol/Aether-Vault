@@ -55,7 +55,7 @@ class VaultClient:
         url = f"{self.server_url}/api/commits"
         try:
             resp = self.session.post(url, json=commit_data)
-            return resp.status_code == 201
+            return resp.status_code in (201, 409)  # 409 = commit already exists, idempotent success
         except requests.exceptions.RequestException as e:
             print(f"Error pushing commit: {e}")
             return False

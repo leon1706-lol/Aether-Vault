@@ -126,6 +126,15 @@ av commit -m "LSTM tuned on Q2 data" \
   --metric drawdown=0.12 \
   --metric val_loss=0.034
 ```
+`av add` only re-stages a file when its content hash actually changed, so running `av add .` again right after a commit with no new changes correctly reports `Nothing to commit` instead of creating an empty duplicate commit.
+
+If the remote registry is unreachable at commit time, the commit is still saved locally and queued in `.av/pending_push` — it will not show up in the Web UI dashboard until it's synced (see `av push`).
+
+### `av push`
+Retry syncing locally committed commits that couldn't reach the remote registry (e.g. the server/Docker stack wasn't running yet). Every `av commit` also auto-retries the queue when the server is back up.
+```bash
+av push
+```
 
 ### `av branch` / `av checkout`
 Create and switch between experiment branches. Missing model weights are automatically downloaded from the remote.

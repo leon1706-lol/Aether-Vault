@@ -25,12 +25,14 @@ class Index:
             json.dump({"entries": self.entries}, f, indent=2)
 
     def add_entry(self, rel_path: str, hash: str, size: int, mtime_ns: int, file_type: str, pointer: str | None = None, auto_save: bool = True) -> None:
+        existing = self.entries.get(rel_path)
+        changed = existing is None or existing.get("hash") != hash
         self.entries[rel_path] = {
             "hash": hash,
             "size": size,
             "mtime_ns": mtime_ns,
             "type": file_type,
-            "staged": True,
+            "staged": changed,
             "pointer": pointer
         }
         if auto_save:

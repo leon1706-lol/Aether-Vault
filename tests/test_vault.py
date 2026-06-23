@@ -37,6 +37,15 @@ def test_index_operations(tmp_path):
     
     idx.clear_staged()
     assert idx.get_staged_entries() == {}
-    
+
+    # Re-adding the same content (same hash) must not re-stage it —
+    # otherwise `add .` after a commit lets you commit again with no real change.
+    idx.add_entry("model.pt", "hash123", 100, 200, "artifact")
+    assert idx.get_staged_entries() == {}
+
+    # A real content change (different hash) must re-stage it.
+    idx.add_entry("model.pt", "hash456", 100, 200, "artifact")
+    assert idx.get_staged_entries()["model.pt"]["staged"] is True
+
     idx.remove_entry("model.pt")
     assert "model.pt" not in idx.entries
