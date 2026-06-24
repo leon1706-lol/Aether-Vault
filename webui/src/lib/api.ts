@@ -3,6 +3,12 @@
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+export interface TreeLayer {
+  name: string;
+  hash: string;
+  size: number;
+}
+
 export interface Commit {
   hash: string;
   message: string;
@@ -12,7 +18,7 @@ export interface Commit {
   root_tree_hash: string | null;
   tags: string[];
   metrics: Record<string, number | string>;
-  tree?: Record<string, { hash: string; size: number; type: string; layers: unknown[] }>;
+  tree?: Record<string, { hash: string; size: number; type: string; layers: TreeLayer[] }>;
 }
 
 export interface Ref {

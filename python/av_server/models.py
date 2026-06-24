@@ -38,7 +38,13 @@ class DBTree(Base):
     tree_hash = Column(String, primary_key=True)
     path_name = Column(String, primary_key=True)
     child_tree_hash = Column(String, nullable=True)
-    object_hash = Column(String, ForeignKey("objects.hash"), nullable=True)
+    # No ForeignKey on objects.hash: a `.safetensors` artifact that gets split into per-layer
+    # shards (see `layers` below) never has its whole-file blob uploaded as a single object —
+    # only the layer shards are (avoids storing the same bytes twice). object_hash still holds
+    # the real whole-file content hash (used by clients to name the reconstructed local file
+    # and as the canonical content-address), it just isn't guaranteed to exist as its own row
+    # in `objects`. Enforcing the FK made every layer-split commit fail to insert.
+    object_hash = Column(String, nullable=True)
     size = Column(BigInteger, nullable=True)  # see DBObject.size — multi-GB artifacts
     type = Column(String)  # 'tree' | 'file' | 'artifact'
     layers = Column(JSON, default=list)

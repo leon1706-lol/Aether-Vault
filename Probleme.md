@@ -160,3 +160,138 @@ Wichtigkeit.
 | 2 | `python/av_cli/main.py` (`save_pending_push`, `update_registry`, `save_config`) | Nicht-atomare JSON-Schreibvorgänge. | **Behoben:** über `atomic_write_json`/`atomic_write_text`. |
 | 2 | `src/core.cpp` (`hash_file_parallel`) | ThreadPool-Overhead bei Dateien knapp über 2× Chunkgröße. | **Behoben:** Parallelisierung erst ab `PARALLEL_MIN_CHUNKS` (8 Chunks ≈ 64 MB). |
 | 1 | `python/av_cli/client.py` (`VaultClient.session`) | `requests.Session` wurde nie geschlossen (kein echtes Leck). | **Behoben:** `close()` + Context-Manager (`__enter__`/`__exit__`) + defensiver `__del__`. |
+
+---
+
+## ✅ Behoben — Weight Diffing (Visual) Feature-Implementierung (2026-06-24)
+
+Neues Feature: vollständig client-seitige visuelle Diff-UI im Web UI (Sidebar-Tab „Weight
+Diff"). Checkpoints lassen sich per Drag-and-Drop (oder Klick) aus einer Liste in zwei
+Vergleichsslots ziehen; ein Heatmap-Grid und ein Recharts-Balkendiagramm zeigen, welche
+`.safetensors`-Layer sich zwischen zwei Commits geändert haben — ohne neue Server-Endpunkte,
+da `GET /api/commits/{hash}` die Per-Layer-Hashes bereits liefert. Beim End-to-End-Test mit
+echten synthetischen Checkpoints (zwei `.safetensors`-Versionen, 5 Tensoren, 1 absichtlich
+verändert) wurden folgende **vorbestehende** Bugs aufgedeckt, die das Feature (und teils auch
+die bereits ausgelieferte CLI-Funktion `av handoff --diff-weights`) komplett unbrauchbar
+gemacht hätten:
+
+### [10] Commits werden vor ihren Objekten gepusht → Server-Sync für Artefakte komplett unbrauchbar
+- **Dateien:** `python/av_cli/main.py` (`commit`, `flush_pending_push`),
+  `python/av_server/server.py` (`push_commit`), `python/av_server/models.py` (`DBTree`).
+- **Problem (zwei sich verstärkende Bugs):**
+  1. **Falsche Reihenfolge:** `commit` rief `client.push_commit(commit_data)` auf, **bevor**
+     die referenzierten Objekte/Layer-Shards hochgeladen wurden (`flush_pending_push` lud sie
+     überhaupt **nie** hoch — der Upload-Code existierte nur inline im Live-Commit-Pfad). Der
+     Server speichert pro Tree-Eintrag aber `object_hash` als **Foreign Key** auf `objects.hash`
+     ([models.py:41](python/av_server/models.py#L41) vor dem Fix). Das Insert in `trees`
+     schlug daher praktisch **immer** mit `ForeignKeyViolationError` fehl.
+  2. **Falsch zugeordnete Fehlerbehandlung:** `push_commit` fing *jeden* `IntegrityError` ab
+     und gab pauschal `409 "Commit already exists"` zurück
+     ([server.py:307](python/av_server/server.py#L307) vor dem Fix) — unabhängig davon, ob der
+     Commit wirklich schon existierte oder ob (wie hier) ein ganz anderer Constraint
+     (Tree→Objekt-FK, später auch Ref→Commit-FK) verletzt wurde. Der Client behandelt 409
+     bewusst als idempotenten Erfolg (Design für gleichzeitige Pushes desselben Hashes) — und
+     wurde so über einen Totalausfall hinweggetäuscht: `av commit`/`av push` meldeten
+     durchgehend Erfolg, aber **Commits und Refs landeten nie in der Datenbank**
+     (`SELECT * FROM commits` → 0 Zeilen, trotz „✓ Pushed 2 commit(s)" auf der Konsole).
+  3. **Tiefere Ursache:** Selbst mit korrekter Reihenfolge schlägt das Insert für **jede**
+     Layer-gesplittete `.safetensors`-Datei weiterhin fehl: Beim Layer-Split wird die
+     Ganzdatei (`object_hash`) bewusst **nie** als eigenes Objekt hochgeladen (nur die
+     Layer-Shards, um doppelte Speicherung zu vermeiden) — der FK auf `objects.hash` verlangt
+     aber genau das.
+  4. Zusätzlich wurde der Rückgabewert von `client.update_ref(...)` nirgends geprüft — ein
+     fehlgeschlagenes Ref-Update wurde als „erledigt" behandelt statt erneut in die
+     Pending-Queue gestellt.
+- **Auswirkung:** Jeder Commit mit einer `.safetensors`-Datei über der LFS-Schwelle (also
+  genau der Use-Case dieses Tools) konnte **nie erfolgreich synchronisiert** werden — weder
+  live noch über die Offline-Pending-Queue. Das gesamte „Weight Diffing"-Feature (CLI **und**
+  neue Web-UI) lief leer, weil schlicht keine zweite Version eines Modells je auf dem Server
+  ankam.
+- **Fix:**
+  - Gemeinsamer Helper `upload_commit_objects()` (statt dupliziertem Inline-Code), der **vor**
+    `push_commit()` aufgerufen wird — sowohl im Live-Commit-Pfad als auch in
+    `flush_pending_push()` (vorher: Objekte wurden beim Queue-Replay nie hochgeladen).
+  - `DBTree.object_hash` verliert seinen `ForeignKey("objects.hash")` (analog zur bereits
+    vorher entfernten `parent_hash`-FK) — der Hash bleibt als Inhalts-Identität erhalten, ohne
+    eine physische Objekt-Zeile zu erzwingen, die für Layer-gesplittete Dateien nie existiert.
+  - `push_commit` prüft nach einem `IntegrityError` jetzt **erneut per Hash**, ob der Commit
+    tatsächlich existiert, bevor es 409 zurückgibt; andernfalls 500 mit echter Fehlermeldung
+    (kein falsches „Erfolg" mehr für den Client).
+  - `flush_pending_push`/`commit` prüfen jetzt das Ergebnis von `update_ref()` und behalten den
+    Commit in der Pending-Queue, falls das Ref-Update fehlschlägt.
+- **Verifiziert (End-to-End gegen echten Docker-Stack):** Vier reale Commits mit
+  Layer-gesplitteten Synthetik-Checkpoints erzeugt; vor dem Fix landeten 0 von 2 Commits in
+  der DB (`SELECT hash FROM commits` leer) trotz Erfolgsmeldung. Nach dem Fix: Live-Push UND
+  Offline-Queue-Push landen beide korrekt in `commits`/`refs`; `GET /api/commits/{hash}`
+  liefert die erwarteten Per-Layer-Hashes; ein Node-Skript, das exakt die Browser-Diff-Logik
+  nachbildet, bestätigt den korrekten Layer-Diff zwischen zwei echten Server-Commits.
+- **Hinweis:** Bestehende Dev-Datenbanken (vor diesem Fix erstellt via `create_all`, keine
+  Migrationen) behalten die alte FK-Constraint physisch im Schema, bis sie manuell entfernt
+  wird (`ALTER TABLE trees DROP CONSTRAINT trees_object_hash_fkey;`) oder die DB neu angelegt
+  wird — bereits dokumentiertes Migrations-Caveat, siehe Eintrag zu `BigInteger`/`parent_hash`.
+
+### [9] `av add` persistiert Per-Layer-Hashes nie auf die Festplatte
+- **Datei:** `python/av_cli/main.py` (`add`), `python/av_cli/index.py` (`Index.add_entry`).
+- **Problem:** `idx.add_entry(...)` ruft intern bereits `self.save()` auf (Parameter
+  `auto_save=True`), **bevor** der Aufrufer in `add` die Zeile
+  `idx.entries[rel_path]["layers"] = layers` ausführt. Die Layer-Liste landet damit nur im
+  In-Memory-Dict des bereits beendeten `add`-Prozesses — die `.av/index`-Datei auf der Platte
+  hat nie `"layers"`. Da `av commit` den Index in einem **neuen** Prozess frisch von der Platte
+  lädt, war `tree[rel_path]["layers"]` in jedem Commit-Objekt immer `[]`, unabhängig von der
+  Konsolenausgabe „Staged [ARTIFACT] … (LFS, 6 layers)". Folge: Sowohl `av handoff
+  --diff-weights` als auch die neue Web-UI fielen für **jede** `.safetensors`-Datei auf den
+  Ganzdatei-Hash-Vergleich zurück (`status: changed`, aber keine einzelne geänderte Layer
+  gemeldet) — das komplette „Per-Layer Weight Diffing"-Feature aus README Phase 11 war seit
+  dessen Einführung wirkungslos.
+- **Fix:** Nach dem Setzen von `idx.entries[rel_path]["layers"]` wird explizit `idx.save()`
+  aufgerufen, damit die Layer-Daten tatsächlich persistiert werden.
+- **Verifiziert:** Zwei synthetische `.safetensors`-Commits erzeugt (Layer `layer2.weight`
+  geändert); `av handoff --diff-weights` meldet danach korrekt
+  `changed layers: layer2.weight`, vorher nur `status: changed` ohne Detail.
+
+### [4] `atomic_write_text`-Temp-Dateiname kann Windows-`MAX_PATH` sprengen
+- **Datei:** `python/av_cli/main.py` (`atomic_write_text`).
+- **Problem:** Der Temp-Suffix `f".tmp.{os.getpid()}.{uuid.uuid4().hex}"` (PID + voller
+  32-stelliger UUID4-Hex) macht zusammen mit einem 64-Zeichen-Commit-Hash-Dateinamen und einem
+  tief verschachtelten Repo-Pfad (z.B. CI-Runner-Tempverzeichnisse, OneDrive-Sync-Ordner) den
+  Gesamtpfad leicht länger als Windows' 260-Zeichen-`MAX_PATH`. Statt „nur" lang zu sein,
+  schlägt der `open()`-Aufruf dann mit `FileNotFoundError` fehl — der gesamte `av commit`
+  bricht ab, obwohl das eigentliche Ziel (atomare, crash-sichere Schreibvorgänge) das Gegenteil
+  von „Operation schlägt fehl" sein sollte. Beim Testen dieses Features reproduzierbar
+  aufgetreten (Repo unter einem tiefen Temp-Pfad).
+- **Fix:** Temp-Suffix auf einen kurzen 8-stelligen Zufalls-Hex reduziert (PID entfernt, war
+  ohnehin redundant zur UUID für Kollisionsvermeidung).
+
+### [3] Synthetischer `__header__`-Pseudo-Layer verschmutzt die Diff-Ansicht
+- **Datei:** `webui/src/lib/diffWeights.ts` (neu).
+- **Problem:** `aether_core.split_and_hash_safetensors` gibt neben den echten Tensoren einen
+  zusätzlichen Eintrag `__header__` zurück (Hash über den safetensors-JSON-Header, für die
+  Rekonstruktions-Integrität). `av_cli/main.py` übernimmt diesen ungefiltert in
+  `idx.entries[rel_path]["layers"]`. In der bisherigen CLI-Textausgabe (`--diff-weights`) fiel
+  das kaum auf; in einer **visuellen** Layer-für-Layer-Ansicht wäre es jedoch ein verwirrender,
+  nicht-Tensor-Eintrag in Heatmap und Drift-Chart.
+- **Fix:** `diffFile()` filtert Layer-Einträge mit Namen `__header__` heraus, bevor sie in die
+  UI-Diff-Struktur einfließen (rein clientseitig, keine Änderung an Core/Server/Index-Format).
+
+### 🔸 Offen — Checkpoint-Liste löst N Commits über N parallele Requests auf
+- **Datei:** `webui/src/components/WeightDiffPanel.tsx`.
+- **Problem:** `GET /api/commits` (Listen-Endpoint) liefert **keine** Tree-/Layer-Daten (nur
+  Metadaten); um die Checkpoint-Liste mit `rel_path`/Layer-Infos zu befüllen, muss für jeden
+  in Frage kommenden Commit einzeln `GET /api/commits/{hash}` aufgerufen werden. Um nicht exakt
+  das N+1-Request-Muster zu wiederholen, das in diesem Projekt bereits einmal für
+  `fetchCommitsForBranches` behoben wurde, laufen diese Requests **parallel** (`Promise.all`,
+  nicht seriell) und sind hart auf `CHECKPOINT_FETCH_LIMIT = 30` begrenzt.
+- **Warum nicht behoben:** Eine echte Lösung bräuchte einen neuen Server-Endpunkt (z.B.
+  `GET /api/commits?include_layers=true`), was laut Scope-Entscheidung für dieses Feature
+  explizit vermieden werden sollte (keine Server-/API-Änderungen). Bei Repos mit nur einigen
+  Dutzend Commits unproblematisch; bei sehr langer Historie mit vielen Checkpoints wäre ein
+  Aggregat-Endpunkt nötig.
+
+### 🔸 Offen — `Index.save()` ist nicht atomar
+- **Datei:** `python/av_cli/index.py` (`Index.save`).
+- **Problem:** Schreibt `.av/index` direkt (`open(..., 'w')`), ohne das in `main.py` bereits
+  etablierte Temp-Datei+`fsync`+`os.replace`-Muster (`atomic_write_text`/`atomic_write_json`).
+  Ein Crash mitten im Schreiben kann eine abgeschnittene/leere Index-Datei hinterlassen.
+- **Warum nicht behoben:** Außerhalb des Scopes dieses Features; konsistent mit der bereits in
+  diesem Dokument unter „Kleinere Punkte" gelisteten Kategorie nicht-atomarer Schreibvorgänge
+  — zur späteren Behebung vorgemerkt.

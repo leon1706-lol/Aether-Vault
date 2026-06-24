@@ -116,7 +116,11 @@ def atomic_write_text(path: Path, text: str) -> None:
     either the old or the new complete content. os.replace is atomic on POSIX and Windows.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    # Short random suffix (not pid + full uuid4 hex): commit filenames are already a 64-char
+    # hash, and on Windows the combined path can exceed the 260-char MAX_PATH once a long
+    # temp suffix is appended, which makes the "atomic" write fail outright instead of just
+    # being verbose.
+    tmp = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex[:8]}")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
@@ -188,6 +192,30 @@ def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) 
     save_pending_push(repo_root, pending)
 
 
+def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) -> None:
+    """Upload every artifact's object/layer shards referenced by a commit tree.
+
+    Must run BEFORE push_commit(): the server stores each tree entry's object hash as a
+    foreign key into its objects table (see DBTree.object_hash in av_server/models.py), so
+    pushing the commit first makes that insert violate the FK — the commit silently never
+    lands in the database even though the server used to (incorrectly) report success.
+    """
+    for rel_path, info in tree.items():
+        if info.get("type") != "artifact":
+            continue
+        # Upload individual layer shards first (PR #8)
+        for layer in info.get("layers", []):
+            l_hash = layer["hash"]
+            l_obj = repo_root / ".av" / "objects" / l_hash[:2] / l_hash[2:]
+            if l_obj.exists():
+                client.upload_object(l_obj, l_hash)
+        # Upload the whole-file object only if layers weren't successfully chunked
+        if not info.get("layers"):
+            obj_file = repo_root / ".av" / "objects" / info["hash"][:2] / info["hash"][2:]
+            if obj_file.exists():
+                client.upload_object(obj_file, info["hash"])
+
+
 def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
     """Retry pushing queued commits to the remote server. Returns the entries still pending."""
     pending = load_pending_push(repo_root)
@@ -201,11 +229,14 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
             continue
         with open(commit_path, "r") as f:
             commit_data = json.load(f)
+        upload_commit_objects(repo_root, client, commit_data.get("tree", {}))
         if client.push_commit(commit_data):
+            ref_ok = True
             if entry.get("ref_name"):
-                client.update_ref(entry["ref_name"], entry["commit_hash"])
-        else:
-            still_pending.append(entry)
+                ref_ok = client.update_ref(entry["ref_name"], entry["commit_hash"])
+            if ref_ok:
+                continue
+        still_pending.append(entry)
 
     save_pending_push(repo_root, still_pending)
     return still_pending
@@ -392,7 +423,14 @@ def add(paths: tuple) -> None:
             pointer_rel_path = rel_path + ".av-pointer"
             idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, pointer_rel_path)
             if layers:
+                # add_entry() above already wrote the index to disk via its own auto_save
+                # (without "layers", which isn't one of its parameters), so the per-layer
+                # data was previously lost the moment `av add` exited: a fresh `av commit`
+                # process re-loads the index from disk and finds no layers, silently
+                # degrading every per-layer weight diff (`av handoff --diff-weights`, and the
+                # Web UI's checkpoint diff) into a whole-file hash comparison. Persist it.
                 idx.entries[rel_path]["layers"] = layers
+                idx.save()
             click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {len(layers)} layers)", fg="green")
         else:
             idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None)
@@ -560,23 +598,22 @@ def commit(
 
     # --- Push to remote if available ---
     flush_pending_push(repo_root, client)
-    if client.server_available() and client.push_commit(commit_data):
-        if ref_path:
-            client.update_ref(ref_path.name, commit_hash)
-
-        for rel_path, info in tree.items():
-            if info["type"] == "artifact":
-                # Upload individual layer shards first (PR #8)
-                for layer in info.get("layers", []):
-                    l_hash = layer["hash"]
-                    l_obj = repo_root / ".av" / "objects" / l_hash[:2] / l_hash[2:]
-                    if l_obj.exists():
-                        client.upload_object(l_obj, l_hash)
-                # Upload the whole-file object only if layers weren't successfully chunked
-                if not info.get("layers"):
-                    obj_file = repo_root / ".av" / "objects" / info["hash"][:2] / info["hash"][2:]
-                    if obj_file.exists():
-                        client.upload_object(obj_file, info["hash"])
+    if client.server_available():
+        # Objects must reach the server before the commit: the server's tree rows store each
+        # entry's object hash as a foreign key, so pushing the commit first makes that insert
+        # fail (previously misreported as a successful 409 "already exists" — see
+        # upload_commit_objects()'s docstring / Probleme.md).
+        upload_commit_objects(repo_root, client, tree)
+        if client.push_commit(commit_data):
+            ref_ok = True
+            if ref_path:
+                ref_ok = client.update_ref(ref_path.name, commit_hash)
+            if not ref_ok:
+                queue_pending_push(repo_root, commit_hash, ref_path.name if ref_path else None)
+                click.secho("  Ref update failed — commit queued for retry (run `av push` later)", fg="yellow")
+        else:
+            queue_pending_push(repo_root, commit_hash, ref_path.name if ref_path else None)
+            click.secho("  Push failed — commit queued for retry (run `av push` later)", fg="yellow")
     else:
         queue_pending_push(repo_root, commit_hash, ref_path.name if ref_path else None)
         click.secho("  Server unreachable — commit queued for push (run `av push` later)", fg="yellow")

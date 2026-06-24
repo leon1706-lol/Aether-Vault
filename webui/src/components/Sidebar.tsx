@@ -1,7 +1,5 @@
 "use client";
 
-import { useState } from "react";
-
 type NavItem = {
   id: string;
   label: string;
@@ -64,11 +62,26 @@ const navItems: NavItem[] = [
       </svg>
     ),
   },
+  {
+    id: "weight-diff",
+    label: "Weight Diff",
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="3" y="3" width="8" height="8" rx="1" />
+        <rect x="13" y="13" width="8" height="8" rx="1" />
+        <path d="M11 7h6a2 2 0 0 1 2 2v4" />
+        <path d="M13 17H7a2 2 0 0 1-2-2V11" />
+      </svg>
+    ),
+  },
 ];
 
-export function Sidebar() {
-  const [active, setActive] = useState("dashboard");
+interface Props {
+  active: string;
+  onSelect: (id: string) => void;
+}
 
+export function Sidebar({ active, onSelect }: Props) {
   return (
     <aside className="sidebar">
       <div className="sidebar-logo">
@@ -84,7 +97,7 @@ export function Sidebar() {
             key={item.id}
             id={`nav-${item.id}`}
             className={`nav-item ${active === item.id ? "active" : ""}`}
-            onClick={() => setActive(item.id)}
+            onClick={() => onSelect(item.id)}
           >
             <span className="nav-icon">{item.icon}</span>
             {item.label}

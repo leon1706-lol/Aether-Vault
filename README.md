@@ -19,7 +19,7 @@ Aether-Vault bridges Python and C++ for maximum throughput:
 - **C++ Performance Core (`aether_core`)** — Reads multi-gigabyte files in 8MB chunks, hashing them in parallel with a C++11 ThreadPool. Layer-aware `.safetensors` parsing enables per-layer deduplication.
 - **Python CLI (`av_cli`)** — Familiar Git-like interface (`av add`, `av commit`, `av checkout`). Files above the LFS threshold are automatically replaced by lightweight pointer files.
 - **FastAPI CAS Server (`av_server`)** — Dockerized Content-Addressable Storage backend, backed by PostgreSQL (Merkle Tree DAG) and RedisBloom (O(1) existence checks).
-- **Next.js Web UI (`webui`)** — Browser-based dashboard for visualizing the commit graph, branches, and ML metrics. Launched with `av webui`.
+- **Next.js Web UI (`webui`)** — Browser-based dashboard for visualizing the commit graph, branches, and ML metrics, plus a "Weight Diff" tab for visually comparing per-layer checkpoint changes. Launched with `av webui`.
 
 ### System Diagram
 
@@ -31,7 +31,7 @@ graph TD
         CPP("⚙️ aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
         LocalDAG("📁 .av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
         PendingQ("⏳ pending_push queue<br>(.av/pending_push — offline-resilient commits)")
-        WebUI("🌐 Web UI<br>(Next.js Dashboard · localhost:3000)")
+        WebUI("🌐 Web UI<br>(Next.js Dashboard + Weight Diff Tab · localhost:3000)")
         Vault("🗒️ Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
 
         CLI -- "1. Reads & Hashes Files" --> CPP
@@ -53,7 +53,7 @@ graph TD
         FastAPI -- "Writes Trees & Commits" --> DB
         FastAPI -- "Streams Large Chunks" --> Storage
         FastAPI -- "Mark-and-Sweep Sweep" --> Storage
-        WebUI -- "Fetches Commits, Refs & Metrics" --> FastAPI
+        WebUI -- "Fetches Commits, Refs, Metrics & Per-Layer Hashes" --> FastAPI
     end
 
     CLI -- "Push: Uploads Objects, Trees & Refs" --> FastAPI
@@ -279,6 +279,13 @@ Aether-Vault was built in eight distinct phases:
 - **Single-Request Commit Loading**: The Web UI fetches recent commits in one `/api/commits` call (newest-first, with parent links) instead of walking the parent chain one request at a time, and runs all dashboard fetches in parallel.
 - **Smaller polish**: pointer detection reads only the fixed magic prefix in binary mode (safe on multi-GB inputs); the parallel hasher only spins up a thread pool when there is enough work to amortize it; `VaultClient` is now closable / a context manager; deprecated `datetime.utcnow()` and `@app.on_event` replaced with timezone-correct helpers and a FastAPI `lifespan`.
 
+### Phase 13 — Visual Weight Diffing
+- **"Weight Diff" Web UI tab**: a sidebar tab (lifted into the existing single-page dashboard, no new route) lets you drag two checkpoints from a list into two comparison slots and see a colored per-layer heatmap, summary stats (changed/total/% changed), and a Recharts bar chart of which layers changed across model depth. Entirely client-side — it reuses the per-layer hashes `GET /api/commits/{hash}` already returns, so no new server endpoints were needed.
+- **Fixed while building it — commits referencing layer-split `.safetensors` artifacts could never sync to the server.** Two compounding bugs: (1) `av commit`/`av push` uploaded a commit *before* its objects, and the server's tree rows had a hard foreign key to the objects table, so the insert always failed; the offline-queue retry path additionally never uploaded objects at all; (2) the server's generic `except IntegrityError` mapped *any* integrity violation to a "commit already exists" 409 — which the client (by design) treats as idempotent success — so the failure was completely silent: `av push` reported success while the commit and ref never reached the database. Fixed by uploading objects before the commit (in both the live and queued-retry paths), dropping the now-provably-wrong foreign key (a layer-split file's whole-file blob is never uploaded by design), and having the server re-check by hash before deciding a 409 is genuine.
+- **Fixed:** `av add` computed per-layer safetensors hashes but never actually persisted them to `.av/index` (an internal `auto_save` wrote the index before the layers were attached to the in-memory entry) — so every `av commit` silently shipped an empty `layers: []`, degrading `av handoff --diff-weights` (and now the Web UI) into a whole-file comparison for every checkpoint, undetected until this feature exercised it end-to-end.
+- **Fixed:** `atomic_write_text`'s temp filename (PID + full UUID4 hex) could push a commit's path past Windows' 260-character `MAX_PATH` limit, making the write — and the whole commit — fail outright on deeply nested working directories.
+- See [`Probleme.md`](Probleme.md) for full details, severity ratings, and a couple of smaller items left open.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
 
 ---
@@ -290,7 +297,7 @@ Aether-Vault was built in eight distinct phases:
 | ✅ | **Web UI Dashboard** — Browser interface for commit graph, branches & ML metrics (`av webui`) |
 | ✅ | **Offline-Resilient Commits** — Change-aware staging + `.av/pending_push` queue + `av push`, so no commit is lost or dashboard-invisible due to a down registry |
 | ✅ | **Agent Context Handoff** — Open `.avh` format + `av handoff` snapshots for AI-agent-to-agent ML pipeline handoff, including per-layer weight-diffing |
-| 🔲 | **Weight Diffing (Visual)** — A full visual diff UI between two `.safetensors` checkpoints in the Web UI (the per-layer hash comparison itself now ships via `av handoff --diff-weights`) |
+| ✅ | **Weight Diffing (Visual)** — A "Weight Diff" tab in the Web UI: drag two checkpoints from a list into comparison slots to get a colored layer heatmap, summary stats, and a per-layer depth chart of what changed |
 | 🔲 | **Framework Plugins** — Native callbacks for PyTorch Lightning & HuggingFace Transformers |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
 

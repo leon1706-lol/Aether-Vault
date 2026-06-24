@@ -304,10 +304,28 @@ async def push_commit(
         db.add(new_commit)
         await db.commit()
         return Response(status_code=201)
-    except IntegrityError:
-        # Concurrent push of the same commit hash raced us to the insert — idempotent success.
+    except IntegrityError as exc:
         await db.rollback()
-        return Response(status_code=409, content="Commit already exists")
+        # An IntegrityError here is NOT necessarily "this commit hash already exists" — it can
+        # equally be a FK violation on DBTree.object_hash (a tree entry references an object
+        # that the client hasn't uploaded yet) or on DBRef in a later request. Blindly mapping
+        # every IntegrityError to 409 previously caused commits referencing not-yet-uploaded
+        # objects to be silently dropped: the client (which treats 409 as idempotent success,
+        # by design, for genuine duplicate-hash races) believed the push succeeded while the
+        # commit/tree never actually made it into the database. Re-check what actually
+        # happened before deciding the response.
+        recheck = await db.execute(select(DBCommit).where(DBCommit.hash == commit_hash))
+        if recheck.scalar_one_or_none():
+            return Response(status_code=409, content="Commit already exists")
+        # Anything other than 201/409 is treated as a failed push by the client (it retries /
+        # keeps the commit queued) — unlike the bug above, this must NOT be 409.
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Commit references an object or tree that violates a database constraint "
+                f"(commit not stored — are all objects uploaded first?): {exc}"
+            ),
+        )
     except Exception as exc:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
