@@ -52,6 +52,7 @@ webui/.next/
 .vscode/
 .idea/
 .claude/
+.claude/settings.json
 .DS_Store
 
 # context for agents:
