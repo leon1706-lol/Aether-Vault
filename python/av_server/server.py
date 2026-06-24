@@ -264,6 +264,15 @@ async def push_commit(
     if len(commit_data.get("message", "") or "") > MAX_MESSAGE_LEN:
         raise HTTPException(status_code=422, detail="Commit message too long")
 
+    # Per-project separation: every repo gets a project_id at `av init` (backfilled for repos
+    # initialized before this was added — see python/av_cli/main.py's load_config). Fall back
+    # to a single "legacy" bucket rather than rejecting the push outright, so an older client
+    # that hasn't picked up the backfill yet still syncs instead of erroring.
+    project_id = commit_data.get("project_id") or "legacy"
+    project_name = commit_data.get("project_name") or "Legacy / Unknown"
+    if not isinstance(project_id, str) or len(project_id) > 128 or not isinstance(project_name, str) or len(project_name) > 200:
+        raise HTTPException(status_code=422, detail="Invalid project_id/project_name")
+
     # Support both new flat-tree and legacy {code:{}, artifacts:{}} formats
     if "code" in raw_tree or "artifacts" in raw_tree:
         # Flatten legacy format into unified dict
@@ -298,6 +307,8 @@ async def push_commit(
             root_tree_hash=root_tree_hash,
             tags=tags,
             metrics=metrics,
+            project_id=project_id,
+            project_name=project_name,
         )
         if commit_ts is not None:
             new_commit.timestamp = commit_ts
@@ -395,6 +406,8 @@ async def get_commit(
         "tags": commit.tags or [],
         "metrics": commit.metrics or {},
         "tree": tree_data,
+        "project_id": commit.project_id,
+        "project_name": commit.project_name,
     }
 
 
@@ -435,11 +448,19 @@ async def get_ref(
 
 
 @app.get("/api/refs")
-async def list_refs(db: AsyncSession = Depends(get_session)) -> dict:
-    result = await db.execute(select(DBRef))
+async def list_refs(project_id: Optional[str] = None, db: AsyncSession = Depends(get_session)) -> dict:
+    # Refs are namespaced "<project_id>/<branch>" by the client (see av_cli/main.py's
+    # `commit` command) rather than via a DB column, since the ref-name path parameter
+    # already supports slashes and is already validated — no schema change needed here.
+    query = select(DBRef)
+    if project_id:
+        query = query.where(DBRef.name.like(f"{project_id}/%"))
+    result = await db.execute(query)
     refs = result.scalars().all()
     if refs:
         return {r.name: r.commit_hash for r in refs}
+    if project_id:
+        return {}
     # Fallback to legacy storage
     return storage.list_refs()
 
@@ -640,17 +661,24 @@ async def check_objects_batch(hashes: List[str], db: AsyncSession = Depends(get_
 async def list_commits(
     limit: int = 50,
     offset: int = 0,
+    project_id: Optional[str] = None,
     db: AsyncSession = Depends(get_session)
 ) -> dict:
-    """Paginated commit list for the Web UI dashboard, newest first."""
-    result = await db.execute(
-        select(DBCommit)
-        .order_by(DBCommit.timestamp.desc())
-        .limit(limit)
-        .offset(offset)
-    )
+    """Paginated commit list for the Web UI dashboard, newest first.
+
+    Optionally scoped to a single project via ?project_id= — without it, commits from every
+    project on this shared registry are returned (matches the dashboard's pre-existing
+    behavior so it doesn't break for callers that don't know about projects yet).
+    """
+    query = select(DBCommit)
+    count_query = select(func.count(DBCommit.hash))
+    if project_id:
+        query = query.where(DBCommit.project_id == project_id)
+        count_query = count_query.where(DBCommit.project_id == project_id)
+
+    result = await db.execute(query.order_by(DBCommit.timestamp.desc()).limit(limit).offset(offset))
     commits = result.scalars().all()
-    total_result = await db.execute(select(func.count(DBCommit.hash)))
+    total_result = await db.execute(count_query)
     total = total_result.scalar_one()
 
     return {
@@ -664,6 +692,8 @@ async def list_commits(
                 "root_tree_hash": c.root_tree_hash,
                 "tags": c.tags or [],
                 "metrics": c.metrics or {},
+                "project_id": c.project_id,
+                "project_name": c.project_name,
             }
             for c in commits
         ],
@@ -671,6 +701,32 @@ async def list_commits(
         "limit": limit,
         "offset": offset,
         "next_offset": offset + limit if offset + limit < total else None,
+    }
+
+
+@app.get("/api/projects")
+async def list_projects(db: AsyncSession = Depends(get_session)) -> dict:
+    """Every project that has ever pushed a commit to this registry, for the Web UI's
+    Projects tab (lets a user discover and switch between local repos sharing this server)."""
+    result = await db.execute(
+        select(
+            DBCommit.project_id,
+            DBCommit.project_name,
+            func.count(DBCommit.hash).label("commit_count"),
+            func.max(DBCommit.timestamp).label("last_push"),
+        ).group_by(DBCommit.project_id, DBCommit.project_name)
+        .order_by(func.max(DBCommit.timestamp).desc())
+    )
+    return {
+        "projects": [
+            {
+                "project_id": row.project_id,
+                "project_name": row.project_name,
+                "commit_count": row.commit_count,
+                "last_push": row.last_push.isoformat() if row.last_push else None,
+            }
+            for row in result.all()
+        ]
     }
 
 

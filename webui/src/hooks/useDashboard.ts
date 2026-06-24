@@ -6,17 +6,18 @@ import {
   type DashboardData,
 } from "@/lib/api";
 
-export function useDashboard(refreshIntervalMs = 15000) {
+export function useDashboard(refreshIntervalMs = 15000, projectId?: string | null) {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
-    const d = await fetchDashboardData();
+    const d = await fetchDashboardData(projectId);
     setData(d);
     setLoading(false);
-  }, []);
+  }, [projectId]);
 
   useEffect(() => {
+    setLoading(true);
     refresh();
     const id = setInterval(refresh, refreshIntervalMs);
     return () => clearInterval(id);

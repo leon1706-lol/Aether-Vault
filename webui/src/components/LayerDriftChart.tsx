@@ -26,6 +26,18 @@ const STATUS_COLOR: Record<LayerStatus, string> = {
   removed: "#f6ad55",
 };
 
+const STATUS_LABEL: Record<LayerStatus, string> = {
+  unchanged: "Unchanged",
+  changed: "Changed",
+  added: "Added",
+  removed: "Removed",
+};
+
+// The Y-axis itself only encodes a binary unchanged(0)/changed(1) value — "changed" covers
+// added/removed too, since those also aren't byte-identical to the other side. The legend
+// below the chart is what actually distinguishes all 4 statuses (matches the bar colors).
+const Y_AXIS_LABEL: Record<number, string> = { 0: "unchanged", 1: "changed" };
+
 export function LayerDriftChart({ layers }: Props) {
   if (layers.length === 0) {
     return <div className="empty-state">No per-layer data for this file.</div>;
@@ -48,25 +60,34 @@ export function LayerDriftChart({ layers }: Props) {
           Showing {MAX_RENDERED_LAYERS} of {layers.length} layers
         </div>
       )}
-      <div className="chart-container" style={{ height: 200 }}>
+      <div className="chart-container" style={{ height: 220 }}>
         <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={data} margin={{ top: 4, right: 12, left: -8, bottom: 0 }}>
+          <BarChart data={data} margin={{ top: 4, right: 12, left: -8, bottom: 24 }}>
             <XAxis
               dataKey="idx"
               tick={false}
               axisLine={{ stroke: "rgba(255,255,255,0.08)" }}
               tickLine={false}
-              label={{ value: "Layer depth →", position: "insideBottom", offset: -2, fill: "#718096", fontSize: 11 }}
+              label={{ value: "Layer depth →", position: "bottom", offset: 6, fill: "#718096", fontSize: 11 }}
             />
-            <YAxis domain={[0, 1]} ticks={[0, 1]} tick={{ fill: "#718096", fontSize: 11 }} axisLine={false} tickLine={false} width={24} />
+            <YAxis
+              domain={[0, 1]}
+              ticks={[0, 1]}
+              tickFormatter={(v: number) => Y_AXIS_LABEL[v] ?? String(v)}
+              tick={{ fill: "#718096", fontSize: 11 }}
+              axisLine={false}
+              tickLine={false}
+              width={68}
+            />
             <Tooltip
               contentStyle={{
                 background: "#0b0f1e",
                 border: "1px solid rgba(255,255,255,0.1)",
                 borderRadius: 8,
                 fontSize: 12,
-                color: "#e2e8f0",
               }}
+              labelStyle={{ color: "#718096" }}
+              itemStyle={{ color: "#e2e8f0" }}
               formatter={(_value: number, _name: string, ctx: { payload?: { name: string; status: string } }) => [
                 ctx.payload?.status ?? "",
                 ctx.payload?.name ?? "",
@@ -79,6 +100,14 @@ export function LayerDriftChart({ layers }: Props) {
             </Bar>
           </BarChart>
         </ResponsiveContainer>
+      </div>
+      <div className="status-legend">
+        {(Object.keys(STATUS_LABEL) as LayerStatus[]).map((status) => (
+          <span key={status} className="status-legend-item">
+            <span className="status-legend-dot" style={{ background: STATUS_COLOR[status] }} />
+            {STATUS_LABEL[status]}
+          </span>
+        ))}
       </div>
     </div>
   );

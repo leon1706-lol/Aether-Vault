@@ -93,10 +93,25 @@ def load_config(repo_root: Path) -> dict:
     if config_path.exists():
         try:
             with open(config_path, "r") as f:
-                return json.load(f)
+                cfg = json.load(f)
+            # Repos initialized before per-project separation was added have no
+            # project_id/project_name. Backfill once and persist immediately — generating a
+            # fresh uuid4 on every load_config() call without saving it would give the same
+            # repo a different identity on each command invocation (every push would look
+            # like a new project).
+            if "project_id" not in cfg or "project_name" not in cfg:
+                cfg.setdefault("project_id", uuid.uuid4().hex)
+                cfg.setdefault("project_name", repo_root.name)
+                save_config(repo_root, cfg)
+            return cfg
         except (json.JSONDecodeError, OSError) as exc:
             print(f"Warning: Failed to load config, using defaults: {exc}", file=sys.stderr)
-    return {"lfs_threshold_mb": 50, "remote_url": "http://localhost:8000"}
+    return {
+        "lfs_threshold_mb": 50,
+        "remote_url": "http://localhost:8000",
+        "project_id": uuid.uuid4().hex,
+        "project_name": repo_root.name,
+    }
 
 
 def save_config(repo_root: Path, config: dict) -> None:
@@ -316,7 +331,12 @@ def init() -> None:
     (av_dir / "refs" / "heads").mkdir(parents=True, exist_ok=True)
     (av_dir / "commits").mkdir(parents=True, exist_ok=True)
 
-    save_config(repo_root, {"lfs_threshold_mb": 50, "remote_url": "http://localhost:8000"})
+    save_config(repo_root, {
+        "lfs_threshold_mb": 50,
+        "remote_url": "http://localhost:8000",
+        "project_id": uuid.uuid4().hex,
+        "project_name": repo_root.name,
+    })
 
     idx = Index(repo_root)
     idx.save()
@@ -331,14 +351,35 @@ def init() -> None:
 
 
 @cli.command()
-@click.argument("value", type=int)
-def config(value: int) -> None:
-    """Set the LFS threshold in MB."""
+@click.argument("value", type=int, required=False, default=None)
+@click.option("--remote-url", default=None, help="Set the remote registry URL for this repo.")
+@click.option("--name", "project_name", default=None, help="Rename this repo's project (display name only — does not change its project_id).")
+def config(value: int | None, remote_url: str | None, project_name: str | None) -> None:
+    """Set the LFS threshold in MB, the remote registry URL, and/or the project name.
+
+    Run with no arguments to print the current configuration.
+    """
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
-    cfg["lfs_threshold_mb"] = value
+
+    if value is None and remote_url is None and project_name is None:
+        click.echo(f"LFS threshold : {cfg.get('lfs_threshold_mb')} MB")
+        click.echo(f"Remote URL    : {cfg.get('remote_url')}")
+        click.echo(f"Project name  : {cfg.get('project_name')}")
+        click.echo(f"Project ID    : {cfg.get('project_id')}")
+        return
+
+    if value is not None:
+        cfg["lfs_threshold_mb"] = value
+        click.secho(f"Configured LFS threshold to {value} MB", fg="green")
+    if remote_url is not None:
+        cfg["remote_url"] = remote_url
+        click.secho(f"Configured remote URL to {remote_url}", fg="green")
+    if project_name is not None:
+        cfg["project_name"] = project_name
+        click.secho(f"Configured project name to {project_name}", fg="green")
+
     save_config(repo_root, cfg)
-    click.secho(f"Configured LFS threshold to {value} MB", fg="green")
 
 
 @cli.command()
@@ -572,6 +613,12 @@ def commit(
         "tree": tree,
         "tags": list(tags),
         "metrics": metrics,
+        # Included in the hashed payload (not just attached after) so two different
+        # projects can never collide on the same commit hash even if their tree/message/
+        # timestamp happened to be byte-identical — the shared registry's `commits` table
+        # is keyed by hash alone.
+        "project_id": cfg["project_id"],
+        "project_name": cfg["project_name"],
     }
 
     # Deterministic hash over sorted JSON (preserves DAG integrity)
@@ -597,6 +644,10 @@ def commit(
         click.secho(f"  Metrics: {metrics}", fg="cyan")
 
     # --- Push to remote if available ---
+    # Refs are namespaced as "<project_id>/<branch>" on the shared registry so two projects
+    # can each have a branch named "main" without overwriting each other's ref.
+    remote_ref_name = f"{cfg['project_id']}/{ref_path.name}" if ref_path else None
+
     flush_pending_push(repo_root, client)
     if client.server_available():
         # Objects must reach the server before the commit: the server's tree rows store each
@@ -606,16 +657,16 @@ def commit(
         upload_commit_objects(repo_root, client, tree)
         if client.push_commit(commit_data):
             ref_ok = True
-            if ref_path:
-                ref_ok = client.update_ref(ref_path.name, commit_hash)
+            if remote_ref_name:
+                ref_ok = client.update_ref(remote_ref_name, commit_hash)
             if not ref_ok:
-                queue_pending_push(repo_root, commit_hash, ref_path.name if ref_path else None)
+                queue_pending_push(repo_root, commit_hash, remote_ref_name)
                 click.secho("  Ref update failed — commit queued for retry (run `av push` later)", fg="yellow")
         else:
-            queue_pending_push(repo_root, commit_hash, ref_path.name if ref_path else None)
+            queue_pending_push(repo_root, commit_hash, remote_ref_name)
             click.secho("  Push failed — commit queued for retry (run `av push` later)", fg="yellow")
     else:
-        queue_pending_push(repo_root, commit_hash, ref_path.name if ref_path else None)
+        queue_pending_push(repo_root, commit_hash, remote_ref_name)
         click.secho("  Server unreachable — commit queued for push (run `av push` later)", fg="yellow")
 
 
@@ -992,7 +1043,11 @@ def handoff_show(snapshot_id: str) -> None:
 
 
 @cli.command("webui")
-def webui_cmd() -> None:
+@click.option(
+    "--rebuild", is_flag=True, default=False,
+    help="Force a fresh Docker image build even if the container is already running.",
+)
+def webui_cmd(rebuild: bool) -> None:
     """Start the Aether-Vault Web UI dashboard and open it in the browser.
 
     \b
@@ -1000,6 +1055,10 @@ def webui_cmd() -> None:
     2. Starts the aether-vault-webui container (+ deps) via docker-compose
     3. Waits for the UI to become ready
     4. Opens http://localhost:3000 in the default browser
+
+    If the container is already running and healthy, this skips straight to opening the
+    browser instead of re-running compose (use --rebuild to force a fresh image build after
+    changing webui source code).
     """
     import subprocess
     import time
@@ -1009,6 +1068,7 @@ def webui_cmd() -> None:
 
     repo_root = Path(__file__).parents[2]  # av_cli/ → python/ → aether-vault/
     compose_file = repo_root / "docker-compose.yml"
+    url = "http://localhost:3000"
 
     # ── 1. Check Docker ──────────────────────────────────────────────────────
     click.secho("🔍 Checking Docker…", fg="cyan")
@@ -1033,6 +1093,34 @@ def webui_cmd() -> None:
 
     click.secho("  ✓ Docker is running", fg="green")
 
+    # ── 1b. Already running? Skip straight to the browser ───────────────────
+    # `docker compose up -d --build` unconditionally re-evaluates/builds the image on every
+    # invocation — slow, and pointless if nothing changed and the container is already
+    # serving traffic. Short-circuit unless the caller explicitly wants a rebuild.
+    if not rebuild:
+        try:
+            health = subprocess.run(
+                ["docker", "inspect", "--format={{.State.Health.Status}}", "aether-vault-webui"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if health.returncode == 0 and health.stdout.strip() == "healthy":
+                click.secho("  ✓ Web UI container already running and healthy", fg="green")
+                click.secho(f"🌐 Opening {url} in your browser…", fg="green")
+                try:
+                    webbrowser.open(url)
+                except Exception as exc:
+                    click.secho(f"  Could not open browser automatically: {exc}", fg="yellow")
+                click.secho(
+                    f"\n✅ Aether-Vault Web UI is running at {url}\n"
+                    "   Press Ctrl+C or run 'docker compose down' to stop.\n"
+                    "   (Use `av webui --rebuild` if you changed webui source and need a fresh image.)",
+                    fg="green",
+                    bold=True,
+                )
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # fall through to the normal startup path below
+
     # ── 2. Start containers ──────────────────────────────────────────────────
     click.secho("🚀 Starting Web UI container…", fg="cyan")
 
@@ -1040,14 +1128,14 @@ def webui_cmd() -> None:
         click.secho(f"✗ docker-compose.yml not found at {compose_file}", fg="red")
         return
 
+    compose_args = ["docker", "compose", "-f", str(compose_file), "up", "-d"]
+    if rebuild:
+        compose_args.append("--build")
+    compose_args.append("aether-vault-webui")
+
     try:
         proc = subprocess.run(
-            [
-                "docker", "compose",
-                "-f", str(compose_file),
-                "up", "-d", "--build",
-                "aether-vault-webui",
-            ],
+            compose_args,
             capture_output=False,
             timeout=1200,
         )
@@ -1059,7 +1147,6 @@ def webui_cmd() -> None:
         return
 
     # ── 3. Wait for UI to be ready ───────────────────────────────────────────
-    url = "http://localhost:3000"
     click.secho(f"⏳ Waiting for Web UI at {url}…", fg="cyan")
 
     for attempt in range(30):

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useDashboard } from "@/hooks/useDashboard";
 import { Sidebar } from "@/components/Sidebar";
 import { TopBar } from "@/components/TopBar";
@@ -10,10 +10,40 @@ import { CommitList } from "@/components/CommitList";
 import { BranchList } from "@/components/BranchList";
 import { MetricsChart } from "@/components/MetricsChart";
 import { WeightDiffPanel } from "@/components/WeightDiffPanel";
+import { ProjectsPanel } from "@/components/ProjectsPanel";
+import type { Project } from "@/lib/api";
+
+const SELECTED_PROJECT_KEY = "aether-vault:selected-project";
 
 export default function DashboardPage() {
-  const { data, loading, refresh } = useDashboard(15000);
   const [active, setActive] = useState("dashboard");
+  // null = no project selected, dashboard shows every project on the shared registry
+  // (preserves the original pre-Projects-tab behavior). Persisted across reloads.
+  const [selectedProject, setSelectedProject] = useState<Project | null>(null);
+
+  useEffect(() => {
+    const raw = window.localStorage.getItem(SELECTED_PROJECT_KEY);
+    if (raw) {
+      try {
+        setSelectedProject(JSON.parse(raw));
+      } catch {
+        window.localStorage.removeItem(SELECTED_PROJECT_KEY);
+      }
+    }
+  }, []);
+
+  const { data, loading, refresh } = useDashboard(15000, selectedProject?.project_id ?? null);
+
+  function openProject(project: Project) {
+    setSelectedProject(project);
+    window.localStorage.setItem(SELECTED_PROJECT_KEY, JSON.stringify(project));
+    setActive("dashboard");
+  }
+
+  function clearProject() {
+    setSelectedProject(null);
+    window.localStorage.removeItem(SELECTED_PROJECT_KEY);
+  }
 
   return (
     <div className="app-shell">
@@ -23,10 +53,14 @@ export default function DashboardPage() {
           health={data?.health ?? null}
           loading={loading}
           onRefresh={refresh}
+          projectName={selectedProject?.project_name ?? null}
+          onClearProject={clearProject}
         />
         <div className="page-content">
           {active === "weight-diff" ? (
-            <WeightDiffPanel />
+            <WeightDiffPanel projectId={selectedProject?.project_id ?? null} />
+          ) : active === "projects" ? (
+            <ProjectsPanel selectedProjectId={selectedProject?.project_id ?? null} onOpen={openProject} />
           ) : (
             <>
               {/* Stats row */}

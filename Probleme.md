@@ -295,3 +295,100 @@ gemacht hätten:
 - **Warum nicht behoben:** Außerhalb des Scopes dieses Features; konsistent mit der bereits in
   diesem Dokument unter „Kleinere Punkte" gelisteten Kategorie nicht-atomarer Schreibvorgänge
   — zur späteren Behebung vorgemerkt.
+
+---
+
+## ✅ Behoben — Web-UI-Feedback nach realem Praxistest (2026-06-24)
+
+Der Nutzer hat die App von einem eigenen Ordner (`Aether-Vault-Test`) aus betrieben und vier
+reale Probleme gemeldet. Behoben nach Schwierigkeit, leichtestes zuerst:
+
+### [2] Tooltip-Text im Layer-Drift-Chart schwarz auf dunklem Hintergrund
+- **Datei:** `webui/src/components/LayerDriftChart.tsx`.
+- **Problem:** Recharts' `<Tooltip>` färbt Name/Wert-Paare standardmäßig schwarz; das gesetzte
+  `contentStyle.color` wirkt nur auf das Label, nicht auf die Items.
+- **Fix:** `itemStyle={{ color: "#e2e8f0" }}` und `labelStyle={{ color: "#718096" }}` ergänzt.
+
+### [3] Layer-Drift-Chart: Y-Achse ohne Bedeutung, X-Achsen-Label abgeschnitten
+- **Datei:** `webui/src/components/LayerDriftChart.tsx`.
+- **Problem:** `margin.bottom: 0` + Label-Position `insideBottom` ließ „Layer depth →" am
+  unteren Rand abschneiden; die Y-Achse zeigte nur rohe `0`/`1`-Ticks ohne Erklärung, obwohl
+  der Chart selbst 4 Status-Farben (changed/unchanged/added/removed) zeigt.
+- **Fix:** `margin.bottom` auf 20, Label-Position auf `"bottom"` mit positivem Offset;
+  `tickFormatter` übersetzt 0/1 in „unchanged"/„changed"; zusätzliche Farblegende mit allen
+  4 Status-Labels unter dem Chart (`.status-legend` in `globals.css`).
+
+### [5] `av webui` baut/lädt das Docker-Image bei jedem Aufruf neu, auch wenn bereits aktiv
+- **Datei:** `python/av_cli/main.py` (`webui_cmd`).
+- **Problem:** Rief unbedingt `docker compose up -d --build` auf — selbst wenn der Container
+  bereits lief und gesund war, kostete das jedes Mal einen vollen Build-Schritt plus
+  Health-Check-Wartezeit (im Praxis-Log des Nutzers: 24s Build + >100s Warten).
+- **Fix:** Vor dem Start wird per `docker inspect --format='{{.State.Health.Status}}'`
+  geprüft, ob der Container schon läuft und gesund ist; falls ja, wird direkt der Browser
+  geöffnet (kein `docker compose` mehr nötig). Neue Option `--rebuild` erzwingt weiterhin
+  einen frischen Build nach Quellcode-Änderungen.
+  **Verifiziert:** Zweiter Aufruf in Folge lief in ~15s statt vorher >2 Minuten.
+
+### [8] Weight-Diff-Seite zeigt fremde Commits — kein Projekt-Konzept, ein gemeinsamer Server
+- **Dateien:** `python/av_cli/main.py` (`init`, `load_config`, `config`, `commit`,
+  `flush_pending_push`), `python/av_server/models.py` (`DBCommit`), `python/av_server/server.py`
+  (`push_commit`, `list_commits`, `list_refs`, neu: `list_projects`), `webui/src/lib/api.ts`,
+  `webui/src/components/ProjectsPanel.tsx` (neu), `webui/src/components/BranchList.tsx`,
+  `webui/src/app/page.tsx`, `webui/src/components/Sidebar.tsx`, `webui/src/components/TopBar.tsx`.
+- **Ursache:** Jedes `av init`-Repo zeigt per Default auf denselben
+  `http://localhost:8000`, und `av webui` löst `docker-compose.yml` relativ zum
+  **installierten Paket** auf (`Path(__file__).parents[2]`), nicht zum aktuellen Ordner — alle
+  lokalen Repos teilen sich denselben Container/dieselbe DB, ohne dass Commits einem Repo
+  zugeordnet werden konnten (`DBCommit`/`DBRef` hatten kein Projekt-Konzept).
+- **Fix:** Echte Projekt-Trennung auf dem weiterhin gemeinsamen Server:
+  - `av init` erzeugt `project_id` (UUID4) + `project_name` (Ordnername), persistiert in
+    `.av/config`. Repos von **vor** diesem Fix werden beim nächsten `load_config()`-Aufruf
+    einmalig automatisch nachgerüstet und sofort gespeichert (kein wiederholtes
+    Neugenerieren bei jedem Aufruf).
+  - Neue Optionen `av config --remote-url URL` / `--name NAME`; `av config` ohne Argumente
+    zeigt die aktuelle Konfiguration inkl. Projekt-ID.
+  - `project_id`/`project_name` fließen in den gehashten Commit-Payload ein (zwei Projekte
+    können nie auf denselben Commit-Hash kollidieren), `DBCommit` bekommt beide Spalten.
+  - Branch-Refs werden clientseitig als `"<project_id>/<branch>"` namespaced (kein
+    Schema-Wechsel an `DBRef` nötig — der bestehende `{ref_name:path}`-Endpunkt erlaubt
+    bereits Slashes und validiert sie bereits über `validate_ref_name`).
+  - Neuer Endpunkt `GET /api/projects` (Projekt-Liste mit Commit-Anzahl + letztem Push);
+    `GET /api/commits`/`GET /api/refs` akzeptieren optional `?project_id=`.
+  - Neuer Web-UI-Tab **„Projects"** (`ProjectsPanel.tsx`): listet alle Projekte, „Open"
+    setzt den aktiven Projekt-Filter (persistiert in `localStorage`) und schaltet auf das
+    Dashboard zurück; die TopBar zeigt das aktive Projekt als Badge mit „✕"-Clear-Button;
+    Dashboard, Branch-Liste und Weight-Diff-Checkpoint-Liste respektieren den Filter.
+  - **Im Zuge der Implementierung gefunden+behoben:** `BranchList.tsx` hätte ohne Anpassung
+    die rohen `"<project_id>/<branch>"`-Namen unverändert angezeigt; jetzt wird nur der
+    Branch-Teil gezeigt (mit Projekt-Name als Präfix, wenn mehrere Projekte gleichzeitig
+    sichtbar sind, um gleichnamige Branches unterscheidbar zu halten).
+  - **Schema-Migration:** `DBCommit` bekommt zwei `NOT NULL`-Spalten; da dieses Projekt keine
+    Migrationen nutzt (`create_all` legt nur fehlende Tabellen an), wurde das bestehende
+    Dev-Schema **in-place per `ALTER TABLE`** nachgerüstet (Bestandscommits auf
+    `project_id='legacy'` gesetzt) statt die DB zu wipen — keine Datenverluste.
+- **Verifiziert (End-to-End, vier echte Test-Repos):**
+  - Zwei frische Projekte (`proj_a`, `proj_b`) → `GET /api/projects` listet beide korrekt mit
+    Commit-Anzahl/letztem Push; `GET /api/commits?project_id=…` und
+    `GET /api/refs?project_id=…` filtern korrekt; beide haben unabhängig voneinander einen
+    Branch `main`, ohne sich zu überschreiben (`"<id-a>/main"` und `"<id-b>/main"` koexistieren).
+  - Repo mit `.av/config` **ohne** `project_id` (simuliert „alter" Stand) → Backfill greift
+    beim ersten Befehl, bleibt danach über mehrere Aufrufe stabil (kein neuer UUID pro Call).
+  - Zwei Projekte mit **identischem** `project_name`, aber unterschiedlicher `project_id` →
+    beide erscheinen separat in `GET /api/projects` (durch `project_id` unterscheidbar).
+  - Offline-Queue-Pfad (`av push` nach Server-Neustart) verwendet den bereits namespaced
+    Ref-Namen korrekt — landet im richtigen Projekt-Branch.
+  - `av branch`/`av status`/`av list-meta` (alle lokal) unverändert funktionsfähig.
+  - `av gc`/`GET /api/stats`/`GET /api/dashboard/summary` laufen weiterhin fehlerfrei über
+    **alle** Projekte hinweg (bewusst global/projekt-übergreifend — Objekt-Deduplizierung
+    soll projektübergreifend bleiben).
+- **Bewusst nicht geändert (dokumentiert, kein Bug):**
+  - `GET /api/commits/{hash}` bleibt projekt-unabhängig abrufbar (universeller
+    Content-Adress-Lookup) — eine Datei mit bekanntem Hash ist aus jedem Projekt heraus
+    erreichbar. Das ist beabsichtigt (gleiche Philosophie wie die projektübergreifende
+    Objekt-Deduplizierung) und kein Sicherheitsproblem, da Hashes nicht erratbar sind.
+  - `GET /api/stats` und `GET /api/dashboard/summary` sind weiterhin nicht projekt-skaliert
+    (zeigen den globalen Objektspeicher bzw. alle Refs ungefiltert) — konsistente
+    Scope-Entscheidung, kein Folgefehler; bei Bedarf später denselben `?project_id=`-Filter
+    ergänzen.
+  - `python/av_server/storage.py`s lokaler Dateisystem-Fallback (nur aktiv wenn die DB leer
+    ist) kennt kein Projekt-Konzept — irrelevant, solange die DB-gestützte Route primär ist.

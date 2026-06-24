@@ -63,12 +63,20 @@ export function BranchList({ refs, commits, loading }: Props) {
       <div style={{ maxHeight: 360, overflowY: "auto" }}>
         {branches.map(([name, tipHash]) => {
           const tip = commitByHash[tipHash];
+          // Refs are namespaced "<project_id>/<branch>" server-side so two projects can each
+          // have a "main" branch without colliding (see python/av_cli/main.py's `commit`
+          // command). Display only the branch part; when refs from multiple projects are
+          // shown together (no project selected), prefix with the commit's project name
+          // instead so same-named branches from different projects stay distinguishable.
+          const slashIdx = name.indexOf("/");
+          const branchName = slashIdx === -1 ? name : name.slice(slashIdx + 1);
+          const displayName = tip?.project_name ? `${tip.project_name} / ${branchName}` : branchName;
           return (
             <div key={name} className="branch-item">
               <div>
                 <div className="branch-name">
                   <BranchIcon size={14} />
-                  {name}
+                  {displayName}
                 </div>
                 {tip && (
                   <div

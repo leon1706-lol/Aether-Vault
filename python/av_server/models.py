@@ -70,6 +70,14 @@ class DBCommit(Base):
     root_tree_hash = Column(String, nullable=False)
     tags = Column(ARRAY(String), default=list)
     metrics = Column(JSON, default=dict)
+    # Per-project separation: every `av init` repo gets a stable project_id (see
+    # python/av_cli/main.py's load_config/init). Multiple local repos share this one
+    # registry by default, so without this a dashboard has no way to tell which folder a
+    # commit came from. project_id is included in the client's hashed commit payload (so two
+    # projects can never collide on the same hash); project_name is a denormalized display
+    # label (mutable via `av config --name`, intentionally not part of the hash).
+    project_id = Column(String, nullable=False, index=True)
+    project_name = Column(String, nullable=False)
 
 
 class DBRef(Base):

@@ -6,9 +6,11 @@ interface Props {
   health: HealthResponse | null;
   loading: boolean;
   onRefresh: () => void;
+  projectName?: string | null;
+  onClearProject?: () => void;
 }
 
-export function TopBar({ health, loading, onRefresh }: Props) {
+export function TopBar({ health, loading, onRefresh, projectName, onClearProject }: Props) {
   const isOnline = health?.status === "ok";
   const apiUrl =
     process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -18,6 +20,20 @@ export function TopBar({ health, loading, onRefresh }: Props) {
       <span className="top-bar-title">Dashboard</span>
 
       <div className="top-bar-right">
+        {projectName && (
+          <span className="project-badge" title="Scoped to this project — click to clear">
+            📁 {projectName}
+            <button
+              type="button"
+              className="project-badge-clear"
+              onClick={onClearProject}
+              aria-label="Clear project filter"
+            >
+              ✕
+            </button>
+          </span>
+        )}
+
         <span className="server-url" title="FastAPI server URL">
           {apiUrl}
         </span>

@@ -15,7 +15,14 @@ import { LayerDriftChart } from "@/components/LayerDriftChart";
 // aggregate endpoint would be needed to raise this further — see Probleme.md.
 const CHECKPOINT_FETCH_LIMIT = 30;
 
-export function WeightDiffPanel() {
+interface Props {
+  // When set, only checkpoints belonging to this project are offered for comparison — keeps
+  // an unrelated project's commits (sharing the same registry) out of the picker. When null,
+  // checkpoints from every project are shown (matches the dashboard's default behavior).
+  projectId?: string | null;
+}
+
+export function WeightDiffPanel({ projectId = null }: Props) {
   const [fullCommits, setFullCommits] = useState<Map<string, Commit>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -25,9 +32,12 @@ export function WeightDiffPanel() {
 
   useEffect(() => {
     let cancelled = false;
+    setLoading(true);
+    setSlotA(null);
+    setSlotB(null);
     (async () => {
       try {
-        const metas = await fetchCommits(CHECKPOINT_FETCH_LIMIT);
+        const metas = await fetchCommits(CHECKPOINT_FETCH_LIMIT, projectId);
         const details = await Promise.all(
           metas.map((c) => fetchCommit(c.hash).catch(() => null))
         );
@@ -48,7 +58,7 @@ export function WeightDiffPanel() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [projectId]);
 
   const rows: CheckpointRow[] = useMemo(() => {
     // Oldest → newest so iteration numbers ("v1, v2, …") increase with history.

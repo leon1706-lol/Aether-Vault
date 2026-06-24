@@ -31,7 +31,7 @@ graph TD
         CPP("⚙️ aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
         LocalDAG("📁 .av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
         PendingQ("⏳ pending_push queue<br>(.av/pending_push — offline-resilient commits)")
-        WebUI("🌐 Web UI<br>(Next.js Dashboard + Weight Diff Tab · localhost:3000)")
+        WebUI("🌐 Web UI<br>(Dashboard + Weight Diff + Projects Tabs · localhost:3000)")
         Vault("🗒️ Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
 
         CLI -- "1. Reads & Hashes Files" --> CPP
@@ -46,7 +46,7 @@ graph TD
     subgraph Remote [Dockerized Remote Registry]
         FastAPI("🚀 FastAPI Server<br>(Upload/Download · Commit & Ref Sync ·<br>Dashboard API · Admin GC)")
         Redis("⚡ RedisBloom Cache<br>(O(1) Existence Checks)")
-        DB("🐘 PostgreSQL<br>(Merkle Trees · Branches · Metrics)")
+        DB("🐘 PostgreSQL<br>(Merkle Trees · Project-Scoped Branches · Metrics)")
         Storage("💾 Persistent Volume<br>(Deduplicated Model & Dataset Chunks)")
 
         FastAPI -- "Checks if Object Exists" --> Redis
@@ -61,6 +61,12 @@ graph TD
     PendingQ -- "Retried by av push" --> FastAPI
     CLI -- "gc: Triggers Remote Garbage Collection" --> FastAPI
 ```
+
+> The "Local" box represents **any number** of independent `av init` repos on the same (or
+> different) machines — they all default to sharing the one Dockerized registry shown here.
+> Each repo gets its own `project_id` (see Phase 14), so the registry's commits/branches stay
+> attributable per project even though the object store is intentionally deduplicated across
+> all of them. Use `av config --remote-url` to point a repo at a different registry instead.
 
 ---
 
@@ -106,9 +112,12 @@ av init
 ```
 
 ### `av config`
-Set the LFS size threshold (in MB). Files larger than this are automatically streamed to the remote and replaced by pointer files.
+Set the LFS size threshold (in MB), the remote registry URL, and/or this repo's display name on a shared registry. Run with no arguments to print the current configuration (including the auto-generated `project_id`).
 ```bash
-av config 100   # 100 MB threshold
+av config 100                              # 100 MB LFS threshold
+av config --remote-url http://host:8000    # point this repo at a different registry
+av config --name "my-llm-finetune"         # rename this repo's project (display only)
+av config                                  # print current LFS threshold / remote URL / project
 ```
 
 ### `av add`
@@ -167,13 +176,15 @@ av graph --update   # Silently regenerate after code changes
 ```
 
 ### `av webui` 
-Launch the browser-based Web UI dashboard. Checks that Docker is running, starts the `aether-vault-webui` container, and opens `http://localhost:3000` automatically.
+Launch the browser-based Web UI dashboard. Checks that Docker is running, starts the `aether-vault-webui` container, and opens `http://localhost:3000` automatically. If the container is already running and healthy, this skips straight to opening the browser instead of re-running `docker compose` every time.
 ```bash
 av webui
 # 1. Checks Docker is running
-# 2. Starts the Next.js Web UI container
-# 3. Waits for the service to be ready
+# 2. If already running & healthy, opens the browser immediately
+# 3. Otherwise starts the Next.js Web UI container and waits for it to be ready
 # 4. Opens http://localhost:3000 in your browser
+
+av webui --rebuild   # force a fresh image build after changing webui/ source
 ```
 
 **Dashboard panels:**
@@ -182,6 +193,8 @@ av webui
 - **Branch List** — All refs with tip commit details
 - **ML Metrics Chart** — Line chart plotting all numeric metrics over commits
 - **Stats Bar** — Live counts for commits, branches, CAS objects, and storage size
+- **Weight Diff** — drag two checkpoints into comparison slots for a per-layer heatmap + drift chart (see Phase 13)
+- **Projects** — every project that has pushed to this registry, with an "Open" button to scope the whole dashboard to just that one (see Phase 14)
 
 ### `av gc`
 Trigger a mark-and-sweep garbage collection on the remote server to purge orphaned storage shards and rebuild the Redis Bloom Filter.
@@ -285,6 +298,14 @@ Aether-Vault was built in eight distinct phases:
 - **Fixed:** `av add` computed per-layer safetensors hashes but never actually persisted them to `.av/index` (an internal `auto_save` wrote the index before the layers were attached to the in-memory entry) — so every `av commit` silently shipped an empty `layers: []`, degrading `av handoff --diff-weights` (and now the Web UI) into a whole-file comparison for every checkpoint, undetected until this feature exercised it end-to-end.
 - **Fixed:** `atomic_write_text`'s temp filename (PID + full UUID4 hex) could push a commit's path past Windows' 260-character `MAX_PATH` limit, making the write — and the whole commit — fail outright on deeply nested working directories.
 - See [`Probleme.md`](Probleme.md) for full details, severity ratings, and a couple of smaller items left open.
+
+### Phase 14 — Per-Project Registry Separation + Real-World Fixes
+- **Per-project identity on the shared registry**: every `av init` repo previously pointed at the exact same `http://localhost:8000` with no way to tell commits from different local folders apart — so a Web UI started from one repo would show commits pushed by an unrelated one. `av init` now generates a stable `project_id` (UUID) + `project_name` (folder name, renameable via `av config --name`), included in the hashed commit payload and namespacing every branch ref as `"<project_id>/<branch>"` (so two projects can each have a `main` without colliding). Repos initialized before this change are backfilled automatically and stably on first use.
+- **`av config --remote-url`**: point a repo at a different registry entirely; `av config` with no arguments now prints the current LFS threshold, remote URL, and project identity.
+- **New "Projects" Web UI tab**: lists every project that has pushed to the registry (commit count, last push), with an "Open" button that scopes the Dashboard, Branch List, and Weight Diff tab to just that project (persisted across reloads); a badge in the top bar shows the active filter with a one-click clear.
+- **`GET /api/projects`** (new) and an optional `?project_id=` filter on `GET /api/commits`/`GET /api/refs`. Object storage stays deduplicated *across* projects on purpose — only commit/ref metadata is scoped.
+- **Fixed real usability bugs reported from a separate test install**: the Layer Drift chart's tooltip text was unreadable (black on dark background) and its X-axis label was clipped with no Y-axis explanation; `av webui` rebuilt/re-evaluated the Docker image on every single invocation even when nothing changed (now skips straight to the browser if already healthy, ~15s instead of 2+ minutes; `--rebuild` forces a fresh build when needed).
+- See [`Probleme.md`](Probleme.md) for the full edge-case pass (legacy configs, project-name collisions, branch-name collisions across projects, GC/stats behavior with multiple projects) and what was deliberately left unscoped.
 
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
 

@@ -682,6 +682,32 @@ code, pre, .mono {
   font-variant-numeric: tabular-nums;
 }
 
+/* Project badge (top bar) */
+.project-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent-purple);
+  background: rgba(183,148,244,0.1);
+  border: 1px solid rgba(183,148,244,0.25);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.project-badge-clear {
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.7;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+}
+
+.project-badge-clear:hover { opacity: 1; }
+
 /* Top bar server URL */
 .server-url {
   font-family: 'JetBrains Mono', monospace;
@@ -896,3 +922,27 @@ code, pre, .mono {
 .layer-cell--changed   { background: var(--accent-red); }
 .layer-cell--added      { background: var(--accent-blue); }
 .layer-cell--removed    { background: var(--accent-amber); }
+
+/* Status legend (Layer Drift chart) */
+.status-legend {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  padding: 0 4px;
+  flex-wrap: wrap;
+}
+
+.status-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.status-legend-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
