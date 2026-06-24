@@ -51,6 +51,7 @@ webui/.next/
 # IDEs / OS
 .vscode/
 .idea/
+.claude/
 .DS_Store
 
 # context for agents:
