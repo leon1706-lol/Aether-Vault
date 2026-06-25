@@ -384,3 +384,61 @@ problems. Fixed in order of difficulty, easiest first:
     bug; the same `?project_id=` filter can be added later if needed.
   - `python/av_server/storage.py`'s local filesystem fallback (only active when the DB is empty)
     has no project concept — irrelevant as long as the DB-backed route is primary.
+
+---
+
+## ✅ Fixed — Framework Plugins: dataset auto-logging + symmetric import commands (2026-06-25)
+
+Added dataset auto-logging (`dataset_paths` on both training callbacks) and a matching
+"import" entry point across all three plugins (Lightning, Transformers, MLflow) for backfilling
+artifacts that already exist on disk/in MLflow from before a callback was wired in. Found via a
+real manual debugging pass (actual installed MLflow against a sqlite-backed tracking store, not
+mocks) rather than unit tests alone.
+
+### [4] `MlflowClient.download_artifacts()` raises instead of returning empty for a zero-artifact run
+- **File:** `python/av_plugins/mlflow.py` (`import_run`).
+- **Problem:** The intended flow was "download artifacts, then check if the resulting directory
+  is empty, then raise a clear error." In practice, calling
+  `client.download_artifacts(run_id, ".", dst_path=...)` on a run with **zero** logged artifacts
+  doesn't return an empty directory at all — MLflow's `RunsArtifactRepository` itself raises an
+  internal `mlflow.exceptions.MlflowException` ("Failed to download artifacts from path '.',
+  please ensure that the path is correct."), which would have leaked straight through `import_run`
+  to the caller as a confusing, MLflow-internals-specific error instead of Aether-Vault's own
+  clear message.
+- **How found:** Only surfaced when testing against a real MLflow installation
+  (`pip install mlflow`, sqlite-backed tracking store) with a run that logs a metric but no
+  artifacts — the equivalent mocked/stub-based test would not have caught this, since it would
+  need to know to replicate MLflow's specific failure mode rather than just "return empty".
+- **Fix:** Check `client.list_artifacts(run_id)` *before* attempting any download; raise
+  Aether-Vault's `AetherVaultException("MLflow run {run_id} has no artifacts to import.")`
+  immediately if it's empty, so `download_artifacts` is never called in the zero-artifact case.
+- **Verified:** `tests/test_plugins.py::test_mlflow_import_run_raises_when_no_artifacts` now
+  passes against a real MLflow run with a metric but no artifacts (previously failed with the
+  raw `MlflowException` traceback before this fix).
+
+### 🔸 Not a bug — imports commit everything currently staged, not just the imported path
+- **Files:** `python/av_plugins/lightning.py`, `python/av_plugins/transformers.py`,
+  `python/av_plugins/mlflow.py` (all three `import_*`/callback functions).
+- **Observation during manual testing:** staging an unrelated file (`av add notes.py`) and then
+  calling `import_checkpoint()` produces a commit containing **both** the unrelated file and the
+  imported checkpoint.
+- **Why not changed:** This is the existing, intentional behavior of `av commit` everywhere else
+  in the tool (it commits the full staging area, mirroring `git commit`'s model) — the plugins
+  reuse `commit` as-is rather than duplicating its logic (see the in-process CLI-invocation
+  design note in `Aether-vault-Obsidian-Vault/ARCHITECTURE.md`). Changing it would mean the
+  plugins' commits behave differently from every other `av commit` in the tool, which would be
+  more surprising, not less. Documented as a usage caveat in `README.md` instead of "fixed."
+
+### [2] Test fixtures let MLflow write a stray `mlruns/` folder into the real repo root
+- **File:** `tests/test_plugins.py` (`test_mlflow_import_run`, `test_mlflow_import_run_raises_when_no_artifacts`).
+- **Problem:** Both tests pointed MLflow's **tracking** URI at a sqlite DB inside `tmp_path`,
+  but a sqlite tracking URI only relocates run *metadata* — MLflow still defaults **artifact**
+  storage to `./mlruns` relative to the process's current working directory. Since pytest's cwd
+  is the real repository root, running these tests left a real `mlruns/` directory (with actual
+  run/artifact files) sitting in the repo working tree — caught when the next Obsidian vault
+  regeneration picked up an unexpected `mlruns.md` folder index that had no business existing.
+- **Fix:** Both tests now use `monkeypatch.chdir(tmp_path)` before setting the tracking URI, so
+  MLflow's default relative artifact path lands inside the test's own temp directory instead of
+  the real repo.
+- **Verified:** Re-ran the full suite from the repo root; confirmed no `mlruns/` directory is
+  created there afterward (`git status` clean of it).

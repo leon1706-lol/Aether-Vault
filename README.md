@@ -265,17 +265,41 @@ pip install aether-vault[transformers]   # HuggingFace Transformers
 # PyTorch Lightning
 from av_plugins.lightning import AetherVaultCallback
 
-trainer = Trainer(callbacks=[AetherVaultCallback(tag="experiment-1")])
+trainer = Trainer(callbacks=[AetherVaultCallback(tag="experiment-1", dataset_paths="data/train.parquet")])
 ```
 
 ```python
 # HuggingFace Transformers
 from av_plugins.transformers import AetherVaultTrainerCallback
 
-trainer = Trainer(..., callbacks=[AetherVaultTrainerCallback(tag="experiment-1")])
+trainer = Trainer(..., callbacks=[AetherVaultTrainerCallback(tag="experiment-1", dataset_paths="data/train.csv")])
 ```
 
 Each callback commits with the current step/epoch as the message and any numeric metrics (loss, eval scores, ...) attached via `--metric`, and flushes a final `av push` at the end of training. The training script must be run from inside (or below) an `av init`-ed repository.
+
+`dataset_paths` (a single path or list of paths) is staged and committed once at the start of training, tagged `dataset` so `av handoff`'s lineage classification reports it as dataset lineage rather than a model checkpoint. There's no reliable way to auto-detect a dataset's on-disk path from a generic `Dataset`/`DataLoader` object, so this is opt-in rather than automatic.
+
+### Importing existing artifacts
+
+If a checkpoint or run already exists on disk (or in MLflow) from before a callback was wired in, all three plugins provide a matching import path — both as a Python function and as a CLI command, so backfilling works the same way regardless of framework:
+
+```bash
+av import-lightning path/to/epoch=12.ckpt --tag backfill
+av import-transformers path/to/checkpoint-1000 --tag backfill
+av import-mlflow <run_id> --tag backfill                      # requires: pip install aether-vault[mlflow]
+```
+
+```python
+from av_plugins.lightning import import_checkpoint as import_lightning_checkpoint
+from av_plugins.transformers import import_checkpoint as import_transformers_checkpoint
+from av_plugins.mlflow import import_run as import_mlflow_run
+
+import_lightning_checkpoint("path/to/epoch=12.ckpt", tag="backfill")
+import_transformers_checkpoint("path/to/checkpoint-1000", tag="backfill")
+import_mlflow_run("<run_id>", tag="backfill")
+```
+
+Each import commits the checkpoint/run artifacts plus any metrics found alongside them (Lightning reads `checkpoint["callback_metrics"]`, Transformers reads `trainer_state.json`'s `log_history`, MLflow reads the run's own metrics/params) — tagged `lightning-import`, `transformers-import`, or `mlflow-import` respectively. Re-importing an unchanged checkpoint is a no-op (same "Nothing to commit" behavior as `av commit`). Like every `av commit`, an import commits *everything* currently staged, not just the imported path — stage only what you want included before running an import if you have other unrelated changes pending.
 
 ---
 

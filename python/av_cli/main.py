@@ -1174,6 +1174,40 @@ def webui_cmd(rebuild: bool) -> None:
     )
 
 
+@cli.command("import-lightning")
+@click.argument("checkpoint_path", type=click.Path(exists=True))
+@click.option("--tag", default=None, help="Additional tag to attach to the imported commit.")
+def import_lightning(checkpoint_path: str, tag: str | None) -> None:
+    """Backfill a pre-existing PyTorch Lightning checkpoint not captured live by the callback."""
+    repo_root = ensure_repo()
+    from av_plugins.lightning import import_checkpoint
+    import_checkpoint(checkpoint_path, repo_root=repo_root, tag=tag)
+    click.secho(f"Imported Lightning checkpoint: {checkpoint_path}", fg="green")
+
+
+@cli.command("import-transformers")
+@click.argument("checkpoint_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--tag", default=None, help="Additional tag to attach to the imported commit.")
+def import_transformers(checkpoint_dir: str, tag: str | None) -> None:
+    """Backfill a pre-existing HuggingFace Transformers checkpoint directory."""
+    repo_root = ensure_repo()
+    from av_plugins.transformers import import_checkpoint
+    import_checkpoint(checkpoint_dir, repo_root=repo_root, tag=tag)
+    click.secho(f"Imported Transformers checkpoint: {checkpoint_dir}", fg="green")
+
+
+@cli.command("import-mlflow")
+@click.argument("run_id")
+@click.option("--tracking-uri", default=None, help="MLflow tracking URI (defaults to MLflow's own resolution).")
+@click.option("--tag", default=None, help="Additional tag to attach to the imported commit.")
+def import_mlflow(run_id: str, tracking_uri: str | None, tag: str | None) -> None:
+    """Import an existing MLflow run's artifacts and metrics as a new Aether-Vault commit."""
+    repo_root = ensure_repo()
+    from av_plugins.mlflow import import_run
+    import_run(run_id, repo_root=repo_root, tracking_uri=tracking_uri, tag=tag)
+    click.secho(f"Imported MLflow run: {run_id}", fg="green")
+
+
 if __name__ == "__main__":
     cli()
 
