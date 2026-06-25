@@ -202,7 +202,7 @@ Trigger a mark-and-sweep garbage collection on the remote server to purge orphan
 av gc
 ```
 
-### `av handoff` 🆕 — Agent Context Export
+### `av handoff`  — Agent Context Export
 While most ML tracking tools (MLflow, DVC, W&B) record experiments for humans to read, `av handoff` generates a structured, machine-readable context snapshot for **AI agents** picking up the work — branch, commit, tags, metrics, model/dataset lineage, and an optional freeform instruction note, in an open `.avh` (Aether Vault Handoff) JSON format. Every invocation also writes a human-readable Markdown note into `Aether-Handoff/`, indexed chronologically by a central hub file.
 
 ```bash
@@ -227,6 +227,29 @@ Aether-Handoff/
 ```
 
 `--diff-weights` reuses the per-layer safetensors hashes already produced during `av add` (see Phase 5 below) to report exactly which model layers changed since the parent commit — a focused slice of the "Weight Diffing" roadmap item.
+
+### Framework Plugins — PyTorch Lightning & HuggingFace Transformers
+Optional callbacks that auto-stage and auto-commit checkpoints as they're saved during training, so versioning never depends on remembering to run `av add`/`av commit` by hand. Install with the relevant extra:
+```bash
+pip install aether-vault[lightning]      # PyTorch Lightning
+pip install aether-vault[transformers]   # HuggingFace Transformers
+```
+
+```python
+# PyTorch Lightning
+from av_plugins.lightning import AetherVaultCallback
+
+trainer = Trainer(callbacks=[AetherVaultCallback(tag="experiment-1")])
+```
+
+```python
+# HuggingFace Transformers
+from av_plugins.transformers import AetherVaultTrainerCallback
+
+trainer = Trainer(..., callbacks=[AetherVaultTrainerCallback(tag="experiment-1")])
+```
+
+Each callback commits with the current step/epoch as the message and any numeric metrics (loss, eval scores, ...) attached via `--metric`, and flushes a final `av push` at the end of training. The training script must be run from inside (or below) an `av init`-ed repository.
 
 ---
 
@@ -307,6 +330,11 @@ Aether-Vault was built in eight distinct phases:
 - **Fixed real usability bugs reported from a separate test install**: the Layer Drift chart's tooltip text was unreadable (black on dark background) and its X-axis label was clipped with no Y-axis explanation; `av webui` rebuilt/re-evaluated the Docker image on every single invocation even when nothing changed (now skips straight to the browser if already healthy, ~15s instead of 2+ minutes; `--rebuild` forces a fresh build when needed).
 - See [`Probleme.md`](Probleme.md) for the full edge-case pass (legacy configs, project-name collisions, branch-name collisions across projects, GC/stats behavior with multiple projects) and what was deliberately left unscoped.
 
+### Phase 15 — Framework Plugins (PyTorch Lightning & HuggingFace Transformers)
+- **`av_plugins` package**: `AetherVaultCallback` (Lightning) and `AetherVaultTrainerCallback` (Transformers) hook into each framework's native checkpoint-save callback and drive the existing `av` CLI in-process (`cli.main(..., standalone_mode=False)`) rather than duplicating add/commit/push logic — every existing guarantee (LFS pointers, safetensors layer splitting, offline pending-push queueing, per-project ref namespacing) is reused as-is.
+- Both frameworks are optional extras (`pip install aether-vault[lightning]` / `[transformers]`) — the core package stays framework-agnostic.
+- Plain PyTorch/TensorFlow were deliberately left out of scope: neither exposes a native checkpoint-save hook comparable to Lightning's `Callback` or HF's `TrainerCallback`, so supporting them would mean a manual "call this after `torch.save()`" API — a different, lower-value feature.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
 
 ---
@@ -319,7 +347,7 @@ Aether-Vault was built in eight distinct phases:
 | ✅ | **Offline-Resilient Commits** — Change-aware staging + `.av/pending_push` queue + `av push`, so no commit is lost or dashboard-invisible due to a down registry |
 | ✅ | **Agent Context Handoff** — Open `.avh` format + `av handoff` snapshots for AI-agent-to-agent ML pipeline handoff, including per-layer weight-diffing |
 | ✅ | **Weight Diffing (Visual)** — A "Weight Diff" tab in the Web UI: drag two checkpoints from a list into comparison slots to get a colored layer heatmap, summary stats, and a per-layer depth chart of what changed |
-| 🔲 | **Framework Plugins** — Native callbacks for PyTorch Lightning & HuggingFace Transformers |
+| ✅ | **Framework Plugins** — Native callbacks for PyTorch Lightning & HuggingFace Transformers |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
 
 ---

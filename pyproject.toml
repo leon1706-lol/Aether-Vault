@@ -17,5 +17,9 @@ dependencies = [
     "redis>=5.0.0"
 ]
 
+[project.optional-dependencies]
+lightning = ["lightning>=2.0.0"]
+transformers = ["transformers>=4.30.0"]
+
 [project.scripts]
 av = "av_cli.main:cli"

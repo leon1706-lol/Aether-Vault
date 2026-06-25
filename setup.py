@@ -21,6 +21,6 @@ ext_modules = [
 setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
-    packages=["av_cli", "av_server"],
+    packages=["av_cli", "av_server", "av_plugins"],
     package_dir={"": "python"},
 )
