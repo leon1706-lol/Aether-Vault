@@ -51,7 +51,7 @@ graph TD
     %% Local Environment
     subgraph Local [User Machine / Training Node]
         Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-        CLI("av_cli<br>(add · status · commit · branch ·<br>checkout · push · gc · webui)")
+        CLI("av_cli<br>(add · status · commit · branch ·<br>checkout · push · gc · webui · doctor)")
         CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
         LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
         PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
@@ -65,6 +65,8 @@ graph TD
         CLI -- "4. Queues Commit if Server Unreachable" --> PendingQ
         CLI -- "5. Starts Container & Opens Browser" --> WebUI
         CLI -- "6. Generates Code Graph / Handoff Snapshot" --> Vault
+        CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> LocalDAG
+        CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> PendingQ
     end
 
     %% Remote Environment
@@ -229,10 +231,13 @@ av gc
 ```
 
 ### `av doctor`
-Diagnose common repo and environment problems: native core availability, remote server reachability, index/pointer consistency, the pending-push queue, and leftover temp files from interrupted writes. Read-only — reports issues but does not modify anything. Diagnostics only in this release — no `--fix` flag yet; see the Open Source Roadmap.
+Diagnose common repo and environment problems: native core availability, remote server reachability, index/pointer consistency, the pending-push queue, and leftover temp files from interrupted writes. Read-only by default — reports issues but does not modify anything.
 ```bash
-av doctor
+av doctor                    # diagnose only
+av doctor --fix              # repair what's safely recoverable
+av doctor --fix --dry-run    # preview what --fix would do, without changing anything
 ```
+`--fix` re-links orphaned/stale `.av-pointer` files back to their objects (downloading from the remote if the object is only available there), clears `*.tmp.*` leftovers from interrupted writes, and clears pending-push entries whose commit no longer exists locally while retrying the rest. Anything it can't safely recover (e.g. the object is missing both locally and on an unreachable remote) is left as `[WARN]` rather than fabricated or silently dropped.
 
 ### `av test`
 **Development only.** Runs Aether-Vault's own pytest suite from source. Requires an editable/dev install (`pip install -e .[dev]`) — not a tool for inspecting an end user's `.av/` repository (use `av doctor` for that).
@@ -337,7 +342,7 @@ More development-process documents will live under [`development/`](development/
 | ✅ | **Weight Diffing (Visual)** — A "Weight Diff" tab in the Web UI: drag two checkpoints from a list into comparison slots to get a colored layer heatmap, summary stats, and a per-layer depth chart of what changed |
 | ✅ | **Framework Plugins** — Native callbacks for PyTorch Lightning & HuggingFace Transformers |
 | ✅ | **Diagnostics (`av doctor`)** — Read-only health check for native core, server reachability, index/pointer consistency, and the pending-push queue |
-| 🔲 | **`av doctor --fix`** — Auto-repair mode for `av doctor`: re-link orphaned `.av-pointer` files to their objects, clear stale `.tmp.*` leftovers, and retry/clear unrecoverable pending-push entries, instead of just reporting them |
+| ✅ | **`av doctor --fix`** — Auto-repair mode for `av doctor` (plus `--dry-run` to preview): re-links orphaned `.av-pointer` files to their objects, clears stale `.tmp.*` leftovers, and retries/clears unrecoverable pending-push entries, instead of just reporting them |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
 
 ---

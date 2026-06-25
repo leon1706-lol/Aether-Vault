@@ -231,6 +231,148 @@ def test_doctor_outside_repo_errors_cleanly(tmp_path, monkeypatch):
     assert "not an aether-vault repository" in result.output.lower()
 
 
+def test_doctor_fix_relinks_stale_pointer_when_object_intact(repo):
+    invoke("config", "1")
+    big = repo / "weights.pt"
+    big.write_bytes(b"x" * (2 * 1024 * 1024))
+    invoke("add", "weights.pt")
+
+    idx = Index(repo)
+    entry = idx.get_entry("weights.pt")
+    idx.remove_entry("weights.pt")  # object + pointer file remain; only the index entry is lost
+
+    result = invoke("doctor", "--fix")
+    assert result.exit_code == 0, result.output
+    assert "[FIXED]" in result.output
+    assert "Re-linked weights.pt.av-pointer back into the index" in result.output
+
+    restored = Index(repo).get_entry("weights.pt")
+    assert restored is not None
+    assert restored["hash"] == entry["hash"]
+
+
+def test_doctor_fix_downloads_missing_object_from_server(repo, monkeypatch):
+    invoke("config", "1")
+    big = repo / "weights.pt"
+    content = b"x" * (2 * 1024 * 1024)
+    big.write_bytes(content)
+    invoke("add", "weights.pt")
+
+    idx = Index(repo)
+    entry = idx.get_entry("weights.pt")
+    obj_path = repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
+    obj_path.unlink()  # simulate a lost/corrupted CAS object
+
+    def fake_download(self, sha256_hash, dest_path):
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(content)
+        return True
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.VaultClient, "server_available", lambda self: True)
+    monkeypatch.setattr(main_module.VaultClient, "download_object", fake_download)
+
+    result = invoke("doctor", "--fix")
+    assert result.exit_code == 0, result.output
+    assert "[FIXED]" in result.output
+    assert "by downloading its object from the remote" in result.output
+    assert obj_path.exists()
+
+
+def test_doctor_fix_cannot_recover_truly_missing_object(repo):
+    invoke("config", "1")
+    big = repo / "weights.pt"
+    big.write_bytes(b"x" * (2 * 1024 * 1024))
+    invoke("add", "weights.pt")
+
+    idx = Index(repo)
+    entry = idx.get_entry("weights.pt")
+    obj_path = repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
+    obj_path.unlink()
+
+    # No server running in this test environment, so the object genuinely cannot be recovered.
+    result = invoke("doctor", "--fix")
+    assert result.exit_code == 0, result.output
+    assert "[WARN]" in result.output
+    assert "could not recover" in result.output
+    assert "weights.pt" in result.output
+    assert not obj_path.exists()
+
+
+def test_doctor_fix_clears_tmp_leftovers(repo):
+    tmp_file = repo / ".av" / "index.tmp.abcd1234"
+    tmp_file.write_text("garbage")
+
+    result = invoke("doctor", "--fix")
+    assert result.exit_code == 0, result.output
+    assert "[FIXED]" in result.output
+    assert "Removed 1 leftover temp file" in result.output
+    assert not tmp_file.exists()
+
+
+def test_doctor_fix_clears_unrecoverable_pending_push_entries(repo):
+    pending_path = repo / ".av" / "pending_push"
+    pending_path.write_text(json.dumps([{"commit_hash": "deadbeef" * 8, "ref_name": "main"}]))
+
+    result = invoke("doctor", "--fix")
+    assert result.exit_code == 0, result.output
+    assert "[FIXED]" in result.output
+    assert "Cleared 1 unrecoverable pending-push entry" in result.output
+    assert not pending_path.exists()  # save_pending_push removes the file once the queue is empty
+
+
+def test_doctor_without_fix_only_warns(repo):
+    tmp_file = repo / ".av" / "index.tmp.abcd1234"
+    tmp_file.write_text("garbage")
+    pending_path = repo / ".av" / "pending_push"
+    pending_path.write_text(json.dumps([{"commit_hash": "deadbeef" * 8, "ref_name": "main"}]))
+
+    result = invoke("doctor")
+    assert result.exit_code == 0, result.output
+    assert "[FIXED]" not in result.output
+    assert tmp_file.exists()
+    assert pending_path.exists()
+
+
+def test_doctor_fix_dry_run_previews_without_modifying(repo):
+    invoke("config", "1")
+    big = repo / "weights.pt"
+    big.write_bytes(b"x" * (2 * 1024 * 1024))
+    invoke("add", "weights.pt")
+    idx = Index(repo)
+    entry = idx.get_entry("weights.pt")
+    idx.remove_entry("weights.pt")  # stale pointer, object intact
+
+    tmp_file = repo / ".av" / "index.tmp.abcd1234"
+    tmp_file.write_text("garbage")
+    pending_path = repo / ".av" / "pending_push"
+    pending_path.write_text(json.dumps([{"commit_hash": "deadbeef" * 8, "ref_name": "main"}]))
+
+    obj_path = repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
+    assert obj_path.exists()
+    before_index = (repo / ".av" / "index").read_bytes()
+    before_pending = pending_path.read_bytes()
+    before_tmp = tmp_file.read_bytes()
+
+    result = invoke("doctor", "--fix", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "[WOULD FIX]" in result.output
+    assert "[FIXED]" not in result.output
+    assert "(dry run" in result.output
+
+    assert tmp_file.exists() and tmp_file.read_bytes() == before_tmp
+    assert pending_path.exists() and pending_path.read_bytes() == before_pending
+    assert (repo / ".av" / "index").read_bytes() == before_index
+    assert obj_path.exists()
+
+
+def test_doctor_dry_run_without_fix_is_a_noop(repo):
+    result_plain = invoke("doctor")
+    result_dry = invoke("doctor", "--dry-run")
+    assert result_plain.exit_code == result_dry.exit_code == 0
+    assert result_plain.output == result_dry.output
+
+
 # ---------------------------------------------------------------------------
 # av test
 # ---------------------------------------------------------------------------

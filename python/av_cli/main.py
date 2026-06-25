@@ -26,7 +26,7 @@ for _stream in (sys.stdout, sys.stderr):
 from .client import VaultClient
 from .exceptions import AetherVaultException, NetworkError, StorageError, ValidationError
 from .index import Index
-from .pointer import create_pointer, get_pointer_path, is_pointer_file
+from .pointer import create_pointer, get_pointer_path, is_pointer_file, parse_pointer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -981,12 +981,17 @@ def gc() -> None:
 
 
 @cli.command()
-def doctor() -> None:
+@click.option("--fix", is_flag=True, default=False,
+              help="Repair fixable issues: re-link pointers, clear tmp leftovers, clear/retry pending-push entries.")
+@click.option("--dry-run", "dry_run", is_flag=True, default=False,
+              help="With --fix, preview what would be repaired without changing anything.")
+def doctor(fix: bool, dry_run: bool) -> None:
     """Diagnose common repo and environment problems.
 
-    Read-only: reports issues (native core availability, server reachability, index/pointer
-    consistency, pending-push queue, leftover temp files) without modifying anything. There is
-    no auto-repair (`--fix`) yet — see the Open Source Roadmap in README.md.
+    Read-only by default: reports issues (native core availability, server reachability,
+    index/pointer consistency, pending-push queue, leftover temp files) without modifying
+    anything. Pass --fix to repair what's safely recoverable, or --fix --dry-run to preview
+    what --fix would do without changing anything.
     """
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
@@ -997,6 +1002,8 @@ def doctor() -> None:
     click.secho("-------------------", bold=True)
 
     warning_count = 0
+    fixed_count = 0
+    preview = fix and dry_run  # --dry-run only means anything alongside --fix
 
     def ok(msg: str) -> None:
         click.secho(f"[OK]    {msg}", fg="green")
@@ -1005,6 +1012,12 @@ def doctor() -> None:
         nonlocal warning_count
         warning_count += 1
         click.secho(f"[WARN]  {msg}", fg="yellow")
+
+    def fixed(msg: str) -> None:
+        nonlocal fixed_count
+        fixed_count += 1
+        label = "[WOULD FIX]" if preview else "[FIXED]"
+        click.secho(f"{label} {msg}", fg="cyan")
 
     required = [av_dir / "objects", av_dir / "refs" / "heads", av_dir / "commits", av_dir / "HEAD"]
     missing = [str(p.relative_to(repo_root)) for p in required if not p.exists()]
@@ -1026,6 +1039,7 @@ def doctor() -> None:
     idx = Index(repo_root)
     ok(f"Index (.av/index) is valid JSON, {len(idx.entries)} entries")
 
+    # --- Orphaned pointer entries: index entry has a pointer but its CAS object is missing ---
     # An entry with a pointer but no matching CAS object means `av checkout` would silently
     # fail to materialize that file's real content.
     orphaned = [
@@ -1034,15 +1048,32 @@ def doctor() -> None:
         if entry.get("pointer")
         and not (av_dir / "objects" / entry["hash"][:2] / entry["hash"][2:]).exists()
     ]
-    if orphaned:
-        warn(f"{len(orphaned)} pointer entry(ies) missing their object: {', '.join(orphaned)}")
-    else:
+    recovered_orphans = []
+    unrecovered_orphans = []
+    for rel_path in orphaned:
+        h = idx.entries[rel_path]["hash"]
+        obj_path = av_dir / "objects" / h[:2] / h[2:]
+        can_recover = False
+        if fix and preview:
+            can_recover = client.object_exists(h)
+        elif fix:
+            can_recover = client.server_available() and client.download_object(h, obj_path)
+        (recovered_orphans if can_recover else unrecovered_orphans).append(rel_path)
+
+    if recovered_orphans:
+        verb = "Would re-link" if preview else "Re-linked"
+        for rel_path in recovered_orphans:
+            fixed(f"{verb} {rel_path} by downloading its object from the remote")
+    if unrecovered_orphans:
+        note = " (--fix could not recover: not available locally or on the remote)" if fix else ""
+        warn(f"{len(unrecovered_orphans)} pointer entry(ies) missing their object: {', '.join(unrecovered_orphans)}{note}")
+    elif not orphaned:
         pointer_count = sum(1 for e in idx.entries.values() if e.get("pointer"))
         ok(f"No orphaned pointer entries ({pointer_count} pointer(s), all matched)")
 
-    # `.av-pointer` files on disk with no corresponding tracked index entry — left behind by a
-    # manual delete/rename of the original file outside of `av`.
-    stale_pointers = []
+    # --- Stale .av-pointer files: pointer file on disk with no corresponding tracked entry ---
+    # Left behind by a manual delete/rename of the original file outside of `av`.
+    stale_pointers = []  # list of (pointer_rel_path, original_rel_path, pointer_abs_path)
     for dirpath, dirnames, files in os.walk(repo_root):
         dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
         for f in files:
@@ -1051,27 +1082,116 @@ def doctor() -> None:
             ptr_path = Path(dirpath) / f
             original_rel = str(ptr_path.relative_to(repo_root))[: -len(".av-pointer")].replace("\\", "/")
             if original_rel not in idx.entries:
-                stale_pointers.append(str(ptr_path.relative_to(repo_root)).replace("\\", "/"))
-    if stale_pointers:
-        warn(f"{len(stale_pointers)} stale .av-pointer file(s) with no tracked entry: {', '.join(stale_pointers)}")
+                ptr_rel = str(ptr_path.relative_to(repo_root)).replace("\\", "/")
+                stale_pointers.append((ptr_rel, original_rel, ptr_path))
 
+    recovered_stale = []
+    unrecovered_stale = []
+    for ptr_rel, original_rel, ptr_path in stale_pointers:
+        try:
+            parsed = parse_pointer(ptr_path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            parsed = None
+        if not parsed:
+            note = " (--fix could not parse this pointer file)" if fix else ""
+            unrecovered_stale.append(f"{ptr_rel}{note}")
+            continue
+
+        h, size = parsed["hash"], parsed["size"]
+        obj_path = av_dir / "objects" / h[:2] / h[2:]
+        object_available = obj_path.exists()
+
+        if not object_available and fix:
+            if preview:
+                object_available = client.object_exists(h)
+            elif client.server_available() and client.download_object(h, obj_path):
+                object_available = True
+
+        if object_available and fix:
+            if not preview:
+                idx.add_entry(original_rel, h, size, 0, "artifact", ptr_rel)
+            recovered_stale.append(ptr_rel)
+        elif object_available:
+            unrecovered_stale.append(ptr_rel)
+        else:
+            note = " (--fix could not recover: object missing locally and on the remote)" if fix else ""
+            unrecovered_stale.append(f"{ptr_rel}{note}")
+
+    if recovered_stale:
+        verb = "Would re-link" if preview else "Re-linked"
+        for ptr_rel in recovered_stale:
+            fixed(f"{verb} {ptr_rel} back into the index")
+    if unrecovered_stale:
+        warn(f"{len(unrecovered_stale)} stale .av-pointer file(s) with no tracked entry: {', '.join(unrecovered_stale)}")
+
+    # --- Pending-push queue ---
     pending = load_pending_push(repo_root)
-    if pending:
-        warn(f"{len(pending)} commit(s) pending push (.av/pending_push) — run `av push` once the server is back")
+    if not fix:
+        if pending:
+            warn(f"{len(pending)} commit(s) pending push (.av/pending_push) — run `av push` once the server is back")
+        else:
+            ok("No commits pending push")
     else:
-        ok("No commits pending push")
+        commits_dir = av_dir / "commits"
+        recoverable_pending = []
+        unrecoverable_pending = []
+        for entry in pending:
+            if (commits_dir / f"{entry['commit_hash']}.json").exists():
+                recoverable_pending.append(entry)
+            else:
+                unrecoverable_pending.append(entry)
 
-    tmp_leftovers = [str(p.relative_to(repo_root)) for p in av_dir.rglob("*.tmp.*")]
+        if unrecoverable_pending:
+            verb = "Would clear" if preview else "Cleared"
+            fixed(f"{verb} {len(unrecoverable_pending)} unrecoverable pending-push entry(ies) (commit object missing locally)")
+            if not preview:
+                save_pending_push(repo_root, recoverable_pending)
+
+        if recoverable_pending:
+            if preview:
+                if client.server_available():
+                    fixed(f"Would retry pushing {len(recoverable_pending)} remaining pending commit(s) (server reachable)")
+                else:
+                    warn(f"{len(recoverable_pending)} commit(s) pending push (.av/pending_push) — run `av push` once the server is back")
+            elif client.server_available():
+                still_pending = flush_pending_push(repo_root, client)
+                pushed = len(recoverable_pending) - len(still_pending)
+                if pushed:
+                    fixed(f"Retried pending push queue: pushed {pushed}, {len(still_pending)} still pending")
+                if still_pending:
+                    warn(f"{len(still_pending)} commit(s) pending push (.av/pending_push) — run `av push` once the server is back")
+            else:
+                warn(f"{len(recoverable_pending)} commit(s) pending push (.av/pending_push) — run `av push` once the server is back")
+        elif not pending:
+            ok("No commits pending push")
+
+    # --- *.tmp.* leftovers from an interrupted atomic write ---
+    tmp_leftovers = list(av_dir.rglob("*.tmp.*"))
     if tmp_leftovers:
-        warn(f"{len(tmp_leftovers)} leftover temp file(s) from an interrupted write: {', '.join(tmp_leftovers)}")
+        names = [str(p.relative_to(repo_root)) for p in tmp_leftovers]
+        if fix:
+            verb = "Would remove" if preview else "Removed"
+            fixed(f"{verb} {len(tmp_leftovers)} leftover temp file(s): {', '.join(names)}")
+            if not preview:
+                for p in tmp_leftovers:
+                    p.unlink(missing_ok=True)
+        else:
+            warn(f"{len(tmp_leftovers)} leftover temp file(s) from an interrupted write: {', '.join(names)}")
     else:
         ok("No *.tmp.* leftover files in .av/")
 
     click.echo("")
-    if warning_count:
-        click.secho(f"{warning_count} warning(s), 0 errors.", fg="yellow", bold=True)
+    suffix = " (dry run — nothing was changed)" if preview else ""
+    if fixed_count and warning_count:
+        verb = "would be fixed" if preview else "fixed"
+        click.secho(f"{fixed_count} issue(s) {verb}, {warning_count} warning(s) remain, 0 errors.{suffix}", fg="cyan", bold=True)
+    elif fixed_count:
+        verb = "would be fixed" if preview else "fixed"
+        click.secho(f"{fixed_count} issue(s) {verb}, 0 warnings remain, 0 errors.{suffix}", fg="cyan", bold=True)
+    elif warning_count:
+        click.secho(f"{warning_count} warning(s), 0 errors.{suffix}", fg="yellow", bold=True)
     else:
-        click.secho("Everything looks good.", fg="green", bold=True)
+        click.secho(f"Everything looks good.{suffix}", fg="green", bold=True)
 
 
 @cli.command(name="test")

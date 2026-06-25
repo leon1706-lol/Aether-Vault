@@ -116,4 +116,26 @@ findings (resolved and still-open).
   `add`, restoring any changed file type on `checkout`, and uploading code objects to the remote
   in `upload_commit_objects()`.
 
+## Phase 18 — `av doctor --fix` Auto-Repair Mode
+- **`--fix`**: closes the `av doctor --fix` roadmap item — repairs what `av doctor` already
+  knows how to detect: re-links orphaned/stale `.av-pointer` entries back to their CAS object
+  (downloading it from the remote first if it's only available there), removes `*.tmp.*`
+  leftovers from interrupted atomic writes, and clears pending-push queue entries whose commit
+  no longer exists locally (genuinely unrecoverable) while retrying whatever legitimately
+  remains via the existing `flush_pending_push()`. Anything it can't safely recover (object
+  missing both locally and on an unreachable/lacking remote) stays a `[WARN]`, never fabricated
+  or silently dropped.
+- **`--fix --dry-run`**: previews exactly what `--fix` would do — using only non-mutating checks
+  (`VaultClient.object_exists()`'s `HEAD`-only request instead of an actual download, local
+  existence checks instead of writes/deletes) — and prints `[WOULD FIX]` instead of `[FIXED]`,
+  with a "(dry run — nothing was changed)" summary suffix. `--dry-run` without `--fix` is a
+  no-op, identical to plain `av doctor`.
+- **Manually verified end-to-end** (not just unit tests) in a scratch repo: hand-constructed all
+  four broken `.av/` states (orphaned pointer entry with no remote, stale pointer file with an
+  intact object, a `*.tmp.*` leftover, and a pending-push entry referencing a missing commit),
+  confirmed `av doctor` reports each, confirmed `--fix --dry-run` previews without touching
+  anything on disk, then confirmed the real `--fix` actually repairs the recoverable ones and
+  correctly leaves the two genuinely-unrecoverable ones (no local or remote copy of the object)
+  as `[WARN]`. No new bugs found during this pass.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
