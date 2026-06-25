@@ -653,7 +653,7 @@ def commit(
         # Objects must reach the server before the commit: the server's tree rows store each
         # entry's object hash as a foreign key, so pushing the commit first makes that insert
         # fail (previously misreported as a successful 409 "already exists" — see
-        # upload_commit_objects()'s docstring / Probleme.md).
+        # upload_commit_objects()'s docstring / development/Probleme.md).
         upload_commit_objects(repo_root, client, tree)
         if client.push_commit(commit_data):
             ref_ok = True

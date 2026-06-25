@@ -112,7 +112,7 @@ export async function fetchCommits(limit = 40, projectId?: string | null): Promi
 // projectId is optional — when unset, the dashboard shows commits/refs from every project
 // on this shared registry (the pre-existing behavior), exactly as before the Projects tab
 // was added. Stats stay unscoped: they describe the shared object store, which is
-// deliberately deduplicated *across* projects (see Probleme.md).
+// deliberately deduplicated *across* projects (see development/Probleme.md).
 export async function fetchDashboardData(projectId?: string | null): Promise<DashboardData> {
   try {
     const [health, refs, stats, commits] = await Promise.all([

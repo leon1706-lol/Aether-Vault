@@ -1,6 +1,16 @@
-# 🌌 Aether-Vault
+<p align="center"><img src="development/logo.png" width="220" alt="Aether-Vault logo"></p>
 
-> **High-performance, Git-like version control and registry for Machine Learning models, datasets, and code — in a single atomic commit.**
+<h1 align="center">Aether-Vault</h1>
+
+<p align="center">
+  <strong>High-performance, Git-like version control and registry for Machine Learning models, datasets, and code — in a single atomic commit.</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
+  <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
+</p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
 
@@ -10,14 +20,26 @@ Aether-Vault solves the core challenge of ML reproducibility by versioning the *
 | 2 | **Model Weights** | `.pt`, `.safetensors`, `.onnx` |
 | 3 | **Datasets** | `.csv`, `.parquet`, `.h5`, `.arrow` |
 
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [CLI Reference](#cli-reference)
+- [Framework Plugins](#framework-plugins)
+- [Development Progress](#development-progress)
+- [Open Source Roadmap](#open-source-roadmap)
+- [Enterprise Roadmap](#enterprise-roadmap-commercial-variant)
+- [Contributing](#contributing)
+
 ---
 
-## ⚡ Architecture
+## Architecture
 
 Aether-Vault bridges Python and C++ for maximum throughput:
 
 - **C++ Performance Core (`aether_core`)** — Reads multi-gigabyte files in 8MB chunks, hashing them in parallel with a C++11 ThreadPool. Layer-aware `.safetensors` parsing enables per-layer deduplication.
 - **Python CLI (`av_cli`)** — Familiar Git-like interface (`av add`, `av commit`, `av checkout`). Files above the LFS threshold are automatically replaced by lightweight pointer files.
+- **Framework Plugins (`av_plugins`)** — Optional native callbacks for PyTorch Lightning and HuggingFace Transformers that drive the CLI in-process to auto-commit checkpoints during training.
 - **FastAPI CAS Server (`av_server`)** — Dockerized Content-Addressable Storage backend, backed by PostgreSQL (Merkle Tree DAG) and RedisBloom (O(1) existence checks).
 - **Next.js Web UI (`webui`)** — Browser-based dashboard for visualizing the commit graph, branches, and ML metrics, plus a "Weight Diff" tab for visually comparing per-layer checkpoint changes. Launched with `av webui`.
 
@@ -27,13 +49,15 @@ Aether-Vault bridges Python and C++ for maximum throughput:
 graph TD
     %% Local Environment
     subgraph Local [User Machine / Training Node]
-        CLI("🖥️ av_cli<br>(add · status · commit · branch ·<br>checkout · push · gc · webui)")
-        CPP("⚙️ aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
-        LocalDAG("📁 .av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
-        PendingQ("⏳ pending_push queue<br>(.av/pending_push — offline-resilient commits)")
-        WebUI("🌐 Web UI<br>(Dashboard + Weight Diff + Projects Tabs · localhost:3000)")
-        Vault("🗒️ Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
+        Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
+        CLI("av_cli<br>(add · status · commit · branch ·<br>checkout · push · gc · webui)")
+        CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
+        LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
+        PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
+        WebUI("Web UI<br>(Dashboard + Weight Diff + Projects Tabs · localhost:3000)")
+        Vault("Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
 
+        Plugins -- "Drives in-process (add/commit/push)" --> CLI
         CLI -- "1. Reads & Hashes Files" --> CPP
         CLI -- "2. Updates Staging & Pointers" --> LocalDAG
         CLI -- "3. Reconstructs Files on Checkout" --> LocalDAG
@@ -44,10 +68,10 @@ graph TD
 
     %% Remote Environment
     subgraph Remote [Dockerized Remote Registry]
-        FastAPI("🚀 FastAPI Server<br>(Upload/Download · Commit & Ref Sync ·<br>Dashboard API · Admin GC)")
-        Redis("⚡ RedisBloom Cache<br>(O(1) Existence Checks)")
-        DB("🐘 PostgreSQL<br>(Merkle Trees · Project-Scoped Branches · Metrics)")
-        Storage("💾 Persistent Volume<br>(Deduplicated Model & Dataset Chunks)")
+        FastAPI("FastAPI Server<br>(Upload/Download · Commit & Ref Sync ·<br>Dashboard API · Admin GC)")
+        Redis("RedisBloom Cache<br>(O(1) Existence Checks)")
+        DB("PostgreSQL<br>(Merkle Trees · Project-Scoped Branches · Metrics)")
+        Storage("Persistent Volume<br>(Deduplicated Model & Dataset Chunks)")
 
         FastAPI -- "Checks if Object Exists" --> Redis
         FastAPI -- "Writes Trees & Commits" --> DB
@@ -64,13 +88,14 @@ graph TD
 
 > The "Local" box represents **any number** of independent `av init` repos on the same (or
 > different) machines — they all default to sharing the one Dockerized registry shown here.
-> Each repo gets its own `project_id` (see Phase 14), so the registry's commits/branches stay
-> attributable per project even though the object store is intentionally deduplicated across
-> all of them. Use `av config --remote-url` to point a repo at a different registry instead.
+> Each repo gets its own `project_id` (see [Phase 14](development/CHANGELOG.md#phase-14--per-project-registry-separation--real-world-fixes)),
+> so the registry's commits/branches stay attributable per project even though the object store
+> is intentionally deduplicated across all of them. Use `av config --remote-url` to point a repo
+> at a different registry instead.
 
 ---
 
-## 🛠️ Installation
+## Installation
 
 ### Prerequisites
 
@@ -91,7 +116,7 @@ cd aether-vault
 docker compose up --build -d
 ```
 
-The FastAPI server will be available at `http://localhost:8000`.  
+The FastAPI server will be available at `http://localhost:8000`.
 Interactive API docs: `http://localhost:8000/docs`
 
 ### 2. Install the CLI
@@ -103,7 +128,7 @@ pip install -e .
 
 ---
 
-## 📖 CLI Reference
+## CLI Reference
 
 ### `av init`
 Initialize an Aether-Vault repository in the current directory.
@@ -175,7 +200,7 @@ av graph            # Generate and attempt to launch Obsidian
 av graph --update   # Silently regenerate after code changes
 ```
 
-### `av webui` 
+### `av webui`
 Launch the browser-based Web UI dashboard. Checks that Docker is running, starts the `aether-vault-webui` container, and opens `http://localhost:3000` automatically. If the container is already running and healthy, this skips straight to opening the browser instead of re-running `docker compose` every time.
 ```bash
 av webui
@@ -193,8 +218,8 @@ av webui --rebuild   # force a fresh image build after changing webui/ source
 - **Branch List** — All refs with tip commit details
 - **ML Metrics Chart** — Line chart plotting all numeric metrics over commits
 - **Stats Bar** — Live counts for commits, branches, CAS objects, and storage size
-- **Weight Diff** — drag two checkpoints into comparison slots for a per-layer heatmap + drift chart (see Phase 13)
-- **Projects** — every project that has pushed to this registry, with an "Open" button to scope the whole dashboard to just that one (see Phase 14)
+- **Weight Diff** — drag two checkpoints into comparison slots for a per-layer heatmap + drift chart
+- **Projects** — every project that has pushed to this registry, with an "Open" button to scope the whole dashboard to just that one
 
 ### `av gc`
 Trigger a mark-and-sweep garbage collection on the remote server to purge orphaned storage shards and rebuild the Redis Bloom Filter.
@@ -202,7 +227,7 @@ Trigger a mark-and-sweep garbage collection on the remote server to purge orphan
 av gc
 ```
 
-### `av handoff`  — Agent Context Export
+### `av handoff` — Agent Context Export
 While most ML tracking tools (MLflow, DVC, W&B) record experiments for humans to read, `av handoff` generates a structured, machine-readable context snapshot for **AI agents** picking up the work — branch, commit, tags, metrics, model/dataset lineage, and an optional freeform instruction note, in an open `.avh` (Aether Vault Handoff) JSON format. Every invocation also writes a human-readable Markdown note into `Aether-Handoff/`, indexed chronologically by a central hub file.
 
 ```bash
@@ -226,10 +251,11 @@ Aether-Handoff/
 └── latest.avh                    # always-overwritten copy of the most recent snapshot
 ```
 
-`--diff-weights` reuses the per-layer safetensors hashes already produced during `av add` (see Phase 5 below) to report exactly which model layers changed since the parent commit — a focused slice of the "Weight Diffing" roadmap item.
+`--diff-weights` reuses the per-layer safetensors hashes already produced during `av add` to report exactly which model layers changed since the parent commit.
 
-### Framework Plugins — PyTorch Lightning & HuggingFace Transformers
-Optional callbacks that auto-stage and auto-commit checkpoints as they're saved during training, so versioning never depends on remembering to run `av add`/`av commit` by hand. Install with the relevant extra:
+## Framework Plugins
+
+Native callbacks for PyTorch Lightning and HuggingFace Transformers. Optional callbacks that auto-stage and auto-commit checkpoints as they're saved during training, so versioning never depends on remembering to run `av add`/`av commit` by hand. Install with the relevant extra:
 ```bash
 pip install aether-vault[lightning]      # PyTorch Lightning
 pip install aether-vault[transformers]   # HuggingFace Transformers
@@ -253,93 +279,16 @@ Each callback commits with the current step/epoch as the message and any numeric
 
 ---
 
-## 🗺️ Build Phases & Development Walkthrough
+## Development Progress
 
-Aether-Vault was built in eight distinct phases:
+- [`development/CHANGELOG.md`](development/CHANGELOG.md) — full build-phase history: what was built, when, and why, across all 15 development phases.
+- [`development/Probleme.md`](development/Probleme.md) — full audit log of correctness, performance and security findings, resolved and still-open, with severity ratings.
 
-### Phase 1 — High-Performance C++ Hashing Core
-- **Custom SHA-256 Engine**: Thread-safe cryptographic hashing.
-- **Parallel Tree-Hashing**: Splits files into 8MB chunks, hashes concurrently across all CPU cores.
-
-### Phase 2 — CLI Framework & LFS Pointers
-- **Staging Index Manager**: Manages the local `.av/index`.
-- **LFS-Style Pointers**: Detects large files, copies them to object storage, and replaces them with `.av-pointer` files.
-
-### Phase 3 — Content-Addressable Storage (CAS)
-- **Robust CAS Manager**: Deduplicates by SHA-256 hash with atomic writes.
-- **FastAPI Endpoints**: High-concurrency streaming uploads, downloads, and branch management.
-
-### Phase 4 — Database & Cache Integration
-- **PostgreSQL Schema**: Structured SQL representation of the commit DAG, branches, and metadata.
-- **Redis Integration**: `redis-stack-server` for high-performance in-memory caching.
-
-### Phase 5 — Safetensors & Merkle Trees
-- **C++ Layer-Splitting**: Parses `.safetensors` JSON headers to independently hash individual model layers — saving up to **99% storage** when only classifier heads change.
-- **Merkle Tree DAG**: PostgreSQL tables modelling the full directory hierarchy as a content-addressed tree.
-
-### Phase 6 — Scalability & Garbage Collection
-- **RedisBloom Filter**: O(1) hash existence checks, dramatically reducing Postgres load.
-- **Mark-and-Sweep GC**: Traverses all Merkle Trees to purge orphaned data shards.
-
-### Phase 7 — ML Experiment Tracking
-- **Dynamic Metadata**: `--tag` and `--metric` flags bind arbitrary tracking data (Sharpe ratio, loss, accuracy, drawdown) directly into atomic commits.
-
-### Phase 8 — Native Codebase Visualization
-- **AST Parsing & Graph Generation**: `av graph` dynamically maps function calls, external library dependencies, and docstrings into an Obsidian-compatible Markdown vault.
-
-### Phase 9 — Web UI Dashboard 
-- **Next.js Frontend**: Dark glassmorphism dashboard at `http://localhost:3000`.
-- **SVG Commit Graph**: DAG visualizer with coloured branch lanes and bezier edges.
-- **Recharts Metrics**: Line charts plotting all numeric ML metrics over time.
-- **Live API**: `GET /api/commits`, `GET /api/dashboard/summary` — auto-refreshes every 15 seconds.
-- **Docker Service**: `aether-vault-webui` added to `docker-compose.yml`, launched via `av webui`.
-
-### Phase 10 — Commit Integrity & Offline Resilience
-- **Change-Aware Staging**: `av add` only re-stages a file when its content hash actually changed, so re-running `av add .` after a commit no longer produces an empty duplicate commit.
-- **Pending-Push Queue**: Commits made while the remote registry is unreachable are saved locally and queued in `.av/pending_push` instead of silently failing to reach the Web UI dashboard.
-- **`av push`**: Retries syncing queued commits to the remote registry on demand; every `av commit` also auto-retries the queue when the server is back up.
-
-### Phase 11 — Agent Context Handoff
-- **`.avh` Open Format**: A JSON snapshot of branch, commit, tags, metrics, model/dataset lineage, and freeform agent instructions — designed to be read by another AI agent picking up the work.
-- **`av handoff`**: Generates/updates `handoff.avh` plus a human-readable Markdown note logged chronologically into `Aether-Handoff/`, indexed by a central `Handoff-Hub.md`.
-- **Per-Layer Weight Diffing**: `av handoff --diff-weights` reuses the Phase 5 safetensors layer hashes to report exactly which model layers changed since the parent commit, without re-hashing the file.
-- **`av handoff log` / `show`**: Browse and inspect the chronological snapshot history directly from the terminal.
-
-### Phase 12 — Hardening & Robustness
-- **Race-Free Garbage Collection**: `av gc` now honours a grace period — object shards (and their DB rows) created during the upload→commit window are never reaped, so a GC running concurrently with a push can no longer delete a live object whose commit is still in flight.
-- **Batched Merkle-Tree Resolution**: Commit-tree reconstruction (`GET /api/commits/{hash}`) and the GC mark phase no longer issue one DB query per tree node (N+1). Tree resolution runs level-by-level with a single batched query per depth (dedup-safe via path prefixes); GC loads all tree rows once and walks them in memory. Bulk deletes are chunked to stay within driver bind-parameter limits.
-- **Unified File-Metadata Source**: Size/mtime change-detection is handled exclusively through Python's `os.stat` (a single Unix-epoch source). This removes a cross-language hazard where the C++ core's `std::filesystem::last_write_time` (implementation-defined epoch) and Python's `st_mtime_ns` could disagree and make unchanged files appear "modified"; the C++ core is now used purely for hashing.
-- **Crash-Safe Local Writes**: Commit objects, refs/HEAD, the pending-push queue, the metadata registry and config are written atomically (temp file + `fsync` + `os.replace`), so an interrupted `av commit` can never leave a ref pointing at a half-written or missing commit.
-- **Idempotent Registry API**: Concurrent uploads of the same object hash, or concurrent pushes of the same commit, now resolve to a clean `409` instead of a `500` (`IntegrityError` is caught and treated as success). `push_commit` also enforces payload limits (tree size, metric/tag counts, message length) to reject abusive input on the unauthenticated endpoint.
-- **Shallow / Out-of-Order Pushes**: A commit whose parent isn't on the server yet (offline pending-push, partial clone) no longer triggers a foreign-key `500`; DAG integrity is anchored by content-addressed hashes.
-- **Single-Request Commit Loading**: The Web UI fetches recent commits in one `/api/commits` call (newest-first, with parent links) instead of walking the parent chain one request at a time, and runs all dashboard fetches in parallel.
-- **Smaller polish**: pointer detection reads only the fixed magic prefix in binary mode (safe on multi-GB inputs); the parallel hasher only spins up a thread pool when there is enough work to amortize it; `VaultClient` is now closable / a context manager; deprecated `datetime.utcnow()` and `@app.on_event` replaced with timezone-correct helpers and a FastAPI `lifespan`.
-
-### Phase 13 — Visual Weight Diffing
-- **"Weight Diff" Web UI tab**: a sidebar tab (lifted into the existing single-page dashboard, no new route) lets you drag two checkpoints from a list into two comparison slots and see a colored per-layer heatmap, summary stats (changed/total/% changed), and a Recharts bar chart of which layers changed across model depth. Entirely client-side — it reuses the per-layer hashes `GET /api/commits/{hash}` already returns, so no new server endpoints were needed.
-- **Fixed while building it — commits referencing layer-split `.safetensors` artifacts could never sync to the server.** Two compounding bugs: (1) `av commit`/`av push` uploaded a commit *before* its objects, and the server's tree rows had a hard foreign key to the objects table, so the insert always failed; the offline-queue retry path additionally never uploaded objects at all; (2) the server's generic `except IntegrityError` mapped *any* integrity violation to a "commit already exists" 409 — which the client (by design) treats as idempotent success — so the failure was completely silent: `av push` reported success while the commit and ref never reached the database. Fixed by uploading objects before the commit (in both the live and queued-retry paths), dropping the now-provably-wrong foreign key (a layer-split file's whole-file blob is never uploaded by design), and having the server re-check by hash before deciding a 409 is genuine.
-- **Fixed:** `av add` computed per-layer safetensors hashes but never actually persisted them to `.av/index` (an internal `auto_save` wrote the index before the layers were attached to the in-memory entry) — so every `av commit` silently shipped an empty `layers: []`, degrading `av handoff --diff-weights` (and now the Web UI) into a whole-file comparison for every checkpoint, undetected until this feature exercised it end-to-end.
-- **Fixed:** `atomic_write_text`'s temp filename (PID + full UUID4 hex) could push a commit's path past Windows' 260-character `MAX_PATH` limit, making the write — and the whole commit — fail outright on deeply nested working directories.
-- See [`Probleme.md`](Probleme.md) for full details, severity ratings, and a couple of smaller items left open.
-
-### Phase 14 — Per-Project Registry Separation + Real-World Fixes
-- **Per-project identity on the shared registry**: every `av init` repo previously pointed at the exact same `http://localhost:8000` with no way to tell commits from different local folders apart — so a Web UI started from one repo would show commits pushed by an unrelated one. `av init` now generates a stable `project_id` (UUID) + `project_name` (folder name, renameable via `av config --name`), included in the hashed commit payload and namespacing every branch ref as `"<project_id>/<branch>"` (so two projects can each have a `main` without colliding). Repos initialized before this change are backfilled automatically and stably on first use.
-- **`av config --remote-url`**: point a repo at a different registry entirely; `av config` with no arguments now prints the current LFS threshold, remote URL, and project identity.
-- **New "Projects" Web UI tab**: lists every project that has pushed to the registry (commit count, last push), with an "Open" button that scopes the Dashboard, Branch List, and Weight Diff tab to just that project (persisted across reloads); a badge in the top bar shows the active filter with a one-click clear.
-- **`GET /api/projects`** (new) and an optional `?project_id=` filter on `GET /api/commits`/`GET /api/refs`. Object storage stays deduplicated *across* projects on purpose — only commit/ref metadata is scoped.
-- **Fixed real usability bugs reported from a separate test install**: the Layer Drift chart's tooltip text was unreadable (black on dark background) and its X-axis label was clipped with no Y-axis explanation; `av webui` rebuilt/re-evaluated the Docker image on every single invocation even when nothing changed (now skips straight to the browser if already healthy, ~15s instead of 2+ minutes; `--rebuild` forces a fresh build when needed).
-- See [`Probleme.md`](Probleme.md) for the full edge-case pass (legacy configs, project-name collisions, branch-name collisions across projects, GC/stats behavior with multiple projects) and what was deliberately left unscoped.
-
-### Phase 15 — Framework Plugins (PyTorch Lightning & HuggingFace Transformers)
-- **`av_plugins` package**: `AetherVaultCallback` (Lightning) and `AetherVaultTrainerCallback` (Transformers) hook into each framework's native checkpoint-save callback and drive the existing `av` CLI in-process (`cli.main(..., standalone_mode=False)`) rather than duplicating add/commit/push logic — every existing guarantee (LFS pointers, safetensors layer splitting, offline pending-push queueing, per-project ref namespacing) is reused as-is.
-- Both frameworks are optional extras (`pip install aether-vault[lightning]` / `[transformers]`) — the core package stays framework-agnostic.
-- Plain PyTorch/TensorFlow were deliberately left out of scope: neither exposes a native checkpoint-save hook comparable to Lightning's `Callback` or HF's `TrainerCallback`, so supporting them would mean a manual "call this after `torch.save()`" API — a different, lower-value feature.
-
-> See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
+More development-process documents will live under [`development/`](development/) over time.
 
 ---
 
-## 🚀 Open Source Roadmap
+## Open Source Roadmap
 
 | Status | Feature |
 |---|---|
@@ -352,7 +301,7 @@ Aether-Vault was built in eight distinct phases:
 
 ---
 
-## 🏢 Enterprise Roadmap (Commercial Variant)
+## Enterprise Roadmap (Commercial Variant)
 
 For enterprise research teams and institutional algorithmic trading firms:
 
@@ -366,15 +315,15 @@ For enterprise research teams and institutional algorithmic trading firms:
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Commit your changes following the phase structure above
+3. Commit your changes following the existing module structure (see [`development/CHANGELOG.md`](development/CHANGELOG.md) for the project's development history)
 4. Open a Pull Request
 
 ---
 
 <div align="center">
-  <sub>Built with ⚙️ C++11 · 🐍 Python · 🚀 FastAPI · 🌐 Next.js · 🐘 PostgreSQL · ⚡ Redis</sub>
+  <sub>Built with C++11 · Python · FastAPI · Next.js · PostgreSQL · Redis</sub>
 </div>

@@ -12,7 +12,7 @@ import { LayerDriftChart } from "@/components/LayerDriftChart";
 // full detail per commit via N parallel GET /api/commits/{hash} requests. Kept deliberately
 // small and run in parallel (not serial) to avoid the kind of request-waterfall this codebase
 // has already fixed elsewhere (see fetchCommits' comment in lib/api.ts); a server-side
-// aggregate endpoint would be needed to raise this further — see Probleme.md.
+// aggregate endpoint would be needed to raise this further — see development/Probleme.md.
 const CHECKPOINT_FETCH_LIMIT = 30;
 
 interface Props {
