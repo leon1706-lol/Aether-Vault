@@ -21,6 +21,10 @@ dependencies = [
 lightning = ["lightning>=2.0.0"]
 transformers = ["transformers>=4.30.0"]
 mlflow = ["mlflow>=2.0.0"]
+dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0"]
 
 [project.scripts]
 av = "av_cli.main:cli"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -92,4 +92,28 @@ findings (resolved and still-open).
 - **Verified manually** (real throwaway `av init` repos, a real installed MLflow with a sqlite-backed tracking store — file-store backend is deprecated/blocked by default as of MLflow 3.x): double-importing the same unchanged checkpoint is a no-op; importing while unrelated files are staged commits those too (existing, intentional `av commit`-everything-staged behavior, not unique to imports — documented in the README rather than changed); a missing checkpoint path fails with a clear, actionable message.
 - **Also found and fixed:** the new MLflow tests themselves left a stray `mlruns/` folder in the real repo root — a sqlite tracking URI only relocates run *metadata*, not MLflow's default `./mlruns`-relative-to-cwd artifact storage. Fixed with `monkeypatch.chdir(tmp_path)` in both tests. See [`Probleme.md`](Probleme.md).
 
+## Phase 17 — Minimum Viable Test Suite + Diagnostics
+- **45-test pytest suite**: New `tests/test_cli.py` (CLI commands via `click.testing.CliRunner`:
+  `init`, `add`, `status`, `commit`, `checkout`, `doctor`, `test`), `tests/test_core.py` (the
+  `aether_core` pybind11 bindings: `hash_file`, `compare_metadata`, `split_and_hash_safetensors`,
+  skipped cleanly via `pytest.importorskip` if the native core isn't built), and
+  `tests/test_registry.py` (registry/config load-save round-trips), on top of the existing
+  `test_vault.py`/`test_plugins.py`. Shared `tests/conftest.py` `repo` fixture bootstraps a real
+  `.av` repo via `av init` rather than hand-rolled directories.
+- **`av doctor`**: New read-only diagnostic command — checks native core availability, remote
+  server reachability, index/pointer consistency, the pending-push queue, and leftover
+  interrupted-write temp files. No auto-repair (`--fix`) yet; see the Open Source Roadmap.
+- **`av test`**: New dev-only command that runs the project's own pytest suite via
+  `python -m pytest` from the installed package's source root; gives a clear error instead of a
+  crash on a non-editable (wheel) install.
+- **CI**: New `.github/workflows/tests.yml` (GitHub Actions, `windows-latest`) runs the full
+  suite (with `pip install -e .[dev]`, which builds the C++ core) on every push/PR.
+- **Found and fixed while building this suite** (manual end-to-end debugging, not just unit
+  tests — see `Probleme.md`): `av checkout` never restored `code`-type files (only
+  `artifact`-type), and `av add` never wrote a CAS object for code/sub-threshold files in the
+  first place — so rolling back code to an older commit was silently a no-op despite reporting
+  success. Fixed by writing every tracked file (not just LFS artifacts) into `.av/objects/` on
+  `add`, restoring any changed file type on `checkout`, and uploading code objects to the remote
+  in `upload_commit_objects()`.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

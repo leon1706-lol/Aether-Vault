@@ -10,6 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
+  <img src="https://img.shields.io/badge/tests-45%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="45 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -227,6 +228,20 @@ Trigger a mark-and-sweep garbage collection on the remote server to purge orphan
 av gc
 ```
 
+### `av doctor`
+Diagnose common repo and environment problems: native core availability, remote server reachability, index/pointer consistency, the pending-push queue, and leftover temp files from interrupted writes. Read-only — reports issues but does not modify anything. Diagnostics only in this release — no `--fix` flag yet; see the Open Source Roadmap.
+```bash
+av doctor
+```
+
+### `av test`
+**Development only.** Runs Aether-Vault's own pytest suite from source. Requires an editable/dev install (`pip install -e .[dev]`) — not a tool for inspecting an end user's `.av/` repository (use `av doctor` for that).
+```bash
+av test                  # run the full suite
+av test -k checkout      # only run tests matching "checkout"
+av test --cov            # with a coverage report
+```
+
 ### `av handoff` — Agent Context Export
 While most ML tracking tools (MLflow, DVC, W&B) record experiments for humans to read, `av handoff` generates a structured, machine-readable context snapshot for **AI agents** picking up the work — branch, commit, tags, metrics, model/dataset lineage, and an optional freeform instruction note, in an open `.avh` (Aether Vault Handoff) JSON format. Every invocation also writes a human-readable Markdown note into `Aether-Handoff/`, indexed chronologically by a central hub file.
 
@@ -321,6 +336,8 @@ More development-process documents will live under [`development/`](development/
 | ✅ | **Agent Context Handoff** — Open `.avh` format + `av handoff` snapshots for AI-agent-to-agent ML pipeline handoff, including per-layer weight-diffing |
 | ✅ | **Weight Diffing (Visual)** — A "Weight Diff" tab in the Web UI: drag two checkpoints from a list into comparison slots to get a colored layer heatmap, summary stats, and a per-layer depth chart of what changed |
 | ✅ | **Framework Plugins** — Native callbacks for PyTorch Lightning & HuggingFace Transformers |
+| ✅ | **Diagnostics (`av doctor`)** — Read-only health check for native core, server reachability, index/pointer consistency, and the pending-push queue |
+| 🔲 | **`av doctor --fix`** — Auto-repair mode for `av doctor`: re-link orphaned `.av-pointer` files to their objects, clear stale `.tmp.*` leftovers, and retry/clear unrecoverable pending-push entries, instead of just reporting them |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
 
 ---

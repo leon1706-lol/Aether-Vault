@@ -442,3 +442,42 @@ mocks) rather than unit tests alone.
   the real repo.
 - **Verified:** Re-ran the full suite from the repo root; confirmed no `mlruns/` directory is
   created there afterward (`git status` clean of it).
+
+---
+
+## ✅ Fixed — Minimum-viable test suite + diagnostics (2026-06-25)
+
+Added a pytest suite covering the CLI commands (`init`/`add`/`status`/`commit`/`checkout`), the
+`aether_core` C++ bindings, and registry/config load-save, plus two new commands (`av doctor`,
+`av test`). Found via real end-to-end manual testing (not just unit tests) while writing the
+`checkout` tests below.
+
+### [8] `av checkout` never restores `code`-type files — only `artifact`-type
+- **Files:** `python/av_cli/main.py` (`add`, `checkout`, `upload_commit_objects`).
+- **Problem:** `add()` only ever copied a file's bytes into `.av/objects/<hash>` when it was
+  classified `artifact` **and** exceeded the LFS size threshold; every `code`-type file (and any
+  sub-threshold artifact) had its hash recorded in the index/commit tree but its actual bytes
+  were never written anywhere outside the live working-tree file. `checkout()`'s restore loop
+  (the unified flat-tree format from PR #8) then only materialized entries where
+  `file_type == "artifact"` — so checking out an older commit silently left every `code` file at
+  whatever content the working tree already had, while still printing
+  `"Checked out '<hash>'"` and reporting a clean `av status` afterward. `upload_commit_objects()`
+  had the same `type != "artifact"` skip, so even a successful remote push never carried code
+  bytes either.
+- **Impact:** For a tool whose entire pitch is versioning "the Holy Trinity" (code + models +
+  datasets) together, the **code** pillar could never actually be rolled back — `av checkout
+  <old-commit>` silently no-op'd on every `.py`/`.json`/`.md`/etc. file. Manual repro: commit
+  `train.py` with `print('v1')`, overwrite + commit `print('v2')`, `av checkout <v1-hash>` →
+  `train.py` still read `print('v2')`, with no error of any kind.
+- **Fix:** `add()` now writes a CAS object for **every** tracked file regardless of type/size
+  (not just LFS-thresholded artifacts); `checkout()`'s restore step and
+  `upload_commit_objects()` no longer gate on `file_type == "artifact"` — both apply uniformly to
+  every tree entry. The artifact-specific layer-reassembly path is unaffected (code never has
+  `layers`, so it always falls through to the plain copy/download branch).
+- **Verified:** Manual repro above re-run after the fix — `train.py` correctly reads `print('v1')`
+  after `av checkout <v1-hash>`; `tests/test_cli.py::test_checkout_restores_previous_commit` and
+  `test_checkout_refuses_with_uncommitted_changes_without_force` (both use a tracked `code`-type
+  file) pass.
+- **Note:** This doubles on-disk storage for tracked code files (working-tree copy + CAS copy) —
+  the same tradeoff git itself makes for every tracked blob, and necessary for checkout to have
+  anything to restore from.

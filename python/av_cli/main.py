@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -77,6 +78,16 @@ def find_repo_root() -> Path | None:
         if (parent / ".av").is_dir():
             return parent
     return None
+
+
+def _find_source_root() -> Path:
+    """Locate the aether-vault source checkout this package was installed from.
+
+    Only meaningful for an editable/dev install (`pip install -e .`); a wheel install has no
+    `tests/` directory underneath it. Factored out as its own function (rather than inlined in
+    `test_cmd`) so it can be monkeypatched independently in tests.
+    """
+    return Path(__file__).parents[2]  # av_cli/ → python/ → aether-vault/
 
 
 def ensure_repo() -> Path:
@@ -208,7 +219,12 @@ def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) 
 
 
 def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) -> None:
-    """Upload every artifact's object/layer shards referenced by a commit tree.
+    """Upload every tracked file's object/layer shards referenced by a commit tree.
+
+    Covers every type (`code` and `artifact` alike), not just artifacts — `add()` now writes
+    a CAS object for every tracked file (see its comment), so a remote checkout/clone needs
+    code's bytes uploaded too, or `av checkout` against the remote would restore artifacts but
+    silently leave code files at whatever the puller's working tree already had.
 
     Must run BEFORE push_commit(): the server stores each tree entry's object hash as a
     foreign key into its objects table (see DBTree.object_hash in av_server/models.py), so
@@ -216,8 +232,6 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
     lands in the database even though the server used to (incorrectly) report success.
     """
     for rel_path, info in tree.items():
-        if info.get("type") != "artifact":
-            continue
         # Upload individual layer shards first (PR #8)
         for layer in info.get("layers", []):
             l_hash = layer["hash"]
@@ -474,6 +488,17 @@ def add(paths: tuple) -> None:
                 idx.save()
             click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {len(layers)} layers)", fg="green")
         else:
+            # Every tracked file — including code and sub-threshold artifacts, not just
+            # LFS-pointered ones — needs a durable copy under .av/objects/. Without this,
+            # `av checkout` to an older commit has no content to restore a code/small file
+            # from (only its hash was ever recorded), so rolling back code was silently a
+            # no-op. See development/Probleme.md for the full writeup.
+            obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
+            obj_dir.mkdir(parents=True, exist_ok=True)
+            obj_path = obj_dir / file_hash[2:]
+            if not obj_path.exists():
+                shutil.copy2(fpath, obj_path)
+
             idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None)
             click.secho(f"Staged [{file_type.upper()}] {rel_path}", fg="green")
 
@@ -803,40 +828,44 @@ def checkout(target: str, force: bool) -> None:
             if layers:
                 idx.entries[rel_path]["layers"] = layers
 
-            if file_type == "artifact":
-                obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
-                dest = repo_root / rel_path
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                
-                if layers and not obj_path.exists():
-                    click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
-                    try:
-                        with open(dest, "wb") as f_out:
-                            for layer in layers:
-                                lh = layer["hash"]
-                                l_obj = repo_root / ".av" / "objects" / lh[:2] / lh[2:]
-                                if not l_obj.exists() and client.server_available():
-                                    client.download_object(lh, l_obj)
-                                if not l_obj.exists():
-                                    raise click.ClickException(
-                                        f"Missing layer {lh} for {rel_path}; checkout aborted to avoid a corrupt artifact"
-                                    )
-                                with open(l_obj, "rb") as f_in:
-                                    shutil.copyfileobj(f_in, f_out)
-                    except click.ClickException:
-                        dest.unlink(missing_ok=True)
-                        raise
+            # Restore every tracked file's content from the CAS, not just artifacts — `code`
+            # files are written to .av/objects by `add()` too (see its comment there), so an
+            # older commit's code must be materialized here the same way, or `av checkout`
+            # would silently leave the working tree's code untouched while still claiming
+            # success (development/Probleme.md).
+            obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
+            dest = repo_root / rel_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
 
-                    obj_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(dest, obj_path)
-                else:
-                    if obj_path.exists():
-                        shutil.copy2(obj_path, dest)
-                    elif client.server_available():
-                        click.echo(f"Downloading {rel_path}...")
-                        if client.download_object(h, dest):
-                            obj_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(dest, obj_path)
+            if layers and not obj_path.exists():
+                click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
+                try:
+                    with open(dest, "wb") as f_out:
+                        for layer in layers:
+                            lh = layer["hash"]
+                            l_obj = repo_root / ".av" / "objects" / lh[:2] / lh[2:]
+                            if not l_obj.exists() and client.server_available():
+                                client.download_object(lh, l_obj)
+                            if not l_obj.exists():
+                                raise click.ClickException(
+                                    f"Missing layer {lh} for {rel_path}; checkout aborted to avoid a corrupt artifact"
+                                )
+                            with open(l_obj, "rb") as f_in:
+                                shutil.copyfileobj(f_in, f_out)
+                except click.ClickException:
+                    dest.unlink(missing_ok=True)
+                    raise
+
+                obj_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dest, obj_path)
+            else:
+                if obj_path.exists():
+                    shutil.copy2(obj_path, dest)
+                elif client.server_available():
+                    click.echo(f"Downloading {rel_path}...")
+                    if client.download_object(h, dest):
+                        obj_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(dest, obj_path)
 
     for rel_path in old_entries:
         if rel_path not in idx.entries:
@@ -952,6 +981,129 @@ def gc() -> None:
 
 
 @cli.command()
+def doctor() -> None:
+    """Diagnose common repo and environment problems.
+
+    Read-only: reports issues (native core availability, server reachability, index/pointer
+    consistency, pending-push queue, leftover temp files) without modifying anything. There is
+    no auto-repair (`--fix`) yet — see the Open Source Roadmap in README.md.
+    """
+    repo_root = ensure_repo()
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    av_dir = repo_root / ".av"
+
+    click.secho("Aether-Vault Doctor", bold=True)
+    click.secho("-------------------", bold=True)
+
+    warning_count = 0
+
+    def ok(msg: str) -> None:
+        click.secho(f"[OK]    {msg}", fg="green")
+
+    def warn(msg: str) -> None:
+        nonlocal warning_count
+        warning_count += 1
+        click.secho(f"[WARN]  {msg}", fg="yellow")
+
+    required = [av_dir / "objects", av_dir / "refs" / "heads", av_dir / "commits", av_dir / "HEAD"]
+    missing = [str(p.relative_to(repo_root)) for p in required if not p.exists()]
+    if missing:
+        warn(f"Missing repository structure: {', '.join(missing)}")
+    else:
+        ok(f"Repository found at {av_dir}")
+
+    if aether_core:
+        ok("Native core (aether_core) loaded — hashing runs at full speed")
+    else:
+        warn("Native core (aether_core) not loaded — falling back to slower Python hashing")
+
+    if client.server_available():
+        ok(f"Remote server {cfg.get('remote_url')} reachable")
+    else:
+        warn(f"Remote server {cfg.get('remote_url')} unreachable — commits will queue locally")
+
+    idx = Index(repo_root)
+    ok(f"Index (.av/index) is valid JSON, {len(idx.entries)} entries")
+
+    # An entry with a pointer but no matching CAS object means `av checkout` would silently
+    # fail to materialize that file's real content.
+    orphaned = [
+        rel_path
+        for rel_path, entry in idx.entries.items()
+        if entry.get("pointer")
+        and not (av_dir / "objects" / entry["hash"][:2] / entry["hash"][2:]).exists()
+    ]
+    if orphaned:
+        warn(f"{len(orphaned)} pointer entry(ies) missing their object: {', '.join(orphaned)}")
+    else:
+        pointer_count = sum(1 for e in idx.entries.values() if e.get("pointer"))
+        ok(f"No orphaned pointer entries ({pointer_count} pointer(s), all matched)")
+
+    # `.av-pointer` files on disk with no corresponding tracked index entry — left behind by a
+    # manual delete/rename of the original file outside of `av`.
+    stale_pointers = []
+    for dirpath, dirnames, files in os.walk(repo_root):
+        dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
+        for f in files:
+            if not f.endswith(".av-pointer"):
+                continue
+            ptr_path = Path(dirpath) / f
+            original_rel = str(ptr_path.relative_to(repo_root))[: -len(".av-pointer")].replace("\\", "/")
+            if original_rel not in idx.entries:
+                stale_pointers.append(str(ptr_path.relative_to(repo_root)).replace("\\", "/"))
+    if stale_pointers:
+        warn(f"{len(stale_pointers)} stale .av-pointer file(s) with no tracked entry: {', '.join(stale_pointers)}")
+
+    pending = load_pending_push(repo_root)
+    if pending:
+        warn(f"{len(pending)} commit(s) pending push (.av/pending_push) — run `av push` once the server is back")
+    else:
+        ok("No commits pending push")
+
+    tmp_leftovers = [str(p.relative_to(repo_root)) for p in av_dir.rglob("*.tmp.*")]
+    if tmp_leftovers:
+        warn(f"{len(tmp_leftovers)} leftover temp file(s) from an interrupted write: {', '.join(tmp_leftovers)}")
+    else:
+        ok("No *.tmp.* leftover files in .av/")
+
+    click.echo("")
+    if warning_count:
+        click.secho(f"{warning_count} warning(s), 0 errors.", fg="yellow", bold=True)
+    else:
+        click.secho("Everything looks good.", fg="green", bold=True)
+
+
+@cli.command(name="test")
+@click.option("-k", "test_filter", default=None, help="Only run tests matching this substring (forwarded to pytest -k).")
+@click.option("--cov", is_flag=True, default=False, help="Run with a coverage report (--cov=python --cov-report=term-missing).")
+def test_cmd(test_filter: str | None, cov: bool) -> None:
+    """(Development only) Run Aether-Vault's own pytest suite from source.
+
+    Requires an editable/dev install (`pip install -e .[dev]`) — this is not a tool for
+    inspecting an end user's .av/ repository; see `av doctor` for that.
+    """
+    source_root = _find_source_root()
+    tests_dir = source_root / "tests"
+    if not tests_dir.is_dir():
+        click.secho(
+            "av test requires a development install; run from a git clone with `pip install -e .[dev]`",
+            fg="red",
+        )
+        sys.exit(1)
+
+    args = [sys.executable, "-m", "pytest", str(tests_dir)]
+    if test_filter:
+        args += ["-k", test_filter]
+    if cov:
+        args += ["--cov=python", "--cov-report=term-missing"]
+
+    click.secho(f"Running Aether-Vault's test suite (pytest {' '.join(args[3:])})...", fg="cyan")
+    result = subprocess.run(args, cwd=source_root)
+    sys.exit(result.returncode)
+
+
+@cli.command()
 @click.option("--update", is_flag=True, help="Regenerate and update the markdown vault.")
 def graph(update: bool) -> None:
     """Generate or update a markdown vault of code dependencies for Obsidian."""
@@ -1060,13 +1212,12 @@ def webui_cmd(rebuild: bool) -> None:
     browser instead of re-running compose (use --rebuild to force a fresh image build after
     changing webui source code).
     """
-    import subprocess
     import time
     import webbrowser
     import urllib.request
     import urllib.error
 
-    repo_root = Path(__file__).parents[2]  # av_cli/ → python/ → aether-vault/
+    repo_root = _find_source_root()
     compose_file = repo_root / "docker-compose.yml"
     url = "http://localhost:3000"
 
