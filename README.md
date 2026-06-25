@@ -336,14 +336,12 @@ More development-process documents will live under [`development/`](development/
 
 | Status | Feature |
 |---|---|
-| ✅ | **Web UI Dashboard** — Browser interface for commit graph, branches & ML metrics (`av webui`) |
-| ✅ | **Offline-Resilient Commits** — Change-aware staging + `.av/pending_push` queue + `av push`, so no commit is lost or dashboard-invisible due to a down registry |
-| ✅ | **Agent Context Handoff** — Open `.avh` format + `av handoff` snapshots for AI-agent-to-agent ML pipeline handoff, including per-layer weight-diffing |
-| ✅ | **Weight Diffing (Visual)** — A "Weight Diff" tab in the Web UI: drag two checkpoints from a list into comparison slots to get a colored layer heatmap, summary stats, and a per-layer depth chart of what changed |
-| ✅ | **Framework Plugins** — Native callbacks for PyTorch Lightning & HuggingFace Transformers |
-| ✅ | **Diagnostics (`av doctor`)** — Read-only health check for native core, server reachability, index/pointer consistency, and the pending-push queue |
-| ✅ | **`av doctor --fix`** — Auto-repair mode for `av doctor` (plus `--dry-run` to preview): re-links orphaned `.av-pointer` files to their objects, clears stale `.tmp.*` leftovers, and retries/clears unrecoverable pending-push entries, instead of just reporting them |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
+| 🔲 | **`av_server` test coverage** — currently 0%: no automated tests for the FastAPI endpoints (commits, refs, objects, GC), the `validate_ref_name` path-traversal fix, payload limits (`MAX_TREE_ENTRIES`/`MAX_METRICS`/`MAX_TAGS`), or idempotent push (`IntegrityError`→409) — the one component handling untrusted network input |
+| 🔲 | **Integration tests against a live stack** — every existing CLI test runs with the remote server deliberately unreachable (the offline-queue path); nothing exercises a real Postgres/Redis/FastAPI round-trip as a repeatable test (only ever verified manually, per `Probleme.md`/`HANDOFF.MD`) |
+| 🔲 | **`webui/` (Next.js) test suite** — no Jest/Vitest/Playwright setup; the dashboard, Weight Diff panel, and commit graph are entirely unverified by automation |
+| 🔲 | **Framework-plugin callbacks running in CI** — `tests.yml` doesn't install the `lightning`/`transformers` extras, so the 2 tests exercising real callback objects (not just the import-error path) always skip in CI, same as locally |
+| 🔲 | **Direct tests for `branch`/`push`/`gc`/`list-meta`/`webui`/`graph`/`config` and the `import-*` CLI entry points** — only their underlying plugin functions are tested today, not the CLI wiring itself |
 
 ---
 
