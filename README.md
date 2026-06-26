@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-84%2F108%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="84 of 108 tests passing">
+  <img src="https://img.shields.io/badge/tests-105%2F108%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="105 of 108 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -247,6 +247,15 @@ av test -k checkout      # only run tests matching "checkout"
 av test --cov            # with a coverage report
 av test --webui          # also run the webui/ Vitest suite (npm test) after the Python suite
 ```
+`--webui` runs `webui/`'s pure-logic *and* component tests (Vitest + React Testing Library). The
+Playwright E2E suite below (Weight Diff + dashboard, against a real `docker compose` stack) is
+separate, since it needs the live backend running:
+```bash
+docker compose up -d db redis aether-vault-server   # real backend the E2E flows talk to
+python webui/e2e/seed_data.py                       # pushes 2 real commits via the actual av CLI
+cd webui && npm run build && npm run start &        # or `npm run dev` for a quicker iteration loop
+npx playwright test                                 # runs against http://localhost:3000
+```
 
 ### `av handoff` — Agent Context Export
 While most ML tracking tools (MLflow, DVC, W&B) record experiments for humans to read, `av handoff` generates a structured, machine-readable context snapshot for **AI agents** picking up the work — branch, commit, tags, metrics, model/dataset lineage, and an optional freeform instruction note, in an open `.avh` (Aether Vault Handoff) JSON format. Every invocation also writes a human-readable Markdown note into `Aether-Handoff/`, indexed chronologically by a central hub file.
@@ -338,7 +347,6 @@ More development-process documents will live under [`development/`](development/
 | Status | Feature |
 |---|---|
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
-| 🔲 | **`webui/` component & E2E tests** — `webui/` now has a Vitest suite covering the pure diff/formatting logic (`diffWeights.ts`, `api.ts`), but React Testing Library component tests and Playwright E2E (rendering, the Weight Diff UI interactions, the commit graph) are still unverified by automation |
 
 ---
 

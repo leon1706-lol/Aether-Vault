@@ -513,3 +513,104 @@ new `--webui` flag for real (not mocked) on this Windows dev machine.
 - **Verified:** `av test --webui -k test_validate_ref_name_accepts_normal_names` run for real
   (not mocked) on this machine — failed with the npm-not-found message before the fix, ran both
   suites successfully (pytest, then the real `npm test` → Vitest) after it.
+
+---
+
+## ✅ Fixed — `tests/test_server.py` run for real against a live Docker stack (2026-06-26)
+
+`docker compose up -d db redis aether-vault-server` was started and the 17 `test_server.py`
+tests (previously only verified by static source review) were run against it for the first
+time. Found and fixed one genuine production bug plus two test-infrastructure issues.
+
+### [7] GC's physical-shard sweep silently never deletes anything on a host ahead of UTC
+- **File:** `python/av_server/server.py` (`run_garbage_collection`).
+- **Problem:** `grace_ts = gc_cutoff.timestamp()`, where `gc_cutoff` is a **naive** datetime that
+  represents UTC (per `utcnow_naive()`'s own docstring). Calling `.timestamp()` directly on a
+  naive datetime makes Python treat it as **local** time when converting to a Unix epoch — on
+  this host (UTC+2), that silently shifted `grace_ts` two hours earlier than the real cutoff.
+  Since `obj_path.stat().st_mtime` is a real, correctly-UTC-based epoch, the comparison
+  `st_mtime >= grace_ts` then almost never evaluates as "old enough to delete": a file would
+  need to be more than `GC_GRACE_SECONDS + |local UTC offset|` old before the physical sweep
+  would ever touch it — on a host *behind* UTC, the bug runs the other way and would delete
+  objects **before** their real grace window expires, defeating the entire purpose of the grace
+  period (protecting objects mid-upload from a concurrent GC).
+- **How found:** `test_gc_respects_grace_period_then_sweeps_when_aged` — after zeroing
+  `GC_GRACE_SECONDS`, the test asserted the now-orphaned object's shard file was actually
+  removed from disk; it consistently returned `deleted_objects: 0` and the file remained on
+  disk, even though the DB-side deletion (a naive-to-naive datetime comparison, unaffected by
+  this bug) correctly removed the corresponding row. The DB/filesystem inconsistency was the
+  tell — only the epoch-converting comparison was wrong.
+- **Fix:** `grace_ts = gc_cutoff.replace(tzinfo=timezone.utc).timestamp()` — attaching the
+  correct `tzinfo` before converting to epoch makes `.timestamp()` compute the right value
+  regardless of the host's local timezone.
+- **Verified:** Re-ran the test after the fix — the aged object's shard file is now actually
+  removed from disk, and `deleted_objects: 1` is returned as expected.
+
+### [3] Test-only: `tests/test_server.py`'s per-test DB cleanup crashed at teardown
+- **File:** `tests/test_server.py` (`_truncate_all`, `db` fixture).
+- **Problem:** The cleanup helper ran `async with engine.begin() as conn: ...` using the
+  module's pooled SQLAlchemy async engine, invoked via a fresh `asyncio.run()` call in the
+  fixture's teardown. The engine's pooled connection is bound to whichever event loop first used
+  it (`TestClient`'s own internal lifespan loop); reusing that pool from a *different* loop
+  (the one `asyncio.run()` spins up for the teardown call) raised
+  `RuntimeError: ... got Future ... attached to a different loop` on every single test.
+- **Fix:** Open a brand-new `asyncpg.connect()` directly (bypassing the SQLAlchemy pool
+  entirely) for the truncate, scoped wholly to the teardown call's own event loop.
+- **Verified:** Re-ran the suite after the fix — no more teardown errors.
+
+### [2] Test-only: leftover orphan shard files from earlier tests polluted the GC grace test
+- **File:** `tests/test_server.py` (`db` fixture).
+- **Problem:** Per-test cleanup truncated the DB tables but never cleared
+  `CASStorage`'s on-disk `objects/`/`commits/`/`refs/` directories, which are shared across the
+  whole test session. Earlier tests' uploaded objects (now orphaned once their DB rows were
+  truncated) accumulated on disk; once the GC timezone bug above was fixed, the grace-period
+  test's `deleted_objects == 1` assertion became flaky — it correctly swept *all* eligible
+  orphans on disk, not just the one this specific test created (observed once as `3`).
+- **Fix:** `_clear_storage_dirs()` added to the `db` fixture's teardown, deleting file contents
+  (not the directories themselves) from all three storage subdirectories after every test.
+- **Verified:** Full `test_server.py` run is now stable at 29 passed, 0 failed.
+
+### [2] Test-only: the real-wire test's reachability check raced with collection-time load
+- **File:** `tests/test_server.py` (`test_cli_commit_pushes_to_a_live_server`).
+- **Problem:** `_real_server_reachable()` was wired up as a `@pytest.mark.skipif(...)`
+  condition, which pytest evaluates exactly once, at module-collection time — the very start of
+  the whole run, before any other test executes. When the full suite was first run through the
+  plugin `venv/` together with the live Docker stack (a much heavier collection phase, importing
+  `torch`/`transformers`/`lightning`), the 1.5s `httpx` reachability check raced against that
+  load spike and read the server as unreachable even though it was confirmed healthy and fast
+  (51ms) moments later via a direct `curl`.
+- **Fix:** Moved the check into the test body itself (`pytest.skip(...)` called lazily, only
+  when this specific test actually runs, after collection and ~100 other tests have already
+  settled) instead of a collection-time `skipif` decorator.
+- **Verified:** Re-ran the full combined venv+Docker suite twice after the fix — stable at
+  105 passed, 3 skipped (the 3 permanent-by-design "raises ImportError when missing" tests).
+
+---
+
+## ✅ Fixed — `webui/` test infrastructure files broke the production build (2026-06-26)
+
+Found while adding React Testing Library component tests and a Playwright E2E suite for
+`webui/` (the one remaining roadmap line).
+
+### [6] `vitest.setup.ts` broke `next build` via an "unused `@ts-expect-error`" type error
+- **File:** `webui/vitest.setup.ts`, `webui/tsconfig.json`.
+- **Problem:** `next build` type-checks the *entire* TypeScript project, including files that
+  are never part of the shipped app — `vitest.setup.ts` was picked up by `tsconfig.json`'s
+  broad `"**/*.ts"` include. That file stubs `ResizeObserver` for jsdom with an
+  `@ts-expect-error` comment suppressing a type error that exists under Vitest's type
+  resolution but not under Next's (the DOM lib types it pulls in already cover the assignment) —
+  TypeScript itself treats an `@ts-expect-error` with nothing to suppress as an error
+  ("Unused '@ts-expect-error' directive"), so the production Docker image build for
+  `aether-vault-webui` failed outright (`docker compose build aether-vault-webui` → exit 1).
+- **How found:** The Weight Diff E2E test was timing out with the dashboard stuck on
+  "Connecting…"/"Loading checkpoints…" forever, even though a manual `fetch()` to the API from
+  inside the same browser context succeeded — the running `aether-vault-webui` container was
+  46 hours old (built before several of this session's fixes); rebuilding it to get current
+  source is what actually surfaced the type-check failure instead of silently shipping stale
+  code.
+- **Fix:** Replaced the `@ts-expect-error` comment with a plain type cast (never errors either
+  way, so it can't go stale), and added `vitest.config.ts`/`vitest.setup.ts`/
+  `playwright.config.ts`/`e2e/`/`src/**/*.test.ts(x)` to `tsconfig.json`'s `exclude` so test-only
+  files are never part of the app's production type-check scope again.
+- **Verified:** `docker compose build aether-vault-webui` succeeds; the rebuilt container's
+  Weight Diff tab now loads real data and both new Playwright specs pass against it.

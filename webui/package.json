@@ -6,21 +6,28 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
+    "date-fns": "3.6.0",
+    "lucide-react": "^0.400.0",
     "next": "14.2.5",
     "react": "^18",
     "react-dom": "^18",
-    "recharts": "^2.12.7",
-    "lucide-react": "^0.400.0",
-    "date-fns": "3.6.0"
+    "recharts": "^2.12.7"
   },
   "devDependencies": {
-    "typescript": "^5",
+    "@playwright/test": "^1.61.1",
+    "@testing-library/jest-dom": "^6.4.0",
+    "@testing-library/react": "^16.0.0",
+    "@testing-library/user-event": "^14.5.0",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
+    "@vitejs/plugin-react": "^4.3.0",
+    "jsdom": "^25.0.0",
+    "typescript": "^5",
     "vitest": "^2.0.0"
   }
 }

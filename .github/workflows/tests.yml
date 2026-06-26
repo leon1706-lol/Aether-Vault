@@ -108,3 +108,93 @@ jobs:
 
       - name: Run av_server tests (TestClient + real-wire) against live Postgres + Redis
         run: pytest tests/test_server.py -v
+
+  webui-e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: av_user
+          POSTGRES_PASSWORD: av_password
+          POSTGRES_DB: aether_vault
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis/redis-stack-server:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Aether-Vault (for the av CLI used by webui/e2e/seed_data.py)
+        run: pip install -e .
+
+      - name: Start aether-vault-server
+        env:
+          DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/api/health && break
+            sleep 1
+          done
+
+      - name: Seed checkpoint data via the real av CLI
+        run: python webui/e2e/seed_data.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install webui dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: webui
+        run: npx playwright install --with-deps chromium
+
+      # Built fresh in this job (not the docker-compose webui image) so the E2E run always
+      # exercises the current checkout's source, not a stale cached Docker layer — that
+      # exact staleness once produced a passing-looking-but-broken local run, see
+      # development/Probleme.md.
+      - name: Build and start the webui
+        working-directory: webui
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+        run: |
+          npm run build
+          nohup npm run start &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000 && break
+            sleep 1
+          done
+
+      - name: Run Playwright E2E tests
+        working-directory: webui
+        run: npx playwright test
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: webui/playwright-report/
+          retention-days: 7

@@ -575,7 +575,15 @@ async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dic
 
         # --- Sweep physical shard files (skip alive + recently-written, off the event loop) ---
         loop = asyncio.get_running_loop()
-        grace_ts = gc_cutoff.timestamp()
+        # gc_cutoff is a *naive* datetime that represents UTC (see utcnow_naive()'s docstring).
+        # Calling .timestamp() directly on a naive datetime makes Python treat it as *local*
+        # time, silently shifting the resulting epoch by the host's UTC offset — on a host
+        # ahead of UTC this makes grace_ts artificially too early, so st_mtime (a real,
+        # correctly-UTC-based epoch) almost never looks "old enough" and physical shards are
+        # never actually swept; on a host behind UTC it would do the opposite and delete
+        # objects *before* their real grace window expires. Attaching tzinfo=utc first makes
+        # .timestamp() compute the correct epoch regardless of the host's local timezone.
+        grace_ts = gc_cutoff.replace(tzinfo=timezone.utc).timestamp()
 
         def purge_orphans():
             count = 0

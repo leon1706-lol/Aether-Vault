@@ -47,6 +47,9 @@ venv.bak/
 # Web UI
 webui/node_modules/
 webui/.next/
+webui/test-results/
+webui/playwright-report/
+webui/blob-report/
 
 # IDEs / OS
 .vscode/

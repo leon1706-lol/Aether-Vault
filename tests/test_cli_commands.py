@@ -47,10 +47,16 @@ def test_push_with_nothing_pending_is_noop(repo):
     assert "nothing pending" in result.output.lower()
 
 
-def test_push_with_pending_and_unreachable_server_reports_error(repo):
+def test_push_with_pending_and_unreachable_server_reports_error(repo, monkeypatch):
+    # Don't rely on the ambient environment having no real server reachable on the default
+    # remote_url — explicitly force "unreachable" so this test is deterministic whether or not
+    # a real aether-vault-server happens to be running on localhost:8000 during the test run.
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.VaultClient, "server_available", lambda self: False)
+
     (repo / "f.py").write_text("x = 1")
     invoke("add", "f.py")
-    invoke("commit", "-m", "first")  # queues .av/pending_push since no server is reachable
+    invoke("commit", "-m", "first")  # queues .av/pending_push since the server is forced unreachable
 
     result = invoke("push")
     assert result.exit_code == 0
@@ -58,11 +64,16 @@ def test_push_with_pending_and_unreachable_server_reports_error(repo):
 
 
 def test_push_flushes_pending_when_server_reachable(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    # Force unreachable during the commit so it actually queues .av/pending_push (regardless of
+    # whether a real server happens to be reachable in this test run), then force reachable for
+    # the push itself.
+    monkeypatch.setattr(main_module.VaultClient, "server_available", lambda self: False)
     (repo / "f.py").write_text("x = 1")
     invoke("add", "f.py")
     invoke("commit", "-m", "first")
 
-    import python.av_cli.main as main_module
     monkeypatch.setattr(main_module.VaultClient, "server_available", lambda self: True)
     monkeypatch.setattr(main_module, "flush_pending_push", lambda repo_root, client: [])
 
@@ -75,7 +86,10 @@ def test_push_flushes_pending_when_server_reachable(repo, monkeypatch):
 # av gc
 # ---------------------------------------------------------------------------
 
-def test_gc_reports_error_when_server_unreachable(repo):
+def test_gc_reports_error_when_server_unreachable(repo, monkeypatch):
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.VaultClient, "server_available", lambda self: False)
+
     result = invoke("gc")
     assert result.exit_code == 0
     assert "not reachable" in result.output.lower()

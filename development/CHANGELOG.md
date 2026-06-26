@@ -183,4 +183,84 @@ findings (resolved and still-open).
   before invoking it, falling back to the original clear error message only when that genuinely
   returns nothing.
 
+## Phase 20 — Framework-Plugin Tests Verified Against the Real Libraries
+- The 7 `tests/test_plugins.py` tests that previously always skipped in local dev (no
+  `lightning`/`transformers`/`mlflow` installed) were run for real for the first time, in an
+  isolated `venv/` (kept out of the main dev environment specifically to avoid pulling `torch`
+  — a multi-GB transitive dependency of both `lightning` and `transformers` — into it).
+  `pip install -e .[dev,lightning,transformers,mlflow]` succeeded cleanly; all 6 previously-
+  skipped callback/import tests now **pass** (not just skip), and the 3 "raises a clear
+  `ImportError` when missing" tests correctly flip to **skipped** instead (their entire purpose
+  is exercising the *absent*-dependency path, which no longer applies once the packages are
+  genuinely installed). Full suite re-run inside the same venv: 88 passed, 20 skipped (the
+  remaining skips are the 17 `test_server.py` tests needing Postgres/Redis/Docker, unrelated to
+  this venv) — zero regressions from having the heavier packages importable. No bugs found.
+
+## Phase 21 — `tests/test_server.py` Verified Against a Live Docker Stack
+- The 17 `av_server` tests that previously had only ever been verified by static source review
+  (no Docker available in earlier sessions) were run for real for the first time, against
+  `docker compose up -d db redis aether-vault-server` plus a dedicated `aether_vault_test`
+  database (created inside the same Postgres container, kept separate from the real dev
+  database so the tests' per-test `TRUNCATE` cleanup can never touch real data) and Redis
+  index `1` (kept separate from index `0`, the real server's default).
+- **Found and fixed a genuine production bug**: `run_garbage_collection`'s physical-shard sweep
+  computed its cutoff by calling `.timestamp()` directly on a naive UTC datetime, which Python
+  silently interprets as *local* time — on this host (UTC+2) that made the cutoff two hours too
+  early, so aged orphaned objects were never actually swept from disk (the DB-side row deletion
+  was unaffected, since it compares two naive datetimes directly without an epoch conversion).
+  On a host *behind* UTC, the same bug would delete objects *before* their grace period really
+  expired. Fixed by attaching `tzinfo=timezone.utc` before converting to an epoch. See
+  `Probleme.md` for the full writeup.
+- Also fixed two test-only issues surfaced by the same run: the per-test DB cleanup crashed at
+  teardown on every test (a SQLAlchemy pooled connection reused across a mismatched asyncio
+  event loop — fixed by using a fresh, self-contained `asyncpg` connection instead), and
+  leftover orphan shard files from earlier tests made the GC grace-period test's exact-count
+  assertion flaky (fixed by clearing the on-disk storage directories between tests, not just
+  the DB tables).
+- Final result: all 29 `test_server.py` tests pass (17 previously-skipped + 12 always-run pure
+  tests); full suite: 101 passed, 7 skipped (only the framework-plugin "raises ImportError when
+  missing" tests, unrelated to Docker), 0 failed.
+
+## Phase 22 — Combined venv + Docker: the True Test-Suite Maximum
+- Ran the full suite through the plugin `venv/` (Phase 20) *together with* the live Docker
+  stack (Phase 21) for the first time in one `pytest tests/` invocation — previously each had
+  only ever been verified separately. Result: **105 passed, 3 skipped, 0 failed** out of 108 —
+  the 3 remaining skips are permanent by design (the "raises a clear `ImportError` when missing"
+  tests, which structurally can never pass once their package is actually installed).
+- Found and fixed one real flakiness bug surfaced only by this heavier combined run: the
+  real-wire test's reachability check was a collection-time `skipif` condition, which raced
+  against the much heavier import phase (`torch`/`transformers`/`lightning`) and misread the
+  server as unreachable. Moved to a lazy, in-test check instead. See `Probleme.md`.
+- README test badge updated to `105/108` to reflect the real demonstrated maximum.
+
+## Phase 23 — `webui/` Component Tests (RTL) + Playwright E2E
+- **React Testing Library component tests**: extended the existing Vitest setup with a `jsdom`
+  environment scoped to `src/components/**` (the existing pure-logic tests stay on `node`), plus
+  `@vitejs/plugin-react` for JSX support and an explicit `afterEach(cleanup)` (Vitest doesn't
+  auto-register RTL's cleanup the way Jest does). New tests for `StatsRow`, `WeightHeatmap`,
+  `LayerDriftChart`, `CheckpointPicker`, `BranchList`, `CommitList`, and `MetricsChart` — 27 new
+  tests, 46 total in `webui/` now. `WeightDiffPanel`/`ProjectsPanel`/`useDashboard` are
+  deliberately still out of scope (they manage their own async fetch state; testing them
+  meaningfully needs either a fetch-mock layer or extracting that logic into a hook first).
+- **Playwright E2E**: two flows against the real `docker compose` stack — a dashboard smoke test
+  and a full Weight Diff comparison (select two real seeded checkpoints, assert the rendered
+  layer diff matches what was actually pushed). `webui/e2e/seed_data.py` seeds real data through
+  the actual `av` CLI (`CliRunner`, same pattern as `test_cli_commit_pushes_to_a_live_server`),
+  not synthetic API calls. New `webui-e2e` CI job (own service containers + a freshly-built
+  webui, not the cached docker-compose image — see the bug below for why that distinction
+  mattered here).
+- **Found and fixed a real bug**: adding `vitest.setup.ts` broke the *production* `next build` —
+  `next build` type-checks the whole project, and an `@ts-expect-error` directive that suppressed
+  a real Vitest-context type error was flagged as "unused" under Next's own type resolution
+  (TypeScript treats an unused suppression directive as its own error). Fixed by using a plain
+  type cast instead of a suppression comment, and excluded test-only files
+  (`vitest.config.ts`/`vitest.setup.ts`/`playwright.config.ts`/`e2e/`/`*.test.ts(x)`) from the
+  app's `tsconfig.json` scope so this category of cross-contamination can't recur.
+- **Also diagnosed (not a bug)**: the Weight Diff E2E test initially looked broken (checkpoint
+  rows never appeared) when run with 2 parallel Playwright workers — turned out to be genuine
+  slowness, not breakage: the panel resolves up to 30 commits' full Merkle trees via individual
+  sequential requests (no batched server endpoint for this exists yet), and 2 workers competing
+  for CPU/network made an already-slow ~15-20s load look like a hang. Fixed by pinning
+  `workers: 1` and raising the timeout, rather than "fixing" a feature that wasn't broken.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

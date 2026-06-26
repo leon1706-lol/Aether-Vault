@@ -19,7 +19,6 @@ from urllib.parse import urlsplit
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import text
 
 AV_TEST_DATABASE_URL = os.environ.get(
     "AV_TEST_DATABASE_URL",
@@ -36,7 +35,6 @@ os.environ["REDIS_URL"] = AV_TEST_REDIS_URL
 os.environ["AV_DATA_DIR"] = tempfile.mkdtemp(prefix="av-server-test-")
 
 import python.av_server.server as server_module  # noqa: E402
-from python.av_server.database import engine  # noqa: E402
 from python.av_server.server import app, validate_ref_name  # noqa: E402
 from python.av_server.storage import CASStorage  # noqa: E402
 
@@ -61,8 +59,17 @@ def _real_server_reachable() -> bool:
 
 
 async def _truncate_all() -> None:
-    async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE objects, trees, commits, refs CASCADE"))
+    # A raw asyncpg connection, not the SQLAlchemy async engine's pooled connection — the pool's
+    # connections are bound to whichever event loop first used them (TestClient's internal
+    # lifespan loop), so reusing the pool from a *separate* asyncio.run() call here raises
+    # "got Future ... attached to a different loop". Opening (and closing) a brand-new
+    # connection scoped entirely to this call's own loop avoids that cross-loop reuse.
+    import asyncpg
+    conn = await asyncpg.connect(AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"))
+    try:
+        await conn.execute("TRUNCATE objects, trees, commits, refs CASCADE")
+    finally:
+        await conn.close()
 
 
 def _hex_hash(seed: str) -> str:
@@ -95,11 +102,26 @@ def client():
         yield c
 
 
+def _clear_storage_dirs() -> None:
+    # _truncate_all() only clears the DB tables — any object a test uploaded via
+    # POST /api/objects/{hash} still has its physical shard file on disk afterward (CASStorage
+    # has no DB-driven TTL of its own). Without also clearing these, later tests in the same
+    # session (e.g. the GC grace-period test) see genuine orphan files left over from earlier
+    # tests and sweep them too, making "exactly N objects deleted" assertions flaky depending on
+    # what ran before. Clear file contents, not the directories themselves.
+    for d in (server_module.storage.objects_dir, server_module.storage.commits_dir, server_module.storage.refs_dir):
+        for p in d.rglob("*"):
+            if p.is_file():
+                p.unlink()
+
+
 @pytest.fixture
 def db(client):
-    """The TestClient, plus a guarantee that tables are truncated after this test runs."""
+    """The TestClient, plus a guarantee that tables and on-disk storage are reset after this
+    test runs."""
     yield client
     asyncio.run(_truncate_all())
+    _clear_storage_dirs()
 
 
 # ---------------------------------------------------------------------------
@@ -288,12 +310,18 @@ def test_gc_respects_grace_period_then_sweeps_when_aged(db, monkeypatch):
 # Real-wire test — needs the actual aether-vault-server process, not just TestClient
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(
-    not _real_server_reachable(),
-    reason="Live aether-vault-server not reachable on :8000; run "
-    "`docker compose up -d db redis aether-vault-server`",
-)
 def test_cli_commit_pushes_to_a_live_server(tmp_path, monkeypatch):
+    # Checked here (lazily, when this test actually runs) rather than via a `skipif` decorator
+    # (evaluated once at collection time, before any other test has run) — a `skipif` condition
+    # check competes with whatever the rest of collection/the test run is doing for CPU/network
+    # scheduling right at that single moment, and a slow tick there reads as "unreachable" even
+    # though the server is fine moments later (observed once in a heavy combined venv+Docker run).
+    if not _real_server_reachable():
+        pytest.skip(
+            "Live aether-vault-server not reachable on :8000; run "
+            "`docker compose up -d db redis aether-vault-server`"
+        )
+
     from click.testing import CliRunner
 
     from python.av_cli.main import cli
