@@ -20,3 +20,91 @@ jobs:
 
       - name: Run test suite
         run: pytest --cov=python --cov-report=term-missing tests/
+
+  plugin-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Aether-Vault with the Lightning/Transformers/MLflow extras
+        run: pip install -e .[dev,lightning,transformers,mlflow]
+
+      - name: Run framework-plugin tests
+        run: pytest tests/test_plugins.py -v
+
+  webui-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install webui dependencies
+        working-directory: webui
+        run: npm ci
+
+      - name: Run webui Vitest suite
+        working-directory: webui
+        run: npm test
+
+  server-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: av_user
+          POSTGRES_PASSWORD: av_password
+          POSTGRES_DB: aether_vault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis/redis-stack-server:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      AV_TEST_DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test
+      AV_TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Aether-Vault (builds the C++ core via pybind11)
+        run: pip install -e .[dev]
+
+      - name: Start aether-vault-server (for the real-wire test)
+        env:
+          DATABASE_URL: ${{ env.AV_TEST_DATABASE_URL }}
+          REDIS_URL: ${{ env.AV_TEST_REDIS_URL }}
+        run: |
+          nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/api/health && break
+            sleep 1
+          done
+
+      - name: Run av_server tests (TestClient + real-wire) against live Postgres + Redis
+        run: pytest tests/test_server.py -v

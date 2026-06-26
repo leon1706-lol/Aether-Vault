@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-45%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="45 tests passing">
+  <img src="https://img.shields.io/badge/tests-84%2F108%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="84 of 108 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -245,6 +245,7 @@ av doctor --fix --dry-run    # preview what --fix would do, without changing any
 av test                  # run the full suite
 av test -k checkout      # only run tests matching "checkout"
 av test --cov            # with a coverage report
+av test --webui          # also run the webui/ Vitest suite (npm test) after the Python suite
 ```
 
 ### `av handoff` — Agent Context Export
@@ -337,11 +338,7 @@ More development-process documents will live under [`development/`](development/
 | Status | Feature |
 |---|---|
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
-| 🔲 | **`av_server` test coverage** — currently 0%: no automated tests for the FastAPI endpoints (commits, refs, objects, GC), the `validate_ref_name` path-traversal fix, payload limits (`MAX_TREE_ENTRIES`/`MAX_METRICS`/`MAX_TAGS`), or idempotent push (`IntegrityError`→409) — the one component handling untrusted network input |
-| 🔲 | **Integration tests against a live stack** — every existing CLI test runs with the remote server deliberately unreachable (the offline-queue path); nothing exercises a real Postgres/Redis/FastAPI round-trip as a repeatable test (only ever verified manually, per `Probleme.md`/`HANDOFF.MD`) |
-| 🔲 | **`webui/` (Next.js) test suite** — no Jest/Vitest/Playwright setup; the dashboard, Weight Diff panel, and commit graph are entirely unverified by automation |
-| 🔲 | **Framework-plugin callbacks running in CI** — `tests.yml` doesn't install the `lightning`/`transformers` extras, so the 2 tests exercising real callback objects (not just the import-error path) always skip in CI, same as locally |
-| 🔲 | **Direct tests for `branch`/`push`/`gc`/`list-meta`/`webui`/`graph`/`config` and the `import-*` CLI entry points** — only their underlying plugin functions are tested today, not the CLI wiring itself |
+| 🔲 | **`webui/` component & E2E tests** — `webui/` now has a Vitest suite covering the pure diff/formatting logic (`diffWeights.ts`, `api.ts`), but React Testing Library component tests and Playwright E2E (rendering, the Weight Diff UI interactions, the commit graph) are still unverified by automation |
 
 ---
 

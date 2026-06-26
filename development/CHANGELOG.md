@@ -138,4 +138,49 @@ findings (resolved and still-open).
   correctly leaves the two genuinely-unrecoverable ones (no local or remote copy of the object)
   as `[WARN]`. No new bugs found during this pass.
 
+## Phase 19 — Closed the 5 Remaining Test-Coverage Roadmap Gaps
+- **`av_server` test coverage** (was 0%): new `tests/test_server.py` — pure validation tests
+  (`validate_ref_name` path-traversal rejection, `CASStorage._safe_ref_path` escape rejection,
+  always run) plus FastAPI `TestClient`-backed HTTP-layer tests (health, upload/download
+  round-trip, hash-mismatch rejection, idempotent duplicate-upload 409, `push_commit`'s payload
+  limits — `MAX_TREE_ENTRIES`/`MAX_TAGS`/`MAX_TAG_LEN`/`MAX_METRICS`/`MAX_MESSAGE_LEN` — all
+  422, duplicate-commit 409, ref update/get round-trip, project-scoped ref filtering, dashboard/
+  projects endpoint shape, and the GC grace-period logic both protecting a fresh object and
+  sweeping an aged one). Requires a reachable Postgres + Redis (`AV_TEST_DATABASE_URL`/
+  `AV_TEST_REDIS_URL`, sensible localhost defaults) — skips cleanly with a clear message
+  otherwise, same philosophy as `test_core.py`'s `importorskip`.
+- **Integration tests against a live stack**: one dedicated "real wire" test drives a real
+  `av init`/`add`/`commit` through the actual CLI against a genuinely running
+  `aether-vault-server` process (not just `TestClient`), then confirms the commit landed via a
+  direct `GET /api/commits/{hash}` — the first repeatable test of the real wire protocol rather
+  than the in-process ASGI call. Gated on `http://localhost:8000/api/health` responding.
+- **`webui/` test suite** (was none at all): added Vitest, covering the pure diff/formatting
+  logic — `diffWeights.ts`'s `diffFile`/`isModelPath`/`listModelPaths`/`unionModelPaths`
+  (including a regression test for the documented `__header__` pseudo-layer filtering) and
+  `api.ts`'s `formatBytes`/`shortHash`. React Testing Library component tests and Playwright
+  E2E are a deliberate, documented scope decision — not implemented this round (still 🔲 on the
+  README roadmap).
+- **Framework-plugin callbacks now actually run in CI**: root cause was `tests.yml` only ever
+  installing the `[dev]` extra, never `[lightning,transformers,mlflow]` — the 2 callback tests
+  (already written, already correct) silently always skipped. Fixed via a new `plugin-tests` CI
+  job that installs the extras and runs `tests/test_plugins.py`.
+- **Direct CLI command tests**: new `tests/test_cli_commands.py` covers `branch`, `push`, `gc`,
+  `list-meta`, `config`, `graph --update`, `webui` (Docker-not-running path), and all three
+  `import-lightning`/`import-transformers`/`import-mlflow` commands (via `sys.modules`
+  injection, since the real plugin modules raise `ImportError` at import time without their
+  optional extras installed — can't import-then-monkeypatch a module that doesn't import).
+- **New CI**: `plugin-tests` and `webui-tests` (both `ubuntu-latest`) and `server-tests`
+  (`ubuntu-latest` with Postgres + Redis as GitHub Actions service containers, plus a live
+  `uvicorn` process for the real-wire test) — four jobs total in `tests.yml` now.
+- **Bonus, not one of the 5 roadmap lines**: `av test --webui` runs the webui Vitest suite
+  after the Python suite in one command, combining exit codes — closes a real workflow friction
+  (two toolchains, two commands) rather than just the roadmap's literal ask.
+- **Found and fixed during manual debugging**: `av test --webui` failed with a "npm not found
+  on PATH" error on this Windows dev machine *despite npm being genuinely installed and on
+  PATH* — `subprocess.run(["npm", "test"], ...)` doesn't reliably resolve `npm` to `npm.cmd` on
+  Windows without going through `shutil.which()` first (a well-known Windows
+  `subprocess`/`npm` interaction). Fixed by resolving the full path via `shutil.which("npm")`
+  before invoking it, falling back to the original clear error message only when that genuinely
+  returns nothing.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

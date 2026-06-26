@@ -481,3 +481,35 @@ Added a pytest suite covering the CLI commands (`init`/`add`/`status`/`commit`/`
 - **Note:** This doubles on-disk storage for tracked code files (working-tree copy + CAS copy) —
   the same tradeoff git itself makes for every tracked blob, and necessary for checkout to have
   anything to restore from.
+
+---
+
+## ✅ Fixed — Closing the 5 remaining test-coverage roadmap gaps (2026-06-25)
+
+Added `tests/test_server.py` (av_server FastAPI tests + one live-wire integration test),
+`tests/test_cli_commands.py` (direct CLI command tests), a Vitest suite for `webui/`'s pure
+diff/formatting logic, CI jobs for all of the above plus the framework-plugin extras, and an
+`av test --webui` convenience flag. Found via manual end-to-end debugging while exercising the
+new `--webui` flag for real (not mocked) on this Windows dev machine.
+
+### [4] `av test --webui` reports "npm not found on PATH" even when npm is genuinely installed
+- **File:** `python/av_cli/main.py` (`test_cmd`).
+- **Problem:** The initial implementation called `subprocess.run(["npm", "test"], cwd=webui_dir)`
+  directly. On Windows, the real `npm` executable is a `npm.cmd` shim; passing the bare string
+  `"npm"` to `subprocess.run` without `shell=True` frequently fails to locate/execute it via
+  `CreateProcess`, even though `npm` is genuinely installed and resolvable from an interactive
+  shell (`npm --version` worked fine in the same environment). This raised `FileNotFoundError`,
+  which the code caught and reported as the user-facing "npm not found on PATH — install
+  Node.js..." message — a *correct-looking* error for the *wrong* reason, since npm was in fact
+  installed.
+- **How found:** Only surfaced by actually running `av test --webui` for real after writing it
+  (not just the monkeypatched unit tests, which mock `subprocess.run` itself and therefore never
+  exercise the real Windows path-resolution behavior) — exactly the kind of platform-specific gap
+  the manual-debugging step exists to catch.
+- **Fix:** Resolve the executable's full path first via `shutil.which("npm")` (which does the
+  PATHEXT-aware lookup correctly, the same way an interactive shell does) and pass that resolved
+  path to `subprocess.run` instead of the bare string. The "not found" error message is now only
+  shown when `shutil.which` genuinely returns `None`.
+- **Verified:** `av test --webui -k test_validate_ref_name_accepts_normal_names` run for real
+  (not mocked) on this machine — failed with the npm-not-found message before the fix, ran both
+  suites successfully (pytest, then the real `npm test` → Vitest) after it.

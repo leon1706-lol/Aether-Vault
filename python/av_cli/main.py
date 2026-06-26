@@ -1197,11 +1197,14 @@ def doctor(fix: bool, dry_run: bool) -> None:
 @cli.command(name="test")
 @click.option("-k", "test_filter", default=None, help="Only run tests matching this substring (forwarded to pytest -k).")
 @click.option("--cov", is_flag=True, default=False, help="Run with a coverage report (--cov=python --cov-report=term-missing).")
-def test_cmd(test_filter: str | None, cov: bool) -> None:
-    """(Development only) Run Aether-Vault's own pytest suite from source.
+@click.option("--webui", "run_webui", is_flag=True, default=False, help="Also run the webui/ Vitest suite (npm test) after the Python suite.")
+def test_cmd(test_filter: str | None, cov: bool, run_webui: bool) -> None:
+    """(Development only) Run Aether-Vault's own pytest suite from source, and optionally the
+    webui/ Vitest suite too.
 
-    Requires an editable/dev install (`pip install -e .[dev]`) — this is not a tool for
-    inspecting an end user's .av/ repository; see `av doctor` for that.
+    Requires an editable/dev install (`pip install -e .[dev]`) — and, for --webui, `npm install`
+    already run inside webui/. This is not a tool for inspecting an end user's .av/ repository;
+    see `av doctor` for that.
     """
     source_root = _find_source_root()
     tests_dir = source_root / "tests"
@@ -1218,9 +1221,39 @@ def test_cmd(test_filter: str | None, cov: bool) -> None:
     if cov:
         args += ["--cov=python", "--cov-report=term-missing"]
 
+    click.secho("=== Python test suite ===", bold=True, fg="cyan")
     click.secho(f"Running Aether-Vault's test suite (pytest {' '.join(args[3:])})...", fg="cyan")
     result = subprocess.run(args, cwd=source_root)
-    sys.exit(result.returncode)
+    exit_code = result.returncode
+
+    if run_webui:
+        webui_dir = source_root / "webui"
+        if not webui_dir.is_dir() or not (webui_dir / "package.json").exists():
+            click.secho(
+                "av test --webui requires a development install with the webui/ source present "
+                "(run from a git clone, not a built wheel).",
+                fg="red",
+            )
+            sys.exit(1)
+
+        click.secho("\n=== Web UI test suite (webui/) ===", bold=True, fg="cyan")
+        # shutil.which (not a bare "npm" argv) — on Windows, `npm` resolves to `npm.cmd`, which
+        # subprocess.run(["npm", ...]) frequently fails to locate/execute even when npm is
+        # genuinely installed and on PATH; resolving the full path first (as `which` does, via
+        # PATHEXT) avoids a false "npm not found" on a machine that actually has it.
+        npm_path = shutil.which("npm")
+        if npm_path is None:
+            click.secho(
+                "npm not found on PATH — install Node.js to run the webui/ Vitest suite, "
+                "or omit --webui.",
+                fg="red",
+            )
+            sys.exit(1)
+        webui_result = subprocess.run([npm_path, "test"], cwd=webui_dir)
+        if webui_result.returncode != 0:
+            exit_code = webui_result.returncode
+
+    sys.exit(exit_code)
 
 
 @cli.command()

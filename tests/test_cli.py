@@ -426,3 +426,79 @@ def test_test_command_missing_tests_dir_gives_clear_error(repo, monkeypatch, tmp
     result = invoke("test")
     assert result.exit_code != 0
     assert "development install" in result.output.lower()
+
+
+def test_test_command_webui_runs_npm_test_after_pytest(repo, monkeypatch):
+    calls = []
+
+    class FakeCompleted:
+        returncode = 0
+
+    def fake_run(args, cwd=None):
+        calls.append({"args": args, "cwd": cwd})
+        return FakeCompleted()
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    # Don't depend on this machine/CI runner actually having npm on PATH — fix the resolved
+    # path so the test is deterministic either way.
+    monkeypatch.setattr(main_module.shutil, "which", lambda name: r"C:\fake\npm.cmd")
+
+    result = invoke("test", "--webui")
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 2
+    assert calls[0]["args"][1:3] == ["-m", "pytest"]
+    assert calls[1]["args"] == [r"C:\fake\npm.cmd", "test"]
+    assert str(calls[1]["cwd"]).endswith("webui")
+
+
+def test_test_command_without_webui_only_runs_pytest(repo, monkeypatch):
+    calls = []
+
+    class FakeCompleted:
+        returncode = 0
+
+    def fake_run(args, cwd=None):
+        calls.append(args)
+        return FakeCompleted()
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+
+    result = invoke("test")
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+
+
+def test_test_command_webui_combines_nonzero_exit_code(repo, monkeypatch):
+    call_count = {"n": 0}
+
+    def fake_run(args, cwd=None):
+        call_count["n"] += 1
+        returncode = 0 if call_count["n"] == 1 else 1  # pytest passes, npm test fails
+        return type("FakeCompleted", (), {"returncode": returncode})()
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(main_module.shutil, "which", lambda name: r"C:\fake\npm.cmd")
+
+    result = invoke("test", "--webui")
+    assert result.exit_code != 0
+
+
+def test_test_command_webui_missing_webui_dir_gives_clear_error(repo, monkeypatch, tmp_path):
+    fake_source_root = tmp_path / "no-webui-here"
+    (fake_source_root / "tests").mkdir(parents=True)
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: fake_source_root)
+    monkeypatch.setattr(
+        main_module.subprocess,
+        "run",
+        lambda args, cwd=None: type("FakeCompleted", (), {"returncode": 0})(),
+        raising=False,
+    )
+
+    result = invoke("test", "--webui")
+    assert result.exit_code != 0
+    assert "development install" in result.output.lower()
