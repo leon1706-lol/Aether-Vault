@@ -231,6 +231,22 @@ def test_doctor_outside_repo_errors_cleanly(tmp_path, monkeypatch):
     assert "not an aether-vault repository" in result.output.lower()
 
 
+def test_doctor_speed_prints_real_repo_timing_table(repo):
+    result = invoke("doctor", "--speed")
+    assert result.exit_code == 0, result.output
+    assert "Speed diagnostics" in result.output
+    assert "Index.load()" in result.output
+    assert "load_config()" in result.output
+    assert "iter_working_files()" in result.output
+    assert "Storage stats" in result.output
+
+
+def test_doctor_without_speed_has_no_speed_section(repo):
+    result = invoke("doctor")
+    assert result.exit_code == 0, result.output
+    assert "Speed diagnostics" not in result.output
+
+
 def test_doctor_fix_relinks_stale_pointer_when_object_intact(repo):
     invoke("config", "1")
     big = repo / "weights.pt"
@@ -502,3 +518,57 @@ def test_test_command_webui_missing_webui_dir_gives_clear_error(repo, monkeypatc
     result = invoke("test", "--webui")
     assert result.exit_code != 0
     assert "development install" in result.output.lower()
+
+
+def test_test_command_speed_runs_synthetic_probes_and_forwards_durations(repo, monkeypatch):
+    calls = []
+
+    class FakeCompleted:
+        returncode = 0
+
+    def fake_run(args, cwd=None):
+        calls.append(args)
+        return FakeCompleted()
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    # Run with no real `av` on PATH, so the optional "av CLI, end-to-end" subsection is
+    # skipped — this test is only about the internal synthetic probes and -k/--cov-style
+    # flag forwarding to pytest, not the extra end-to-end subprocess timing.
+    monkeypatch.setattr(main_module.shutil, "which", lambda name: None)
+
+    result = invoke("test", "--speed")
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1  # pytest only — no av CLI found
+    assert "--durations=20" in calls[0]
+    assert "Speed check (synthetic fixtures)" in result.output
+    assert "Index.save()" in result.output
+    assert "Storage stats" in result.output
+    assert "av CLI not found on PATH" in result.output
+
+
+def test_test_command_speed_webui_runs_bench_after_npm_test(repo, monkeypatch):
+    calls = []
+
+    class FakeCompleted:
+        returncode = 0
+
+    def fake_run(args, cwd=None):
+        calls.append({"args": args, "cwd": cwd})
+        return FakeCompleted()
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    fake_paths = {"npm": r"C:\fake\npm.cmd", "av": r"C:\fake\av.cmd"}
+    monkeypatch.setattr(main_module.shutil, "which", lambda name: fake_paths.get(name))
+
+    result = invoke("test", "--speed", "--webui")
+    assert result.exit_code == 0, result.output
+    # pytest, npm test, npm run bench, then av init/add/commit for the end-to-end subsection
+    assert len(calls) == 6
+    assert calls[1]["args"] == [r"C:\fake\npm.cmd", "test"]
+    assert calls[2]["args"] == [r"C:\fake\npm.cmd", "run", "bench"]
+    assert calls[3]["args"][0] == r"C:\fake\av.cmd" and calls[3]["args"][1] == "init"
+    assert calls[5]["args"][0] == r"C:\fake\av.cmd" and calls[5]["args"][1] == "commit"
+    assert "Web UI speed bench" in result.output
+    assert "Speed check (av CLI, end-to-end)" in result.output

@@ -263,4 +263,29 @@ findings (resolved and still-open).
   for CPU/network made an already-slow ~15-20s load look like a hang. Fixed by pinning
   `workers: 1` and raising the timeout, rather than "fixing" a feature that wasn't broken.
 
+## Phase 24 — Speed Fixes + `--speed` Diagnostics
+- **Four bottleneck fixes** found by reading the hot paths directly: `av add` was calling
+  `Index.save()` (a full JSON re-serialize + write) once *per staged file* instead of once per
+  `add` invocation — fixed by batching with `auto_save=False` inside the loop, matching the
+  pattern already used elsewhere in the same command. `handoff.py`'s `resolve_head()` read the
+  same ref file twice. `av_server/storage.py`'s `get_storage_stats()` read every ref file's full
+  *contents* just to count them — switched to a plain `os.walk` file count. `webui`'s
+  `CommitGraph`/`MetricsChart` rebuilt their graph/metric-key data from scratch on every render
+  (the dashboard polls every 15s) — wrapped in `useMemo`.
+- **`av doctor --speed`**: a new, read-only timing snapshot of the *current* repo's hot paths
+  (`Index.load()`, `load_config()`, a working-tree scan, local object-store stats) — for an end
+  user diagnosing why their own repo feels slow.
+- **`av test --speed`** (dev-only): the same hot paths timed against disposable, fixed-size
+  synthetic fixtures (`python/av_cli/speedcheck.py`) so results are repeatable across machines and
+  runs, plus `pytest --durations=20`. Each probe prints against a soft advisory budget — exceeding
+  one only flags the row, never fails the run. Combined with `--webui`, also runs a small Vitest
+  `bench()` suite (`webui/src/components/__benchmarks__/speed.bench.ts`) covering `buildGraph()`
+  and `extractMetricKeys()`, and (when `av` is found on `PATH`) a third "av CLI, end-to-end"
+  subsection timing real `av init`/`add`/`commit` subprocess calls.
+- **Benchmark Comparison (README)**: `scripts/run_benchmark_comparison.py` times `av` against
+  equivalent Git LFS and DVC operations on the same synthetic fixture (the script skips and labels
+  any tool not found on `PATH` rather than guessing at numbers) and prints a Markdown table, pasted
+  into a new README section with the exact command, versions, and capture date — so the comparison
+  stays reproducible rather than a stale, undefendable claim.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import {
   LineChart,
   Line,
@@ -26,7 +27,21 @@ const METRIC_COLORS: Record<number, string> = {
   5: "#fc8181",
 };
 
+export function extractMetricKeys(commits: Commit[]): string[] {
+  return [
+    ...new Set(
+      commits.flatMap((c) =>
+        Object.entries(c.metrics ?? {})
+          .filter(([, v]) => typeof v === "number")
+          .map(([k]) => k)
+      )
+    ),
+  ].slice(0, 6);
+}
+
 export function MetricsChart({ commits, loading }: Props) {
+  const metricKeys = useMemo(() => extractMetricKeys(commits), [commits]);
+
   if (loading && commits.length === 0) {
     return (
       <div className="card">
@@ -43,17 +58,6 @@ export function MetricsChart({ commits, loading }: Props) {
       </div>
     );
   }
-
-  // Collect all numeric metric keys
-  const metricKeys = [
-    ...new Set(
-      commits.flatMap((c) =>
-        Object.entries(c.metrics ?? {})
-          .filter(([, v]) => typeof v === "number")
-          .map(([k]) => k)
-      )
-    ),
-  ].slice(0, 6);
 
   const hasMetrics =
     metricKeys.length > 0 &&

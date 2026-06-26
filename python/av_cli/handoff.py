@@ -30,7 +30,8 @@ def resolve_head(repo_root: Path) -> tuple[str, str | None]:
     if head_content.startswith("ref: "):
         branch = head_content.split("/")[-1] if head_content.startswith("ref: refs/heads/") else "detached"
         ref_path = repo_root / ".av" / head_content.split(": ", 1)[1]
-        commit_hash = ref_path.read_text().strip() if ref_path.exists() and ref_path.read_text().strip() else None
+        ref_content = ref_path.read_text().strip() if ref_path.exists() else ""
+        commit_hash = ref_content or None
         return branch, commit_hash
 
     return "detached", head_content

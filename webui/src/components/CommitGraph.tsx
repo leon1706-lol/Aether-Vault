@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { shortHash, type Commit } from "@/lib/api";
 
 interface Props {
@@ -31,7 +32,7 @@ interface GraphNode {
   y: number;
 }
 
-function buildGraph(commits: Commit[]): { nodes: GraphNode[]; edges: { x1: number; y1: number; x2: number; y2: number; color: string }[] } {
+export function buildGraph(commits: Commit[]): { nodes: GraphNode[]; edges: { x1: number; y1: number; x2: number; y2: number; color: string }[] } {
   const sorted = [...commits].sort((a, b) => {
     const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
     const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
@@ -84,6 +85,9 @@ function buildGraph(commits: Commit[]): { nodes: GraphNode[]; edges: { x1: numbe
 }
 
 export function CommitGraph({ commits, loading }: Props) {
+  const displayCommits = useMemo(() => commits.slice(0, 18), [commits]);
+  const { nodes, edges } = useMemo(() => buildGraph(displayCommits), [displayCommits]);
+
   if (loading && commits.length === 0) {
     return (
       <div className="card">
@@ -117,9 +121,6 @@ export function CommitGraph({ commits, loading }: Props) {
       </div>
     );
   }
-
-  const displayCommits = commits.slice(0, 18);
-  const { nodes, edges } = buildGraph(displayCommits);
 
   const maxCol = Math.max(...nodes.map((n) => n.col), 0);
   const svgW = PAD_LEFT * 2 + (maxCol + 1) * COL_W;

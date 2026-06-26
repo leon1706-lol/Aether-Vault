@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -23,6 +24,7 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
+from . import speedcheck
 from .client import VaultClient
 from .exceptions import AetherVaultException, NetworkError, StorageError, ValidationError
 from .index import Index
@@ -476,16 +478,9 @@ def add(paths: tuple) -> None:
                 ptr_f.write(ptr_content)
 
             pointer_rel_path = rel_path + ".av-pointer"
-            idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, pointer_rel_path)
+            idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, pointer_rel_path, auto_save=False)
             if layers:
-                # add_entry() above already wrote the index to disk via its own auto_save
-                # (without "layers", which isn't one of its parameters), so the per-layer
-                # data was previously lost the moment `av add` exited: a fresh `av commit`
-                # process re-loads the index from disk and finds no layers, silently
-                # degrading every per-layer weight diff (`av handoff --diff-weights`, and the
-                # Web UI's checkpoint diff) into a whole-file hash comparison. Persist it.
                 idx.entries[rel_path]["layers"] = layers
-                idx.save()
             click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {len(layers)} layers)", fg="green")
         else:
             # Every tracked file — including code and sub-threshold artifacts, not just
@@ -499,8 +494,11 @@ def add(paths: tuple) -> None:
             if not obj_path.exists():
                 shutil.copy2(fpath, obj_path)
 
-            idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None)
+            idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None, auto_save=False)
             click.secho(f"Staged [{file_type.upper()}] {rel_path}", fg="green")
+
+    if files_to_process:
+        idx.save()
 
 
 @cli.command()
@@ -980,12 +978,25 @@ def gc() -> None:
         click.secho("GC request failed. Check server logs.", fg="red")
 
 
+def _print_real_repo_speed_diagnostics(repo_root: Path) -> None:
+    """`av doctor --speed` — read-only timing snapshot of the current repo."""
+    probes = speedcheck.run_real_repo_probes(repo_root, load_config, iter_working_files)
+    click.echo("")
+    click.secho("=== Speed diagnostics (this repo) ===", bold=True, fg="cyan")
+    click.echo(f"{'Probe':<42} {'Time':>10}")
+    click.echo("-" * 53)
+    for label, elapsed_ms in probes:
+        click.echo(f"{label:<42} {elapsed_ms:>8.1f} ms")
+
+
 @cli.command()
 @click.option("--fix", is_flag=True, default=False,
               help="Repair fixable issues: re-link pointers, clear tmp leftovers, clear/retry pending-push entries.")
 @click.option("--dry-run", "dry_run", is_flag=True, default=False,
               help="With --fix, preview what would be repaired without changing anything.")
-def doctor(fix: bool, dry_run: bool) -> None:
+@click.option("--speed", "speed", is_flag=True, default=False,
+              help="Also print a read-only timing snapshot of this repo's hot paths (index load, config load, file scan, storage stats).")
+def doctor(fix: bool, dry_run: bool, speed: bool) -> None:
     """Diagnose common repo and environment problems.
 
     Read-only by default: reports issues (native core availability, server reachability,
@@ -1193,12 +1204,53 @@ def doctor(fix: bool, dry_run: bool) -> None:
     else:
         click.secho(f"Everything looks good.{suffix}", fg="green", bold=True)
 
+    if speed:
+        _print_real_repo_speed_diagnostics(repo_root)
+
+
+def _print_synthetic_speed_check() -> None:
+    """`av test --speed` — synthetic, repeatable benchmark of av's own hot paths."""
+    with tempfile.TemporaryDirectory(prefix="av-speedcheck-") as tmp:
+        probes = speedcheck.run_synthetic_probes(load_config, iter_working_files, Path(tmp))
+
+    click.secho("\n=== Speed check (synthetic fixtures) ===", bold=True, fg="cyan")
+    click.echo(f"{'Probe':<40} {'Time':>10} {'Budget':>10}  Status")
+    click.echo("-" * 75)
+    slow_count = 0
+    for label, elapsed_ms, budget_ms in probes:
+        if budget_ms is not None and elapsed_ms > budget_ms:
+            slow_count += 1
+            status, color = "SLOW", "yellow"
+        else:
+            status, color = "OK", "green"
+        budget_str = f"{budget_ms:.0f} ms" if budget_ms is not None else "-"
+        click.secho(f"{label:<40} {elapsed_ms:>7.1f} ms {budget_str:>10}  {status}", fg=color)
+
+    if slow_count:
+        click.echo(f"\n{slow_count} of {len(probes)} probes exceeded their budget — see python/av_cli/speedcheck.py to adjust thresholds.")
+
+    av_path = shutil.which("av")
+    if av_path is None:
+        click.echo("\n(av CLI not found on PATH — skipping end-to-end CLI timing.)")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="av-speedcheck-cli-") as tmp:
+        cli_probes = speedcheck.run_av_cli_probes(av_path, Path(tmp))
+
+    click.secho("\n=== Speed check (av CLI, end-to-end) ===", bold=True, fg="cyan")
+    click.echo(f"{'Probe':<28} {'Time':>10}")
+    click.echo("-" * 39)
+    for label, elapsed_ms in cli_probes:
+        click.echo(f"{label:<28} {elapsed_ms:>7.1f} ms")
+
 
 @cli.command(name="test")
 @click.option("-k", "test_filter", default=None, help="Only run tests matching this substring (forwarded to pytest -k).")
 @click.option("--cov", is_flag=True, default=False, help="Run with a coverage report (--cov=python --cov-report=term-missing).")
 @click.option("--webui", "run_webui", is_flag=True, default=False, help="Also run the webui/ Vitest suite (npm test) after the Python suite.")
-def test_cmd(test_filter: str | None, cov: bool, run_webui: bool) -> None:
+@click.option("--speed", "speed", is_flag=True, default=False,
+              help="Also run a synthetic speed benchmark of av's hot paths (and the webui/ bench suite, with --webui).")
+def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -> None:
     """(Development only) Run Aether-Vault's own pytest suite from source, and optionally the
     webui/ Vitest suite too.
 
@@ -1220,6 +1272,8 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool) -> None:
         args += ["-k", test_filter]
     if cov:
         args += ["--cov=python", "--cov-report=term-missing"]
+    if speed:
+        args += ["--durations=20"]
 
     click.secho("=== Python test suite ===", bold=True, fg="cyan")
     click.secho(f"Running Aether-Vault's test suite (pytest {' '.join(args[3:])})...", fg="cyan")
@@ -1252,6 +1306,15 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool) -> None:
         webui_result = subprocess.run([npm_path, "test"], cwd=webui_dir)
         if webui_result.returncode != 0:
             exit_code = webui_result.returncode
+
+        if speed:
+            click.secho("\n=== Web UI speed bench (webui/) ===", bold=True, fg="cyan")
+            bench_result = subprocess.run([npm_path, "run", "bench"], cwd=webui_dir)
+            if bench_result.returncode != 0:
+                exit_code = bench_result.returncode
+
+    if speed:
+        _print_synthetic_speed_check()
 
     sys.exit(exit_code)
 

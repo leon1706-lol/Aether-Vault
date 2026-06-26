@@ -28,6 +28,7 @@ Aether-Vault solves the core challenge of ML reproducibility by versioning the *
 - [CLI Reference](#cli-reference)
 - [Framework Plugins](#framework-plugins)
 - [Development Progress](#development-progress)
+- [Benchmark Comparison](#benchmark-comparison)
 - [Open Source Roadmap](#open-source-roadmap)
 - [Enterprise Roadmap](#enterprise-roadmap-commercial-variant)
 - [Contributing](#contributing)
@@ -236,8 +237,11 @@ Diagnose common repo and environment problems: native core availability, remote 
 av doctor                    # diagnose only
 av doctor --fix              # repair what's safely recoverable
 av doctor --fix --dry-run    # preview what --fix would do, without changing anything
+av doctor --speed            # also print a read-only timing snapshot of this repo's hot paths
 ```
 `--fix` re-links orphaned/stale `.av-pointer` files back to their objects (downloading from the remote if the object is only available there), clears `*.tmp.*` leftovers from interrupted writes, and clears pending-push entries whose commit no longer exists locally while retrying the rest. Anything it can't safely recover (e.g. the object is missing both locally and on an unreachable remote) is left as `[WARN]` rather than fabricated or silently dropped.
+
+`--speed` times `Index.load()`, `load_config()`, a working-tree scan, and the local object-store stats against *this* repo, read-only — a quick way to spot where a specific user's repo is actually slow, as opposed to `av test --speed`'s synthetic, cross-machine-comparable numbers below.
 
 ### `av test`
 **Development only.** Runs Aether-Vault's own pytest suite from source. Requires an editable/dev install (`pip install -e .[dev]`) — not a tool for inspecting an end user's `.av/` repository (use `av doctor` for that).
@@ -246,7 +250,11 @@ av test                  # run the full suite
 av test -k checkout      # only run tests matching "checkout"
 av test --cov            # with a coverage report
 av test --webui          # also run the webui/ Vitest suite (npm test) after the Python suite
+av test --speed          # also run a synthetic speed benchmark of av's hot paths
+av test --speed --webui  # ...and the webui/ Vitest bench suite (npm run bench) too
 ```
+`--speed` runs the same hot paths as `av doctor --speed` against disposable, fixed-size synthetic fixtures (so results are repeatable across machines and runs, not dependent on whatever happens to be in a real repo), plus `pytest --durations=20` to surface the slowest tests. Each probe prints next to a soft advisory budget — exceeding it only flags the row `SLOW`, it never fails the command. Combined with `--webui`, it also runs a small Vitest `bench()` suite (`webui/src/components/__benchmarks__/speed.bench.ts`) covering the dashboard's graph-building and metrics-extraction logic. See `python/av_cli/speedcheck.py` to add probes or adjust budgets.
+
 `--webui` runs `webui/`'s pure-logic *and* component tests (Vitest + React Testing Library). The
 Playwright E2E suite below (Weight Diff + dashboard, against a real `docker compose` stack) is
 separate, since it needs the live backend running:
@@ -339,6 +347,20 @@ Each import commits the checkpoint/run artifacts plus any metrics found alongsid
 - [`development/Probleme.md`](development/Probleme.md) — full audit log of correctness, performance and security findings, resolved and still-open, with severity ratings.
 
 More development-process documents will live under [`development/`](development/) over time.
+
+---
+
+## Benchmark Comparison
+
+`av add` + `av commit` on a 60-file mixed code/model fixture (20MB total: 50 source files + 10 2MB binaries), vs. equivalent Git LFS and DVC operations. Generated via `python scripts/run_benchmark_comparison.py` (Aether-Vault @ `562bad9`, git-lfs 3.7.1, DVC not installed in the capturing environment — shown as such rather than guessed at; re-run the script with `dvc` on PATH to fill that column in), captured 2026-06-26 on Windows:
+
+| Operation | Aether-Vault | Git LFS | DVC |
+|---|---:|---:|---:|
+| init | 1669.2 ms | 4022.9 ms | not installed |
+| add (60 files) | 2711.0 ms | 2099.4 ms | not installed |
+| commit | 3935.1 ms | 1546.0 ms | not installed |
+
+These are single-run, single-machine numbers (disk/antivirus-bound, like the rest of this section) — re-run the script yourself before relying on them for a decision. `av commit` is currently the slower step relative to Git LFS's commit; see `development/Probleme.md` for known performance findings if you're investigating further.
 
 ---
 

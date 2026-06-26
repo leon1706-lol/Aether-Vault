@@ -116,7 +116,7 @@ class CASStorage:
                 total_size += (Path(root) / file).stat().st_size
                 
         total_commits = len(list(self.commits_dir.glob("*.json")))
-        total_refs = len(self.list_refs())
+        total_refs = sum(len(files) for _, _, files in os.walk(self.refs_dir))
         
         return {
             "total_objects": total_objects,
