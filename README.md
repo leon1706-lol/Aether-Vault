@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-105%2F108%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="105 of 108 tests passing">
+  <img src="https://img.shields.io/badge/tests-115%2F116%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="115 of 116 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -52,12 +52,13 @@ graph TD
     %% Local Environment
     subgraph Local [User Machine / Training Node]
         Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-        CLI("av_cli<br>(add · status · commit · branch ·<br>checkout · push · gc · webui · doctor)")
+        CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark ·<br>import-lightning · import-mlflow · import-transformers)")
         CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
         LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
         PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
         WebUI("Web UI<br>(Dashboard + Weight Diff + Projects Tabs · localhost:3000)")
         Vault("Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
+        Benchmarks("development/BENCHMARKS.md<br>(av benchmark vs Git LFS · DVC · MLflow)")
 
         Plugins -- "Drives in-process (add/commit/push)" --> CLI
         CLI -- "1. Reads & Hashes Files" --> CPP
@@ -68,6 +69,7 @@ graph TD
         CLI -- "6. Generates Code Graph / Handoff Snapshot" --> Vault
         CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> LocalDAG
         CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> PendingQ
+        CLI -- "8. Benchmarks Against Competitor Tools" --> Benchmarks
     end
 
     %% Remote Environment
@@ -265,6 +267,16 @@ cd webui && npm run build && npm run start &        # or `npm run dev` for a qui
 npx playwright test                                 # runs against http://localhost:3000
 ```
 
+### `av benchmark`
+**Development only.** Runs the cross-tool benchmark suite against **Git LFS**, **DVC**, and **MLflow** — see [`development/BENCHMARKS.md`](development/BENCHMARKS.md) for the latest captured numbers and [`benchmarks/README.md`](benchmarks/README.md) for the full flag reference. Requires `pip install -e .[dev,benchmarks]` to install DVC/MLflow as comparison targets (Git LFS is assumed already on `PATH`).
+```bash
+av benchmark                                          # run all 8 benchmarks, console output
+av benchmark --only hashing_throughput                # scope to one benchmark (repeatable)
+av benchmark --vs git-lfs --vs dvc                    # scope competitor columns (repeatable)
+av benchmark --markdown development/BENCHMARKS.md     # regenerate the Markdown report
+```
+Every result is a real measured number from a real subprocess/HTTP call — a tool that isn't on `PATH`, or whose primitive doesn't apply to a given benchmark, is shown as `not installed`/`N/A` with a footnote, never guessed at.
+
 ### `av handoff` — Agent Context Export
 While most ML tracking tools (MLflow, DVC, W&B) record experiments for humans to read, `av handoff` generates a structured, machine-readable context snapshot for **AI agents** picking up the work — branch, commit, tags, metrics, model/dataset lineage, and an optional freeform instruction note, in an open `.avh` (Aether Vault Handoff) JSON format. Every invocation also writes a human-readable Markdown note into `Aether-Handoff/`, indexed chronologically by a central hub file.
 
@@ -352,15 +364,28 @@ More development-process documents will live under [`development/`](development/
 
 ## Benchmark Comparison
 
-`av add` + `av commit` on a 60-file mixed code/model fixture (20MB total: 50 source files + 10 2MB binaries), vs. equivalent Git LFS and DVC operations. Generated via `python scripts/run_benchmark_comparison.py` (Aether-Vault @ `562bad9`, git-lfs 3.7.1, DVC not installed in the capturing environment — shown as such rather than guessed at; re-run the script with `dvc` on PATH to fill that column in), captured 2026-06-26 on Windows:
+`av benchmark` runs 8 reproducible benchmarks against **Git LFS**, **DVC**, and **MLflow**. Every number is measured from a real subprocess or HTTP call on the same fixture each tool actually has to process — nothing here is estimated or fabricated, and a tool that cannot run a given benchmark (not installed, or the operation does not apply to it) is reported as such rather than given a guessed value. The table below summarizes the current standing of each benchmark; the linked report at the bottom has the full methodology, every raw number, and the caveats that go with single-machine timings.
+
+| # | Benchmark | What it measures | Current standing |
+|---|---|---|---|
+| 1 | Hashing Throughput at Scale | SHA-256 speed, 10–200MB files | Fastest of the three tools at every size tested |
+| 2 | Safetensors Layer-Dedup | Storage after 6 fine-tune commits | 47MB vs. 126MB for every competitor (about 63% smaller) |
+| 3 | Commit + Push Latency | init/add/commit/push, end-to-end | Push is faster than both competitors; the commit step is currently the slower one and is being investigated |
+| 4 | No-Op `status`/`add` | Re-staging unchanged files | Currently slower than Git LFS here — an open finding, not a hidden one |
+| 5 | Cold Clone / First Pull | Fresh-machine checkout | Not applicable — `av` has no `clone`/`pull` command yet (tracked on the roadmap) |
+| 6 | Partial-Checkpoint Fetch | Fetch one layer vs. the whole file | The only one of the four tools that can fetch a single layer instead of the whole file |
+| 7 | Storage Footprint Curve | Disk growth over 6 commits | The storage gap widens with every additional commit |
+| 8 | Concurrent Push Throughput | 8 simultaneous pushes | Aether-only — none of the other three tools have a comparable concurrent-server primitive to compare against |
+
+`av add` + `av commit` quick sample (benchmark #3's first three steps, vs. equivalent Git LFS and DVC operations, on a 60-file mixed code/model fixture):
 
 | Operation | Aether-Vault | Git LFS | DVC |
 |---|---:|---:|---:|
-| init | 1669.2 ms | 4022.9 ms | not installed |
-| add (60 files) | 2711.0 ms | 2099.4 ms | not installed |
-| commit | 3935.1 ms | 1546.0 ms | not installed |
+| init | 6020.3 ms | 12919.5 ms | 8577.1 ms |
+| add (60 files) | 11224.0 ms | 4332.1 ms | 15166.2 ms |
+| commit | 9374.9 ms | 2353.1 ms | 881.4 ms |
 
-These are single-run, single-machine numbers (disk/antivirus-bound, like the rest of this section) — re-run the script yourself before relying on them for a decision. `av commit` is currently the slower step relative to Git LFS's commit; see `development/Probleme.md` for known performance findings if you're investigating further.
+For the full results, the methodology behind each benchmark, and the rating legend, see [`development/BENCHMARKS.md`](development/BENCHMARKS.md).
 
 ---
 
@@ -368,6 +393,9 @@ These are single-run, single-machine numbers (disk/antivirus-bound, like the res
 
 | Status | Feature |
 |---|---|
+| ✅ | **Cross-Tool Benchmark Suite** (`av benchmark`) — reproducible comparison against Git LFS, DVC, and MLflow ([`development/BENCHMARKS.md`](development/BENCHMARKS.md)) |
+| 🔲 | **`av clone`/`av pull`** — fresh-machine checkout of a project someone else already pushed; today's sync model is push-only from a single working repo (found while building the benchmark suite's cold-clone comparison) |
+| 🔲 | **Performance optimization pass** — targeted work on the bottlenecks the benchmark suite surfaced (the no-op `status`/`add` regression and the slower `commit` step in particular), tracked against `development/BENCHMARKS.md` so improvements are measured, not assumed |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
 
 ---

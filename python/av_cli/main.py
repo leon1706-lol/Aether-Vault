@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -466,11 +467,18 @@ def add(paths: tuple) -> None:
                 except Exception as exc:
                     logger.warning(f"Layer splitting failed for {rel_path}, falling back to whole-file: {exc}")
 
-            obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
-            obj_dir.mkdir(parents=True, exist_ok=True)
-            obj_path = obj_dir / file_hash[2:]
-            if not obj_path.exists():
-                shutil.copy2(fpath, obj_path)
+            # Only store the whole-file blob when layer-splitting didn't happen (or failed) —
+            # mirrors push_objects()'s existing "upload the whole-file object only if layers
+            # weren't successfully chunked" condition. Storing both defeats the entire point
+            # of layer-level dedup: a fine-tune that touches only one layer would still
+            # duplicate the *whole* checkpoint on every commit. `checkout` already reassembles
+            # the whole file from layers on demand when this blob is absent.
+            if not layers:
+                obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
+                obj_dir.mkdir(parents=True, exist_ok=True)
+                obj_path = obj_dir / file_hash[2:]
+                if not obj_path.exists():
+                    shutil.copy2(fpath, obj_path)
 
             ptr_path = get_pointer_path(fpath)
             ptr_content = create_pointer(fpath, file_hash, meta["size"])
@@ -1052,23 +1060,43 @@ def doctor(fix: bool, dry_run: bool, speed: bool) -> None:
 
     # --- Orphaned pointer entries: index entry has a pointer but its CAS object is missing ---
     # An entry with a pointer but no matching CAS object means `av checkout` would silently
-    # fail to materialize that file's real content.
+    # fail to materialize that file's real content. Layer-split artifacts (.safetensors) don't
+    # store a whole-file blob at all (see add()'s comment) — for those, "missing content"
+    # means a missing *layer*, not the absent-by-design whole-file object.
+    def _missing_layers(entry: dict) -> list[dict]:
+        return [l for l in entry["layers"] if not (av_dir / "objects" / l["hash"][:2] / l["hash"][2:]).exists()]
+
+    def _artifact_content_missing(entry: dict) -> bool:
+        if entry.get("layers"):
+            return bool(_missing_layers(entry))
+        return not (av_dir / "objects" / entry["hash"][:2] / entry["hash"][2:]).exists()
+
     orphaned = [
         rel_path
         for rel_path, entry in idx.entries.items()
-        if entry.get("pointer")
-        and not (av_dir / "objects" / entry["hash"][:2] / entry["hash"][2:]).exists()
+        if entry.get("pointer") and _artifact_content_missing(entry)
     ]
     recovered_orphans = []
     unrecovered_orphans = []
     for rel_path in orphaned:
-        h = idx.entries[rel_path]["hash"]
-        obj_path = av_dir / "objects" / h[:2] / h[2:]
+        entry = idx.entries[rel_path]
         can_recover = False
-        if fix and preview:
-            can_recover = client.object_exists(h)
-        elif fix:
-            can_recover = client.server_available() and client.download_object(h, obj_path)
+        if entry.get("layers"):
+            missing = _missing_layers(entry)
+            if fix and preview:
+                can_recover = all(client.object_exists(l["hash"]) for l in missing)
+            elif fix:
+                can_recover = client.server_available() and all(
+                    client.download_object(l["hash"], av_dir / "objects" / l["hash"][:2] / l["hash"][2:])
+                    for l in missing
+                )
+        else:
+            h = entry["hash"]
+            obj_path = av_dir / "objects" / h[:2] / h[2:]
+            if fix and preview:
+                can_recover = client.object_exists(h)
+            elif fix:
+                can_recover = client.server_available() and client.download_object(h, obj_path)
         (recovered_orphans if can_recover else unrecovered_orphans).append(rel_path)
 
     if recovered_orphans:
@@ -1317,6 +1345,70 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
         _print_synthetic_speed_check()
 
     sys.exit(exit_code)
+
+
+BENCHMARK_NAMES = [
+    "hashing_throughput",
+    "safetensors_dedup",
+    "commit_push_latency",
+    "noop_status_speed",
+    "cold_clone",
+    "partial_checkpoint_fetch",
+    "storage_footprint_curve",
+    "concurrent_push",
+]
+
+
+@cli.command()
+@click.option("--only", "only", multiple=True,
+              help=f"Only run these benchmarks by name (repeatable). Default: run all 8. Names: {', '.join(BENCHMARK_NAMES)}.")
+@click.option("--vs", "vs_tools", multiple=True, default=("git-lfs", "dvc", "mlflow"),
+              help="Competitor tools to include (repeatable). Default: all three. Aether-Vault itself always runs.")
+@click.option("--markdown", "markdown_out", type=click.Path(), default=None,
+              help="Also write a Markdown table for every benchmark run to this path (for regenerating BENCHMARKS.md).")
+def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None) -> None:
+    """(Development only) Run cross-tool benchmark comparisons against DVC, Git LFS, and MLflow.
+
+    Requires an editable/dev install (`pip install -e .[dev,benchmarks]`) — see benchmarks/README.md
+    for installing DVC/MLflow as comparison targets. A tool not found on PATH is skipped and
+    labeled "not installed" in the output, never given a fabricated number.
+    """
+    source_root = _find_source_root()
+    benchmarks_dir = source_root / "benchmarks"
+    if not benchmarks_dir.is_dir():
+        click.secho(
+            "av benchmark requires a development install; run from a git clone with `pip install -e .[dev]`",
+            fg="red",
+        )
+        sys.exit(1)
+
+    names = list(only) if only else BENCHMARK_NAMES
+    invalid = [n for n in names if n not in BENCHMARK_NAMES]
+    if invalid:
+        click.secho(f"Unknown benchmark name(s): {', '.join(invalid)}. Valid names: {', '.join(BENCHMARK_NAMES)}", fg="red")
+        sys.exit(1)
+
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from benchmarks.tool_runner import print_table, result_to_markdown
+
+    valid_competitors = {"git-lfs", "dvc", "mlflow"}
+    invalid_tools = [t for t in vs_tools if t not in valid_competitors]
+    if invalid_tools:
+        click.secho(f"Unknown --vs tool(s): {', '.join(invalid_tools)}. Valid: {', '.join(sorted(valid_competitors))}", fg="red")
+        sys.exit(1)
+    tool_order = ["av", *[t for t in vs_tools]]
+
+    markdown_chunks = []
+    for name in names:
+        module = importlib.import_module(f"benchmarks.bench_{name}")
+        result = module.run(tool_order=tool_order)
+        print_table(result)
+        markdown_chunks.append(result_to_markdown(result))
+
+    if markdown_out:
+        Path(markdown_out).write_text("\n".join(markdown_chunks), encoding="utf-8")
+        click.echo(f"\nWrote {markdown_out}")
 
 
 @cli.command()

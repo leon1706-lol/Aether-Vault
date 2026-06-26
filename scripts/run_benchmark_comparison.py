@@ -22,6 +22,7 @@ from av_cli import speedcheck  # noqa: E402 — needs the sys.path tweak above
 # Shared with av_cli.speedcheck.run_av_cli_probes so the av column and the internal
 # "av CLI, end-to-end" section of `av test --speed` always benchmark the same fixture.
 CODE_FILE_COUNT = speedcheck.CLI_CODE_FILE_COUNT
+CODE_FILE_SIZE = speedcheck.CLI_CODE_FILE_SIZE
 LARGE_FILE_COUNT = speedcheck.CLI_LARGE_FILE_COUNT
 LARGE_FILE_SIZE = speedcheck.CLI_LARGE_FILE_SIZE
 _populate_fixture = speedcheck.populate_cli_fixture

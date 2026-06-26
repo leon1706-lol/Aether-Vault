@@ -614,3 +614,34 @@ Found while adding React Testing Library component tests and a Playwright E2E su
   files are never part of the app's production type-check scope again.
 - **Verified:** `docker compose build aether-vault-webui` succeeds; the rebuilt container's
   Weight Diff tab now loads real data and both new Playwright specs pass against it.
+
+### [8] `av add` stored the whole-file blob *in addition to* split layers — layer-dedup gave zero real storage savings
+- **File:** `python/av_cli/main.py` (`add`, `doctor`).
+- **Problem:** When `aether_core.split_and_hash_safetensors` succeeded, `add()` correctly
+  stored each layer separately under `.av/objects/` — but then *unconditionally* also copied
+  the entire original file to `.av/objects/<whole_file_hash>` (lines 469–473, pre-fix). Every
+  fine-tune commit that only touched the classifier head still re-stored the *full* checkpoint
+  every time, on top of the (genuinely deduped) per-layer copies. Net effect: a layered
+  artifact ended up using *more* disk than not splitting at all, completely negating the
+  feature's purpose. The codebase's own `push_objects()` already had the correct condition
+  ("upload the whole-file object only if layers weren't successfully chunked," line 244) and
+  `checkout` already reassembles the whole file from layers on demand when the blob is
+  absent — `add()` was the one place that didn't follow that established pattern.
+- **How found:** Building benchmark #2 of the new `av benchmark` suite ("safetensors
+  layer-dedup storage savings" vs DVC/Git LFS/MLflow) — the real measured numbers came back
+  *worse* for Aether (162.5MB) than all three whole-file-only competitors (125.8MB each) after
+  6 simulated fine-tune commits, the opposite of the intended/advertised behavior.
+- **Fix:** `add()` now only writes the whole-file blob when `layers` is empty, matching
+  `push_objects()`'s existing condition exactly. `doctor`'s orphaned-pointer detection and
+  `--fix` recovery were also made layer-aware (an entry with `layers` is now checked/repaired
+  per-layer, not by checking for an intentionally-absent whole-file blob — without this,
+  every layered artifact would have started failing `av doctor` as a false-positive "orphaned
+  pointer" the moment the whole-file copy was removed).
+- **Verified:** New tests in `tests/test_cli.py`
+  (`test_add_safetensors_skips_whole_file_copy_when_layers_split`,
+  `test_checkout_reassembles_safetensors_from_layers`,
+  `test_doctor_does_not_flag_layered_artifact_as_orphaned`,
+  `test_doctor_detects_orphaned_layered_artifact_with_missing_layer`) — full suite green.
+  Re-ran `benchmarks/bench_safetensors_dedup.py` after the fix: Aether dropped from 162.5MB to
+  36.7MB for the same 6-commit sequence, now genuinely beating all three competitors (125.8MB
+  each) instead of losing to them.

@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from click.testing import CliRunner
 
 from python.av_cli.main import cli
@@ -64,6 +65,98 @@ def test_add_large_file_creates_pointer(repo):
     assert entry["type"] == "artifact"
     obj_path = repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
     assert obj_path.exists()
+
+
+def _make_safetensors(tensors: dict) -> bytes:
+    """Builds a minimal valid safetensors blob: 8-byte LE header length + JSON header +
+    data. Same format as tests/test_core.py's helper of the same name (kept duplicated
+    here rather than imported across test modules, matching this file's existing
+    self-contained-test convention)."""
+    import json
+    import struct
+
+    header = {}
+    offset = 0
+    blobs = []
+    for name, data in tensors.items():
+        header[name] = {"dtype": "U8", "shape": [len(data)], "data_offsets": [offset, offset + len(data)]}
+        offset += len(data)
+        blobs.append(data)
+    header_bytes = json.dumps(header).encode("utf-8")
+    return struct.pack("<Q", len(header_bytes)) + header_bytes + b"".join(blobs)
+
+
+def test_add_safetensors_skips_whole_file_copy_when_layers_split(repo):
+    pytest.importorskip("aether_core")
+    invoke("config", "1")  # 1 MB LFS threshold
+
+    blob = _make_safetensors({"layer1": b"A" * (600 * 1024), "layer2": b"B" * (600 * 1024)})
+    (repo / "model.safetensors").write_bytes(blob)
+
+    result = invoke("add", "model.safetensors")
+    assert result.exit_code == 0, result.output
+
+    idx = Index(repo)
+    entry = idx.get_entry("model.safetensors")
+    assert entry["layers"], "expected layer-splitting to have produced layers"
+
+    for layer in entry["layers"]:
+        layer_obj = repo / ".av" / "objects" / layer["hash"][:2] / layer["hash"][2:]
+        assert layer_obj.exists(), f"layer {layer['name']} object missing"
+
+    # The whole-file blob must NOT be stored — storing it in addition to the layers would
+    # defeat layer-dedup entirely (every fine-tune commit would re-store the full checkpoint
+    # regardless of how many layers actually changed).
+    whole_file_obj = repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
+    assert not whole_file_obj.exists()
+
+
+def test_checkout_reassembles_safetensors_from_layers(repo):
+    pytest.importorskip("aether_core")
+    invoke("config", "1")
+
+    blob = _make_safetensors({"layer1": b"A" * (600 * 1024), "layer2": b"B" * (600 * 1024)})
+    (repo / "model.safetensors").write_bytes(blob)
+    invoke("add", "model.safetensors")
+    invoke("commit", "-m", "v1")
+
+    (repo / "model.safetensors").unlink()
+    result = invoke("checkout", "main", "--force")
+    assert result.exit_code == 0, result.output
+    assert (repo / "model.safetensors").read_bytes() == blob
+
+
+def test_doctor_does_not_flag_layered_artifact_as_orphaned(repo):
+    pytest.importorskip("aether_core")
+    invoke("config", "1")
+
+    blob = _make_safetensors({"layer1": b"A" * (600 * 1024), "layer2": b"B" * (600 * 1024)})
+    (repo / "model.safetensors").write_bytes(blob)
+    invoke("add", "model.safetensors")
+
+    result = invoke("doctor")
+    assert result.exit_code == 0, result.output
+    assert "missing their object" not in result.output
+    assert "No orphaned pointer entries" in result.output
+
+
+def test_doctor_detects_orphaned_layered_artifact_with_missing_layer(repo):
+    pytest.importorskip("aether_core")
+    invoke("config", "1")
+
+    blob = _make_safetensors({"layer1": b"A" * (600 * 1024), "layer2": b"B" * (600 * 1024)})
+    (repo / "model.safetensors").write_bytes(blob)
+    invoke("add", "model.safetensors")
+
+    idx = Index(repo)
+    entry = idx.get_entry("model.safetensors")
+    layer_hash = entry["layers"][0]["hash"]
+    (repo / ".av" / "objects" / layer_hash[:2] / layer_hash[2:]).unlink()
+
+    result = invoke("doctor")
+    assert result.exit_code == 0, result.output
+    assert "missing their object" in result.output
+    assert "model.safetensors" in result.output
 
 
 def test_add_unchanged_file_does_not_restage(repo):
@@ -572,3 +665,107 @@ def test_test_command_speed_webui_runs_bench_after_npm_test(repo, monkeypatch):
     assert calls[5]["args"][0] == r"C:\fake\av.cmd" and calls[5]["args"][1] == "commit"
     assert "Web UI speed bench" in result.output
     assert "Speed check (av CLI, end-to-end)" in result.output
+
+
+# ---------------------------------------------------------------------------
+# av benchmark
+# ---------------------------------------------------------------------------
+# Mocks the module dispatch (importlib.import_module + module.run), not real subprocess
+# work — this suite only exercises av_cli's command-surface (--only/--vs/--markdown/error
+# handling), not bench_*.py's own real-tool timing logic (those are exercised by running
+# them directly, see benchmarks/README.md).
+
+class _FakeBenchModule:
+    def __init__(self, name):
+        self.name = name
+        self.calls = []
+
+    def run(self, tool_order):
+        self.calls.append(tool_order)
+        from benchmarks.tool_runner import BenchmarkResult, Row, ToolStatus
+        return BenchmarkResult(
+            name=self.name,
+            title=f"Fake {self.name}",
+            description="fake",
+            tool_order=tool_order,
+            rows=[Row(operation="op", values={t: 1.0 for t in tool_order}, statuses={t: ToolStatus.AVAILABLE for t in tool_order})],
+        )
+
+
+def test_benchmark_command_missing_benchmarks_dir_gives_clear_error(repo, monkeypatch, tmp_path):
+    fake_source_root = tmp_path / "no-benchmarks-here"
+    fake_source_root.mkdir()
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: fake_source_root)
+
+    result = invoke("benchmark")
+    assert result.exit_code != 0
+    assert "development install" in result.output.lower()
+
+
+def test_benchmark_command_only_filters_to_named_benchmarks(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    imported = []
+
+    def fake_import(name):
+        imported.append(name)
+        return _FakeBenchModule(name)
+
+    monkeypatch.setattr(main_module.importlib, "import_module", fake_import)
+
+    result = invoke("benchmark", "--only", "hashing_throughput")
+    assert result.exit_code == 0, result.output
+    assert imported == ["benchmarks.bench_hashing_throughput"]
+
+
+def test_benchmark_command_runs_all_by_default(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    imported = []
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: (imported.append(name), _FakeBenchModule(name))[1])
+
+    result = invoke("benchmark")
+    assert result.exit_code == 0, result.output
+    assert len(imported) == len(main_module.BENCHMARK_NAMES)
+
+
+def test_benchmark_command_rejects_unknown_only_name(repo):
+    result = invoke("benchmark", "--only", "not_a_real_benchmark")
+    assert result.exit_code != 0
+    assert "unknown benchmark" in result.output.lower()
+
+
+def test_benchmark_command_rejects_unknown_vs_tool(repo):
+    result = invoke("benchmark", "--vs", "not-a-real-tool")
+    assert result.exit_code != 0
+    assert "unknown --vs tool" in result.output.lower()
+
+
+def test_benchmark_command_vs_filters_competitor_tools(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    modules = []
+
+    def fake_import(name):
+        m = _FakeBenchModule(name)
+        modules.append(m)
+        return m
+
+    monkeypatch.setattr(main_module.importlib, "import_module", fake_import)
+
+    result = invoke("benchmark", "--only", "hashing_throughput", "--vs", "git-lfs")
+    assert result.exit_code == 0, result.output
+    assert modules[0].calls == [["av", "git-lfs"]]
+
+
+def test_benchmark_command_markdown_writes_file(repo, monkeypatch, tmp_path):
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _FakeBenchModule(name))
+
+    out_path = tmp_path / "BENCHMARKS.md"
+    result = invoke("benchmark", "--only", "hashing_throughput", "--markdown", str(out_path))
+    assert result.exit_code == 0, result.output
+    assert out_path.exists()
+    assert "Fake benchmarks.bench_hashing_throughput" in out_path.read_text()

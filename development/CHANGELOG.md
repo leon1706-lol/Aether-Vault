@@ -288,4 +288,42 @@ findings (resolved and still-open).
   into a new README section with the exact command, versions, and capture date — so the comparison
   stays reproducible rather than a stale, undefendable claim.
 
+## Phase 25 — Cross-Tool Benchmark Suite (`av benchmark`)
+- **8 new benchmarks** comparing Aether-Vault against **Git LFS**, **DVC**, and **MLflow**, each
+  a real subprocess/HTTP measurement (never fabricated): hashing throughput at scale,
+  safetensors layer-dedup storage savings, commit+push latency, no-op status/add speed, cold
+  clone/first pull, partial-checkpoint (layer-level) fetch, storage footprint over N versions,
+  and concurrent multi-user push throughput. New `benchmarks/` package: `tool_runner.py`
+  (tool detection, a `NOT_APPLICABLE`-vs-`NOT_INSTALLED` distinction, a 1.5x-relative-to-best-
+  competitor good/ok/bad verdict rule, table/Markdown printers) and `fixtures.py` (wraps
+  `av_cli.speedcheck`'s existing fixture builders rather than duplicating them).
+- **`av benchmark` CLI command** (`--only`, `--vs`, `--markdown`) — dispatches into
+  `benchmarks/bench_*.py` by name, same "(Development only)" / `_find_source_root()`
+  convention as `av test`. Results published in [`development/BENCHMARKS.md`](BENCHMARKS.md).
+- **Found and fixed a real bug while building the flagship dedup benchmark**: `add()` stored
+  the whole-file blob *in addition to* split safetensors layers, unconditionally — every
+  fine-tune commit re-stored the *entire* checkpoint regardless of how many layers actually
+  changed, on top of the (correctly deduped) per-layer copies. Net effect: a layered artifact
+  used *more* disk than not splitting at all, the opposite of the feature's purpose. The
+  codebase's own `push_objects()` already had the right condition ("upload the whole-file
+  object only if layers weren't successfully chunked") and `checkout` already reassembles
+  from layers on demand — `add()` was the one place that hadn't caught up. Fixed to match;
+  `doctor`'s orphaned-pointer detection/`--fix` recovery made layer-aware too (otherwise every
+  layered artifact would have started false-positiving as "orphaned" the moment the
+  whole-file copy was removed). See [`Probleme.md`](Probleme.md#8-av-add-stored-the-whole-file-blob-in-addition-to-split-layers--layer-dedup-gave-zero-real-storage-savings).
+  Verified via the benchmark itself: Aether dropped from 162.5MB to 36.7MB for the same
+  6-commit fine-tune sequence, turning a losing number into a winning one.
+- **Also fixed**: `scripts/run_benchmark_comparison.py` had a latent `NameError`
+  (`CODE_FILE_SIZE` was referenced but never re-exported from `av_cli.speedcheck` after an
+  earlier DRY refactor) — never triggered until this phase's first real re-run with DVC
+  installed actually reached that code path.
+- **Real product gap surfaced, not a bug**: `av` has no `clone`/`pull` command — sync is
+  push-only from a single working repo today. Discovered while building the cold-clone
+  benchmark; `av`'s column there is `N/A` with that footnote rather than a fabricated number,
+  and it's now an open Open Source Roadmap item.
+- **DVC and MLflow installed** as a new `benchmarks` extra (`pyproject.toml`) for use as
+  comparison targets only — not runtime dependencies. (MLflow's full package needs `pyarrow`,
+  which has no prebuilt wheel for Python 3.14 yet; `mlflow-skinny` pinned to match the
+  already-installed `mlflow` 3.14.0 avoids a version-mismatch warning instead.)
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
