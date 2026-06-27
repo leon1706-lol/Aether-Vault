@@ -174,6 +174,24 @@ def test_add_unchanged_file_does_not_restage(repo):
     assert idx.get_entry("train.py")["staged"] is False
 
 
+def test_add_noop_does_not_rewrite_index_file(repo):
+    """A no-op `add` (nothing changed) must not touch .av/index at all.
+
+    Re-hashing is already skipped via the size+mtime fast path; this checks the other half —
+    that add() doesn't unconditionally call idx.save() even when zero entries changed.
+    """
+    (repo / "train.py").write_text("print('hi')")
+    invoke("add", "train.py")
+    invoke("commit", "-m", "first")
+
+    index_path = repo / ".av" / "index"
+    mtime_before = index_path.stat().st_mtime_ns
+
+    result = invoke("add", "train.py")
+    assert result.exit_code == 0
+    assert index_path.stat().st_mtime_ns == mtime_before
+
+
 # ---------------------------------------------------------------------------
 # av status
 # ---------------------------------------------------------------------------

@@ -26,13 +26,20 @@ class VaultClient:
         except Exception:
             pass
 
-    def upload_object(self, file_path: Path, sha256_hash: str) -> bool:
+    def upload_object(self, file_path: Path, sha256_hash: str, known_missing: bool = False) -> bool:
+        """Upload `file_path` as object `sha256_hash`.
+
+        Pass known_missing=True when the caller already confirmed (e.g. via
+        batch_check_objects) that the server doesn't have this hash, to skip the HEAD
+        existence check and go straight to the POST.
+        """
         url = f"{self.server_url}/api/objects/{sha256_hash}"
         try:
-            head_resp = self.session.head(url)
-            if head_resp.status_code == 200:
-                return True # Already exists
-            
+            if not known_missing:
+                head_resp = self.session.head(url)
+                if head_resp.status_code == 200:
+                    return True # Already exists
+
             with open(file_path, 'rb') as f:
                 resp = self.session.post(url, data=f)
             return resp.status_code == 201
@@ -68,6 +75,24 @@ class VaultClient:
             return resp.status_code == 200
         except requests.exceptions.RequestException:
             return False
+
+    def batch_check_objects(self, sha256_hashes: list[str]) -> set[str]:
+        """Return the subset of `sha256_hashes` that already exist on the server.
+
+        Single round trip via `/api/sync/batch-objects` instead of one HEAD request per
+        hash — callers uploading many objects (e.g. a commit) should check existence here
+        before falling back to per-object HEAD checks.
+        """
+        if not sha256_hashes:
+            return set()
+        url = f"{self.server_url}/api/sync/batch-objects"
+        try:
+            resp = self.session.post(url, json=sha256_hashes)
+            if resp.status_code == 200:
+                return set(resp.json().get("found", []))
+        except requests.exceptions.RequestException as e:
+            print(f"Error checking object batch: {e}")
+        return set()
 
     def push_commit(self, commit_data: dict) -> bool:
         url = f"{self.server_url}/api/commits"

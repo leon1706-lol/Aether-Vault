@@ -83,6 +83,74 @@ def test_push_flushes_pending_when_server_reachable(repo, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# upload_commit_objects (commit-latency fix — batch existence check + parallel upload,
+# see development/Probleme.md and BENCHMARKS.md #3)
+# ---------------------------------------------------------------------------
+
+def test_upload_commit_objects_skips_objects_the_batch_check_reports_found(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    (repo / "f.py").write_text("x = 1")
+    invoke("add", "f.py")
+    invoke("commit", "-m", "first")
+
+    idx_entries = json.loads((repo / ".av" / "index").read_text())["entries"]
+    tree = {
+        rel: {"hash": e["hash"], "size": e["size"], "type": e["type"], "layers": e.get("layers", [])}
+        for rel, e in idx_entries.items()
+    }
+    tracked_hash = next(iter(tree.values()))["hash"]
+
+    calls = {"batch_check": [], "uploaded": []}
+
+    class FakeClient:
+        def batch_check_objects(self, hashes):
+            calls["batch_check"].append(set(hashes))
+            return {tracked_hash}  # server already has it
+
+        def upload_object(self, path, h, known_missing=False):
+            calls["uploaded"].append((h, known_missing))
+            return True
+
+    main_module.upload_commit_objects(repo, FakeClient(), tree)
+
+    assert calls["batch_check"] == [{tracked_hash}]
+    assert calls["uploaded"] == []  # nothing missing -> nothing uploaded
+
+
+def test_upload_commit_objects_uploads_only_missing_hashes(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    (repo / "a.py").write_text("a = 1")
+    (repo / "b.py").write_text("b = 2")
+    invoke("add", "a.py", "b.py")
+    invoke("commit", "-m", "first")
+
+    idx_entries = json.loads((repo / ".av" / "index").read_text())["entries"]
+    tree = {
+        rel: {"hash": e["hash"], "size": e["size"], "type": e["type"], "layers": e.get("layers", [])}
+        for rel, e in idx_entries.items()
+    }
+    all_hashes = {info["hash"] for info in tree.values()}
+    missing_hash = next(iter(all_hashes))
+
+    calls = {"uploaded": []}
+
+    class FakeClient:
+        def batch_check_objects(self, hashes):
+            assert set(hashes) == all_hashes
+            return all_hashes - {missing_hash}
+
+        def upload_object(self, path, h, known_missing=False):
+            calls["uploaded"].append((h, known_missing))
+            return True
+
+    main_module.upload_commit_objects(repo, FakeClient(), tree)
+
+    assert calls["uploaded"] == [(missing_hash, True)]
+
+
+# ---------------------------------------------------------------------------
 # av gc
 # ---------------------------------------------------------------------------
 

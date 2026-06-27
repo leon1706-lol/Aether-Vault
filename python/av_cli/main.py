@@ -9,14 +9,49 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
-try:
-    import aether_core
-except ImportError:
-    aether_core = None
+if TYPE_CHECKING:
+    from .client import VaultClient
+
+_aether_core = None
+_aether_core_load_attempted = False
+
+
+def _get_aether_core():
+    """Lazily import the aether_core pybind11 extension.
+
+    Loading the compiled extension costs real time (~90ms) that no-op commands like a
+    fully-cached `add` never recoup, since they never reach a hash/split call. Deferred to
+    first actual use instead of importing unconditionally at module load.
+    """
+    global _aether_core, _aether_core_load_attempted
+    if not _aether_core_load_attempted:
+        try:
+            import aether_core as _ac
+
+            _aether_core = _ac
+        except ImportError:
+            _aether_core = None
+        _aether_core_load_attempted = True
+    return _aether_core
+
+
+def __getattr__(name: str):
+    # PEP 562 module __getattr__: keeps `av_cli.main.VaultClient` resolvable (tests and
+    # other callers monkeypatch it via this attribute) without paying for `import requests`
+    # at module load time for commands that never touch the network — see local
+    # `from .client import VaultClient` imports inside the command functions that need it.
+    if name == "VaultClient":
+        from .client import VaultClient
+
+        return VaultClient
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # Windows consoles default to a legacy codepage (e.g. cp1252) that can't
 # encode the emoji/symbols used in CLI output below, crashing with a
@@ -26,7 +61,6 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from . import speedcheck
-from .client import VaultClient
 from .exceptions import AetherVaultException, NetworkError, StorageError, ValidationError
 from .index import Index
 from .pointer import create_pointer, get_pointer_path, is_pointer_file, parse_pointer
@@ -233,19 +267,38 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
     foreign key into its objects table (see DBTree.object_hash in av_server/models.py), so
     pushing the commit first makes that insert violate the FK — the commit silently never
     lands in the database even though the server used to (incorrectly) report success.
+
+    Uploads are batch-checked then sent in parallel (small thread pool — these are
+    network-bound HTTP calls, not CPU work) rather than one HEAD+POST round trip per
+    object in sequence: a 60-object commit was previously ~120 serial round trips.
     """
-    for rel_path, info in tree.items():
-        # Upload individual layer shards first (PR #8)
+    candidates: dict[str, Path] = {}  # hash -> object file on disk, dedup'd
+    for info in tree.values():
         for layer in info.get("layers", []):
             l_hash = layer["hash"]
             l_obj = repo_root / ".av" / "objects" / l_hash[:2] / l_hash[2:]
             if l_obj.exists():
-                client.upload_object(l_obj, l_hash)
-        # Upload the whole-file object only if layers weren't successfully chunked
+                candidates.setdefault(l_hash, l_obj)
         if not info.get("layers"):
             obj_file = repo_root / ".av" / "objects" / info["hash"][:2] / info["hash"][2:]
             if obj_file.exists():
-                client.upload_object(obj_file, info["hash"])
+                candidates.setdefault(info["hash"], obj_file)
+
+    if not candidates:
+        return
+
+    found = client.batch_check_objects(list(candidates.keys()))
+    missing = {h: p for h, p in candidates.items() if h not in found}
+    if not missing:
+        return
+
+    with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
+        futures = [
+            pool.submit(client.upload_object, path, h, known_missing=True)
+            for h, path in missing.items()
+        ]
+        for future in futures:
+            future.result()
 
 
 def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
@@ -279,6 +332,7 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def hash_file_safe(path: str) -> str:
+    aether_core = _get_aether_core()
     if aether_core:
         try:
             return aether_core.hash_file(path)
@@ -416,6 +470,7 @@ def add(paths: tuple) -> None:
         elif path_obj.is_dir():
             files_to_process.extend(iter_working_files(path_obj))
 
+    any_changed = False
     for fpath in files_to_process:
         rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
         if is_pointer_file(fpath):
@@ -425,9 +480,16 @@ def add(paths: tuple) -> None:
 
         # Skip the expensive full-file re-hash when the file is unchanged since it was last
         # indexed (same size + mtime). Without this, `av add .` re-reads every tracked file
-        # (potentially many GB of artifacts) just to discover nothing changed.
+        # (potentially many GB of artifacts) just to discover nothing changed. Compares
+        # directly against `meta` (already stat'd above) rather than calling
+        # compare_meta_safe(), which would stat() the same path a second time.
         existing = idx.get_entry(rel_path)
-        if existing and compare_meta_safe(str(fpath), existing["size"], existing["mtime_ns"]):
+        if (
+            existing
+            and meta["exists"]
+            and meta["size"] == existing["size"]
+            and meta["mtime_ns"] == existing["mtime_ns"]
+        ):
             continue
 
         file_hash = hash_file_safe(str(fpath))
@@ -438,6 +500,7 @@ def add(paths: tuple) -> None:
             layers: list[dict] = []
 
             # PR #8 — displacement-resistant safetensors layer hashing
+            aether_core = _get_aether_core()
             if rel_path.endswith(".safetensors") and aether_core and hasattr(aether_core, "split_and_hash_safetensors"):
                 logger.info(f"Splitting safetensors layers for {rel_path}...")
                 try:
@@ -489,6 +552,7 @@ def add(paths: tuple) -> None:
             idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, pointer_rel_path, auto_save=False)
             if layers:
                 idx.entries[rel_path]["layers"] = layers
+            any_changed = True
             click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {len(layers)} layers)", fg="green")
         else:
             # Every tracked file — including code and sub-threshold artifacts, not just
@@ -503,9 +567,10 @@ def add(paths: tuple) -> None:
                 shutil.copy2(fpath, obj_path)
 
             idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None, auto_save=False)
+            any_changed = True
             click.secho(f"Staged [{file_type.upper()}] {rel_path}", fg="green")
 
-    if files_to_process:
+    if any_changed:
         idx.save()
 
 
@@ -586,6 +651,8 @@ def commit(
     metric_drawdown: float | None,
 ) -> None:
     """Record staged changes to the repository with optional tags and metrics."""
+    from .client import VaultClient
+
     repo_root = ensure_repo()
     idx = Index(repo_root)
     cfg = load_config(repo_root)
@@ -744,6 +811,8 @@ def branch(name: str | None) -> None:
               help="Discard uncommitted local changes instead of aborting.")
 def checkout(target: str, force: bool) -> None:
     """Checkout a branch or a specific commit hash."""
+    from .client import VaultClient
+
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
@@ -942,6 +1011,8 @@ def list_meta() -> None:
 @cli.command()
 def push() -> None:
     """Retry pushing locally committed but not-yet-synced commits to the remote server."""
+    from .client import VaultClient
+
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
@@ -966,6 +1037,8 @@ def push() -> None:
 @cli.command()
 def gc() -> None:
     """Trigger garbage collection on the remote CAS server."""
+    from .client import VaultClient
+
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
@@ -1012,6 +1085,8 @@ def doctor(fix: bool, dry_run: bool, speed: bool) -> None:
     anything. Pass --fix to repair what's safely recoverable, or --fix --dry-run to preview
     what --fix would do without changing anything.
     """
+    from .client import VaultClient
+
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
@@ -1045,7 +1120,7 @@ def doctor(fix: bool, dry_run: bool, speed: bool) -> None:
     else:
         ok(f"Repository found at {av_dir}")
 
-    if aether_core:
+    if _get_aether_core():
         ok("Native core (aether_core) loaded — hashing runs at full speed")
     else:
         warn("Native core (aether_core) not loaded — falling back to slower Python hashing")

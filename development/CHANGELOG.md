@@ -326,4 +326,44 @@ findings (resolved and still-open).
   which has no prebuilt wheel for Python 3.14 yet; `mlflow-skinny` pinned to match the
   already-installed `mlflow` 3.14.0 avoids a version-mismatch warning instead.)
 
+## Phase 26 — Benchmark-Driven Performance Pass (no-op `add`, `commit` latency)
+- **No-op `add`/`status` (Benchmark #4, was 875.0 ms vs Git LFS 143.4 ms, rated BAD)**: the
+  size+mtime fast path (`compare_meta_safe`) already skipped re-hashing correctly — the
+  remaining cost was everything around it. Fixed three things in `python/av_cli/main.py`:
+  (1) `add()` called `get_file_meta_safe()` then `compare_meta_safe()`, which re-stats the
+  same path a second time — now compares directly against the already-fetched `meta` dict;
+  (2) `idx.save()` ran whenever any files were scanned, even when zero entries actually
+  changed — now gated on an `any_changed` flag; (3) `VaultClient` (and the `requests` import
+  it pulls in) and the `aether_core` pybind11 extension were both imported unconditionally at
+  module load, even for commands that never touch the network or never hash anything — both
+  are now lazily imported on first actual use (`_get_aether_core()`, local `from .client
+  import VaultClient` inside the five commands that need it, plus a module `__getattr__` so
+  `main.VaultClient` stays resolvable for existing test monkeypatching). **Result: ~875ms →
+  ~550-625ms (~30% faster)** across repeated captures. Still rated BAD — the residual gap is
+  CPython interpreter + `click` import startup, which a compiled Git LFS binary doesn't pay;
+  out of scope without rewriting the CLI in a compiled language.
+- **`commit` latency (Benchmark #3, was 2,933.7 ms vs DVC 354.4 ms, rated BAD)**:
+  `upload_commit_objects()` did a serial `HEAD`-then-`POST` per object — up to ~120 round
+  trips for a 60-file commit. The server already exposed `POST /api/sync/batch-objects` for
+  exactly this (existence-check many hashes in one call) but nothing in the client called it.
+  Added `VaultClient.batch_check_objects()`, a `known_missing` fast path on `upload_object()`
+  to skip the now-redundant per-object `HEAD`, and rewired `upload_commit_objects()` to
+  batch-check once then upload only the missing objects via a small `ThreadPoolExecutor` —
+  still waiting for every upload to finish before `push_commit()` is called, preserving the
+  existing FK-ordering invariant. Same code path is used by `flush_pending_push()`, so the
+  offline-retry queue benefits too. **Result: ~2,933.7 ms → ~1,357-2,532 ms (45-54% faster)
+  depending on machine load.** Still rated BAD against DVC — DVC's `commit` never touches the
+  network (`dvc push` is separate), while av intentionally uploads synchronously during
+  `commit` per the FK constraint documented in `upload_commit_objects()`'s docstring; that
+  architectural difference wasn't in scope for this pass.
+- **New tests**: `tests/test_client.py` (new file) covers `batch_check_objects()` and the
+  `known_missing` HEAD-skip; `tests/test_cli_commands.py` adds two tests asserting
+  `upload_commit_objects()` batch-checks once and uploads only what's missing;
+  `tests/test_cli.py` adds a test asserting a true no-op `add` never rewrites `.av/index`.
+- Verified against a real `av_server` (Docker Compose: Postgres + Redis + FastAPI), not just
+  mocks: ran `av init/add/commit/push` end-to-end, confirmed all uploaded objects land
+  server-side via a live `batch-objects` query, and confirmed the offline pending-push queue
+  still flushes correctly through the same (now parallelized) upload path.
+- See [`Probleme.md`](Probleme.md#-fixed--benchmark-driven-performance-pass-no-op-add-and-commit-latency-2026-06-27) for severity/difficulty ratings and exact file:line citations; full before/after numbers in [`BENCHMARKS.md`](BENCHMARKS.md).
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

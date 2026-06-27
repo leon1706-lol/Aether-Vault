@@ -370,8 +370,8 @@ More development-process documents will live under [`development/`](development/
 |---|---|---|---|
 | 1 | Hashing Throughput at Scale | SHA-256 speed, 10–200MB files | Fastest of the three tools at every size tested |
 | 2 | Safetensors Layer-Dedup | Storage after 6 fine-tune commits | 47MB vs. 126MB for every competitor (about 63% smaller) |
-| 3 | Commit + Push Latency | init/add/commit/push, end-to-end | Push is faster than both competitors; the commit step is currently the slower one and is being investigated |
-| 4 | No-Op `status`/`add` | Re-staging unchanged files | Currently slower than Git LFS here — an open finding, not a hidden one |
+| 3 | Commit + Push Latency | init/add/commit/push, end-to-end | Push is faster than both competitors; `commit` was optimized (~2.9s → ~1.4–2.5s, see below) but stays slower than DVC's metadata-only commit by design — av uploads objects synchronously during commit, DVC defers all upload to a separate `push` |
+| 4 | No-Op `status`/`add` | Re-staging unchanged files | Optimized ~30% (~875ms → ~550-625ms); still slower than Git LFS's compiled-binary startup — an open finding, not a hidden one |
 | 5 | Cold Clone / First Pull | Fresh-machine checkout | Not applicable — `av` has no `clone`/`pull` command yet (tracked on the roadmap) |
 | 6 | Partial-Checkpoint Fetch | Fetch one layer vs. the whole file | The only one of the four tools that can fetch a single layer instead of the whole file |
 | 7 | Storage Footprint Curve | Disk growth over 6 commits | The storage gap widens with every additional commit |
@@ -381,9 +381,9 @@ More development-process documents will live under [`development/`](development/
 
 | Operation | Aether-Vault | Git LFS | DVC |
 |---|---:|---:|---:|
-| init | 6020.3 ms | 12919.5 ms | 8577.1 ms |
-| add (60 files) | 11224.0 ms | 4332.1 ms | 15166.2 ms |
-| commit | 9374.9 ms | 2353.1 ms | 881.4 ms |
+| init | 858.8 ms | 5167.6 ms | 4412.8 ms |
+| add (60 files) | 2683.6 ms | 1730.9 ms | 6871.7 ms |
+| commit | 2531.7 ms | 1276.1 ms | 256.9 ms |
 
 For the full results, the methodology behind each benchmark, and the rating legend, see [`development/BENCHMARKS.md`](development/BENCHMARKS.md).
 
@@ -393,9 +393,7 @@ For the full results, the methodology behind each benchmark, and the rating lege
 
 | Status | Feature |
 |---|---|
-| ✅ | **Cross-Tool Benchmark Suite** (`av benchmark`) — reproducible comparison against Git LFS, DVC, and MLflow ([`development/BENCHMARKS.md`](development/BENCHMARKS.md)) |
 | 🔲 | **`av clone`/`av pull`** — fresh-machine checkout of a project someone else already pushed; today's sync model is push-only from a single working repo (found while building the benchmark suite's cold-clone comparison) |
-| 🔲 | **Performance optimization pass** — targeted work on the bottlenecks the benchmark suite surfaced (the no-op `status`/`add` regression and the slower `commit` step in particular), tracked against `development/BENCHMARKS.md` so improvements are measured, not assumed |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
 
 ---
