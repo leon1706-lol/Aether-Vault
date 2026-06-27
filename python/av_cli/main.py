@@ -505,9 +505,35 @@ def init(mode: str | None, yes: bool, no_repl: bool) -> None:
 @click.option("--list-versions", "list_versions_flag", is_flag=True, default=False, help="List every published version.")
 @click.option("--enable-auto-update", is_flag=True, default=False, help="Turn on silent auto-update.")
 @click.option("--disable-auto-update", is_flag=True, default=False, help="Turn off silent auto-update.")
-def update(check_only: bool, list_versions_flag: bool, enable_auto_update: bool, disable_auto_update: bool) -> None:
+@click.option("--docker", "docker_flag", is_flag=True, default=False,
+              help="Pull the latest local Docker backend image and restart it if it changed. "
+                   "Separate from the CLI update above — never bundled into plain `av update`.")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip the restart confirmation prompt (used with --docker).")
+def update(check_only: bool, list_versions_flag: bool, enable_auto_update: bool, disable_auto_update: bool,
+           docker_flag: bool, yes: bool) -> None:
     """Check for, and optionally install, the latest aether-vault release."""
     from . import update_check
+
+    if docker_flag:
+        from . import docker_runtime
+
+        result = docker_runtime.check_for_docker_update(_find_source_root())
+        if not result.checked:
+            click.secho(result.message, fg="yellow")
+            return
+        click.secho(result.message, fg="green" if not result.updated else "yellow")
+        if not result.updated:
+            return
+
+        if yes or click.confirm("Restart the local backend now to apply it?", default=True):
+            compose_file, _ = docker_runtime.resolve_compose_file(_find_source_root())
+            for service in docker_runtime.RELEASE_IMAGES:
+                docker_runtime.restart_service(compose_file, service)
+            # Only remove the old images once the new containers are confirmed up on the new
+            # ones — never leave a window where neither image is safely runnable.
+            docker_runtime.remove_old_images(result.old_image_ids)
+            click.secho("Local backend restarted and old images cleaned up.", fg="green")
+        return
 
     if enable_auto_update or disable_auto_update:
         cfg = update_check.load_user_config()

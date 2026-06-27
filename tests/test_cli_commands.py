@@ -248,6 +248,71 @@ def test_webui_reports_docker_not_running(repo, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# av update --docker
+# ---------------------------------------------------------------------------
+
+def test_update_docker_dev_checkout_noops(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    monkeypatch.setattr(
+        docker_runtime_module, "check_for_docker_update",
+        lambda source_root: docker_runtime_module.DockerUpdateResult(
+            checked=False, message="Running from a source checkout — use `git pull` + `av webui --rebuild` instead.",
+        ),
+    )
+    result = invoke("update", "--docker")
+    assert result.exit_code == 0, result.output
+    assert "source checkout" in result.output
+
+
+def test_update_docker_pulls_and_restarts_with_yes(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    monkeypatch.setattr(
+        docker_runtime_module, "check_for_docker_update",
+        lambda source_root: docker_runtime_module.DockerUpdateResult(
+            checked=True, updated=True, message="A newer Docker image was pulled.",
+            old_image_ids=["old-server-id", "old-webui-id"],
+        ),
+    )
+    monkeypatch.setattr(
+        docker_runtime_module, "resolve_compose_file", lambda source_root: (source_root / "compose.yml", False)
+    )
+    restarted = []
+    monkeypatch.setattr(
+        docker_runtime_module, "restart_service",
+        lambda compose_file, service: restarted.append(service),
+    )
+    removed = []
+    monkeypatch.setattr(
+        docker_runtime_module, "remove_old_images",
+        lambda image_ids: removed.extend(image_ids),
+    )
+
+    result = invoke("update", "--docker", "--yes")
+    assert result.exit_code == 0, result.output
+    assert "pulled" in result.output
+    assert "restarted" in result.output.lower()
+    assert "cleaned up" in result.output.lower()
+    assert set(restarted) == set(docker_runtime_module.RELEASE_IMAGES)
+    assert removed == ["old-server-id", "old-webui-id"]
+
+
+def test_update_docker_already_up_to_date(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    monkeypatch.setattr(
+        docker_runtime_module, "check_for_docker_update",
+        lambda source_root: docker_runtime_module.DockerUpdateResult(
+            checked=True, updated=False, message="Docker backend is already up to date.",
+        ),
+    )
+    result = invoke("update", "--docker")
+    assert result.exit_code == 0, result.output
+    assert "up to date" in result.output
+
+
+# ---------------------------------------------------------------------------
 # av import-lightning / import-transformers / import-mlflow
 #
 # The real av_plugins.lightning/transformers modules raise ImportError at import time when

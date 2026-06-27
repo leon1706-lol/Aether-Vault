@@ -71,7 +71,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   build-and-push-docker:
-    name: Build and push Docker image (GHCR)
+    name: Build and push Docker images (GHCR)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -85,10 +85,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - name: Build and push server image
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/leon1706/aether-vault-server:latest
+            ghcr.io/leon1706/aether-vault-server:${{ github.ref_name }}
+
+      - name: Build and push webui image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./webui
+          push: true
+          tags: |
+            ghcr.io/leon1706/aether-vault-webui:latest
+            ghcr.io/leon1706/aether-vault-webui:${{ github.ref_name }}

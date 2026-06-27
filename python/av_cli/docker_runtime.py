@@ -8,6 +8,7 @@ subprocess logic in two places.
 
 from __future__ import annotations
 
+import importlib.resources
 import subprocess
 import time
 import urllib.error
@@ -18,6 +19,14 @@ from enum import Enum
 from pathlib import Path
 
 from . import ui
+
+# Images published by .github/workflows/release.yml (tagged releases) and docker-edge.yml
+# (rolling :edge builds from main) — keep these names in sync with both workflows and with
+# docker/docker-compose.release.yml, which references the same images by name.
+RELEASE_IMAGES = {
+    "aether-vault-server": "ghcr.io/leon1706/aether-vault-server:latest",
+    "aether-vault-webui": "ghcr.io/leon1706/aether-vault-webui:latest",
+}
 
 
 class DockerCheckResult(Enum):
@@ -33,6 +42,18 @@ class DockerOnboardingResult:
     already_running: bool
     backend_url: str | None = None
     message: str | None = None
+
+
+@dataclass
+class DockerUpdateResult:
+    checked: bool  # False when running from a dev/source checkout (nothing to pull against)
+    updated: bool = False
+    message: str | None = None
+    old_image_ids: list[str] = None  # populated only when updated=True; for post-restart cleanup
+
+    def __post_init__(self):
+        if self.old_image_ids is None:
+            self.old_image_ids = []
 
 
 def check_docker_running() -> DockerCheckResult:
@@ -110,6 +131,119 @@ def wait_for_http_ready(url: str, attempts: int = 30, interval: float = 2.0) -> 
     return False
 
 
+def resolve_compose_file(source_root: Path) -> tuple[Path, bool]:
+    """Picks which compose file to run against.
+
+    Returns (path, is_dev_checkout). A real source checkout (editable/dev install) has its own
+    docker-compose.yml (build:-based) and keeps using it unchanged. A real `pip install
+    aether-vault` end user has no such file on disk at all — `source_root` resolves to a
+    meaningless path inside site-packages — so this falls back to the image-based
+    docker-compose.release.yml bundled inside the wheel as package data.
+    """
+    dev_compose_file = source_root / "docker-compose.yml"
+    if dev_compose_file.exists():
+        return dev_compose_file, True
+
+    release_compose = importlib.resources.files("av_cli.docker").joinpath("docker-compose.release.yml")
+    return Path(str(release_compose)), False
+
+
+def pull_latest_image(compose_file: Path, service: str, image: str) -> tuple[bool, str | None]:
+    """Pulls the given service's image. Returns (changed, old_image_id).
+
+    Compares `docker images -q <image>` before and after the pull — covers both "first pull"
+    (before is empty) and "newer image available" (before/after IDs differ) without depending on
+    parsing `docker compose pull`'s text output. `old_image_id` is returned (non-empty) only when
+    the image actually changed, so the caller can remove the now-dangling old image afterward —
+    surgically, by exact ID, never a blanket prune (this machine has plenty of unrelated images
+    from other projects that must not be touched).
+    """
+    before = _image_id(image)
+    try:
+        subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "pull", service],
+            capture_output=False, timeout=600,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, None
+    after = _image_id(image)
+    if before and before != after:
+        return True, before
+    return before != after, None
+
+
+def _image_id(image: str) -> str:
+    try:
+        result = subprocess.run(
+            ["docker", "images", "-q", image], capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def restart_service(compose_file: Path, service: str) -> bool:
+    """Recreates the container against whatever image is now cached locally for it."""
+    try:
+        proc = subprocess.run(
+            ["docker", "compose", "-f", str(compose_file), "up", "-d", service],
+            capture_output=False, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return proc.returncode == 0
+
+
+def remove_old_images(image_ids: list[str]) -> None:
+    """Removes specific, exact image IDs left dangling after an update — never a blanket prune.
+
+    Called only after the new container is confirmed running on the new image, so the old image
+    has no running container referencing it anymore. Failures (e.g. still in use, or already
+    removed) are silently ignored — this is best-effort cleanup, not something that should fail
+    the whole update if it can't tidy up.
+    """
+    for image_id in image_ids:
+        if not image_id:
+            continue
+        subprocess.run(["docker", "rmi", image_id], capture_output=True, timeout=30)
+
+
+def check_for_docker_update(source_root: Path) -> DockerUpdateResult:
+    """Pulls the latest published images and reports whether anything actually changed.
+
+    Only does real work against the release (image-based) compose file — a dev/source checkout's
+    `build:`-based compose file has nothing meaningful to "pull" (its services aren't tied to a
+    published image tag at all), so that case no-ops with guidance instead of silently pulling
+    unrelated base images.
+    """
+    compose_file, is_dev_checkout = resolve_compose_file(source_root)
+    if is_dev_checkout:
+        return DockerUpdateResult(
+            checked=False,
+            message="Running from a source checkout — use `git pull` + `av webui --rebuild` instead.",
+        )
+
+    # Fail fast and clearly instead of letting `docker compose pull` hang/time out (up to 600s
+    # per service) against a daemon that isn't even running — found via manual debugging.
+    docker_state = check_docker_running()
+    if docker_state != DockerCheckResult.RUNNING:
+        return DockerUpdateResult(
+            checked=False, message="Docker is not running. Please start Docker Desktop and try again.",
+        )
+
+    old_image_ids = []
+    for service, image in RELEASE_IMAGES.items():
+        changed, old_id = pull_latest_image(compose_file, service, image)
+        if changed and old_id:
+            old_image_ids.append(old_id)
+
+    if not old_image_ids:
+        return DockerUpdateResult(checked=True, updated=False, message="Docker backend is already up to date.")
+    return DockerUpdateResult(
+        checked=True, updated=True, message="A newer Docker image was pulled.", old_image_ids=old_image_ids,
+    )
+
+
 def ensure_local_backend_running(
     source_root: Path,
     open_browser: bool,
@@ -119,7 +253,7 @@ def ensure_local_backend_running(
     url: str = "http://localhost:3000",
 ) -> DockerOnboardingResult:
     """Top-level orchestrator: not running -> image missing -> start -> wait -> connect."""
-    compose_file = source_root / "docker-compose.yml"
+    compose_file, _ = resolve_compose_file(source_root)
 
     ui.print_step("Checking Docker…", status="info")
     docker_state = check_docker_running()

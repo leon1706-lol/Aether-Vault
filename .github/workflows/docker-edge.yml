@@ -1,0 +1,47 @@
+name: Docker Edge Build
+
+# Rolling ":edge" build tracking `main` — for visibility/testing between tagged releases.
+# Never touches `:latest`, which stays exclusively tied to tagged releases (see release.yml).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'webui/**'
+      - 'python/**'
+      - 'src/**'
+      - 'docker-compose*.yml'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - '.github/workflows/docker-edge.yml'
+
+jobs:
+  build-and-push-edge:
+    name: Build and push :edge images (GHCR)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/leon1706/aether-vault-server:edge
+
+      - name: Build and push webui image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./webui
+          push: true
+          tags: ghcr.io/leon1706/aether-vault-webui:edge

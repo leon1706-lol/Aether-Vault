@@ -447,4 +447,60 @@ findings (resolved and still-open).
   tested but has not been exercised end-to-end against a real Docker daemon in this pass — no
   Docker install was available in the environment this phase was built in.
 
+## Phase 28 — Docker Auto-Update: Rolling `:edge` Builds + `av update --docker`
+
+- **Real gap found while investigating "can the Docker image auto-update"**: `docker-compose.yml`
+  (used by `docker_runtime.ensure_local_backend_running`, called from `av init` and `av webui`)
+  defines `aether-vault-server`/`aether-vault-webui` with `build: .` / `build: ./webui` — it
+  builds from local source, it never pulled a published image at all. Combined with
+  `_find_source_root()` resolving relative to the installed package's file location, **Local-mode
+  onboarding only worked for an editable/source install** — a real `pip install aether-vault` end
+  user has no `Dockerfile`/`docker-compose.yml` on disk for it to find. Fixed by adding a second,
+  image-only compose file (`python/av_cli/docker/docker-compose.release.yml`, no `build:` keys,
+  references `ghcr.io/leon1706/aether-vault-server`/`-webui:latest`), shipped as package data
+  (`[tool.setuptools.package-data]` in `pyproject.toml`). New
+  `docker_runtime.resolve_compose_file()` picks the right one: the dev compose file when a real
+  source checkout is found (unchanged behavior for contributors), the bundled release compose file
+  otherwise. `ensure_local_backend_running()` now calls this instead of hardcoding the dev path.
+- **Also found**: `release.yml`'s `build-and-push-docker` job only ever built **one** image (the
+  server) — the webui's Docker image had never been published to GHCR at all. Fixed: the job now
+  builds and pushes both images, renamed to `ghcr.io/leon1706/aether-vault-server` and
+  `...-webui` (safe to rename — no real tag has ever been pushed, nothing live to break).
+- **`av update --docker`** (new flag, deliberately separate from plain `av update` — restarting a
+  running backend is disruptive, same reasoning as `auto_update` being off-by-default): pulls the
+  latest published image via `docker_runtime.pull_latest_image()` (compares `docker images -q`
+  before/after the pull rather than parsing `docker compose pull`'s text output), reports whether
+  anything changed, and on confirmation (or `--yes`) calls `restart_service()` then
+  `remove_old_images()` to clean up the now-superseded image by its exact ID — never a blanket
+  `docker image prune`, since a real machine can have plenty of unrelated images from other
+  projects that must not be touched. No-ops with guidance ("use `git pull` + `av webui --rebuild`
+  instead") when run from a dev/source checkout, since that backend isn't tied to a published
+  image tag at all.
+- **Bug found in manual debugging and fixed**: `check_for_docker_update()` didn't check whether
+  Docker was even running before calling `docker compose pull` — against a registry image that
+  doesn't exist yet (nothing's been published), this can hang for minutes (up to the 600s
+  per-service timeout) instead of failing fast. Fixed by checking `check_docker_running()` first,
+  matching the existing fast-fail UX everywhere else in `docker_runtime.py`.
+- **New workflow `.github/workflows/docker-edge.yml`**: rolling `:edge` build on every push to
+  `main` (path-filtered to Dockerfile/webui/python/compose/pyproject changes, so doc-only commits
+  don't trigger a rebuild), pushing both images tagged `:edge`. `:latest` is left untouched — it
+  stays exclusively tied to tagged releases via `release.yml`, so "stable" and "bleeding edge"
+  never collide.
+- **Verified locally** (real Docker, not mocked — this machine has Docker installed and running):
+  ran `docker compose build` against the dev compose file to confirm the rebuild path still works
+  unchanged, then `docker compose up -d` to restart all four containers on the freshly built
+  images, confirmed all four (`server`, `webui`, `db`, `redis`) report `healthy`, and confirmed no
+  aether-vault image duplicates were left behind (the old pre-rebuild image IDs were already
+  superseded by BuildKit's tag-reuse; the one dangling image found on the machine afterward
+  belongs to an unrelated project and was correctly left untouched).
+- **New tests**: extended `tests/test_docker_runtime.py` (`resolve_compose_file`,
+  `pull_latest_image`'s old-ID tracking, `remove_old_images`, `check_for_docker_update`'s
+  dev-checkout/not-running/up-to-date/updated paths) and `tests/test_cli_commands.py`
+  (`av update --docker`'s three outcomes, including that `remove_old_images` is called with the
+  right IDs after a confirmed restart). Full suite: 133 passed, 3 skipped (pre-existing).
+- **Deferred**: the actual GHCR pull/restart path against real published images can't be
+  end-to-end verified until something is actually published — no tag has been pushed and
+  `docker-edge.yml` hasn't run yet (this work itself hasn't been pushed to `main`). Tracked on the
+  README roadmap alongside the existing "first real tagged release" item.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

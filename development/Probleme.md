@@ -742,3 +742,27 @@ implement, both rated 1–10.
   warning). Manually re-ran the exact repro from a real Git Bash shell — bare `av`, `av init`
   (fresh repo), and re-running `av init` against an already-initialized repo (reconnect path)
   all now complete cleanly with the warning instead of a traceback.
+
+## ✅ Fixed — `av update --docker` could hang for minutes against a non-running/unreachable Docker daemon (2026-06-27)
+
+### [6] `check_for_docker_update()` attempted `docker compose pull` without first checking Docker was running
+- **Files:** `python/av_cli/docker_runtime.py` (`check_for_docker_update`).
+- **Problem (Severity 6, Difficulty 1):** Found during manual debugging while building the
+  Docker auto-update feature — calling `docker_runtime.check_for_docker_update()` against a
+  registry image that doesn't exist yet (nothing published to GHCR) caused the process to sit
+  unresponsively for over a minute (up to the 600s-per-service timeout on `pull_latest_image()`,
+  twice, since there are two release images) instead of failing fast. Root cause: every other
+  Docker-facing entry point in this module (`ensure_local_backend_running()`) checks
+  `check_docker_running()` first and fails fast with a clear message
+  ("Docker is not running...") — `check_for_docker_update()` was the one path that skipped this
+  check and went straight to `docker compose pull`, which has no comparable fast-fail behavior of
+  its own against an unresponsive/absent daemon or a registry image that 404s.
+- **Fix:** Added the same `check_docker_running()` guard used elsewhere in this module, before
+  attempting any pull — returns a `DockerUpdateResult(checked=False, message="Docker is not
+  running...")` immediately, matching the existing UX convention instead of introducing a new
+  failure mode.
+- **Verified:** added `tests/test_docker_runtime.py::test_check_for_docker_update_fails_fast_when_docker_not_running`
+  (monkeypatches `check_docker_running` to report not-running, asserts `pull_latest_image` is
+  never called). Found live by actually running the unguarded version against this machine's real
+  Docker installation pointed at the (not-yet-published) GHCR images and observing the hang
+  firsthand, then killing the process — not just inferred from reading the code.

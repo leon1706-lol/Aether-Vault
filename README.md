@@ -96,6 +96,9 @@ graph TD
 
     PyPI("PyPI<br>(pip install aether-vault · release.yml on git tag push)")
     CLI -- "update: Checks Latest Version (av init / av update)" --> PyPI
+
+    GHCR("GHCR<br>(aether-vault-server/-webui images ·<br>:latest on tag push · :edge on every push to main)")
+    CLI -- "update --docker: Pulls Latest Image & Restarts Local Backend" --> GHCR
 ```
 
 > The "Local" box represents **any number** of independent `av init` repos on the same (or
@@ -201,6 +204,15 @@ av update --list-versions       # list every published version, newest first
 av update --enable-auto-update  # opt in to silent auto-upgrade (off by default)
 av update --disable-auto-update
 ```
+`av update --docker` is a separate, opt-in action that only touches the local Docker backend —
+it never runs as part of plain `av update`, since restarting a running container is disruptive:
+```bash
+av update --docker          # pull the latest published image; prompts before restarting if changed
+av update --docker --yes    # skip the restart confirmation
+```
+Only does real work when running from a real `pip install aether-vault` (against the
+GHCR-published `:latest` image); from a source checkout it tells you to `git pull` +
+`av webui --rebuild` instead, since a dev checkout's backend isn't tied to a published image tag.
 
 ### `av help`
 Every command supports `--help`, including the top-level `av` group itself — the fastest way
@@ -465,8 +477,7 @@ For the full results, the methodology behind each benchmark, and the rating lege
 
 | Status | Feature |
 |---|---|
-| 🔲 | **`av clone`/`av pull`** — fresh-machine checkout of a project someone else already pushed; today's sync model is push-only from a single working repo (found while building the benchmark suite's cold-clone comparison) |
-| 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
+| 🔲 | **`av stash`** — git-stash-style temporary shelving of uncommitted changes, so you can switch branches or pull without committing half-finished work |
 | 🔲 | **First real tagged release** — `release.yml` exists and has been validated structurally, but no `vX.Y.Z` tag has been pushed yet; needs a TestPyPI dry run before pointing trusted publishing at the real `pypi.org` project (see `development/CHANGELOG.md`) |
 
 ---
@@ -478,6 +489,7 @@ For enterprise research teams and institutional algorithmic trading firms:
 | Feature | Description |
 |---|---|
 | **Enterprise Login** (🔲 not yet built) | `av init`/`av update` already expose an "Enterprise" mode choice and a stable `EnterpriseAuthProvider` seam (`python/av_cli/enterprise.py`) — selecting it today shows a "coming soon" message and falls back to Local. The real account-based login (the items below) plugs into that seam without changing the CLI surface |
+| **Multi-User Collaboration: `av clone`/`av pull`** | Fresh-machine checkout of a project someone else already pushed — today's sync model is push-only from a single working repo. Real multi-user collaboration (not just a shared registry one person pushes to) is an Enterprise-tier feature |
 | **RBAC** | Fine-grained read/write permissions for teams, users, and repositories |
 | **SSO** | OAuth2, SAML, and Active Directory integration |
 | **Audit Logging** | Immutable, cryptographically signed logs for regulatory compliance |
