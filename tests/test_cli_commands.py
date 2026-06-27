@@ -235,12 +235,12 @@ def test_graph_update_generates_vault_without_opening_browser(repo):
 # ---------------------------------------------------------------------------
 
 def test_webui_reports_docker_not_running(repo, monkeypatch):
-    import python.av_cli.main as main_module
+    import python.av_cli.docker_runtime as docker_runtime_module
 
     def fake_run(args, **kwargs):
         return type("FakeCompleted", (), {"returncode": 1})()
 
-    monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(docker_runtime_module.subprocess, "run", fake_run, raising=False)
 
     result = invoke("webui")
     assert result.exit_code == 0, result.output

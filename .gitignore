@@ -20,6 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# setuptools-scm generated version file (derived from git tags at build time)
+python/av_cli/_version.py
+
 # Aether-Vault internal repository tracking data
 # We don't want to sync local Aether-Vault databases to Git!
 .av/

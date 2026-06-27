@@ -38,7 +38,7 @@ def _bench_av() -> float | None:
     with tempfile.TemporaryDirectory(prefix="bench-noop-av-") as tmp:
         root = Path(tmp)
         _populate_fixture(root)
-        time_subprocess([av_path, "init"], root)
+        time_subprocess([av_path, "init", "--mode", "local", "--yes", "--no-repl"], root)
         time_subprocess([av_path, "add", "."], root)
         time_subprocess([av_path, "commit", "-m", "bench"], root)
         return time_subprocess([av_path, "add", "."], root)

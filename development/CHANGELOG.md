@@ -366,4 +366,85 @@ findings (resolved and still-open).
   still flushes correctly through the same (now parallelized) upload path.
 - See [`Probleme.md`](Probleme.md#-fixed--benchmark-driven-performance-pass-no-op-add-and-commit-latency-2026-06-27) for severity/difficulty ratings and exact file:line citations; full before/after numbers in [`BENCHMARKS.md`](BENCHMARKS.md).
 
+## Phase 27 — Pretty `av init` UX, Local/Enterprise Login, PyPI Packaging, Auto-Update
+- **Pretty `av init`**: shows a `rich`-rendered banner and a `questionary` arrow-key select
+  asking Local vs. Enterprise on first run in a project. New `python/av_cli/ui.py` centralizes
+  the rendering helpers (banner/step/select) so `init`, `webui`, and `update` all render
+  consistently instead of each hand-rolling `click.secho` color/emoji prefixes.
+- **Enterprise login seam (stub)**: new `python/av_cli/enterprise.py` defines
+  `EnterpriseAuthProvider` (`login`/`logout`/`current_session`/`refresh`) and the only
+  implementation today, `StubEnterpriseAuthProvider`, which prints a "coming soon" message and
+  falls back to Local. Real account-based auth plugs into this seam later without changing any
+  call site in `main.py`/`repl.py`.
+- **Local-mode Docker onboarding factored out and extended**: new
+  `python/av_cli/docker_runtime.py` extracts the docker-compose logic that used to live only in
+  `webui_cmd` (`check_docker_running`, `get_container_health`, `start_services`,
+  `wait_for_http_ready`) and adds the one capability that was missing — `image_exists()`, which
+  distinguishes "image never built/pulled" from "built but the container is stopped" from
+  "already running and healthy". `ensure_local_backend_running()` is the new top-level
+  orchestrator, used by both `av webui` (refactor, behavior-preserving — same
+  `"Docker is not running"` message the existing test asserts on) and `av init`'s local-mode
+  first-run/reconnect path.
+- **Interactive REPL session**: new `python/av_cli/repl.py`. `av init` (after setup or
+  reconnect) and bare `av` (in an already-initialized repo) now drop into a persistent session
+  built on `prompt_toolkit.PromptSession`, where commands are still typed with the `av` prefix
+  (e.g. `av status`) and dispatched into the same Click group used for one-shot invocations
+  (`cli.main(..., standalone_mode=False)`), so behavior never diverges from running the same
+  command outside the session. `exit`/`quit`/Ctrl+D leave; Ctrl+C cancels the current line only.
+  `cli()` gained `invoke_without_command=True` so bare `av` in an initialized repo reconnects
+  (no re-prompting) straight into the session instead of just printing help.
+  - **Bug found in manual debugging (step 1) and fixed**: on Git Bash/mintty on Windows,
+    `sys.stdin.isatty()`/`sys.stdout.isatty()` both report `True` but `prompt_toolkit`'s Win32
+    backend still can't get a real console screen buffer handle, so
+    `PromptSession(...)` itself raised an unhandled `NoConsoleScreenBufferError` and crashed
+    bare `av` outright. Fixed by wrapping both the session construction and each `.prompt()`
+    call in `run_repl()` in a broad `except Exception`, degrading to a one-line warning
+    ("Interactive session isn't available in this terminal — run `av <command>` directly
+    instead.") instead of crashing. See
+    [`Probleme.md`](Probleme.md#-fixed--repl-session-construction-crashed-bare-av-under-git-bashmintty-on-windows-2026-06-27).
+    Regression test: `tests/test_repl.py::test_repl_degrades_gracefully_when_session_cannot_be_constructed`.
+- **PyPI packaging**: `pyproject.toml` switched from a hardcoded `version = "1.0.0"` to
+  `dynamic = ["version"]` via `setuptools-scm` (`write_to = "python/av_cli/_version.py"`,
+  gitignored, derived from git tags at build time) — eliminates the prior risk of the
+  `pyproject.toml`/`__init__.py` version strings drifting out of sync. Added
+  `[tool.cibuildwheel]` so releases ship prebuilt wheels (no local C++ compiler needed for most
+  users; the sdist fallback still requires one, same as today, for platforms outside the built
+  matrix). New `.github/workflows/release.yml`, triggered on `v*.*.*` tag push: builds wheels
+  (`cibuildwheel`) + sdist, publishes to PyPI via trusted publishing (OIDC, no stored token),
+  and builds/pushes the Docker image to **GHCR** (chosen over Docker Hub — uses the repo's
+  built-in `GITHUB_TOKEN`, no extra secrets, no anonymous pull-rate limits).
+- **Update checking**: new `python/av_cli/update_check.py`. User-level config at
+  `~/.aether-vault/config.json` (distinct from the existing per-repo `.av/config`) holds
+  `auto_update` (off by default — opt-in only), `update_check_enabled`, and a cached
+  last-check result (12h cache window, so most invocations are a zero-network-call file read).
+  New `av update` command: `--check` (report only), `--list-versions` (every published
+  version, newest first, current one marked), `--enable-auto-update`/`--disable-auto-update`.
+  `av init` prints a one-line "update available" banner at the end of its flow; deliberately
+  **not** hooked into every routine command (`av add`, `av status`, ...) — only `av init` and
+  the explicit `av update` ever make a PyPI network call.
+- **Shared atomic-write helper extracted**: `atomic_write_text`/`atomic_write_json` moved from
+  `main.py` into new `python/av_cli/fsutil.py` so both the per-repo config (`main.py`) and the
+  new user-level config (`update_check.py`) can use them without importing each other.
+- **Docs cleanup (unrelated to the feature, done alongside)**: removed the
+  "Optimization pass (2026-06-27)" narrative from `README.md`'s Benchmark Comparison section
+  and `development/BENCHMARKS.md` — both now show only current benchmark standing, since the
+  optimization history already lives in this changelog and in `Probleme.md`.
+- **New tests**: `tests/test_docker_runtime.py`, `tests/test_repl.py`, `tests/test_update_check.py`.
+  Updated every existing call site that invokes `av init` as a subprocess or in-process
+  (`tests/conftest.py`'s `repo` fixture, `tests/test_cli.py`, `tests/test_server.py`,
+  `tests/test_plugins.py`, `python/av_cli/speedcheck.py`, three `benchmarks/bench_*.py` files)
+  to pass `--mode local --yes --no-repl` so none of them block on an interactive prompt or
+  the REPL. Full suite: 122 passed, 3 skipped (pre-existing, unrelated).
+- **Verified manually** (step 1 of the wrap-up checklist, via the real installed `av` binary in
+  a scratch dir outside this checkout, not just `CliRunner`): `av init` (default, no flags),
+  re-running `av init` against an already-initialized repo (reconnect path), `av init --mode
+  enterprise` (stub fallback), bare `av`, and a full `add`/`commit`/`status` cycle — this is
+  what surfaced the Git Bash/mintty REPL bug above.
+- **Deferred, tracked on the README roadmap**: no real `vX.Y.Z` tag has been pushed yet — the
+  release workflow needs a TestPyPI dry run before trusted publishing points at the real
+  `pypi.org` project, and the `aether-vault` PyPI name needs to be confirmed available/claimed.
+  The Docker-onboarding three-state decision tree (`image_exists`/health/not-running) is unit
+  tested but has not been exercised end-to-end against a real Docker daemon in this pass — no
+  Docker install was available in the environment this phase was built in.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

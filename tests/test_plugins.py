@@ -7,7 +7,7 @@ from python.av_plugins._shared import build_metric_args, resolve_repo_root, run_
 
 
 def _init_repo(tmp_path):
-    run_av(tmp_path, ["init"])
+    run_av(tmp_path, ["init", "--mode", "local", "--yes", "--no-repl"])
     return tmp_path
 
 

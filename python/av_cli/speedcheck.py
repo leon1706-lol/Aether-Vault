@@ -177,7 +177,7 @@ def run_av_cli_probes(av_path: str, tmp_root: Path) -> list[Probe]:
     populate_cli_fixture(tmp_root)
     file_count = CLI_CODE_FILE_COUNT + CLI_LARGE_FILE_COUNT
     steps = [
-        ("av init", [av_path, "init"]),
+        ("av init", [av_path, "init", "--mode", "local", "--yes", "--no-repl"]),
         (f"av add . ({file_count} files)", [av_path, "add", "."]),
         ("av commit", [av_path, "commit", "-m", "speedcheck"]),
     ]

@@ -17,7 +17,7 @@ def invoke(*args):
 
 def test_init_creates_av_structure(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    result = invoke("init")
+    result = invoke("init", "--mode", "local", "--yes", "--no-repl")
     assert result.exit_code == 0, result.output
 
     av_dir = tmp_path / ".av"
@@ -26,12 +26,30 @@ def test_init_creates_av_structure(tmp_path, monkeypatch):
     assert (av_dir / "commits").is_dir()
     assert av_dir.joinpath("HEAD").read_text().strip() == "ref: refs/heads/main"
     assert json.loads((av_dir / "config").read_text())["lfs_threshold_mb"] == 50
+    assert json.loads((av_dir / "config").read_text())["login_mode"] == "local"
 
 
 def test_init_twice_is_a_noop(repo):
-    result = invoke("init")
+    result = invoke("init", "--no-repl")
     assert result.exit_code == 0
     assert "already initialized" in result.output.lower()
+
+
+def test_init_non_interactive_defaults_to_local(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = invoke("init", "--no-repl")
+    assert result.exit_code == 0, result.output
+    cfg = json.loads((tmp_path / ".av" / "config").read_text())
+    assert cfg["login_mode"] == "local"
+
+
+def test_init_enterprise_mode_shows_stub_message(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = invoke("init", "--mode", "enterprise", "--no-repl")
+    assert result.exit_code == 0, result.output
+    assert "coming soon" in result.output.lower()
+    cfg = json.loads((tmp_path / ".av" / "config").read_text())
+    assert cfg["login_mode"] == "local"  # stub falls back to local
 
 
 # ---------------------------------------------------------------------------

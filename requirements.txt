@@ -6,3 +6,7 @@ pybind11>=2.11.0
 sqlalchemy>=2.0.0
 asyncpg>=0.29.0
 redis>=5.0.0
+rich>=13.7.0
+questionary>=2.0.0
+prompt_toolkit>=3.0.0
+packaging>=23.0

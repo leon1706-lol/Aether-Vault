@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68.0", "pybind11>=2.11.0"]
+requires = ["setuptools>=68.0", "setuptools-scm>=8", "pybind11>=2.11.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-vault"
-version = "1.0.0"
+dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.104.0",
@@ -14,7 +14,11 @@ dependencies = [
     "pybind11>=2.11.0",
     "sqlalchemy>=2.0.0",
     "asyncpg>=0.29.0",
-    "redis>=5.0.0"
+    "redis>=5.0.0",
+    "rich>=13.7.0",
+    "questionary>=2.0.0",
+    "prompt_toolkit>=3.0.0",
+    "packaging>=23.0"
 ]
 
 [project.optional-dependencies]
@@ -29,3 +33,11 @@ av = "av_cli.main:cli"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools_scm]
+write_to = "python/av_cli/_version.py"
+fallback_version = "0.0.0.dev0"
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-*"
+skip = "*-musllinux* pp*"

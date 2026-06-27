@@ -328,7 +328,7 @@ def test_cli_commit_pushes_to_a_live_server(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
-    runner.invoke(cli, ["init"])
+    runner.invoke(cli, ["init", "--no-repl"])
     runner.invoke(cli, ["config", "--remote-url", "http://localhost:8000"])
     (tmp_path / "train.py").write_text("print('live wire test')")
     runner.invoke(cli, ["add", "train.py"])

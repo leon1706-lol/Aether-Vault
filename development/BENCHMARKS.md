@@ -8,37 +8,11 @@ calls to each tool — never fabricated. A tool that genuinely can't run a given
 guessed at.
 
 **Captured:** 2026-06-27, on Windows. Aether-Vault @ `b82e998`, git-lfs 3.7.1, dvc 3.67.1,
-mlflow 3.14.0, Python 3.14.0. Re-captured after the no-op-add and commit-latency
-optimization pass described below.
+mlflow 3.14.0, Python 3.14.0.
 
 **Caveat:** these are single-run, single-machine timings — disk/antivirus/OS-scheduler noise
 is real (see the 200MB hashing row and the commit-latency row below, where that noise shows
 up as a non-monotonic result). Re-run before relying on any single number for a decision.
-
-## Optimization pass (2026-06-27)
-
-Targeted the two BAD-rated benchmarks (`commit`, no-op `add`/`status`) with localized fixes —
-no architecture changes (see `development/Probleme.md` for full writeups, severity/difficulty
-ratings, and exact file:line citations):
-
-- **No-op `add`/`status` (was 875.0 ms vs git-lfs 143.4 ms):** removed a redundant second
-  `stat()` per file in the unchanged-file fast path, stopped calling `idx.save()` when zero
-  entries actually changed, and made both the `VaultClient`/`requests` import and the
-  `aether_core` C-extension import lazy (only paid for by commands/paths that actually need
-  them). **Result: 875.0 ms → ~552–624 ms (~30% faster)** across repeated runs. Still rated
-  BAD — the remaining gap is dominated by CPython interpreter + `click` import startup cost
-  on every invocation, which a compiled Git LFS binary doesn't pay at all; closing that fully
-  would mean rewriting the CLI in a compiled language, which is out of scope for this pass.
-- **`commit` (was 2,933.7 ms vs DVC 354.4 ms):** `upload_commit_objects()` used to do a serial
-  `HEAD`-then-`POST` per object (up to ~120 round trips for a 60-file commit). It now collects
-  every referenced hash up front, checks existence in one call to the server's existing (and
-  previously unused) `POST /api/sync/batch-objects` endpoint, then uploads only the missing
-  objects in parallel via a small thread pool. **Result: 2,933.7 ms → ~1,357–2,532 ms
-  (45–54% faster** depending on machine load during the run). Still rated BAD against DVC's
-  354.4 ms — DVC's `commit` never touches the network at all (objects are pushed later, in a
-  separate `dvc push`), while av intentionally uploads objects synchronously during `commit`
-  to satisfy the server's FK ordering constraint (see `upload_commit_objects()`'s docstring).
-  That's an architectural difference, not something this pass changed.
 
 ## Legend
 
@@ -97,7 +71,7 @@ init/add/commit/push on the same 60-file mixed fixture, across all four tools.
 |---|---:|---:|---:|---:|---|
 | init | 858.8 ms | 5,167.6 ms | 4,412.8 ms | 4,661.6 ms | GOOD |
 | add (60 files) | 2,683.6 ms | 1,730.9 ms | 6,871.7 ms | 0.0 ms | OK |
-| commit | 2,531.7 ms | 1,276.1 ms | 256.9 ms | 333.3 ms | BAD (was 2,933.7 ms — see Optimization pass above) |
+| commit | 2,531.7 ms | 1,276.1 ms | 256.9 ms | 333.3 ms | BAD |
 | push | 1,742.5 ms | 3,907.4 ms | 3,444.0 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | GOOD |
 
 ## No-Op status/add Speed at Scale
@@ -106,7 +80,7 @@ Re-running the staging step a second time with nothing changed.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| re-add unchanged (60 files) | 552.5 ms | 82.9 ms | 7,527.4 ms | N/A (no incremental staging/status primitive) | BAD (was 875.0 ms — see Optimization pass above) |
+| re-add unchanged (60 files) | 552.5 ms | 82.9 ms | 7,527.4 ms | N/A (no incremental staging/status primitive) | BAD |
 
 ## Cold Clone / First Pull Time
 
@@ -125,14 +99,9 @@ Fetching one 5MB layer of a 20MB checkpoint vs the whole thing, from a real remo
 | fetch single layer | 88.8 ms | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | OK |
 | fetch whole checkpoint | 821.5 ms | 1,403.0 ms | 3,877.2 ms | 131.2 ms | BAD |
 
-Note: this benchmark's code path (`VaultClient.download_object`, `av checkout` layer
-reassembly) was not touched in the 2026-06-27 optimization pass — the BAD verdict here
-(unchanged from the prior capture) is driven entirely by MLflow's number being a local
-filesystem read rather than a real network fetch (see methodology note above), and the
-absolute av number moves run-to-run with local Docker/network conditions. Candidate follow-up
-(not yet implemented): parallelize multi-layer downloads the same way `upload_commit_objects`
-was parallelized, if a future capture shows av's own whole-checkpoint number regressing
-independent of MLflow's baseline.
+Note: the BAD verdict here is driven entirely by MLflow's number being a local filesystem
+read rather than a real network fetch (see methodology note above), and the absolute av
+number moves run-to-run with local Docker/network conditions.
 
 ## Storage Footprint Over N Versions
 
@@ -158,6 +127,6 @@ Cumulative on-disk storage after each of 6 fine-tune commits (same scenario as t
 Note: this run's absolute number is noticeably higher than the prior capture (877.9 ms) —
 this benchmark ran 8th in sequence in a freshly-built Docker container during this capture,
 competing for the same container's resources as the other server-backed benchmarks that ran
-immediately before it. No code on this path changed in the 2026-06-27 pass; re-capture in
-isolation (`av benchmark --only concurrent_push`) before treating either number as canonical.
-Still OK regardless, since there's no real competitor baseline to compare against.
+immediately before it; re-capture in isolation (`av benchmark --only concurrent_push`) before
+treating either number as canonical. Still OK regardless, since there's no real competitor
+baseline to compare against.

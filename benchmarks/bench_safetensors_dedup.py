@@ -32,7 +32,7 @@ DEFAULT_STEPS = fixtures.STORAGE_CURVE_COMMIT_COUNT
 
 
 def _av_sequence(av_path: str, repo: Path, steps: int) -> list[int]:
-    subprocess.run([av_path, "init"], cwd=repo)
+    subprocess.run([av_path, "init", "--mode", "local", "--yes", "--no-repl"], cwd=repo)
     # Default LFS threshold is 50MB; the fixture's total file size is well under that, so
     # without lowering it `av add` would never engage layer-splitting at all and this
     # benchmark would (silently) show no dedup advantage for any tool.

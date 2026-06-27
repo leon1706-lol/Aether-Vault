@@ -25,6 +25,7 @@ Aether-Vault solves the core challenge of ML reproducibility by versioning the *
 
 - [Architecture](#architecture)
 - [Installation](#installation)
+- [Quick Start: From Install to Push](#quick-start-from-install-to-push)
 - [CLI Reference](#cli-reference)
 - [Framework Plugins](#framework-plugins)
 - [Development Progress](#development-progress)
@@ -52,13 +53,14 @@ graph TD
     %% Local Environment
     subgraph Local [User Machine / Training Node]
         Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-        CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark ·<br>import-lightning · import-mlflow · import-transformers)")
+        CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update ·<br>import-lightning · import-mlflow · import-transformers)")
         CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
         LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
         PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
         WebUI("Web UI<br>(Dashboard + Weight Diff + Projects Tabs · localhost:3000)")
         Vault("Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
         Benchmarks("development/BENCHMARKS.md<br>(av benchmark vs Git LFS · DVC · MLflow)")
+        Session("Interactive Session<br>(av init / bare av → av status, av commit, ... · exit/quit)")
 
         Plugins -- "Drives in-process (add/commit/push)" --> CLI
         CLI -- "1. Reads & Hashes Files" --> CPP
@@ -70,6 +72,7 @@ graph TD
         CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> LocalDAG
         CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> PendingQ
         CLI -- "8. Benchmarks Against Competitor Tools" --> Benchmarks
+        CLI -- "9. Opens Local/Enterprise Session After Init/Reconnect" --> Session
     end
 
     %% Remote Environment
@@ -90,6 +93,9 @@ graph TD
     CLI -- "Checkout: Downloads Missing Objects" --> FastAPI
     PendingQ -- "Retried by av push" --> FastAPI
     CLI -- "gc: Triggers Remote Garbage Collection" --> FastAPI
+
+    PyPI("PyPI<br>(pip install aether-vault · release.yml on git tag push)")
+    CLI -- "update: Checks Latest Version (av init / av update)" --> PyPI
 ```
 
 > The "Local" box represents **any number** of independent `av init` repos on the same (or
@@ -103,43 +109,111 @@ graph TD
 
 ## Installation
 
+### Quick Install
+
+```bash
+pip install aether-vault
+av init
+```
+
+That's it. `av init` walks you through choosing **Local** (Docker-backed, runs on this machine)
+or **Enterprise** (account login), and for Local mode checks whether the Docker backend is
+running, built, or missing and handles whichever applies automatically — no manual
+`docker compose` step required.
+
 ### Prerequisites
 
 | Requirement | Notes |
 |---|---|
-| **Docker & Docker Compose** | Required for the registry and Web UI |
 | **Python ≥ 3.10** | For the `av` CLI |
-| **C++ Build Tools** | Visual Studio Build Tools (Windows) · GCC/Clang (Linux/macOS) |
-| **CMake** | For building the C++ hashing core |
+| **Docker & Docker Compose** | Only needed for **Local** mode's registry/Web UI — `av init` detects and walks you through it, nothing to set up by hand first |
+| **C++ Build Tools + CMake** | Only if `pip` falls back to building from source (no prebuilt wheel for your platform/Python version) — most users on common platforms/Python versions never hit this path |
 
-### 1. Start the Registry (Docker)
+### Development Install (from source)
 
 ```bash
 git clone https://github.com/leon1706/aether-vault
 cd aether-vault
 
-# Start the full backend stack (API server, PostgreSQL, Redis)
+# Compiles the C++ core locally and installs the `av` command in editable mode
+pip install -e .[dev]
+```
+
+This path always compiles the C++ core via pybind11, so the C++ Build Tools + CMake prerequisite
+above does apply here. To start the registry manually instead of via `av init` (e.g. for
+webui-only development):
+```bash
 docker compose up --build -d
 ```
+The FastAPI server will then be available at `http://localhost:8000` (interactive API docs at
+`http://localhost:8000/docs`).
 
-The FastAPI server will be available at `http://localhost:8000`.
-Interactive API docs: `http://localhost:8000/docs`
+---
 
-### 2. Install the CLI
+## Quick Start: From Install to Push
 
 ```bash
-# Compiles the C++ core and installs the `av` command
-pip install -e .
+pip install aether-vault
+av init                                  # pick Local or Enterprise; opens the interactive shell
+av status                                # (now inside the shell — still typed with the `av` prefix)
+av add train.py model.safetensors
+av commit -m "first commit"
+av push
+exit                                     # back to your normal shell
 ```
+
+Every one of these also works as a normal one-off command from outside the shell — `av status`
+typed in a regular terminal behaves identically. The shell (entered automatically by `av init`,
+and by bare `av` in an already-initialized repo) is a convenience layer for staying "inside"
+aether-vault across several commands, not a different mode of operation. See `av init` below for
+the full Local/Enterprise/shell details.
 
 ---
 
 ## CLI Reference
 
 ### `av init`
-Initialize an Aether-Vault repository in the current directory.
+*(see [Quick Start](#quick-start-from-install-to-push) for the full install-to-push walkthrough)*
+
+Initialize an Aether-Vault repository in the current directory. On first run, shows a banner
+and asks whether to use **Local** (Docker-backed, runs on this machine) or **Enterprise**
+(account login — coming soon, currently falls back to Local). The choice is saved to
+`.av/config`; re-running `av init` in an already-initialized repo skips the prompt and
+reconnects straight to the stored mode. Either way, `av init` drops you into an interactive
+session afterward — type commands (still prefixed with `av`, e.g. `av status`) without
+re-invoking the process each time; `exit`/`quit`/Ctrl+D leaves back to your normal shell.
+Running bare `av` (no subcommand) in an already-initialized repo does the same reconnect +
+session entry without needing `init` again.
 ```bash
-av init
+av init                                   # interactive: asks Local/Enterprise, then opens the session
+av init --mode local --yes --no-repl      # non-interactive: for scripts/CI, skips the session
+av                                        # bare, in an initialized repo: reconnect + open the session
+```
+
+### `av update`
+Check PyPI for a newer release and optionally install it. `av init` also prints a one-line
+banner if you're behind, but never checks on routine commands (`av add`, `av status`, etc.) —
+only here and at `init` time, so normal usage never pays a network-call cost.
+```bash
+av update                       # check, then prompt to upgrade if one's available
+av update --check               # report only, no prompt
+av update --list-versions       # list every published version, newest first
+av update --enable-auto-update  # opt in to silent auto-upgrade (off by default)
+av update --disable-auto-update
+```
+
+### `av help`
+Every command supports `--help`, including the top-level `av` group itself — the fastest way
+to see the full command list or a specific command's options without leaving the terminal.
+```bash
+av --help            # list every command
+av commit --help     # options for a specific command
+```
+
+### `av status`
+Show staged, modified, deleted, and untracked files.
+```bash
+av status
 ```
 
 ### `av config`
@@ -158,12 +232,6 @@ av add src/train.py data/features.parquet weights/epoch_50.safetensors
 
 # Stage everything recursively
 av add .
-```
-
-### `av status`
-Show staged, modified, deleted, and untracked files.
-```bash
-av status
 ```
 
 ### `av commit`
@@ -193,19 +261,6 @@ av checkout feature-transformers
 av checkout main
 ```
 
-### `av list-meta`
-Display all registered tag labels and metric keys across the repository history.
-```bash
-av list-meta
-```
-
-### `av graph`
-Parse the repository's Python AST and generate an Obsidian-compatible Markdown vault of the full function call graph and dependency map.
-```bash
-av graph            # Generate and attempt to launch Obsidian
-av graph --update   # Silently regenerate after code changes
-```
-
 ### `av webui`
 Launch the browser-based Web UI dashboard. Checks that Docker is running, starts the `aether-vault-webui` container, and opens `http://localhost:3000` automatically. If the container is already running and healthy, this skips straight to opening the browser instead of re-running `docker compose` every time.
 ```bash
@@ -226,6 +281,45 @@ av webui --rebuild   # force a fresh image build after changing webui/ source
 - **Stats Bar** — Live counts for commits, branches, CAS objects, and storage size
 - **Weight Diff** — drag two checkpoints into comparison slots for a per-layer heatmap + drift chart
 - **Projects** — every project that has pushed to this registry, with an "Open" button to scope the whole dashboard to just that one
+
+### `av list-meta`
+Display all registered tag labels and metric keys across the repository history.
+```bash
+av list-meta
+```
+
+### `av graph`
+Parse the repository's Python AST and generate an Obsidian-compatible Markdown vault of the full function call graph and dependency map.
+```bash
+av graph            # Generate and attempt to launch Obsidian
+av graph --update   # Silently regenerate after code changes
+```
+
+### `av handoff` — Agent Context Export
+While most ML tracking tools (MLflow, DVC, W&B) record experiments for humans to read, `av handoff` generates a structured, machine-readable context snapshot for **AI agents** picking up the work — branch, commit, tags, metrics, model/dataset lineage, and an optional freeform instruction note, in an open `.avh` (Aether Vault Handoff) JSON format. Every invocation also writes a human-readable Markdown note into `Aether-Handoff/`, indexed chronologically by a central hub file.
+
+```bash
+av handoff                              # write handoff.avh + a new Aether-Handoff/ snapshot
+av handoff --update                     # refresh handoff.avh with the latest repo state
+av handoff --note "fine-tune lr=0.001"  # attach freeform instructions for the next agent
+av handoff --instructions-file task.md  # read instructions from a file instead
+av handoff --diff-weights               # add a per-layer weight-diff vs. the parent commit
+av handoff --since <commit-or-tag>      # diff against an arbitrary earlier commit/tag
+av handoff init                         # create the Aether-Handoff/ folder structure only
+av handoff log                          # list all snapshots taken so far
+av handoff show <snapshot-id>           # print a previous snapshot's Markdown note
+```
+
+```
+Aether-Handoff/
+├── Handoff-Hub.md                # chronological index of every snapshot
+├── snapshots/
+│   ├── 2026-06-23T120000Z_abc123d.avh
+│   └── 2026-06-23T120000Z_abc123d.md
+└── latest.avh                    # always-overwritten copy of the most recent snapshot
+```
+
+`--diff-weights` reuses the per-layer safetensors hashes already produced during `av add` to report exactly which model layers changed since the parent commit.
 
 ### `av gc`
 Trigger a mark-and-sweep garbage collection on the remote server to purge orphaned storage shards and rebuild the Redis Bloom Filter.
@@ -276,32 +370,6 @@ av benchmark --vs git-lfs --vs dvc                    # scope competitor columns
 av benchmark --markdown development/BENCHMARKS.md     # regenerate the Markdown report
 ```
 Every result is a real measured number from a real subprocess/HTTP call — a tool that isn't on `PATH`, or whose primitive doesn't apply to a given benchmark, is shown as `not installed`/`N/A` with a footnote, never guessed at.
-
-### `av handoff` — Agent Context Export
-While most ML tracking tools (MLflow, DVC, W&B) record experiments for humans to read, `av handoff` generates a structured, machine-readable context snapshot for **AI agents** picking up the work — branch, commit, tags, metrics, model/dataset lineage, and an optional freeform instruction note, in an open `.avh` (Aether Vault Handoff) JSON format. Every invocation also writes a human-readable Markdown note into `Aether-Handoff/`, indexed chronologically by a central hub file.
-
-```bash
-av handoff                              # write handoff.avh + a new Aether-Handoff/ snapshot
-av handoff --update                     # refresh handoff.avh with the latest repo state
-av handoff --note "fine-tune lr=0.001"  # attach freeform instructions for the next agent
-av handoff --instructions-file task.md  # read instructions from a file instead
-av handoff --diff-weights               # add a per-layer weight-diff vs. the parent commit
-av handoff --since <commit-or-tag>      # diff against an arbitrary earlier commit/tag
-av handoff init                         # create the Aether-Handoff/ folder structure only
-av handoff log                          # list all snapshots taken so far
-av handoff show <snapshot-id>           # print a previous snapshot's Markdown note
-```
-
-```
-Aether-Handoff/
-├── Handoff-Hub.md                # chronological index of every snapshot
-├── snapshots/
-│   ├── 2026-06-23T120000Z_abc123d.avh
-│   └── 2026-06-23T120000Z_abc123d.md
-└── latest.avh                    # always-overwritten copy of the most recent snapshot
-```
-
-`--diff-weights` reuses the per-layer safetensors hashes already produced during `av add` to report exactly which model layers changed since the parent commit.
 
 ## Framework Plugins
 
@@ -364,26 +432,30 @@ More development-process documents will live under [`development/`](development/
 
 ## Benchmark Comparison
 
-`av benchmark` runs 8 reproducible benchmarks against **Git LFS**, **DVC**, and **MLflow**. Every number is measured from a real subprocess or HTTP call on the same fixture each tool actually has to process — nothing here is estimated or fabricated, and a tool that cannot run a given benchmark (not installed, or the operation does not apply to it) is reported as such rather than given a guessed value. The table below summarizes the current standing of each benchmark; the linked report at the bottom has the full methodology, every raw number, and the caveats that go with single-machine timings.
+`av benchmark` runs 8 reproducible benchmarks against **Git LFS**, **DVC**, and **MLflow**. Every number is measured from a real subprocess or HTTP call on the same fixture each tool actually has to process — nothing here is estimated or fabricated, and a tool that cannot run a given benchmark (not installed, or the operation does not apply to it) is reported as such rather than given a guessed value.
 
-| # | Benchmark | What it measures | Current standing |
+**At a glance:** Aether wins outright on 5 of 8 benchmarks, has two honestly-labeled losses (no-op `status`/`add`; `commit` latency, by design — both explained below, not hidden), and one N/A (no `clone`/`pull` command yet). The table below summarizes each benchmark as a percentage/multiplier vs. the best competitor wherever that comparison is fair; the linked report at the bottom has the full methodology, every raw number, and the caveats that go with single-machine timings.
+
+| # | Benchmark | vs. best competitor | Notes |
 |---|---|---|---|
-| 1 | Hashing Throughput at Scale | SHA-256 speed, 10–200MB files | Fastest of the three tools at every size tested |
-| 2 | Safetensors Layer-Dedup | Storage after 6 fine-tune commits | 47MB vs. 126MB for every competitor (about 63% smaller) |
-| 3 | Commit + Push Latency | init/add/commit/push, end-to-end | Push is faster than both competitors; `commit` was optimized (~2.9s → ~1.4–2.5s, see below) but stays slower than DVC's metadata-only commit by design — av uploads objects synchronously during commit, DVC defers all upload to a separate `push` |
-| 4 | No-Op `status`/`add` | Re-staging unchanged files | Optimized ~30% (~875ms → ~550-625ms); still slower than Git LFS's compiled-binary startup — an open finding, not a hidden one |
-| 5 | Cold Clone / First Pull | Fresh-machine checkout | Not applicable — `av` has no `clone`/`pull` command yet (tracked on the roadmap) |
-| 6 | Partial-Checkpoint Fetch | Fetch one layer vs. the whole file | The only one of the four tools that can fetch a single layer instead of the whole file |
-| 7 | Storage Footprint Curve | Disk growth over 6 commits | The storage gap widens with every additional commit |
-| 8 | Concurrent Push Throughput | 8 simultaneous pushes | Aether-only — none of the other three tools have a comparable concurrent-server primitive to compare against |
+| 1 | Hashing Throughput at Scale | ~2–4x faster than Git LFS, up to 13x faster than DVC | fastest at every size tested (10–200MB) |
+| 2 | Safetensors Layer-Dedup | **63% smaller** | 47MB vs. 126MB after 6 fine-tune commits |
+| 3 | Commit + Push Latency | init ~80% faster · push ~50% faster · commit ~10x slower *(by design, vs. DVC)* | av uploads objects synchronously during `commit`; DVC defers all upload to a separate `push` |
+| 4 | No-Op `status`/`add` | ~6.7x slower than Git LFS | open finding, not a hidden one — interpreter/import startup cost, not yet fixed |
+| 5 | Cold Clone / First Pull | N/A | `av` has no `clone`/`pull` command yet (tracked on the roadmap) |
+| 6 | Partial-Checkpoint Fetch | unique capability | only one of the four tools that can fetch a single layer instead of the whole file |
+| 7 | Storage Footprint Curve | **63% smaller**, gap widens every commit | same dedup advantage as #2, sustained over time |
+| 8 | Concurrent Push Throughput | Aether-only | no competitor has a comparable concurrent-server primitive |
 
 `av add` + `av commit` quick sample (benchmark #3's first three steps, vs. equivalent Git LFS and DVC operations, on a 60-file mixed code/model fixture):
 
-| Operation | Aether-Vault | Git LFS | DVC |
-|---|---:|---:|---:|
-| init | 858.8 ms | 5167.6 ms | 4412.8 ms |
-| add (60 files) | 2683.6 ms | 1730.9 ms | 6871.7 ms |
-| commit | 2531.7 ms | 1276.1 ms | 256.9 ms |
+| Operation | Aether-Vault | Git LFS | DVC | vs. Git LFS | vs. DVC |
+|---|---:|---:|---:|---:|---:|
+| init | 858.8 ms | 5167.6 ms | 4412.8 ms | 83% faster | 81% faster |
+| add (60 files) | 2683.6 ms | 1730.9 ms | 6871.7 ms | 55% slower | 61% faster |
+| commit | 2531.7 ms | 1276.1 ms | 256.9 ms | ~2x slower | ~10x slower* |
+
+\* by design — see row 3 above; DVC's `commit` never touches the network, av's intentionally does.
 
 For the full results, the methodology behind each benchmark, and the rating legend, see [`development/BENCHMARKS.md`](development/BENCHMARKS.md).
 
@@ -395,6 +467,7 @@ For the full results, the methodology behind each benchmark, and the rating lege
 |---|---|
 | 🔲 | **`av clone`/`av pull`** — fresh-machine checkout of a project someone else already pushed; today's sync model is push-only from a single working repo (found while building the benchmark suite's cold-clone comparison) |
 | 🔲 | **S3 Support** — Amazon S3 as an alternative backend storage adapter |
+| 🔲 | **First real tagged release** — `release.yml` exists and has been validated structurally, but no `vX.Y.Z` tag has been pushed yet; needs a TestPyPI dry run before pointing trusted publishing at the real `pypi.org` project (see `development/CHANGELOG.md`) |
 
 ---
 
@@ -404,6 +477,7 @@ For enterprise research teams and institutional algorithmic trading firms:
 
 | Feature | Description |
 |---|---|
+| **Enterprise Login** (🔲 not yet built) | `av init`/`av update` already expose an "Enterprise" mode choice and a stable `EnterpriseAuthProvider` seam (`python/av_cli/enterprise.py`) — selecting it today shows a "coming soon" message and falls back to Local. The real account-based login (the items below) plugs into that seam without changing the CLI surface |
 | **RBAC** | Fine-grained read/write permissions for teams, users, and repositories |
 | **SSO** | OAuth2, SAML, and Active Directory integration |
 | **Audit Logging** | Immutable, cryptographically signed logs for regulatory compliance |

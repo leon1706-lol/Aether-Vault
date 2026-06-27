@@ -48,7 +48,7 @@ def _bench_av() -> dict[str, float | None]:
 
     with tempfile.TemporaryDirectory(prefix="bench-fetch-av-") as tmp:
         root = Path(tmp)
-        subprocess.run([av_path, "init"], cwd=root)
+        subprocess.run([av_path, "init", "--mode", "local", "--yes", "--no-repl"], cwd=root)
         subprocess.run([av_path, "config", "1"], cwd=root)
         _make_checkpoint(root / "model.safetensors")
         subprocess.run([av_path, "add", "model.safetensors"], cwd=root)

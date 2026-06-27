@@ -714,3 +714,31 @@ implement, both rated 1–10.
   never touches the network (`dvc push` is a separate step), while av intentionally uploads
   objects synchronously during `commit` to satisfy the server's FK ordering constraint; that
   architectural difference is out of scope for this pass (see README's Open Source Roadmap).
+
+## ✅ Fixed — REPL session construction crashed bare `av` under Git Bash/mintty on Windows (2026-06-27)
+
+### [7] Bare `av` (and `av init`) crashed with an unhandled `NoConsoleScreenBufferError` outside a real Windows console
+- **Files:** `python/av_cli/repl.py` (`run_repl`).
+- **Problem (Severity 7, Difficulty 1):** Found during step 1 of the Phase 27 wrap-up
+  (manual debugging against the real installed `av` binary, not `CliRunner`) — bare `av` and
+  `av init` (default flow) both crashed outright when run from Git Bash/mintty on Windows.
+  `sys.stdin.isatty()`/`sys.stdout.isatty()` both report `True` in that terminal, so
+  `ui.is_interactive()` correctly decided to skip the Local/Enterprise prompt only where
+  expected — but `run_repl()`'s call to `prompt_toolkit.PromptSession(...)` still raised
+  `prompt_toolkit.output.win32.NoConsoleScreenBufferError` ("Found xterm-256color, while
+  expecting a Windows console") unconditionally, because mintty's pty emulation has no real
+  Win32 console screen buffer behind it even though it reports as a tty. Nothing caught the
+  exception, so it propagated all the way out and crashed the whole `av` invocation with a
+  raw Python traceback — a real first-impression bug for exactly the platform (Windows + Git
+  Bash) this CLI's own dev environment runs on.
+- **Fix:** Wrapped the `PromptSession(...)` construction, and each loop iteration's
+  `session.prompt(...)` call, in a broad `except Exception` in `run_repl()`. On failure, prints
+  one warning line ("Interactive session isn't available in this terminal — run `av <command>`
+  directly instead.") and returns/breaks instead of crashing — the rest of `av init`/bare `av`
+  (repo bootstrap, Docker reconnect) already completed before this point, so the user still
+  gets a fully working repo, just without the interactive session in that specific terminal.
+- **Verified:** added `tests/test_repl.py::test_repl_degrades_gracefully_when_session_cannot_be_constructed`
+  (monkeypatches `PromptSession` to raise, asserts `run_repl()` doesn't raise and prints the
+  warning). Manually re-ran the exact repro from a real Git Bash shell — bare `av`, `av init`
+  (fresh repo), and re-running `av init` against an already-initialized repo (reconnect path)
+  all now complete cleanly with the warning instead of a traceback.

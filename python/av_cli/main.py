@@ -61,6 +61,7 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from . import speedcheck
+from . import __version__
 from .exceptions import AetherVaultException, NetworkError, StorageError, ValidationError
 from .index import Index
 from .pointer import create_pointer, get_pointer_path, is_pointer_file, parse_pointer
@@ -172,31 +173,7 @@ def save_config(repo_root: Path, config: dict) -> None:
 # Atomic write helpers
 # ---------------------------------------------------------------------------
 
-def atomic_write_text(path: Path, text: str) -> None:
-    """Write text to `path` atomically (write to a temp file in the same dir, then replace).
-
-    Prevents a crash mid-write from leaving a truncated/corrupt file: readers always see
-    either the old or the new complete content. os.replace is atomic on POSIX and Windows.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Short random suffix (not pid + full uuid4 hex): commit filenames are already a 64-char
-    # hash, and on Windows the combined path can exceed the 260-char MAX_PATH once a long
-    # temp suffix is appended, which makes the "atomic" write fail outright instead of just
-    # being verbose.
-    tmp = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex[:8]}")
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
-
-
-def atomic_write_json(path: Path, data) -> None:
-    atomic_write_text(path, json.dumps(data, indent=2))
+from .fsutil import atomic_write_json, atomic_write_text  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +352,7 @@ def compare_meta_safe(path: str, exp_size: int, exp_mtime: int) -> bool:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option("--verbose", is_flag=True, default=False, help="Enable debug logging.")
 @click.option("--silent", is_flag=True, default=False, help="Suppress all output.")
 @click.pass_context
@@ -384,20 +361,31 @@ def cli(ctx: click.Context, verbose: bool, silent: bool) -> None:
     ctx.ensure_object(dict)
     setup_logging(verbose, silent)
 
+    if ctx.invoked_subcommand is not None:
+        return
+
+    # Bare `av` with no subcommand: in an already-initialized project, reconnect and drop
+    # straight into the interactive session; otherwise fall back to the normal help screen.
+    repo_root = find_repo_root()
+    if repo_root is None:
+        click.echo(ctx.get_help())
+        click.echo("\nRun `av init` to get started.")
+        return
+
+    cfg = load_config(repo_root)
+    _reconnect_existing_repo(repo_root, cfg)
+    from . import repl
+
+    repl.run_repl(repo_root, login_mode=cfg.get("login_mode", "local"))
+
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-@cli.command()
-def init() -> None:
-    """Initialize a new Aether-Vault repository in the current directory."""
-    repo_root = Path.cwd()
+def _init_repo_structure(repo_root: Path) -> None:
+    """Bootstrap the .av/ directory layout. Behavior-preserving extraction from `init`."""
     av_dir = repo_root / ".av"
-    if av_dir.exists():
-        click.secho(f"Repository already initialized at {av_dir}", fg="yellow")
-        return
-
     (av_dir / "objects").mkdir(parents=True, exist_ok=True)
     (av_dir / "refs" / "heads").mkdir(parents=True, exist_ok=True)
     (av_dir / "commits").mkdir(parents=True, exist_ok=True)
@@ -418,7 +406,144 @@ def init() -> None:
     with open(av_dir / "refs" / "heads" / "main", "w") as f:
         f.write("")
 
+
+def _reconnect_existing_repo(repo_root: Path, cfg: dict) -> None:
+    """Reconnect to an already-initialized repo's stored backend (no questions asked)."""
+    login_mode = cfg.get("login_mode", "local")
+    if login_mode == "enterprise":
+        from . import enterprise
+
+        enterprise.run_enterprise_login_flow()
+        return
+
+    from . import docker_runtime
+
+    try:
+        docker_runtime.ensure_local_backend_running(_find_source_root(), open_browser=False)
+    except Exception as exc:
+        click.secho(f"⚠ Could not reach the local backend: {exc}", fg="yellow")
+
+
+@cli.command()
+@click.option(
+    "--mode", "mode", type=click.Choice(["local", "enterprise"]), default=None,
+    help="Skip the interactive prompt and use this login mode.",
+)
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip interactive prompts.")
+@click.option(
+    "--no-repl", is_flag=True, default=False,
+    help="Don't enter the interactive session after init (used by scripts/CI).",
+)
+def init(mode: str | None, yes: bool, no_repl: bool) -> None:
+    """Initialize a new Aether-Vault repository in the current directory."""
+    from . import ui
+
+    repo_root = Path.cwd()
+    av_dir = repo_root / ".av"
+
+    if av_dir.exists():
+        click.secho(f"Repository already initialized at {av_dir}", fg="yellow")
+        cfg = load_config(repo_root)
+        if not no_repl:
+            _reconnect_existing_repo(repo_root, cfg)
+            from . import repl
+
+            repl.run_repl(repo_root, login_mode=cfg.get("login_mode", "local"))
+        return
+
+    ui.print_banner("Aether-Vault", "version control for ML models & datasets")
+
+    if mode is not None:
+        login_mode = mode
+    elif yes or not ui.is_interactive():
+        login_mode = "local"
+    else:
+        login_mode = ui.select_login_mode()
+
+    _init_repo_structure(repo_root)
     click.secho(f"Initialized empty Aether-Vault repository in {av_dir}", fg="green")
+
+    if login_mode == "enterprise":
+        from . import enterprise
+
+        established = enterprise.run_enterprise_login_flow()
+        if not established:
+            login_mode = "local"
+
+    cfg = load_config(repo_root)
+    cfg["login_mode"] = login_mode
+    save_config(repo_root, cfg)
+
+    if login_mode == "local" and not no_repl:
+        from . import docker_runtime
+
+        try:
+            docker_runtime.ensure_local_backend_running(_find_source_root(), open_browser=False)
+        except Exception as exc:
+            click.secho(
+                f"⚠ Could not start the local backend ({exc}). Run `av webui` later once Docker is ready.",
+                fg="yellow",
+            )
+
+    from . import update_check
+
+    result = update_check.check_for_update()
+    if result is not None and result.is_outdated:
+        click.secho(
+            f"\naether-vault {result.current} → {result.latest} available — run `av update`",
+            fg="yellow",
+        )
+
+    if not no_repl:
+        from . import repl
+
+        repl.run_repl(repo_root, login_mode=login_mode)
+
+
+@cli.command()
+@click.option("--check", "check_only", is_flag=True, default=False, help="Only report; don't prompt to upgrade.")
+@click.option("--list-versions", "list_versions_flag", is_flag=True, default=False, help="List every published version.")
+@click.option("--enable-auto-update", is_flag=True, default=False, help="Turn on silent auto-update.")
+@click.option("--disable-auto-update", is_flag=True, default=False, help="Turn off silent auto-update.")
+def update(check_only: bool, list_versions_flag: bool, enable_auto_update: bool, disable_auto_update: bool) -> None:
+    """Check for, and optionally install, the latest aether-vault release."""
+    from . import update_check
+
+    if enable_auto_update or disable_auto_update:
+        cfg = update_check.load_user_config()
+        cfg["auto_update"] = bool(enable_auto_update)
+        update_check.save_user_config(cfg)
+        state = "enabled" if enable_auto_update else "disabled"
+        click.secho(f"Auto-update {state}.", fg="green")
+        return
+
+    if list_versions_flag:
+        versions = update_check.list_versions()
+        if versions is None:
+            click.secho("Could not reach PyPI to list versions.", fg="red")
+            return
+        for v in versions:
+            marker = " (installed)" if v == __version__ else ""
+            click.echo(f"{v}{marker}")
+        click.echo(f"\nRun `pip install {update_check.PACKAGE_NAME}==<version>` to switch.")
+        return
+
+    result = update_check.check_for_update(force=True)
+    if result is None:
+        click.secho("Could not reach PyPI to check for updates.", fg="red")
+        return
+    if not result.is_outdated:
+        click.secho(f"aether-vault {result.current} is up to date.", fg="green")
+        return
+
+    click.secho(f"aether-vault {result.current} → {result.latest} available.", fg="yellow")
+    if check_only:
+        return
+
+    if click.confirm("Upgrade now?", default=True):
+        import subprocess
+
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", update_check.PACKAGE_NAME])
 
 
 @cli.command()
@@ -1595,117 +1720,22 @@ def webui_cmd(rebuild: bool) -> None:
     browser instead of re-running compose (use --rebuild to force a fresh image build after
     changing webui source code).
     """
-    import time
-    import webbrowser
-    import urllib.request
-    import urllib.error
+    from . import docker_runtime
 
-    repo_root = _find_source_root()
-    compose_file = repo_root / "docker-compose.yml"
-    url = "http://localhost:3000"
-
-    # ── 1. Check Docker ──────────────────────────────────────────────────────
-    click.secho("🔍 Checking Docker…", fg="cyan")
-    try:
-        result = subprocess.run(
-            ["docker", "info"],
-            capture_output=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            click.secho(
-                "✗ Docker is not running. Please start Docker Desktop and try again.",
-                fg="red",
-            )
-            return
-    except FileNotFoundError:
-        click.secho("✗ Docker not found. Install Docker Desktop from https://docker.com", fg="red")
-        return
-    except subprocess.TimeoutExpired:
-        click.secho("✗ Docker daemon timed out. Is Docker Desktop running?", fg="red")
-        return
-
-    click.secho("  ✓ Docker is running", fg="green")
-
-    # ── 1b. Already running? Skip straight to the browser ───────────────────
-    # `docker compose up -d --build` unconditionally re-evaluates/builds the image on every
-    # invocation — slow, and pointless if nothing changed and the container is already
-    # serving traffic. Short-circuit unless the caller explicitly wants a rebuild.
-    if not rebuild:
-        try:
-            health = subprocess.run(
-                ["docker", "inspect", "--format={{.State.Health.Status}}", "aether-vault-webui"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if health.returncode == 0 and health.stdout.strip() == "healthy":
-                click.secho("  ✓ Web UI container already running and healthy", fg="green")
-                click.secho(f"🌐 Opening {url} in your browser…", fg="green")
-                try:
-                    webbrowser.open(url)
-                except Exception as exc:
-                    click.secho(f"  Could not open browser automatically: {exc}", fg="yellow")
-                click.secho(
-                    f"\n✅ Aether-Vault Web UI is running at {url}\n"
-                    "   Press Ctrl+C or run 'docker compose down' to stop.\n"
-                    "   (Use `av webui --rebuild` if you changed webui source and need a fresh image.)",
-                    fg="green",
-                    bold=True,
-                )
-                return
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass  # fall through to the normal startup path below
-
-    # ── 2. Start containers ──────────────────────────────────────────────────
-    click.secho("🚀 Starting Web UI container…", fg="cyan")
-
-    if not compose_file.exists():
-        click.secho(f"✗ docker-compose.yml not found at {compose_file}", fg="red")
-        return
-
-    compose_args = ["docker", "compose", "-f", str(compose_file), "up", "-d"]
-    if rebuild:
-        compose_args.append("--build")
-    compose_args.append("aether-vault-webui")
-
-    try:
-        proc = subprocess.run(
-            compose_args,
-            capture_output=False,
-            timeout=1200,
-        )
-        if proc.returncode != 0:
-            click.secho("✗ Failed to start containers. Check docker compose logs for details.", fg="red")
-            return
-    except subprocess.TimeoutExpired:
-        click.secho("✗ Container startup timed out.", fg="red")
-        return
-
-    # ── 3. Wait for UI to be ready ───────────────────────────────────────────
-    click.secho(f"⏳ Waiting for Web UI at {url}…", fg="cyan")
-
-    for attempt in range(30):
-        time.sleep(2)
-        try:
-            urllib.request.urlopen(url, timeout=3)
-            break
-        except (urllib.error.URLError, OSError):
-            click.echo(f"  … waiting ({attempt + 1}/30)")
-    else:
-        click.secho("⚠ Web UI did not respond in time — opening browser anyway.", fg="yellow")
-
-    # ── 4. Open browser ──────────────────────────────────────────────────────
-    click.secho(f"🌐 Opening {url} in your browser…", fg="green")
-    try:
-        webbrowser.open(url)
-    except Exception as exc:
-        click.secho(f"  Could not open browser automatically: {exc}", fg="yellow")
-
-    click.secho(
-        f"\n✅ Aether-Vault Web UI is running at {url}\n"
-        "   Press Ctrl+C or run 'docker compose down' to stop.",
-        fg="green",
-        bold=True,
+    result = docker_runtime.ensure_local_backend_running(
+        _find_source_root(), open_browser=True, rebuild=rebuild,
     )
+    if result.success:
+        suffix = (
+            "" if result.already_running
+            else "\n   (Use `av webui --rebuild` if you changed webui source and need a fresh image.)"
+        )
+        click.secho(
+            f"\n✅ Aether-Vault Web UI is running at {result.backend_url}\n"
+            "   Press Ctrl+C or run 'docker compose down' to stop." + suffix,
+            fg="green",
+            bold=True,
+        )
 
 
 @cli.command("import-lightning")
