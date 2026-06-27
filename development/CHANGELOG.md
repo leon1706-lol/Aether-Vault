@@ -503,4 +503,67 @@ findings (resolved and still-open).
   `docker-edge.yml` hasn't run yet (this work itself hasn't been pushed to `main`). Tracked on the
   README roadmap alongside the existing "first real tagged release" item.
 
+## Phase 29 — `av init` Polish, `.avignore`/`av file`, `av unstage`, `av stash`
+
+- **`av init` prompt cleanup**: `select_login_mode()` now passes `instruction=""` to suppress
+  questionary's default "(Use arrow keys)" hint, drops the "(recommended)" label from the Local
+  choice (pre-highlighted via `default=` instead), and prints a blank line before the prompt.
+- **Real logo banner**: `print_banner()` no longer renders a `rich.panel.Panel` box — it renders
+  a small ANSI block-art rendering of the actual "AV" monogram (`development/logo.png`), two-tone
+  (graphite `rgb(90,90,90)` / copper `rgb(230,160,40)`, exact TrueColor values, not approximated
+  hex), with the title/subtitle text preserved underneath it. Design provided by the user as a
+  bash/ANSI mockup; compared side by side against an earlier draft (which read as two abstract
+  diagonal bars, not recognizable as "A"/"V") and rated 8/10 vs. 4/10 before implementing it.
+- **`.avignore` + `av file --avignore`**: new `load_avignore_patterns()`/`_matches_avignore()` in
+  `main.py`, wired into `iter_working_files()` (the single function already shared by `add`,
+  `status`, `doctor --speed`, and the speedcheck probes) — one change covers every caller.
+  Gitignore-*lite* (plain `fnmatch` globs, `#` comments, no negation/anchoring/`**`). New `av
+  file` command (`--avignore` flag, extensible for future generated-file types as new flags;
+  refuses to overwrite an existing file).
+- **`av unstage`**: undoes `av add` without touching the working tree — reverts a staged entry
+  back to its last-committed state (so `av status` correctly reports it "modified" again) or
+  removes it entirely if it was never committed (back to "untracked"), using the already-existing
+  `Index.remove_entry()`/`get_staged_entries()`.
+- **`av stash`** (`push`/`list`/`pop`/`apply`/`drop`, `@cli.group(invoke_without_command=True)`
+  mirroring git's own `git stash` shape): shelves staged + modified-tracked-file changes and
+  reverts the working tree to HEAD, so `checkout`/`branch` can proceed without `--force`; `pop`
+  restores everything exactly as it was, staged or not. Built on four small extractions from
+  `add()`/`checkout()` rather than reimplementing their logic freehand — deliberately, since
+  `checkout`'s safetensors restore path has had a real corruption bug fixed in it before
+  (see Phase history) and duplicating that logic risked reintroducing a similar one:
+  - `materialize_file()` / `remove_file_and_pointer()` — extracted from `checkout()`'s per-entry
+    restore/cleanup blocks; `checkout()` now calls these instead of inlining them
+    (behavior-preserving refactor, verified against the full existing `checkout`/`add` test suite).
+  - `resolve_head_tree()` — new helper reading HEAD's commit tree, normalizing the legacy
+    `{"code":..., "artifacts":...}` shape into the unified flat one.
+  - `stage_one_file()` — extracted from `add()`'s per-file loop body (hash, LFS-threshold check,
+    safetensors layer-split, pointer creation); `add()`'s loop now calls this once per file.
+  - `compute_status()` — extracted from `status()`'s staged/modified/deleted/untracked
+    classification, so `av stash push` computes the exact same dirty set `status()` displays.
+- **Two real bugs found via manual debugging (not just unit tests) and fixed**:
+  1. `av stash pop` initially restored a previously-modified-but-unstaged file's index entry
+     using its *dirty* hash/stat instead of HEAD's baseline — since `status()` detects
+     "modified" purely via a stat mismatch against the stored entry, this made the file look
+     silently clean after popping instead of "modified" again. Fixed by looking up
+     `resolve_head_tree()` again during pop for `was_staged=False` entries and storing HEAD's
+     baseline (with a deliberately non-matching mtime) instead of the dirty data.
+  2. Two stashes created within the same second sorted unpredictably in `av stash list` — the
+     filename-based newest-first sort relied on a second-resolution timestamp prefix, so a tie
+     fell back to comparing the random shortid suffix, which isn't time-ordered. Fixed by using
+     microsecond resolution in the stash ID. Found by the test suite itself
+     (`test_stash_list_orders_newest_first`), not inferred from reading the code.
+- **New tests**: `tests/test_stash.py` (10 cases — push reverting staged/modified entries, pop's
+  exact staged/unstaged restoration, apply keeping the record, drop, list ordering, "nothing to
+  stash", skipped-deleted-files warning, a full safetensors layer-split push/pop round-trip);
+  extended `tests/test_cli.py` with 9 cases for `.avignore`/`av file`/`av unstage`. Full suite:
+  161 passed, 3 skipped (pre-existing, unrelated) — the `checkout()`/`add()`/`status()` refactors
+  introduced zero behavior change there.
+- **Manually verified** end-to-end with the real installed `av` binary, not just `CliRunner`:
+  the full `init` → `file --avignore` → `add` (ignoring a `venv/`) → `unstage` → `stash` cycle,
+  including the motivating scenario itself — `checkout` blocked by dirty state, `av stash`
+  unblocking it, a clean branch switch, then `av stash pop` restoring everything exactly as it
+  was. Also verified every new command works identically inside the REPL both bare and
+  `av`-prefixed, and outside it with the `av` prefix required — per the existing,
+  un-special-cased dispatch mechanism in `repl.py`.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

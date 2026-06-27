@@ -1,4 +1,5 @@
 import datetime
+import fnmatch
 import hashlib
 import importlib
 import json
@@ -97,15 +98,50 @@ def setup_logging(verbose: bool, silent: bool) -> None:
 _IGNORED_DIRS = {".av", ".git", "__pycache__"}
 
 
-def iter_working_files(root: Path):
-    """Yield every working-tree file path under `root`, skipping ignored dirs and noise.
+def load_avignore_patterns(repo_root: Path) -> list[str]:
+    """Reads `.avignore` from the repo root, if present.
 
-    Prunes ignored directories in-place so the CAS object store is never traversed.
+    Gitignore-*lite*, not full gitignore semantics: plain glob patterns, one per line, `#`
+    comments and blank lines skipped, matched via `fnmatch` against a path's filename or any of
+    its path components. Deliberately doesn't implement negation (`!pattern`), anchoring
+    (`/pattern`), or `**` double-glob — covers the stated use case (`venv`, `node_modules`,
+    `*.log`) without the edge cases of a full gitignore parser.
     """
+    avignore_path = repo_root / ".avignore"
+    if not avignore_path.exists():
+        return []
+    patterns = []
+    for line in avignore_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        patterns.append(line.rstrip("/"))
+    return patterns
+
+
+def _matches_avignore(name: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+
+
+def iter_working_files(root: Path):
+    """Yield every working-tree file path under `root`, skipping ignored dirs/noise and
+    anything matching a `.avignore` pattern.
+
+    Prunes ignored/ignored-by-pattern directories in-place so the CAS object store (and e.g. a
+    `.avignore`'d `venv/`) is never traversed in the first place, not just filtered after a full
+    walk.
+    """
+    repo_root = find_repo_root() or root
+    avignore_patterns = load_avignore_patterns(repo_root)
     for dirpath, dirnames, files in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _IGNORED_DIRS and not _matches_avignore(d, avignore_patterns)
+        ]
         for f in files:
             if f.endswith(".pyc") or f.endswith(".av-pointer"):
+                continue
+            if _matches_avignore(f, avignore_patterns):
                 continue
             yield Path(dirpath) / f
 
@@ -348,6 +384,193 @@ def compare_meta_safe(path: str, exp_size: int, exp_mtime: int) -> bool:
     return meta["exists"] and meta["size"] == exp_size and meta["mtime_ns"] == exp_mtime
 
 
+def materialize_file(repo_root: Path, client: "VaultClient", rel_path: str, h: str, layers: list) -> None:
+    """Writes a tracked path's content to the working tree from the CAS (or from the layers
+    it's split into), downloading from the remote if the local object is missing.
+
+    Extracted from `checkout()`'s per-entry restore logic so `av stash pop`/`apply` can
+    materialize a stashed file's content the exact same way `checkout` restores a commit's —
+    reusing this instead of reimplementing it avoids re-introducing the safetensors
+    reconstruction bug this exact code path already had fixed once (development/Probleme.md).
+    """
+    obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
+    dest = repo_root / rel_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if layers and not obj_path.exists():
+        click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
+        try:
+            with open(dest, "wb") as f_out:
+                for layer in layers:
+                    lh = layer["hash"]
+                    l_obj = repo_root / ".av" / "objects" / lh[:2] / lh[2:]
+                    if not l_obj.exists() and client.server_available():
+                        client.download_object(lh, l_obj)
+                    if not l_obj.exists():
+                        raise click.ClickException(
+                            f"Missing layer {lh} for {rel_path}; aborted to avoid a corrupt artifact"
+                        )
+                    with open(l_obj, "rb") as f_in:
+                        shutil.copyfileobj(f_in, f_out)
+        except click.ClickException:
+            dest.unlink(missing_ok=True)
+            raise
+
+        obj_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dest, obj_path)
+    else:
+        if obj_path.exists():
+            shutil.copy2(obj_path, dest)
+        elif client.server_available():
+            click.echo(f"Downloading {rel_path}...")
+            if client.download_object(h, dest):
+                obj_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dest, obj_path)
+
+
+def remove_file_and_pointer(repo_root: Path, rel_path: str) -> None:
+    """Deletes a working-tree file (and its `.av-pointer` sibling, if any), pruning now-empty
+    parent directories — extracted from `checkout()`'s "this path no longer exists in the
+    target commit" cleanup so `av stash push`/`av unstage` can remove a file the same way.
+    """
+    file_path = repo_root / rel_path
+    if file_path.exists() and file_path.is_file():
+        file_path.unlink()
+        try:
+            for parent in file_path.parents:
+                if parent == repo_root or parent.name == ".av":
+                    break
+                if not any(parent.iterdir()):
+                    parent.rmdir()
+                else:
+                    break
+        except Exception:
+            pass
+    ptr_path = repo_root / (rel_path + ".av-pointer")
+    if ptr_path.exists() and ptr_path.is_file():
+        ptr_path.unlink()
+
+
+def resolve_head_tree(repo_root: Path) -> dict:
+    """Reads the current HEAD commit's tree (rel_path -> {hash, size, type, layers}), or {}
+    if there are no commits yet. Normalizes the legacy {"code":..., "artifacts":...} shape
+    (see `checkout()`) into the unified flat shape so callers only handle one format.
+    """
+    head_path = repo_root / ".av" / "HEAD"
+    if not head_path.exists():
+        return {}
+    head_content = head_path.read_text().strip()
+    if head_content.startswith("ref: "):
+        ref_path = repo_root / ".av" / head_content.split(": ", 1)[1]
+        commit_hash = ref_path.read_text().strip() if ref_path.exists() else ""
+    else:
+        commit_hash = head_content
+    if not commit_hash:
+        return {}
+
+    commit_file = repo_root / ".av" / "commits" / f"{commit_hash}.json"
+    if not commit_file.exists():
+        return {}
+    with open(commit_file, "r") as f:
+        commit_data = json.load(f)
+
+    tree = commit_data.get("tree", {})
+    if "code" in tree or "artifacts" in tree:
+        normalized = {}
+        for rel_path, h in tree.get("code", {}).items():
+            normalized[rel_path] = {"hash": h, "size": 0, "type": "code", "layers": []}
+        for rel_path, artifact in tree.get("artifacts", {}).items():
+            normalized[rel_path] = {
+                "hash": artifact["hash"], "size": artifact["size"],
+                "type": "artifact", "layers": artifact.get("layers", []),
+            }
+        return normalized
+    return tree
+
+
+def stage_one_file(repo_root: Path, idx: Index, threshold_bytes: int, fpath: Path, rel_path: str) -> bool:
+    """Hashes and stores a single file's current content (LFS threshold check, safetensors
+    layer-split if applicable, pointer creation) and records it in the index. Returns whether
+    anything actually changed (False = already up to date in the index).
+
+    Extracted from `add()`'s per-file loop body so `av stash push` can get a modified-but-not-
+    yet-staged file's content safely into the CAS before reverting the working copy, using
+    exactly the same logic `add()` already uses — not a reimplementation of it.
+    """
+    meta = get_file_meta_safe(str(fpath))
+
+    existing = idx.get_entry(rel_path)
+    if (
+        existing
+        and meta["exists"]
+        and meta["size"] == existing["size"]
+        and meta["mtime_ns"] == existing["mtime_ns"]
+    ):
+        return False
+
+    file_hash = hash_file_safe(str(fpath))
+    file_type = idx.classify_file(rel_path)
+
+    if file_type == "artifact" and meta["size"] > threshold_bytes:
+        layers: list[dict] = []
+
+        aether_core = _get_aether_core()
+        if rel_path.endswith(".safetensors") and aether_core and hasattr(aether_core, "split_and_hash_safetensors"):
+            logger.info(f"Splitting safetensors layers for {rel_path}...")
+            try:
+                layer_results = aether_core.split_and_hash_safetensors(str(fpath))
+                for lr in layer_results:
+                    l_hash = lr["hash"]
+                    l_size = lr["size"]
+                    l_offset = lr["offset"]
+                    l_obj_dir = repo_root / ".av" / "objects" / l_hash[:2]
+                    l_obj_dir.mkdir(parents=True, exist_ok=True)
+                    l_obj_path = l_obj_dir / l_hash[2:]
+                    if not l_obj_path.exists():
+                        with open(fpath, "rb") as src_f:
+                            src_f.seek(l_offset)
+                            with open(l_obj_path, "wb") as dst_f:
+                                remaining = l_size
+                                while remaining > 0:
+                                    chunk = src_f.read(min(8 * 1024 * 1024, remaining))
+                                    if not chunk:
+                                        break
+                                    dst_f.write(chunk)
+                                    remaining -= len(chunk)
+                    layers.append({"name": lr["name"], "hash": l_hash, "size": l_size})
+            except Exception as exc:
+                logger.warning(f"Layer splitting failed for {rel_path}, falling back to whole-file: {exc}")
+
+        if not layers:
+            obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
+            obj_dir.mkdir(parents=True, exist_ok=True)
+            obj_path = obj_dir / file_hash[2:]
+            if not obj_path.exists():
+                shutil.copy2(fpath, obj_path)
+
+        ptr_path = get_pointer_path(fpath)
+        ptr_content = create_pointer(fpath, file_hash, meta["size"])
+        with open(ptr_path, "w") as ptr_f:
+            ptr_f.write(ptr_content)
+
+        pointer_rel_path = rel_path + ".av-pointer"
+        idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, pointer_rel_path, auto_save=False)
+        if layers:
+            idx.entries[rel_path]["layers"] = layers
+        click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {len(layers)} layers)", fg="green")
+    else:
+        obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
+        obj_dir.mkdir(parents=True, exist_ok=True)
+        obj_path = obj_dir / file_hash[2:]
+        if not obj_path.exists():
+            shutil.copy2(fpath, obj_path)
+
+        idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None, auto_save=False)
+        click.secho(f"Staged [{file_type.upper()}] {rel_path}", fg="green")
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -421,7 +644,7 @@ def _reconnect_existing_repo(repo_root: Path, cfg: dict) -> None:
     try:
         docker_runtime.ensure_local_backend_running(_find_source_root(), open_browser=False)
     except Exception as exc:
-        click.secho(f"⚠ Could not reach the local backend: {exc}", fg="yellow")
+        click.secho(f"[WARN] Could not reach the local backend: {exc}", fg="yellow")
 
 
 @cli.command()
@@ -481,7 +704,7 @@ def init(mode: str | None, yes: bool, no_repl: bool) -> None:
             docker_runtime.ensure_local_backend_running(_find_source_root(), open_browser=False)
         except Exception as exc:
             click.secho(
-                f"⚠ Could not start the local backend ({exc}). Run `av webui` later once Docker is ready.",
+                f"[WARN] Could not start the local backend ({exc}). Run `av webui` later once Docker is ready.",
                 fg="yellow",
             )
 
@@ -626,120 +849,119 @@ def add(paths: tuple) -> None:
         rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
         if is_pointer_file(fpath):
             continue
-
-        meta = get_file_meta_safe(str(fpath))
-
-        # Skip the expensive full-file re-hash when the file is unchanged since it was last
-        # indexed (same size + mtime). Without this, `av add .` re-reads every tracked file
-        # (potentially many GB of artifacts) just to discover nothing changed. Compares
-        # directly against `meta` (already stat'd above) rather than calling
-        # compare_meta_safe(), which would stat() the same path a second time.
-        existing = idx.get_entry(rel_path)
-        if (
-            existing
-            and meta["exists"]
-            and meta["size"] == existing["size"]
-            and meta["mtime_ns"] == existing["mtime_ns"]
-        ):
-            continue
-
-        file_hash = hash_file_safe(str(fpath))
-        file_type = idx.classify_file(rel_path)
-        pointer_rel_path = None
-
-        if file_type == "artifact" and meta["size"] > threshold_bytes:
-            layers: list[dict] = []
-
-            # PR #8 — displacement-resistant safetensors layer hashing
-            aether_core = _get_aether_core()
-            if rel_path.endswith(".safetensors") and aether_core and hasattr(aether_core, "split_and_hash_safetensors"):
-                logger.info(f"Splitting safetensors layers for {rel_path}...")
-                try:
-                    layer_results = aether_core.split_and_hash_safetensors(str(fpath))
-                    for lr in layer_results:
-                        l_hash = lr["hash"]
-                        l_size = lr["size"]
-                        l_offset = lr["offset"]
-                        l_obj_dir = repo_root / ".av" / "objects" / l_hash[:2]
-                        l_obj_dir.mkdir(parents=True, exist_ok=True)
-                        l_obj_path = l_obj_dir / l_hash[2:]
-                        if not l_obj_path.exists():
-                            # Copy the layer byte-range in 8 MB chunks. Reading the whole
-                            # layer with src_f.read(l_size) would spike memory by a full
-                            # layer's size (hundreds of MB / GB for large tensors).
-                            with open(fpath, "rb") as src_f:
-                                src_f.seek(l_offset)
-                                with open(l_obj_path, "wb") as dst_f:
-                                    remaining = l_size
-                                    while remaining > 0:
-                                        chunk = src_f.read(min(8 * 1024 * 1024, remaining))
-                                        if not chunk:
-                                            break
-                                        dst_f.write(chunk)
-                                        remaining -= len(chunk)
-                        layers.append({"name": lr["name"], "hash": l_hash, "size": l_size})
-                except Exception as exc:
-                    logger.warning(f"Layer splitting failed for {rel_path}, falling back to whole-file: {exc}")
-
-            # Only store the whole-file blob when layer-splitting didn't happen (or failed) —
-            # mirrors push_objects()'s existing "upload the whole-file object only if layers
-            # weren't successfully chunked" condition. Storing both defeats the entire point
-            # of layer-level dedup: a fine-tune that touches only one layer would still
-            # duplicate the *whole* checkpoint on every commit. `checkout` already reassembles
-            # the whole file from layers on demand when this blob is absent.
-            if not layers:
-                obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
-                obj_dir.mkdir(parents=True, exist_ok=True)
-                obj_path = obj_dir / file_hash[2:]
-                if not obj_path.exists():
-                    shutil.copy2(fpath, obj_path)
-
-            ptr_path = get_pointer_path(fpath)
-            ptr_content = create_pointer(fpath, file_hash, meta["size"])
-            with open(ptr_path, "w") as ptr_f:
-                ptr_f.write(ptr_content)
-
-            pointer_rel_path = rel_path + ".av-pointer"
-            idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, pointer_rel_path, auto_save=False)
-            if layers:
-                idx.entries[rel_path]["layers"] = layers
+        if stage_one_file(repo_root, idx, threshold_bytes, fpath, rel_path):
             any_changed = True
-            click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {len(layers)} layers)", fg="green")
-        else:
-            # Every tracked file — including code and sub-threshold artifacts, not just
-            # LFS-pointered ones — needs a durable copy under .av/objects/. Without this,
-            # `av checkout` to an older commit has no content to restore a code/small file
-            # from (only its hash was ever recorded), so rolling back code was silently a
-            # no-op. See development/Probleme.md for the full writeup.
-            obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
-            obj_dir.mkdir(parents=True, exist_ok=True)
-            obj_path = obj_dir / file_hash[2:]
-            if not obj_path.exists():
-                shutil.copy2(fpath, obj_path)
-
-            idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None, auto_save=False)
-            any_changed = True
-            click.secho(f"Staged [{file_type.upper()}] {rel_path}", fg="green")
 
     if any_changed:
         idx.save()
 
 
+_AVIGNORE_TEMPLATE = """\
+# Aether-Vault ignore patterns — one glob per line, # for comments.
+# Examples (uncomment or add your own):
+# venv/
+# __pycache__/
+# node_modules/
+# *.log
+"""
+
+
 @cli.command()
-def status() -> None:
-    """Show the working tree status."""
+@click.option("--avignore", "make_avignore", is_flag=True, default=False,
+              help="Generate a .avignore template in the repo root.")
+def file(make_avignore: bool) -> None:
+    """Generate scaffold files (e.g. .avignore) in the repo root.
+
+    Each kind of generated file is its own flag, so more can be added later without
+    restructuring this command.
+    """
+    repo_root = ensure_repo()
+
+    if not make_avignore:
+        click.secho("Nothing to do — pass a flag, e.g. `av file --avignore`.", fg="yellow")
+        return
+
+    avignore_path = repo_root / ".avignore"
+    if avignore_path.exists():
+        click.secho(f".avignore already exists at {avignore_path} — not overwriting.", fg="yellow")
+        return
+
+    avignore_path.write_text(_AVIGNORE_TEMPLATE, encoding="utf-8")
+    click.secho(f"Wrote {avignore_path}", fg="green")
+
+
+@cli.command()
+@click.argument("paths", nargs=-1)
+def unstage(paths: tuple) -> None:
+    """Unstage files staged by `av add`, without touching the working tree.
+
+    Reverts each staged index entry back to its last-committed state (so it correctly shows up
+    as "modified" again, or as untracked if it was never committed) — like `git reset` / `git
+    restore --staged`, this only ever touches the index, never the working-tree files.
+    """
     repo_root = ensure_repo()
     idx = Index(repo_root)
 
-    head_path = repo_root / ".av" / "HEAD"
-    branch = "detached"
-    if head_path.exists():
-        head_content = head_path.read_text().strip()
-        if head_content.startswith("ref: refs/heads/"):
-            branch = head_content.split("/")[-1]
+    staged = idx.get_staged_entries()
+    if not staged:
+        click.secho("Nothing staged to unstage", fg="yellow")
+        return
 
-    click.secho(f"On branch {branch}\n", bold=True)
+    if paths:
+        rel_paths = []
+        for p in paths:
+            try:
+                rel = str(Path(p).resolve().relative_to(repo_root)).replace("\\", "/")
+            except ValueError:
+                continue
+            if rel in staged:
+                rel_paths.append(rel)
+        if not rel_paths:
+            click.secho("None of the given paths are staged", fg="yellow")
+            return
+    else:
+        rel_paths = list(staged.keys())
 
+    head_tree = resolve_head_tree(repo_root)
+    for rel_path in rel_paths:
+        entry = idx.entries[rel_path]
+        head_data = head_tree.get(rel_path)
+        if head_data:
+            # Was already tracked before this staging — revert the index entry to HEAD's
+            # data (mtime_ns=0 deliberately never matches a real file's stat, so `av status`
+            # correctly reports it as "modified" again rather than silently looking clean).
+            new_entry = {
+                "hash": head_data["hash"],
+                "size": head_data["size"],
+                "mtime_ns": 0,
+                "type": head_data["type"],
+                "staged": False,
+                "pointer": rel_path + ".av-pointer" if head_data["type"] == "artifact" else None,
+            }
+            if head_data.get("layers"):
+                new_entry["layers"] = head_data["layers"]
+            idx.entries[rel_path] = new_entry
+        else:
+            # Never committed — unstaging makes it untracked again. The `.av-pointer` is pure
+            # bookkeeping `add()` created, not user data, so it's removed; the real working-tree
+            # file (if any) is never touched.
+            pointer = entry.get("pointer")
+            if pointer:
+                ptr_path = repo_root / pointer
+                if ptr_path.exists() and ptr_path.is_file():
+                    ptr_path.unlink()
+            del idx.entries[rel_path]
+
+    idx.save()
+    click.secho(f"Unstaged {len(rel_paths)} file(s):", fg="green")
+    for rel_path in rel_paths:
+        click.echo(f"  {rel_path}")
+
+
+def compute_status(repo_root: Path, idx: Index) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Returns (staged, modified, deleted, untracked) rel_paths — the same dirty-state
+    classification `status()` displays, factored out so `av stash` can compute exactly the same
+    dirty set instead of re-deriving its own (slightly different) notion of "dirty"."""
     staged, modified, deleted, untracked = [], [], [], []
 
     disk_files: set[str] = set()
@@ -757,6 +979,26 @@ def status() -> None:
     for rel_path in disk_files:
         if rel_path not in idx.entries:
             untracked.append(rel_path)
+
+    return staged, modified, deleted, untracked
+
+
+@cli.command()
+def status() -> None:
+    """Show the working tree status."""
+    repo_root = ensure_repo()
+    idx = Index(repo_root)
+
+    head_path = repo_root / ".av" / "HEAD"
+    branch = "detached"
+    if head_path.exists():
+        head_content = head_path.read_text().strip()
+        if head_content.startswith("ref: refs/heads/"):
+            branch = head_content.split("/")[-1]
+
+    click.secho(f"On branch {branch}\n", bold=True)
+
+    staged, modified, deleted, untracked = compute_status(repo_root, idx)
 
     if staged:
         click.secho("Changes to be committed:", fg="green")
@@ -1059,58 +1301,11 @@ def checkout(target: str, force: bool) -> None:
             # older commit's code must be materialized here the same way, or `av checkout`
             # would silently leave the working tree's code untouched while still claiming
             # success (development/Probleme.md).
-            obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
-            dest = repo_root / rel_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-
-            if layers and not obj_path.exists():
-                click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
-                try:
-                    with open(dest, "wb") as f_out:
-                        for layer in layers:
-                            lh = layer["hash"]
-                            l_obj = repo_root / ".av" / "objects" / lh[:2] / lh[2:]
-                            if not l_obj.exists() and client.server_available():
-                                client.download_object(lh, l_obj)
-                            if not l_obj.exists():
-                                raise click.ClickException(
-                                    f"Missing layer {lh} for {rel_path}; checkout aborted to avoid a corrupt artifact"
-                                )
-                            with open(l_obj, "rb") as f_in:
-                                shutil.copyfileobj(f_in, f_out)
-                except click.ClickException:
-                    dest.unlink(missing_ok=True)
-                    raise
-
-                obj_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, obj_path)
-            else:
-                if obj_path.exists():
-                    shutil.copy2(obj_path, dest)
-                elif client.server_available():
-                    click.echo(f"Downloading {rel_path}...")
-                    if client.download_object(h, dest):
-                        obj_path.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(dest, obj_path)
+            materialize_file(repo_root, client, rel_path, h, layers)
 
     for rel_path in old_entries:
         if rel_path not in idx.entries:
-            file_path = repo_root / rel_path
-            if file_path.exists() and file_path.is_file():
-                file_path.unlink()
-                try:
-                    for parent in file_path.parents:
-                        if parent == repo_root or parent.name == '.av':
-                            break
-                        if not any(parent.iterdir()):
-                            parent.rmdir()
-                        else:
-                            break
-                except Exception:
-                    pass
-            ptr_path = repo_root / (rel_path + ".av-pointer")
-            if ptr_path.exists() and ptr_path.is_file():
-                ptr_path.unlink()
+            remove_file_and_pointer(repo_root, rel_path)
 
     # Record the real on-disk size/mtime for every materialized file and clear the staged
     # flag, so `av status` reports a clean tree right after checkout. Previously entries were
@@ -1134,6 +1329,259 @@ def checkout(target: str, force: bool) -> None:
             f.write(f"{commit_hash}\n")
 
     click.secho(f"Checked out '{target}'", fg="green")
+
+
+# ---------------------------------------------------------------------------
+# av stash
+# ---------------------------------------------------------------------------
+
+def _stash_dir(repo_root: Path) -> Path:
+    return repo_root / ".av" / "stash"
+
+
+def _list_stash_files(repo_root: Path) -> list[Path]:
+    stash_dir = _stash_dir(repo_root)
+    if not stash_dir.exists():
+        return []
+    # Filenames are timestamp-prefixed (YYYYMMDDTHHMMSSZ-<shortid>.json), so a reverse
+    # lexicographic sort is already newest-first.
+    return sorted(stash_dir.glob("*.json"), reverse=True)
+
+
+def _resolve_stash_file(repo_root: Path, stash_id: str | None) -> Path | None:
+    files = _list_stash_files(repo_root)
+    if not files:
+        return None
+    if stash_id is None:
+        return files[0]
+    for f in files:
+        if f.stem == stash_id or f.name == stash_id:
+            return f
+    return None
+
+
+def _stash_push(message: str | None) -> None:
+    from .client import VaultClient
+
+    repo_root = ensure_repo()
+    idx = Index(repo_root)
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    threshold_bytes = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
+
+    staged, modified, deleted, _untracked = compute_status(repo_root, idx)
+    if deleted:
+        click.secho(
+            f"Skipping {len(deleted)} deleted file(s) — not yet supported by `av stash`.",
+            fg="yellow",
+        )
+
+    dirty_paths = staged + modified  # compute_status's branches are mutually exclusive
+    if not dirty_paths:
+        click.secho("No local changes to stash", fg="yellow")
+        return
+
+    head_tree = resolve_head_tree(repo_root)
+    stash_entries = []
+
+    for rel_path in dirty_paths:
+        was_staged = rel_path in staged
+        if not was_staged:
+            # Modified-but-unstaged: get its current content safely into the CAS first,
+            # exactly the way `av add` would — so reverting the working copy below doesn't
+            # lose it.
+            stage_one_file(repo_root, idx, threshold_bytes, repo_root / rel_path, rel_path)
+
+        entry = idx.entries[rel_path]
+        stash_entries.append({
+            "rel_path": rel_path,
+            "hash": entry["hash"],
+            "size": entry["size"],
+            "type": entry["type"],
+            "layers": entry.get("layers", []),
+            "pointer": entry.get("pointer"),
+            "was_staged": was_staged,
+        })
+
+        head_data = head_tree.get(rel_path)
+        if head_data:
+            materialize_file(repo_root, client, rel_path, head_data["hash"], head_data.get("layers", []))
+            new_entry = {
+                "hash": head_data["hash"],
+                "size": head_data["size"],
+                "mtime_ns": 0,
+                "type": head_data["type"],
+                "staged": False,
+                "pointer": rel_path + ".av-pointer" if head_data["type"] == "artifact" else None,
+            }
+            if head_data.get("layers"):
+                new_entry["layers"] = head_data["layers"]
+            idx.entries[rel_path] = new_entry
+            # Re-stat now that HEAD's content has actually been written to disk, so the index
+            # matches the real (clean) file instead of the 0 placeholder above — otherwise
+            # `av status` would immediately call every reverted file "modified" again.
+            fpath = repo_root / rel_path
+            if fpath.exists():
+                m = get_file_meta_safe(str(fpath))
+                idx.entries[rel_path]["size"] = m["size"]
+                idx.entries[rel_path]["mtime_ns"] = m["mtime_ns"]
+        else:
+            # Never committed — same as `av unstage` for a new file: it disappears until
+            # popped, since there's no HEAD baseline to revert to.
+            remove_file_and_pointer(repo_root, rel_path)
+            del idx.entries[rel_path]
+
+    idx.save()
+
+    stash_dir = _stash_dir(repo_root)
+    stash_dir.mkdir(parents=True, exist_ok=True)
+    # Microsecond resolution, not just seconds — two stashes created in quick succession (e.g.
+    # back-to-back in a test, or a fast manual `av stash` / `av stash` retry) would otherwise
+    # share the same second-resolution prefix and sort arbitrarily (by the random shortid)
+    # instead of newest-first (found via the test suite, not just inferred).
+    stash_id = f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex[:6]}"
+
+    branch = "detached"
+    head_path = repo_root / ".av" / "HEAD"
+    if head_path.exists():
+        head_content = head_path.read_text().strip()
+        if head_content.startswith("ref: refs/heads/"):
+            branch = head_content.split("/")[-1]
+
+    atomic_write_json(stash_dir / f"{stash_id}.json", {
+        "id": stash_id,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "branch": branch,
+        "message": message,
+        "entries": stash_entries,
+    })
+
+    label = f": {message}" if message else ""
+    click.secho(f"Saved working directory state: stash@{{0}}{label}", fg="green")
+
+
+def _stash_apply_or_pop(stash_id: str | None, delete_after: bool) -> None:
+    from .client import VaultClient
+
+    repo_root = ensure_repo()
+    stash_file = _resolve_stash_file(repo_root, stash_id)
+    if stash_file is None:
+        msg = f"No stash found matching '{stash_id}'" if stash_id else "No stashes to apply"
+        click.secho(msg, fg="yellow")
+        return
+
+    with open(stash_file, "r") as f:
+        record = json.load(f)
+
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    idx = Index(repo_root)
+    head_tree = resolve_head_tree(repo_root)  # only needed for was_staged=False entries below
+
+    for entry in record["entries"]:
+        rel_path = entry["rel_path"]
+        layers = entry.get("layers", [])
+        # v1 doesn't attempt conflict detection against a dirty tree — this overwrites
+        # whatever's currently at rel_path, same caveat as the plan this was built from.
+        materialize_file(repo_root, client, rel_path, entry["hash"], layers)
+
+        if entry["was_staged"]:
+            # Was staged before the stash: restore it staged again, with the real (dirty)
+            # content's hash/stat — `status()` shows staged entries as "to be committed"
+            # purely from the `staged` flag, regardless of stat matching.
+            meta = get_file_meta_safe(str(repo_root / rel_path))
+            new_entry = {
+                "hash": entry["hash"], "size": meta["size"], "mtime_ns": meta["mtime_ns"],
+                "type": entry["type"], "staged": True, "pointer": entry.get("pointer"),
+            }
+        else:
+            # Was modified-but-unstaged before the stash: the working-tree file is restored
+            # to that dirty content above, but the index entry must go back to HEAD's
+            # baseline (with a deliberately non-matching mtime) so `status()`'s stat-mismatch
+            # check reports "modified" again instead of looking clean — mirroring exactly how
+            # `_stash_push` represents an unstaged modification in the first place.
+            head_data = head_tree.get(rel_path, {})
+            new_entry = {
+                "hash": head_data.get("hash", entry["hash"]),
+                "size": head_data.get("size", entry["size"]),
+                "mtime_ns": 0,
+                "type": entry["type"], "staged": False, "pointer": entry.get("pointer"),
+            }
+        if layers:
+            new_entry["layers"] = layers
+        idx.entries[rel_path] = new_entry
+
+    idx.save()
+
+    if delete_after:
+        stash_file.unlink()
+
+    verb = "Popped" if delete_after else "Applied"
+    click.secho(f"{verb} stash {stash_file.stem} ({len(record['entries'])} file(s) restored)", fg="green")
+
+
+@cli.group(invoke_without_command=True, name="stash")
+@click.option("-m", "--message", default=None, help="Optional label for this stash.")
+@click.pass_context
+def stash(ctx: click.Context, message: str | None) -> None:
+    """Temporarily shelve uncommitted changes (staged + modified tracked files).
+
+    Reverts the working tree to match HEAD — same scope as `git stash`: staged and modified
+    tracked files, not untracked or deleted ones — so `checkout`/`branch` can proceed without
+    --force. `av stash pop` brings everything back exactly as it was, staged or not.
+    """
+    if ctx.invoked_subcommand is None:
+        _stash_push(message)
+
+
+@stash.command("push")
+@click.option("-m", "--message", default=None, help="Optional label for this stash.")
+def stash_push_cmd(message: str | None) -> None:
+    """Shelve uncommitted changes (same as bare `av stash`)."""
+    _stash_push(message)
+
+
+@stash.command("list")
+def stash_list_cmd() -> None:
+    """List stashes, newest first."""
+    repo_root = ensure_repo()
+    files = _list_stash_files(repo_root)
+    if not files:
+        click.secho("No stashes", fg="yellow")
+        return
+    for i, f in enumerate(files):
+        with open(f, "r") as fh:
+            record = json.load(fh)
+        label = f": {record['message']}" if record.get("message") else ""
+        click.echo(f"stash@{{{i}}}  {record['created_at']}  ({len(record['entries'])} file(s)){label}  [{f.stem}]")
+
+
+@stash.command("pop")
+@click.argument("stash_id", required=False)
+def stash_pop_cmd(stash_id: str | None) -> None:
+    """Apply the most recent (or a given) stash, then delete it."""
+    _stash_apply_or_pop(stash_id, delete_after=True)
+
+
+@stash.command("apply")
+@click.argument("stash_id", required=False)
+def stash_apply_cmd(stash_id: str | None) -> None:
+    """Apply the most recent (or a given) stash, keeping it for reuse."""
+    _stash_apply_or_pop(stash_id, delete_after=False)
+
+
+@stash.command("drop")
+@click.argument("stash_id", required=False)
+def stash_drop_cmd(stash_id: str | None) -> None:
+    """Delete a stash without applying it."""
+    repo_root = ensure_repo()
+    stash_file = _resolve_stash_file(repo_root, stash_id)
+    if stash_file is None:
+        msg = f"No stash found matching '{stash_id}'" if stash_id else "No stashes to drop"
+        click.secho(msg, fg="yellow")
+        return
+    stash_file.unlink()
+    click.secho(f"Dropped stash {stash_file.stem}", fg="green")
 
 
 @cli.command("list-meta")
@@ -1180,7 +1628,7 @@ def push() -> None:
     still_pending = flush_pending_push(repo_root, client)
     pushed = len(pending_before) - len(still_pending)
     if pushed:
-        click.secho(f"✓ Pushed {pushed} commit(s) to the remote server", fg="green")
+        click.secho(f"[OK] Pushed {pushed} commit(s) to the remote server", fg="green")
     if still_pending:
         click.secho(f"  {len(still_pending)} commit(s) still pending", fg="yellow")
 
@@ -1200,7 +1648,7 @@ def gc() -> None:
 
     result = client.run_gc()
     if result:
-        click.secho("✓ Garbage collection complete", fg="green")
+        click.secho("[OK] Garbage collection complete", fg="green")
         click.echo(
             f"  Alive objects : {result.get('alive_objects', '?')}\n"
             f"  Deleted objects: {result.get('deleted_objects', '?')}\n"
@@ -1757,7 +2205,7 @@ def webui_cmd(rebuild: bool) -> None:
             else "\n   (Use `av webui --rebuild` if you changed webui source and need a fresh image.)"
         )
         click.secho(
-            f"\n✅ Aether-Vault Web UI is running at {result.backend_url}\n"
+            f"\n[OK] Aether-Vault Web UI is running at {result.backend_url}\n"
             "   Press Ctrl+C or run 'docker compose down' to stop." + suffix,
             fg="green",
             bold=True,

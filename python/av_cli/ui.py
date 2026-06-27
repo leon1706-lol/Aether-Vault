@@ -9,42 +9,87 @@ from __future__ import annotations
 import sys
 
 import click
-import questionary
-from rich.console import Console
-from rich.panel import Panel
+
+# Added to pyproject.toml's core dependencies alongside the rest of the "pretty av init" work —
+# an environment whose install predates that (or whose reinstall didn't pick up the new
+# dependency set) would otherwise hit a raw ModuleNotFoundError partway through this file's
+# imports. This module is only ever imported lazily (`from . import ui` inside
+# init/update/webui/the REPL entry point), so raising one clear, actionable error here — listing
+# every missing package at once rather than crashing on the first and rediscovering the rest one
+# `av init` retry at a time — doesn't affect commands that never touch this path.
+_missing_deps: list[str] = []
+try:
+    import questionary
+except ImportError:
+    _missing_deps.append("questionary")
+try:
+    from rich.console import Console
+except ImportError:
+    _missing_deps.append("rich")
+
+if _missing_deps:
+    raise click.ClickException(
+        f"Missing required dependencies: {', '.join(_missing_deps)}.\n"
+        "Reinstall aether-vault to pick them up:\n"
+        "  pip install --upgrade aether-vault   (if installed from PyPI)\n"
+        "  pip install -e .                     (if installed from source)"
+    )
 
 console = Console()
 
 _STATUS_STYLE = {
-    "info": ("cyan", "🔍"),
-    "success": ("green", "✓"),
-    "error": ("red", "✗"),
-    "warn": ("yellow", "⚠"),
+    "info": ("cyan", "[INFO]"),
+    "success": ("green", "[OK]"),
+    "error": ("red", "[ERROR]"),
+    "warn": ("yellow", "[WARN]"),
 }
+
+# Same two-tone palette as development/logo.png's "AV" monogram (graphite "A", copper/gold "V" +
+# tail) — TrueColor RGB values, not approximated hex, so the terminal rendering matches exactly.
+_LOGO_GRAY = "rgb(90,90,90)"
+_LOGO_GOLD = "rgb(230,160,40)"
+_LOGO_LINES = [
+    f"       [{_LOGO_GRAY}]▄▄███▄▄[/]",
+    f"      [{_LOGO_GRAY}]▄█▀▀[/]█[{_LOGO_GRAY}]▀▀█▄[/]                 [{_LOGO_GOLD}]▄▄[/]",
+    f"     [{_LOGO_GRAY}]▄█▀[/]  █  [{_LOGO_GRAY}]▀█▄[/]               [{_LOGO_GOLD}]▄█▀[/]",
+    f"    [{_LOGO_GRAY}]███████████[/][{_LOGO_GOLD}]▄▄▄[/]           [{_LOGO_GOLD}]▄█▀[/]",
+    f"   [{_LOGO_GRAY}]██▀[/]    █    [{_LOGO_GRAY}]▀██[/][{_LOGO_GOLD}]█▄▄▄[/]     [{_LOGO_GOLD}]▄█▀[/]",
+    f"  [{_LOGO_GRAY}]██▀[/]     █      [{_LOGO_GOLD}]▀█████████▀[/]",
+    f" [{_LOGO_GRAY}]▀▀[/]       █         [{_LOGO_GOLD}]▀████▀[/]",
+]
 
 
 def print_banner(title: str, subtitle: str | None = None) -> None:
-    """Render a rounded banner panel, e.g. at the top of `av init`."""
-    body = f"[bold]{title}[/bold]"
+    """Render the AV monogram logo (ANSI block art, matching development/logo.png's two-tone
+    graphite/copper palette), with the title/subtitle printed as plain text underneath it."""
+    console.print()
+    for line in _LOGO_LINES:
+        console.print(line)
+    console.print()
+    console.print(f"  [bold]{title}[/bold]")
     if subtitle:
-        body += f"\n[dim]{subtitle}[/dim]"
-    console.print(Panel(body, border_style="cyan", expand=False))
+        console.print(f"  [dim]{subtitle}[/dim]")
 
 
 def print_step(msg: str, status: str = "info") -> None:
-    """Standardized status line: emoji + color, matching the existing main.py conventions."""
-    color, emoji = _STATUS_STYLE.get(status, _STATUS_STYLE["info"])
-    click.secho(f"{emoji} {msg}", fg=color)
+    """Standardized status line: bracketed tag + color, matching `av doctor`'s existing
+    [OK]/[WARN] convention so the whole CLI reads consistently."""
+    color, tag = _STATUS_STYLE.get(status, _STATUS_STYLE["info"])
+    click.secho(f"{tag} {msg}", fg=color)
 
 
 def select_login_mode() -> str:
     """Prompt the user to choose Local or Enterprise. Returns "local" or "enterprise"."""
+    local_choice = questionary.Choice("Local — Docker-backed, runs on this machine", value="local")
+    console.print()  # blank line between the banner above and the prompt
     choice = questionary.select(
         "How would you like to use Aether-Vault?",
         choices=[
-            questionary.Choice("Local (recommended) — Docker-backed, runs on this machine", value="local"),
+            local_choice,
             questionary.Choice("Enterprise — sign in with your account", value="enterprise"),
         ],
+        default=local_choice,
+        instruction="",
     ).ask()
     if choice is None:
         # Ctrl+C / Ctrl+D during the prompt — default to local rather than crashing.

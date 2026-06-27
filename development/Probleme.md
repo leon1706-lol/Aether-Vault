@@ -766,3 +766,43 @@ implement, both rated 1–10.
   never called). Found live by actually running the unguarded version against this machine's real
   Docker installation pointed at the (not-yet-published) GHCR images and observing the hang
   firsthand, then killing the process — not just inferred from reading the code.
+
+## ✅ Fixed — `av stash pop`/`av stash list` had two real bugs, found via manual debugging and the test suite (2026-06-28)
+
+### [6] `av stash pop` restored a modified-but-unstaged file's index entry with the dirty hash/stat instead of HEAD's baseline, making it look falsely clean
+- **Files:** `python/av_cli/main.py` (`_stash_apply_or_pop`).
+- **Problem (Severity 6, Difficulty 2):** `status()` detects a "modified" tracked file purely by
+  a stat mismatch between the on-disk file and the size/mtime stored in its index entry — there's
+  no separate "dirty" flag. `_stash_apply_or_pop()`'s first version restored every entry
+  (regardless of `was_staged`) using the stash record's own hash and the just-written file's real
+  stat — which, for a `was_staged=False` entry, makes the stored stat match the restored (dirty)
+  file exactly. Found via manual debugging (this session's established practice of driving new
+  features with the real `av` binary, not just unit tests): after `av stash` then `av stash pop`,
+  a file that had been modified-but-unstaged before the stash silently vanished from `av status`
+  entirely instead of showing up under "Changes not staged for commit" again.
+- **Fix:** `_stash_apply_or_pop()` now branches on `was_staged`. For `True`, it keeps the original
+  behavior (dirty hash + real stat + `staged=True`, so it shows as "to be committed" — `status()`
+  trusts the `staged` flag before ever checking the stat). For `False`, it looks up
+  `resolve_head_tree()` again and stores *HEAD's* hash/size with `mtime_ns=0` (deliberately
+  non-matching) — exactly mirroring how `_stash_push()` represents an unstaged modification in
+  the first place, so the stat-mismatch check correctly reports "modified" again after pop.
+- **Verified:** `tests/test_stash.py::test_stash_pop_restores_staged_and_modified_state_correctly`
+  asserts both the staged and modified-unstaged entries are reported correctly by `av status`
+  after a push/pop round-trip, not just that the file contents are right.
+
+### [4] Two stashes created within the same second sorted unpredictably in `av stash list`
+- **Files:** `python/av_cli/main.py` (`_stash_push`'s stash ID generation).
+- **Problem (Severity 4, Difficulty 1):** Stash filenames are `<timestamp>-<shortid>.json`, and
+  `_list_stash_files()` sorts them newest-first by reverse filename order — relying on the
+  timestamp prefix to dominate the comparison. The timestamp used second-level resolution
+  (`%Y%m%dT%H%M%SZ`); two stashes created within the same second (an entirely realistic case —
+  e.g. a script, or just two fast manual `av stash` calls) share an identical prefix, so the sort
+  falls back to comparing the random 6-hex-character shortid, which has no relationship to
+  creation order at all. Found by the test suite itself
+  (`tests/test_stash.py::test_stash_list_orders_newest_first`), which failed on the very first
+  run — not inferred from reading the code first.
+- **Fix:** Switched the stash ID's timestamp component to microsecond resolution
+  (`%Y%m%dT%H%M%S%f`), which two sequential CLI invocations (each involving real file I/O) will
+  not collide on in practice.
+- **Verified:** re-ran the previously-failing test 5 times in a row to rule out remaining
+  flakiness (all passed) in addition to the full suite.

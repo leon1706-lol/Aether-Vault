@@ -211,6 +211,123 @@ def test_add_noop_does_not_rewrite_index_file(repo):
 
 
 # ---------------------------------------------------------------------------
+# av file / .avignore
+# ---------------------------------------------------------------------------
+
+def test_file_avignore_writes_template(repo):
+    result = invoke("file", "--avignore")
+    assert result.exit_code == 0
+    assert "Wrote" in result.output
+
+    avignore_path = repo / ".avignore"
+    assert avignore_path.exists()
+    assert "venv/" in avignore_path.read_text()
+
+
+def test_file_avignore_refuses_to_overwrite(repo):
+    (repo / ".avignore").write_text("# my custom patterns\nmystuff/\n")
+    result = invoke("file", "--avignore")
+    assert result.exit_code == 0
+    assert "already exists" in result.output.lower()
+    assert "mystuff/" in (repo / ".avignore").read_text()
+
+
+def test_file_with_no_flags_is_a_noop(repo):
+    result = invoke("file")
+    assert result.exit_code == 0
+    assert "nothing to do" in result.output.lower()
+    assert not (repo / ".avignore").exists()
+
+
+def test_avignore_excludes_matching_dir_from_add_and_status(repo):
+    (repo / ".avignore").write_text("venv/\n*.log\n")
+    (repo / "venv").mkdir()
+    (repo / "venv" / "site.py").write_text("ignored")
+    (repo / "debug.log").write_text("ignored too")
+    (repo / "real_code.py").write_text("print('keep me')")
+
+    result = invoke("add", ".")
+    assert result.exit_code == 0
+    assert "venv" not in result.output
+    assert "debug.log" not in result.output
+    assert "real_code.py" in result.output
+
+    status = invoke("status")
+    assert "venv" not in status.output
+    assert "debug.log" not in status.output
+
+
+# ---------------------------------------------------------------------------
+# av unstage
+# ---------------------------------------------------------------------------
+
+def test_unstage_with_nothing_staged(repo):
+    result = invoke("unstage")
+    assert result.exit_code == 0
+    assert "nothing staged" in result.output.lower()
+
+
+def test_unstage_new_file_makes_it_untracked_again(repo):
+    (repo / "newfile.py").write_text("a = 1")
+    invoke("add", "newfile.py")
+
+    result = invoke("unstage")
+    assert result.exit_code == 0
+    assert "newfile.py" in result.output
+
+    status = invoke("status")
+    assert "Untracked files" in status.output
+    assert "newfile.py" in status.output
+    assert (repo / "newfile.py").read_text() == "a = 1"  # working tree untouched
+
+
+def test_unstage_modified_tracked_file_shows_modified_again(repo):
+    (repo / "train.py").write_text("v1")
+    invoke("add", "train.py")
+    invoke("commit", "-m", "first")
+
+    (repo / "train.py").write_text("v2 dirty")
+    invoke("add", "train.py")
+
+    result = invoke("unstage")
+    assert result.exit_code == 0
+
+    status = invoke("status")
+    assert "Changes not staged for commit" in status.output
+    assert "train.py" in status.output
+    assert (repo / "train.py").read_text() == "v2 dirty"  # working tree untouched
+
+
+def test_unstage_single_path_leaves_others_staged(repo):
+    (repo / "a.py").write_text("a")
+    (repo / "b.py").write_text("b")
+    invoke("add", "a.py", "b.py")
+
+    result = invoke("unstage", "a.py")
+    assert result.exit_code == 0
+
+    idx = Index(repo)
+    assert idx.get_entry("a.py") is None
+    assert idx.get_entry("b.py")["staged"] is True
+
+    status = invoke("status")
+    assert "a.py" in status.output  # untracked again
+    assert "b.py" in status.output  # still staged
+
+
+def test_unstage_artifact_removes_pointer_sidecar(repo):
+    invoke("config", "1")  # 1MB LFS threshold
+    (repo / "weights.pt").write_bytes(b"x" * (2 * 1024 * 1024))
+    invoke("add", "weights.pt")
+    assert (repo / "weights.pt.av-pointer").exists()
+
+    result = invoke("unstage")
+    assert result.exit_code == 0
+    assert not (repo / "weights.pt.av-pointer").exists()
+    assert (repo / "weights.pt").exists()  # real artifact untouched
+
+
+# ---------------------------------------------------------------------------
 # av status
 # ---------------------------------------------------------------------------
 

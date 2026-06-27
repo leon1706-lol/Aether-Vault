@@ -11,8 +11,19 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import click
 import requests
-from packaging.version import InvalidVersion, Version
+
+try:
+    from packaging.version import InvalidVersion, Version
+except ImportError:
+    # Same stale-install scenario as ui.py's guarded imports — see that file's comment.
+    raise click.ClickException(
+        "Missing required dependency: packaging.\n"
+        "Reinstall aether-vault to pick it up:\n"
+        "  pip install --upgrade aether-vault   (if installed from PyPI)\n"
+        "  pip install -e .                     (if installed from source)"
+    )
 
 from . import __version__
 from .fsutil import atomic_write_json

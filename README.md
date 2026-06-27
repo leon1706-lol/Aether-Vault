@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-115%2F116%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="115 of 116 tests passing">
+  <img src="https://img.shields.io/badge/tests-161%2F164%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="161 of 164 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -53,7 +53,7 @@ graph TD
     %% Local Environment
     subgraph Local [User Machine / Training Node]
         Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-        CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update ·<br>import-lightning · import-mlflow · import-transformers)")
+        CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file ·<br>unstage · stash · import-lightning · import-mlflow · import-transformers)")
         CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
         LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
         PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
@@ -73,6 +73,7 @@ graph TD
         CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> PendingQ
         CLI -- "8. Benchmarks Against Competitor Tools" --> Benchmarks
         CLI -- "9. Opens Local/Enterprise Session After Init/Reconnect" --> Session
+        CLI -- "10. Shelves/Restores Uncommitted Changes (av stash)" --> LocalDAG
     end
 
     %% Remote Environment
@@ -245,6 +246,25 @@ av add src/train.py data/features.parquet weights/epoch_50.safetensors
 # Stage everything recursively
 av add .
 ```
+`av add .` skips anything matching a pattern in `.avignore` (gitignore-style, one glob per
+line) — see `av file --avignore` below to generate one.
+
+### `av file`
+Generates scaffold files in the repo root. Each kind of generated file is its own flag, so more
+can be added later without restructuring the command.
+```bash
+av file --avignore   # writes a .avignore template (gitignore-style — venv/, *.log, etc.)
+```
+Refuses to overwrite an existing file rather than silently clobbering edits you've already made.
+
+### `av unstage`
+Undo `av add` — without touching the working-tree files. Reverts each staged entry back to its
+last-committed state (so it shows up as "modified" again, or untracked if it was never
+committed), like `git reset` / `git restore --staged`.
+```bash
+av unstage              # unstage everything currently staged
+av unstage file1 file2  # unstage just these paths
+```
 
 ### `av commit`
 Record a snapshot of the staged files into the local DAG and push to the remote registry. Attach arbitrary ML metrics and labels directly to the commit.
@@ -272,6 +292,24 @@ av branch feature-transformers
 av checkout feature-transformers
 av checkout main
 ```
+`checkout` refuses to run if you have uncommitted changes it would overwrite, unless you pass
+`--force` (which discards them) — `av stash` is the non-destructive alternative.
+
+### `av stash`
+Git-stash-style temporary shelving of uncommitted changes (staged + modified tracked files —
+not untracked or deleted files), so you can switch branches or pull without committing
+half-finished work. Reverts the working tree to match HEAD; `pop`/`apply` bring it back exactly
+as it was, staged or not.
+```bash
+av stash                    # shelve everything dirty (same as `av stash push`)
+av stash -m "wip on lr"      # ...with a label
+av stash list                # newest first
+av stash pop [id]            # apply + delete (defaults to the most recent)
+av stash apply [id]          # apply without deleting
+av stash drop [id]           # delete without applying
+```
+v1 doesn't attempt conflict detection against a dirty tree on `pop`/`apply` — it overwrites
+whatever's currently at each path, same as a `checkout` would.
 
 ### `av webui`
 Launch the browser-based Web UI dashboard. Checks that Docker is running, starts the `aether-vault-webui` container, and opens `http://localhost:3000` automatically. If the container is already running and healthy, this skips straight to opening the browser instead of re-running `docker compose` every time.
@@ -477,7 +515,6 @@ For the full results, the methodology behind each benchmark, and the rating lege
 
 | Status | Feature |
 |---|---|
-| 🔲 | **`av stash`** — git-stash-style temporary shelving of uncommitted changes, so you can switch branches or pull without committing half-finished work |
 | 🔲 | **First real tagged release** — `release.yml` exists and has been validated structurally, but no `vX.Y.Z` tag has been pushed yet; needs a TestPyPI dry run before pointing trusted publishing at the real `pypi.org` project (see `development/CHANGELOG.md`) |
 
 ---

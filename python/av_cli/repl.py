@@ -12,8 +12,18 @@ import shlex
 from pathlib import Path
 
 import click
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+except ImportError:
+    # Same stale-install scenario as ui.py's guarded imports — see that file's comment.
+    raise click.ClickException(
+        "Missing required dependency: prompt_toolkit.\n"
+        "Reinstall aether-vault to pick it up:\n"
+        "  pip install --upgrade aether-vault   (if installed from PyPI)\n"
+        "  pip install -e .                     (if installed from source)"
+    )
 
 from . import ui
 
