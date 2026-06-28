@@ -2613,6 +2613,29 @@ def import_mlflow(run_id: str, tracking_uri: str | None, tag: str | None) -> Non
     click.secho(f"Imported MLflow run: {run_id}", fg="green")
 
 
+def run() -> None:
+    """Console-script entry point (`av = "av_cli.main:run"` in pyproject.toml).
+
+    Wraps `cli()` so the opt-in auto-update check (`av update --enable-auto-update`) runs
+    exactly once per OS process, right as it's about to exit — including after any REPL
+    session `cli()` may have run internally. Can't hook this into `_AuthRetryGroup.invoke()`
+    instead: that fires once per `cli.main()` call, which is once per line typed inside the
+    REPL too, not once per process. `cli()` itself calls `sys.exit(...)` (Click's
+    standalone_mode=True default) — Python still runs `finally` before that exit completes, so
+    the update check reliably gets a turn either way. Any failure in the update check itself is
+    swallowed here so it can never mask the real command's exit code or crash on the way out.
+    """
+    try:
+        cli()
+    finally:
+        from . import update_check
+
+        try:
+            update_check.maybe_auto_update()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    cli()
+    run()
 

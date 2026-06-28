@@ -1364,3 +1364,45 @@ def test_auth_status_reports_protected_without_printing_the_token(repo, monkeypa
     assert "Protected" in result.output
     assert "super-secret-value" not in result.output
     assert "alue" in result.output  # last 4 chars of the token are shown, masked
+
+
+# ---------------------------------------------------------------------------
+# main.run() — the console-script entry point wraps cli() with a one-shot
+# auto-update check at process exit (see python/av_cli/main.py's run() docstring)
+# ---------------------------------------------------------------------------
+
+def test_run_calls_maybe_auto_update_exactly_once_after_cli_exits(monkeypatch):
+    import python.av_cli.main as main_module
+    import python.av_cli.update_check as update_check_module
+
+    calls = []
+
+    def fake_cli(*a, **k):
+        raise SystemExit(0)
+
+    monkeypatch.setattr(main_module, "cli", fake_cli)
+    monkeypatch.setattr(update_check_module, "maybe_auto_update", lambda: calls.append(1))
+
+    with pytest.raises(SystemExit):
+        main_module.run()
+
+    assert calls == [1]
+
+
+def test_run_swallows_a_failing_auto_update_check_without_changing_exit_code(monkeypatch):
+    import python.av_cli.main as main_module
+    import python.av_cli.update_check as update_check_module
+
+    def fake_cli(*a, **k):
+        raise SystemExit(3)
+
+    def fake_maybe_auto_update():
+        raise RuntimeError("network is down")
+
+    monkeypatch.setattr(main_module, "cli", fake_cli)
+    monkeypatch.setattr(update_check_module, "maybe_auto_update", fake_maybe_auto_update)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main_module.run()
+
+    assert exc_info.value.code == 3  # the real command's exit code is untouched

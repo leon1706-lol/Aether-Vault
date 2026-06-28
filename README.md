@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-303%2F303%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="303 of 303 tests passing">
+  <img src="https://img.shields.io/badge/tests-309%2F309%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="309 of 309 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -237,6 +237,12 @@ av update --list-versions       # list every published version, newest first
 av update --enable-auto-update  # opt in to silent auto-upgrade (off by default)
 av update --disable-auto-update
 ```
+With `--enable-auto-update` on, every `av` command checks once more for an update right as the
+process is about to exit (after any interactive session has finished) and silently
+`pip install --upgrade`s if one's available — pushing a new tagged release to GitHub is enough
+for already-installed opted-in users to pick it up on their next `av` invocation, with no
+action needed on their end. Off by default; explicit `av update` always works regardless of
+this setting.
 `av update --docker` is a separate, opt-in action that only touches the local Docker backend —
 it never runs as part of plain `av update`, since restarting a running container is disruptive:
 ```bash

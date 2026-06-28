@@ -65,3 +65,76 @@ def test_list_versions_sorted_descending(monkeypatch):
     monkeypatch.setattr(update_check.requests, "get", lambda *a, **k: _FakeResp())
     versions = update_check.list_versions()
     assert versions == ["1.2.0", "1.0.0", "0.9.0"]  # 1.1.0 excluded: empty file list (yanked)
+
+
+# ---------------------------------------------------------------------------
+# maybe_auto_update — opt-in silent upgrade, wired into main.run() at process exit
+# ---------------------------------------------------------------------------
+
+def _set_auto_update(enabled: bool) -> None:
+    cfg = update_check.load_user_config()
+    cfg["auto_update"] = enabled
+    update_check.save_user_config(cfg)
+
+
+def test_maybe_auto_update_noop_when_not_opted_in(monkeypatch):
+    _set_auto_update(False)
+    calls = []
+    monkeypatch.setattr(update_check, "check_for_update", lambda *a, **k: calls.append(1))
+
+    assert update_check.maybe_auto_update() is False
+    assert calls == []  # never even checks for an update if not opted in
+
+
+def test_maybe_auto_update_noop_when_already_up_to_date(monkeypatch):
+    _set_auto_update(True)
+    monkeypatch.setattr(
+        update_check, "check_for_update",
+        lambda *a, **k: update_check.UpdateCheckResult(current="1.0.0", latest="1.0.0", is_outdated=False),
+    )
+
+    def fake_run(*a, **k):
+        raise AssertionError("should not invoke pip when already up to date")
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert update_check.maybe_auto_update() is False
+
+
+def test_maybe_auto_update_upgrades_when_outdated(monkeypatch):
+    _set_auto_update(True)
+    monkeypatch.setattr(
+        update_check, "check_for_update",
+        lambda *a, **k: update_check.UpdateCheckResult(current="1.0.0", latest="2.0.0", is_outdated=True),
+    )
+
+    calls = []
+
+    class _FakeCompletedProcess:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeCompletedProcess()
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert update_check.maybe_auto_update() is True
+    assert calls and calls[0][-3:] == ["install", "--upgrade", "aether-vault"]
+
+
+def test_maybe_auto_update_reports_failure_on_nonzero_pip_exit(monkeypatch):
+    _set_auto_update(True)
+    monkeypatch.setattr(
+        update_check, "check_for_update",
+        lambda *a, **k: update_check.UpdateCheckResult(current="1.0.0", latest="2.0.0", is_outdated=True),
+    )
+
+    class _FakeCompletedProcess:
+        returncode = 1
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeCompletedProcess())
+
+    assert update_check.maybe_auto_update() is False

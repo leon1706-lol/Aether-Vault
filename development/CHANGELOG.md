@@ -813,4 +813,39 @@ findings (resolved and still-open).
   commit-queueing fix actually recovers a "lost" commit via `av push` once the right token is
   restored.
 
+## Phase 34 — Wired Up Real Auto-Update (closing the `maybe_auto_update` dead-code gap)
+- **Files:** `python/av_cli/main.py` (new `run()`), `pyproject.toml` (`[project.scripts]`),
+  `python/av_cli/update_check.py`, `tests/test_update_check.py`, `tests/test_cli.py`, `README.md`.
+- **Problem:** `av update --enable-auto-update` already existed and persisted a real config
+  flag, but the function that actually performs the silent upgrade
+  (`update_check.maybe_auto_update()`) was never called from anywhere — confirmed via zero test
+  coverage for it. Enabling the flag had no effect.
+- **Fix:** added `main.py`'s `run()` — the new console-script entry point
+  (`pyproject.toml`: `av = "av_cli.main:run"`, was `av_cli.main:cli`) — which wraps `cli()` and
+  calls `maybe_auto_update()` exactly once in a `finally`, right as the whole process is about
+  to exit. Deliberately **not** hooked into `_AuthRetryGroup.invoke()` (the existing
+  centralized-error-handling class): that fires once per `cli.main()` call, which is once per
+  line typed inside the interactive REPL session too — wrapping the single outer `cli()` call
+  instead is the only place that fires exactly once regardless of whether a REPL session ran
+  inside it. Any exception from the update check itself is swallowed so it can never mask the
+  real command's exit code. Also hardened `maybe_auto_update()` itself: it previously ran
+  `pip install --upgrade` without checking the subprocess's return code, so a failed upgrade
+  (no network, no permissions) silently looked identical to success — now checks
+  `returncode` and prints a clear one-line success/failure notice either way.
+- Stays **off by default** (`auto_update: False` in the user-level config) — this round closes
+  the wiring gap, it doesn't change the feature's opt-in nature.
+- **Verified**: 6 new tests (`maybe_auto_update`'s opted-out/up-to-date/outdated/failed-pip
+  cases; `run()` calling it exactly once and swallowing its own failures without changing the
+  real exit code), plus a real manual end-to-end run against the actual installed `av` binary
+  (reinstalled editable to pick up the new entry point) — opted in via the real
+  `av update --enable-auto-update`, simulated a newer release by monkeypatching
+  `_fetch_latest_version` in-process, confirmed the real `pip install --upgrade` subprocess ran
+  and the success message printed, then reset the machine's user config back to the off
+  default and cleared the synthetic cached result afterward. Full suite: 309 passed, 3 skipped.
+- **Deliberately left to the user, not scriptable**: the one-time PyPI↔GitHub trusted-publisher
+  link (pypi.org account settings → pending publisher, pointing at this repo's `release.yml`
+  under the `pypi` environment) and pushing the actual first `vX.Y.Z` tag — both manual,
+  account-level web steps. Once done, this closes the README roadmap's last open item
+  ("First real tagged release").
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

@@ -133,7 +133,9 @@ def list_versions() -> list[str] | None:
 def maybe_auto_update() -> bool:
     """Upgrades via pip if the user has opted in and an update is available.
 
-    Only call this right before the process would exit anyway — never mid-command.
+    Only call this right before the process would exit anyway — never mid-command. Returns
+    True only on a confirmed-successful upgrade (checked via the subprocess's return code),
+    so a failed `pip install` (no network, no permissions) can't silently look like success.
     """
     import subprocess
     import sys
@@ -146,5 +148,15 @@ def maybe_auto_update() -> bool:
     if result is None or not result.is_outdated:
         return False
 
-    subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_NAME])
-    return True
+    click.secho(f"Auto-updating aether-vault {result.current} -> {result.latest}...", fg="cyan")
+    proc = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", PACKAGE_NAME])
+    if proc.returncode == 0:
+        click.secho(f"Updated to {result.latest}.", fg="green")
+        return True
+
+    click.secho(
+        f"Auto-update to {result.latest} failed (pip exited {proc.returncode}) — "
+        "run `av update` manually to see why.",
+        fg="yellow",
+    )
+    return False
