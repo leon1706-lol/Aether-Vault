@@ -1,7 +1,9 @@
-"""Tests for python/av_cli/client.py — VaultClient's batch-existence check and the
+"""Tests for python/av_cli/client.py — VaultClient's batch-existence check, the
 known_missing fast path on upload_object (added to cut commit latency, see
-development/Probleme.md and BENCHMARKS.md #3)."""
-from python.av_cli.client import VaultClient
+development/Probleme.md and BENCHMARKS.md #3), and the "Protected" mode token handling."""
+import pytest
+
+from python.av_cli.client import AuthenticationError, VaultClient
 
 
 class _FakeResponse:
@@ -76,3 +78,77 @@ def test_upload_object_default_still_checks_head_first(monkeypatch, tmp_path):
     monkeypatch.setattr(client.session, "post", fake_post)
 
     assert client.upload_object(f, "deadbeef") is True
+
+
+# ---------------------------------------------------------------------------
+# "Protected" mode — token header + 401 handling
+# ---------------------------------------------------------------------------
+
+def test_constructing_with_a_token_sets_the_authorization_header():
+    client = VaultClient(api_token="my-secret")
+    assert client.session.headers["Authorization"] == "Bearer my-secret"
+
+
+def test_constructing_without_a_token_sets_no_authorization_header():
+    client = VaultClient()
+    assert "Authorization" not in client.session.headers
+
+
+@pytest.mark.parametrize(
+    "method_name, call",
+    [
+        ("batch_check_objects", lambda c: c.batch_check_objects(["aaa"])),
+        ("push_commit", lambda c: c.push_commit({"hash": "x"})),
+        ("update_ref", lambda c: c.update_ref("main", "x")),
+        ("get_commit", lambda c: c.get_commit("x")),
+        ("get_ref", lambda c: c.get_ref("main")),
+        ("run_gc", lambda c: c.run_gc()),
+        ("object_exists", lambda c: c.object_exists("x")),
+    ],
+)
+def test_methods_raise_authentication_error_on_401(monkeypatch, method_name, call):
+    client = VaultClient()
+    fake_401 = _FakeResponse(401)
+    monkeypatch.setattr(client.session, "get", lambda *a, **k: fake_401)
+    monkeypatch.setattr(client.session, "post", lambda *a, **k: fake_401)
+    monkeypatch.setattr(client.session, "put", lambda *a, **k: fake_401)
+    monkeypatch.setattr(client.session, "head", lambda *a, **k: fake_401)
+
+    with pytest.raises(AuthenticationError):
+        call(client)
+
+
+def test_server_available_never_raises_authentication_error_even_on_401(monkeypatch):
+    # /api/health is exempt from auth server-side and should never actually return 401, but
+    # this pins the client's own contract too: server_available() must stay a plain bool probe
+    # (never raise) even if it somehow did, since restart_service's readiness wait depends on
+    # calling this with zero credentials before any token exists.
+    client = VaultClient()
+    monkeypatch.setattr(client.session, "get", lambda *a, **k: _FakeResponse(401))
+    assert client.server_available() is False
+
+
+def test_upload_object_raises_authentication_error_from_head_check(monkeypatch, tmp_path):
+    client = VaultClient()
+    f = tmp_path / "obj.bin"
+    f.write_bytes(b"content")
+    monkeypatch.setattr(client.session, "head", lambda *a, **k: _FakeResponse(401))
+
+    with pytest.raises(AuthenticationError):
+        client.upload_object(f, "deadbeef")
+
+
+def test_download_object_raises_authentication_error_on_401(monkeypatch, tmp_path):
+    client = VaultClient()
+
+    class _FakeStreamResponse:
+        status_code = 401
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(client.session, "get", lambda *a, **k: _FakeStreamResponse())
+
+    with pytest.raises(AuthenticationError):
+        client.download_object("deadbeef", tmp_path / "out.bin")

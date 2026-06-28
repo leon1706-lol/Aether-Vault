@@ -3,10 +3,27 @@ import uuid
 import requests
 from pathlib import Path
 
+
+class AuthenticationError(Exception):
+    """Raised when the server rejects a request with 401 — either no token was sent at all,
+    or the one sent doesn't match the server's AV_API_TOKEN ("Protected" mode). Callers (CLI
+    commands) catch this to prompt for the current token interactively rather than letting it
+    look like a generic network/not-found failure."""
+
+
 class VaultClient:
-    def __init__(self, server_url: str = 'http://localhost:8000'):
+    def __init__(self, server_url: str = 'http://localhost:8000', api_token: str | None = None):
         self.server_url = server_url.rstrip('/')
         self.session = requests.Session()
+        if api_token:
+            self.session.headers["Authorization"] = f"Bearer {api_token}"
+
+    def _raise_for_auth(self, resp: "requests.Response") -> None:
+        if resp.status_code == 401:
+            raise AuthenticationError(
+                "Server rejected the request (401) — this registry is protected and needs a "
+                "valid access token."
+            )
 
     def close(self) -> None:
         """Release the pooled HTTP connections held by the underlying Session."""
@@ -37,11 +54,13 @@ class VaultClient:
         try:
             if not known_missing:
                 head_resp = self.session.head(url)
+                self._raise_for_auth(head_resp)
                 if head_resp.status_code == 200:
                     return True # Already exists
 
             with open(file_path, 'rb') as f:
                 resp = self.session.post(url, data=f)
+            self._raise_for_auth(resp)
             return resp.status_code == 201
         except requests.exceptions.RequestException as e:
             print(f"Error uploading object: {e}")
@@ -52,6 +71,7 @@ class VaultClient:
         tmp_path = None
         try:
             with self.session.get(url, stream=True) as resp:
+                self._raise_for_auth(resp)
                 if resp.status_code == 200:
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp_path = dest_path.with_name(dest_path.name + f".tmp.{uuid.uuid4().hex}")
@@ -72,6 +92,7 @@ class VaultClient:
         url = f"{self.server_url}/api/objects/{sha256_hash}"
         try:
             resp = self.session.head(url)
+            self._raise_for_auth(resp)
             return resp.status_code == 200
         except requests.exceptions.RequestException:
             return False
@@ -88,6 +109,7 @@ class VaultClient:
         url = f"{self.server_url}/api/sync/batch-objects"
         try:
             resp = self.session.post(url, json=sha256_hashes)
+            self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return set(resp.json().get("found", []))
         except requests.exceptions.RequestException as e:
@@ -98,6 +120,7 @@ class VaultClient:
         url = f"{self.server_url}/api/commits"
         try:
             resp = self.session.post(url, json=commit_data)
+            self._raise_for_auth(resp)
             return resp.status_code in (201, 409)  # 409 = commit already exists, idempotent success
         except requests.exceptions.RequestException as e:
             print(f"Error pushing commit: {e}")
@@ -107,6 +130,7 @@ class VaultClient:
         url = f"{self.server_url}/api/commits/{commit_hash}"
         try:
             resp = self.session.get(url)
+            self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json()
             return None
@@ -117,6 +141,7 @@ class VaultClient:
         url = f"{self.server_url}/api/refs/{ref_name}"
         try:
             resp = self.session.put(url, json={"commit_hash": commit_hash})
+            self._raise_for_auth(resp)
             return resp.status_code == 200
         except requests.exceptions.RequestException:
             return False
@@ -125,6 +150,7 @@ class VaultClient:
         url = f"{self.server_url}/api/refs/{ref_name}"
         try:
             resp = self.session.get(url)
+            self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json().get("commit_hash")
             return None
@@ -132,6 +158,11 @@ class VaultClient:
             return None
 
     def server_available(self) -> bool:
+        # /api/health is always exempt from auth (server.py's require_token middleware), even
+        # in Protected mode — never raises AuthenticationError, deliberately: this is the one
+        # probe that must keep working with zero credentials so "is the server up at all" stays
+        # answerable before anyone has a token configured (and so restart_service's own
+        # readiness wait, which calls this, never deadlocks against a freshly-protected server).
         url = f"{self.server_url}/api/health"
         try:
             resp = self.session.get(url, timeout=2)
@@ -144,6 +175,7 @@ class VaultClient:
         url = f"{self.server_url}/api/admin/gc"
         try:
             resp = self.session.post(url)
+            self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json()
             return None
@@ -159,6 +191,7 @@ class VaultClient:
         while True:
             try:
                 resp = self.session.get(url, params={"limit": limit, "offset": offset})
+                self._raise_for_auth(resp)
                 if resp.status_code == 200:
                     data = resp.json()
                     refs.update(data.get("refs", {}))

@@ -97,6 +97,53 @@ def select_login_mode() -> str:
     return choice
 
 
+def select_protection_mode() -> str:
+    """Prompt the user to choose Anonymous or Protected (the shared-secret access token).
+    Returns "anonymous" or "protected"."""
+    anon_choice = questionary.Choice("Anonymous — no access token, anyone reachable can use it", value="anonymous")
+    choice = questionary.select(
+        "Run this registry anonymously, or protect it with an access token?",
+        choices=[
+            anon_choice,
+            questionary.Choice("Protected — requires an access token for every action", value="protected"),
+        ],
+        default=anon_choice,
+        instruction="",
+    ).ask()
+    if choice is None:
+        return "anonymous"
+    return choice
+
+
+def select_token_source() -> str:
+    """Once "Protected" is chosen, asks whether this is a fresh registry (generate a token) or
+    joining one a teammate already protected (enter their existing token). Returns "generate"
+    or "existing"."""
+    generate_choice = questionary.Choice(
+        "Generate a new token — I'm setting up this registry for the first time", value="generate"
+    )
+    choice = questionary.select(
+        "Is this a new registry, or are you joining one someone else already protected?",
+        choices=[
+            generate_choice,
+            questionary.Choice("Enter an existing token — I'm joining a registry a teammate set up", value="existing"),
+        ],
+        default=generate_choice,
+        instruction="",
+    ).ask()
+    if choice is None:
+        return "generate"
+    return choice
+
+
+def prompt_for_existing_token() -> str | None:
+    """Prompts for a token value when joining an already-protected registry. Returns None on
+    empty input/Ctrl+C — callers must treat that as "no token entered", never silently store
+    an empty string (which is indistinguishable from "no token configured" downstream)."""
+    token = questionary.password("Access token:").ask()
+    return token or None
+
+
 def is_interactive() -> bool:
     """True only when both stdin and stdout are a real terminal.
 

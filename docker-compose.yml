@@ -10,6 +10,14 @@ services:
       - AV_DATA_DIR=/data
       - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db:5432/aether_vault
       - REDIS_URL=redis://redis:6379/0
+      # Optional shared-secret gate ("Protected" mode) — empty/unset means every route behaves
+      # exactly as before ("Anonymous"). Set via `av auth set-token`, which writes this to a
+      # .env file next to this compose file and restarts this service to pick it up. Postgres/
+      # Redis ports stay mapped to the host in *this* dev compose file specifically so
+      # tests/test_server.py's direct localhost:5432/6379 connections keep working — see
+      # docker-compose.release.yml (the one real end users run) for the hardened version of
+      # this same stack, which removes those mappings.
+      - AV_API_TOKEN=${AV_API_TOKEN:-}
     depends_on:
       db:
         condition: service_healthy

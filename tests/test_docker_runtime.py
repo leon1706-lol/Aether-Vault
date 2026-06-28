@@ -190,3 +190,82 @@ def test_check_for_docker_update_release_path_with_change(monkeypatch, tmp_path)
     assert result.checked is True
     assert result.updated is True
     assert set(result.old_image_ids) == {f"old-{s}" for s in docker_runtime.RELEASE_IMAGES}
+
+
+# ---------------------------------------------------------------------------
+# .env read/write helpers (AV_API_TOKEN — "Protected" mode)
+# ---------------------------------------------------------------------------
+
+def test_write_env_token_creates_file_when_none_exists(tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    docker_runtime.write_env_token(compose_file, "my-token")
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == 'AV_API_TOKEN="my-token"\n'
+
+
+def test_read_env_token_round_trips_a_plain_token(tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    docker_runtime.write_env_token(compose_file, "my-token")
+    assert docker_runtime.read_env_token(compose_file) == "my-token"
+
+
+def test_write_env_token_preserves_other_lines(tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    (tmp_path / ".env").write_text("SOME_OTHER_VAR=keep-me\nAV_API_TOKEN=\"old-token\"\n", encoding="utf-8")
+
+    docker_runtime.write_env_token(compose_file, "new-token")
+
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "SOME_OTHER_VAR=keep-me" in text
+    assert 'AV_API_TOKEN="new-token"' in text
+    assert "old-token" not in text
+
+
+def test_write_env_token_with_none_removes_the_line_not_writes_empty(tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    (tmp_path / ".env").write_text("SOME_OTHER_VAR=keep-me\nAV_API_TOKEN=\"old-token\"\n", encoding="utf-8")
+
+    docker_runtime.write_env_token(compose_file, None)
+
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "AV_API_TOKEN" not in text
+    assert "SOME_OTHER_VAR=keep-me" in text
+    assert docker_runtime.read_env_token(compose_file) is None
+
+
+def test_read_env_token_returns_none_when_no_env_file_exists(tmp_path):
+    compose_file = tmp_path / "docker-compose.yml"
+    assert docker_runtime.read_env_token(compose_file) is None
+
+
+@pytest.mark.parametrize(
+    "awkward_token",
+    [
+        "has space",
+        "has#hash",
+        'has"doublequote',
+        "has\\backslash",
+        "has=equals",
+    ],
+)
+def test_env_token_round_trips_awkward_characters(tmp_path, awkward_token):
+    compose_file = tmp_path / "docker-compose.yml"
+    docker_runtime.write_env_token(compose_file, awkward_token)
+    assert docker_runtime.read_env_token(compose_file) == awkward_token
+
+
+def test_open_browser_appends_token_as_query_param(monkeypatch):
+    opened = []
+    monkeypatch.setattr(docker_runtime.webbrowser, "open", lambda url: opened.append(url))
+
+    docker_runtime._open_browser("http://localhost:3000", "abc123")
+
+    assert opened == ["http://localhost:3000?av_token=abc123"]
+
+
+def test_open_browser_without_token_opens_plain_url(monkeypatch):
+    opened = []
+    monkeypatch.setattr(docker_runtime.webbrowser, "open", lambda url: opened.append(url))
+
+    docker_runtime._open_browser("http://localhost:3000")
+
+    assert opened == ["http://localhost:3000"]

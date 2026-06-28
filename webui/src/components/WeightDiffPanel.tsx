@@ -1,19 +1,21 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { fetchCommit, fetchCommits, shortHash, type Commit } from "@/lib/api";
+import { fetchCommitsWithLayers, shortHash, type Commit } from "@/lib/api";
 import { diffFile, unionModelPaths, type FileDiff } from "@/lib/diffWeights";
 import { CheckpointPicker, type CheckpointRow } from "@/components/CheckpointPicker";
 import { WeightHeatmap } from "@/components/WeightHeatmap";
 import { LayerDriftChart } from "@/components/LayerDriftChart";
 
 // How many recent commits to eagerly resolve into full trees so the checkpoint list can be
-// built. GET /api/commits (list_commits) does not include per-file layer data, so this fetches
-// full detail per commit via N parallel GET /api/commits/{hash} requests. Kept deliberately
-// small and run in parallel (not serial) to avoid the kind of request-waterfall this codebase
-// has already fixed elsewhere (see fetchCommits' comment in lib/api.ts); a server-side
-// aggregate endpoint would be needed to raise this further — see development/Probleme.md.
-const CHECKPOINT_FETCH_LIMIT = 30;
+// built. Previously fetched via fetchCommits() + N parallel GET /api/commits/{hash} requests
+// (one HTTP round trip per candidate checkpoint); now a single GET /api/commits?include_layers
+// request returns all of them with trees already attached (see development/Probleme.md's
+// now-fixed "checkpoint list resolves N commits via N parallel requests" entry, and the new
+// ?include_layers query param on list_commits in server.py). Raised from the old 30 — that cap
+// was specifically there to bound the number of *parallel requests*, which no longer applies
+// now that this is one request; kept at 100 to bound response size/render cost instead.
+const CHECKPOINT_FETCH_LIMIT = 100;
 
 interface Props {
   // When set, only checkpoints belonging to this project are offered for comparison — keeps
@@ -37,15 +39,10 @@ export function WeightDiffPanel({ projectId = null }: Props) {
     setSlotB(null);
     (async () => {
       try {
-        const metas = await fetchCommits(CHECKPOINT_FETCH_LIMIT, projectId);
-        const details = await Promise.all(
-          metas.map((c) => fetchCommit(c.hash).catch(() => null))
-        );
+        const details = await fetchCommitsWithLayers(CHECKPOINT_FETCH_LIMIT, projectId);
         if (cancelled) return;
         const map = new Map<string, Commit>();
-        details.forEach((d) => {
-          if (d) map.set(d.hash, d);
-        });
+        details.forEach((d) => map.set(d.hash, d));
         setFullCommits(map);
       } catch (err) {
         if (!cancelled) {

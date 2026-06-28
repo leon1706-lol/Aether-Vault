@@ -53,6 +53,86 @@ def test_init_enterprise_mode_shows_stub_message(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# av init — Anonymous/Protected (--protected / --token)
+# ---------------------------------------------------------------------------
+
+def test_init_default_is_anonymous_no_token_saved(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = invoke("init", "--mode", "local", "--yes", "--no-repl")
+    assert result.exit_code == 0, result.output
+    cfg = json.loads((tmp_path / ".av" / "config").read_text())
+    assert "remote_api_token" not in cfg
+
+
+def test_init_protected_flag_generates_and_saves_a_token(tmp_path, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+    import python.av_cli.main as main_module
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    result = invoke("init", "--mode", "local", "--protected", "--no-repl")
+    assert result.exit_code == 0, result.output
+    assert "Token set:" in result.output
+
+    cfg = json.loads((tmp_path / ".av" / "config").read_text())
+    assert cfg.get("remote_api_token")
+    assert cfg["remote_api_token"] in (tmp_path / ".env").read_text(encoding="utf-8")
+
+
+def test_init_token_flag_validates_and_saves_without_touching_env(tmp_path, monkeypatch):
+    from python.av_cli.client import VaultClient
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
+    monkeypatch.setattr(VaultClient, "fetch_all_refs", lambda self: {})
+
+    result = invoke("init", "--mode", "local", "--token", "teammates-token", "--no-repl")
+    assert result.exit_code == 0, result.output
+    assert "Token saved" in result.output
+
+    cfg = json.loads((tmp_path / ".av" / "config").read_text())
+    assert cfg["remote_api_token"] == "teammates-token"
+    assert not (tmp_path / ".env").exists()  # join-existing never writes .env
+
+
+def test_init_token_flag_rejected_token_is_not_saved(tmp_path, monkeypatch):
+    from python.av_cli.client import AuthenticationError, VaultClient
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
+
+    def fake_fetch_all_refs(self):
+        raise AuthenticationError("nope")
+
+    monkeypatch.setattr(VaultClient, "fetch_all_refs", fake_fetch_all_refs)
+
+    result = invoke("init", "--mode", "local", "--token", "wrong-token", "--no-repl")
+    assert result.exit_code == 0, result.output
+    assert "rejected" in result.output.lower()
+
+    cfg = json.loads((tmp_path / ".av" / "config").read_text())
+    assert "remote_api_token" not in cfg
+
+
+def test_init_token_flag_saves_anyway_when_server_unreachable(tmp_path, monkeypatch):
+    from python.av_cli.client import VaultClient
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(VaultClient, "server_available", lambda self: False)
+
+    result = invoke("init", "--mode", "local", "--token", "some-token", "--no-repl")
+    assert result.exit_code == 0, result.output
+    assert "could not reach" in result.output.lower()
+
+    cfg = json.loads((tmp_path / ".av" / "config").read_text())
+    assert cfg["remote_api_token"] == "some-token"
+
+
+# ---------------------------------------------------------------------------
 # av add
 # ---------------------------------------------------------------------------
 
@@ -398,6 +478,62 @@ def test_commit_with_tags_and_metrics(repo):
     registry = json.loads((repo / ".av" / "registry.json").read_text())
     assert registry["tags"] == ["v1"]
     assert registry["metrics"] == ["sharpe"]
+
+
+def test_commit_queues_for_retry_instead_of_losing_it_when_token_is_rejected(repo, monkeypatch):
+    # Regression test for a real bug found via manual debugging (development/Probleme.md):
+    # server_available() is exempt from the auth gate (so it stays answerable with no
+    # credentials), which means it returning True does NOT mean this client's token is valid.
+    # upload_commit_objects() raising AuthenticationError used to propagate straight out of
+    # `commit()`, skipping the queue_pending_push() fallback entirely — the commit was created
+    # locally but silently never queued for retry, unlike every other kind of push failure.
+    from python.av_cli.client import AuthenticationError, VaultClient
+
+    monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
+    monkeypatch.setattr(
+        VaultClient, "batch_check_objects",
+        lambda self, hashes: (_ for _ in ()).throw(AuthenticationError("nope")),
+    )
+
+    (repo / "train.py").write_text("print('hi')")
+    invoke("add", "train.py")
+    result = invoke("commit", "-m", "should be queued, not lost")
+    assert result.exit_code == 0, result.output
+    assert "queued for retry" in result.output.lower()
+
+    commit_hash = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+    pending = json.loads((repo / ".av" / "pending_push").read_text())
+    assert any(p["commit_hash"] == commit_hash for p in pending)
+
+
+def test_flush_pending_push_preserves_queue_on_auth_failure(repo, monkeypatch):
+    # Companion regression test: flush_pending_push() must not lose *other* already-queued
+    # commits either when a bad/stale token is hit partway through retrying them.
+    from python.av_cli.client import AuthenticationError, VaultClient
+    import python.av_cli.main as main_module
+
+    monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
+
+    # Queue two commits directly (bypassing a real push attempt) the same way commit() would
+    # after a push failure, so flush_pending_push() has something to retry.
+    for seed in ("a", "b"):
+        commit_hash = "f" * 63 + seed
+        (repo / ".av" / "commits" / f"{commit_hash}.json").write_text(
+            json.dumps({"hash": commit_hash, "tree": {}, "message": "x", "author": "t"})
+        )
+        main_module.queue_pending_push(repo, commit_hash, None)
+
+    monkeypatch.setattr(
+        VaultClient, "push_commit",
+        lambda self, data: (_ for _ in ()).throw(AuthenticationError("nope")),
+    )
+
+    client = VaultClient("http://localhost:8000", "irrelevant")
+    with pytest.raises(AuthenticationError):
+        main_module.flush_pending_push(repo, client)
+
+    pending = json.loads((repo / ".av" / "pending_push").read_text())
+    assert len(pending) == 2  # neither queued commit was dropped
 
 
 # ---------------------------------------------------------------------------
@@ -1107,3 +1243,124 @@ def test_benchmark_command_accepts_gc_throughput_via_only(repo, monkeypatch):
     result = invoke("benchmark", "--only", "gc_throughput")
     assert result.exit_code == 0, result.output
     assert imported == ["benchmarks.bench_gc_throughput"]
+
+
+# ---------------------------------------------------------------------------
+# av auth
+# ---------------------------------------------------------------------------
+# Docker itself is never touched here — restart_service/check_docker_running are mocked, same
+# convention as the docker_runtime tests for `av update --docker`.
+
+def _sandbox_compose_dir(repo, monkeypatch):
+    """`av auth set-token`/`clear` resolve a real compose file via _find_source_root() ->
+    resolve_compose_file() and write a real .env next to it — without this, that would write
+    into this *actual checkout's* docker-compose.yml directory (a real, dangerous side effect
+    a manual run of these tests already caused once during development). Giving `repo` itself
+    a dummy docker-compose.yml makes resolve_compose_file() treat it as the (fake) dev
+    checkout, sandboxing every .env read/write to this test's own tmp_path.
+    """
+    import python.av_cli.main as main_module
+    (repo / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: repo)
+
+
+def test_auth_set_token_generates_one_when_omitted(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+    import python.av_cli.main as main_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    result = invoke("auth", "set-token")
+    assert result.exit_code == 0, result.output
+    assert "Token set:" in result.output
+
+    cfg = main_module.load_config(repo)
+    assert cfg.get("remote_api_token")
+    env_text = (repo / ".env").read_text(encoding="utf-8")
+    assert cfg["remote_api_token"] in env_text
+
+
+def test_auth_set_token_with_explicit_value(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+    import python.av_cli.main as main_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    result = invoke("auth", "set-token", "my-explicit-token")
+    assert result.exit_code == 0, result.output
+
+    cfg = main_module.load_config(repo)
+    assert cfg["remote_api_token"] == "my-explicit-token"
+
+
+def test_auth_set_token_restarts_the_server(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    restart_calls = []
+    monkeypatch.setattr(
+        docker_runtime_module, "restart_service",
+        lambda compose_file, service: (restart_calls.append(service), True)[1],
+    )
+
+    invoke("auth", "set-token", "a-token")
+    assert restart_calls == ["aether-vault-server"]
+
+
+def test_auth_set_token_when_docker_not_running_warns_but_still_saves(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+    import python.av_cli.main as main_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.NOT_RUNNING)
+
+    result = invoke("auth", "set-token", "a-token")
+    assert result.exit_code == 0, result.output
+    assert "take effect next time" in result.output.lower()
+
+    cfg = main_module.load_config(repo)
+    assert cfg["remote_api_token"] == "a-token"
+
+
+def test_auth_clear_removes_token_everywhere(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+    import python.av_cli.main as main_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    invoke("auth", "set-token", "a-token")
+    result = invoke("auth", "clear")
+    assert result.exit_code == 0, result.output
+    assert "Anonymous" in result.output
+
+    cfg = main_module.load_config(repo)
+    assert "remote_api_token" not in cfg
+    assert "AV_API_TOKEN" not in (repo / ".env").read_text(encoding="utf-8")
+
+
+def test_auth_status_reports_anonymous_by_default(repo):
+    result = invoke("auth", "status")
+    assert result.exit_code == 0, result.output
+    assert "Anonymous" in result.output
+
+
+def test_auth_status_reports_protected_without_printing_the_token(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    invoke("auth", "set-token", "super-secret-value")
+    result = invoke("auth", "status")
+    assert result.exit_code == 0, result.output
+    assert "Protected" in result.output
+    assert "super-secret-value" not in result.output
+    assert "alue" in result.output  # last 4 chars of the token are shown, masked

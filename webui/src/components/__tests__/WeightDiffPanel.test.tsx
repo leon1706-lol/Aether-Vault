@@ -5,14 +5,13 @@ import { describe, expect, it, vi } from "vitest";
 import { WeightDiffPanel } from "../WeightDiffPanel";
 import type { Commit } from "@/lib/api";
 
-const { fetchCommits, fetchCommit } = vi.hoisted(() => ({
-  fetchCommits: vi.fn(),
-  fetchCommit: vi.fn(),
+const { fetchCommitsWithLayers } = vi.hoisted(() => ({
+  fetchCommitsWithLayers: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
-  return { ...actual, fetchCommits, fetchCommit };
+  return { ...actual, fetchCommitsWithLayers };
 });
 
 function makeCommit(overrides: Partial<Commit> = {}): Commit {
@@ -64,23 +63,20 @@ const commitV2 = makeCommit({
 
 describe("WeightDiffPanel", () => {
   it("shows a loading state while checkpoints are being resolved", () => {
-    fetchCommits.mockReturnValue(new Promise(() => {})); // never resolves
+    fetchCommitsWithLayers.mockReturnValue(new Promise(() => {})); // never resolves
     render(<WeightDiffPanel />);
     expect(screen.getByText("Loading checkpoints…")).toBeInTheDocument();
   });
 
   it("shows an empty state when there are no model checkpoints", async () => {
-    fetchCommits.mockResolvedValueOnce([]);
+    fetchCommitsWithLayers.mockResolvedValueOnce([]);
     render(<WeightDiffPanel />);
     await waitFor(() => expect(screen.getByText("No model checkpoints found")).toBeInTheDocument());
   });
 
   it("computes and renders a per-layer diff once two checkpoints are selected", async () => {
     const user = userEvent.setup();
-    fetchCommits.mockResolvedValueOnce([commitV1, commitV2]);
-    fetchCommit.mockImplementation((hash: string) =>
-      Promise.resolve(hash === commitV1.hash ? commitV1 : commitV2)
-    );
+    fetchCommitsWithLayers.mockResolvedValueOnce([commitV1, commitV2]);
 
     render(<WeightDiffPanel />);
 
@@ -118,10 +114,7 @@ describe("WeightDiffPanel", () => {
         },
       },
     });
-    fetchCommits.mockResolvedValueOnce([commitV1, otherFileCommit]);
-    fetchCommit.mockImplementation((hash: string) =>
-      Promise.resolve(hash === commitV1.hash ? commitV1 : otherFileCommit)
-    );
+    fetchCommitsWithLayers.mockResolvedValueOnce([commitV1, otherFileCommit]);
 
     render(<WeightDiffPanel />);
 

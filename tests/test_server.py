@@ -124,6 +124,25 @@ def db(client):
     _clear_storage_dirs()
 
 
+@pytest.fixture
+def protected_token(db):
+    """Turns on the require_token middleware for the duration of one test ("Protected" mode).
+
+    AV_API_TOKEN is read once at module import (see server.py) — empty in this whole test
+    file's process, since nothing sets the env var before `app` is imported above. Reassigning
+    the module attribute directly is the correct way to flip it for a single test: the
+    middleware looks up the bare name `AV_API_TOKEN` in its enclosing module's globals at call
+    time, not at function-definition time, so this is picked up by every request the test
+    issues through `db` and is restored afterward so later tests stay in Anonymous mode.
+    """
+    token = "test-secret-token-12345"
+    server_module.AV_API_TOKEN = token
+    try:
+        yield token
+    finally:
+        server_module.AV_API_TOKEN = ""
+
+
 # ---------------------------------------------------------------------------
 # Pure validation tests — no DB/Redis needed, always run
 # ---------------------------------------------------------------------------
@@ -162,6 +181,88 @@ def test_health_check_ok(db):
     resp = db.get("/api/health")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# require_token middleware ("Anonymous" vs "Protected" mode)
+# ---------------------------------------------------------------------------
+
+def test_no_token_configured_behaves_exactly_as_before(db):
+    # AV_API_TOKEN is unset for every other test in this file — this just makes the "Anonymous
+    # is truly unchanged" guarantee explicit rather than implicit.
+    resp = db.get("/api/health")
+    assert resp.status_code == 200
+    resp = db.get("/api/refs")
+    assert resp.status_code == 200
+
+
+def test_protected_mode_rejects_reads_without_a_token(db, protected_token):
+    resp = db.get("/api/refs")
+    assert resp.status_code == 401
+
+
+def test_protected_mode_accepts_reads_with_the_correct_token(db, protected_token):
+    resp = db.get("/api/refs", headers={"Authorization": f"Bearer {protected_token}"})
+    assert resp.status_code == 200
+
+
+def test_protected_mode_rejects_the_wrong_token(db, protected_token):
+    resp = db.get("/api/refs", headers={"Authorization": "Bearer wrong-token"})
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "header_value",
+    [
+        "",  # header present but empty
+        "Bearer",  # scheme with no token at all
+        "Bearer ",  # scheme with trailing space, no token
+        "Basic test-secret-token-12345",  # wrong scheme entirely
+        "bearer test-secret-token-12345",  # lowercase scheme — still must work (see next test)
+    ],
+)
+def test_protected_mode_header_parsing_edge_cases(db, protected_token, header_value):
+    resp = db.get("/api/refs", headers={"Authorization": header_value})
+    # Only the lowercase-scheme case is a valid token presentation; everything else here is
+    # a malformed/missing credential and must be rejected, not crash with a 500.
+    if header_value.lower() == f"bearer {protected_token}":
+        assert resp.status_code == 200
+    else:
+        assert resp.status_code == 401
+
+
+def test_protected_mode_scheme_is_case_insensitive(db, protected_token):
+    resp = db.get("/api/refs", headers={"Authorization": f"bearer {protected_token}"})
+    assert resp.status_code == 200
+
+
+def test_health_check_is_always_exempt_even_when_protected(db, protected_token):
+    resp = db.get("/api/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_docs_routes_are_always_exempt_even_when_protected(db, protected_token):
+    for path in ("/docs", "/openapi.json", "/redoc"):
+        resp = db.get(path)
+        assert resp.status_code != 401, f"{path} should be reachable without a token"
+
+
+def test_protected_mode_gates_writes_too_not_just_reads(db, protected_token):
+    # The whole point of the revised scope decision: Protected means everything, not just the
+    # 4 mutating routes from the first draft of this plan.
+    auth_header = {"Authorization": f"Bearer {protected_token}"}
+    commit = _make_commit("gated-write-test")
+    assert db.post("/api/commits", json=commit, headers=auth_header).status_code == 201
+
+    resp = db.put("/api/refs/proj/main", json={"commit_hash": commit["hash"]})
+    assert resp.status_code == 401
+    resp = db.put(
+        "/api/refs/proj/main",
+        json={"commit_hash": commit["hash"]},
+        headers=auth_header,
+    )
+    assert resp.status_code == 200
 
 
 def test_upload_then_download_object_roundtrip(db):
@@ -204,6 +305,48 @@ def test_push_commit_then_get_commit_roundtrip(db):
     body = resp.json()
     assert body["message"] == commit["message"]
     assert body["tree"]["train.py"]["hash"] == file_hash
+
+
+def test_list_commits_omits_tree_by_default(db):
+    commit = _make_commit("list-no-layers", tree={"a.py": {"hash": _hex_hash("a"), "size": 1, "type": "code"}})
+    assert db.post("/api/commits", json=commit).status_code == 201
+
+    resp = db.get("/api/commits")
+    assert resp.status_code == 200
+    found = next(c for c in resp.json()["commits"] if c["hash"] == commit["hash"])
+    assert "tree" not in found
+
+
+def test_list_commits_include_layers_matches_get_commit(db):
+    # Two commits, so the sequential-resolution loop in list_commits is actually exercised
+    # with more than one tree, not just a single trivial case.
+    file_hash_a = _hex_hash("layer-content-a")
+    file_hash_b = _hex_hash("layer-content-b")
+    commit_a = _make_commit("layers-a", tree={"model.bin": {"hash": file_hash_a, "size": 5, "type": "artifact"}})
+    commit_b = _make_commit("layers-b", tree={"model.bin": {"hash": file_hash_b, "size": 7, "type": "artifact"}})
+    assert db.post("/api/commits", json=commit_a).status_code == 201
+    assert db.post("/api/commits", json=commit_b).status_code == 201
+
+    resp = db.get("/api/commits", params={"include_layers": "true"})
+    assert resp.status_code == 200
+    by_hash = {c["hash"]: c for c in resp.json()["commits"]}
+
+    for commit, file_hash in ((commit_a, file_hash_a), (commit_b, file_hash_b)):
+        assert "tree" in by_hash[commit["hash"]]
+        assert by_hash[commit["hash"]]["tree"]["model.bin"]["hash"] == file_hash
+        # Must match GET /api/commits/{hash}'s own tree exactly — same resolve_tree() call.
+        direct = db.get(f"/api/commits/{commit['hash']}").json()
+        assert by_hash[commit["hash"]]["tree"] == direct["tree"]
+
+
+def test_list_commits_include_layers_handles_a_commit_with_no_tree(db):
+    commit = _make_commit("empty-tree-commit", tree={})
+    assert db.post("/api/commits", json=commit).status_code == 201
+
+    resp = db.get("/api/commits", params={"include_layers": "true"})
+    assert resp.status_code == 200
+    found = next(c for c in resp.json()["commits"] if c["hash"] == commit["hash"])
+    assert found["tree"] == {}
 
 
 def test_push_commit_duplicate_returns_409(db):

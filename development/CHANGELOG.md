@@ -749,4 +749,68 @@ findings (resolved and still-open).
   the per-tab topbar title and neon-orange theme render correctly with real commits/branches.
   Full suite: 249 passed, 3 skipped (Python); 73 passed (webui).
 
+## Phase 33 — Optional "Protected" Access Token, Weight Diff Aggregate Endpoint, Atomic Index Save
+- **Closed all 3 remaining `🔸 Open` items in `Probleme.md`** — re-verified each was still
+  present in the current codebase (not just trusted from the doc) before fixing.
+- **Optional shared-secret access token ("Protected" mode)**: unset by default, so a solo/local
+  install behaves exactly as before ("Anonymous" — zero config). Setting one switches every
+  route (reads included, `GET /api/health` and the FastAPI docs routes exempt) behind a
+  `require_token` FastAPI middleware using `secrets.compare_digest` for the header check.
+  - `av auth set-token [TOKEN]` / `clear` / `status` manage it; re-running `set-token` is also
+    the "I forgot it" path — no separate reset flow needed for a self-hosted secret.
+  - `av init` now asks Anonymous-or-Protected for Local mode, and Protected splits further into
+    *generate a new token* (standing a registry up) vs. *enter an existing one* (joining a
+    registry a teammate already protected — validated against the live server, distinguishing
+    "rejected" from "unreachable," and saved to `.av/config` only, without touching `.env` or
+    restarting anything).
+  - `VaultClient` attaches the token header and raises `AuthenticationError` on 401 (instead of
+    a generic failure); a centralized `click.Group` subclass catches it across every CLI
+    command and prompts interactively for the current token (or prints the exact fix
+    non-interactively) rather than each command handling it separately.
+  - Webui gets a `TokenGate` component: `av webui` hands the token to the browser via a
+    one-time `?av_token=` URL param (stripped immediately via `history.replaceState`) so
+    launching through the CLI never shows a manual prompt when the CLI already has one; opening
+    the dashboard any other way shows the same one-time entry screen on a 401.
+  - The externally-mapped Postgres/Redis ports were removed from `docker-compose.release.yml`
+    (the file real `pip install` users actually deploy) but deliberately **kept** in the dev
+    `docker-compose.yml` — removing them there would have silently degraded
+    `tests/test_server.py`'s direct `localhost:5432`/`6379` connections to skip-mode instead of
+    a loud failure (checked, not assumed).
+  - **A real bug found via manual debugging against the live Docker stack, not unit tests**:
+    `commit()`'s push-to-remote logic assumed any failure would return `False`/`None` (its
+    existing "queue for `av push` later" fallback) — but a rejected token now *raises*
+    `AuthenticationError` instead, since `server_available()`'s health probe is deliberately
+    auth-exempt and so can't prove the token itself is valid. That exception skipped the
+    queueing fallback entirely; a commit made with a stale/wrong token was created locally but
+    silently never queued, unlike every other kind of push failure. Reproduced for real
+    (committed against the live server with a deliberately wrong token, confirmed the commit
+    was missing from both the server and `.av/pending_push`), then fixed by catching
+    `AuthenticationError` in `commit()`'s push block and in `flush_pending_push()` (which now
+    preserves the rest of its queue before re-raising, so one bad token mid-retry doesn't drop
+    the untried entries too) and queueing exactly like any other push failure.
+- **Weight Diff checkpoint list — N parallel requests collapsed to one**: `get_commit`'s tree
+  resolution was factored into a module-level `resolve_tree(db, root_hash)`; `GET /api/commits`
+  gained `include_layers=true` to attach each commit's resolved tree in the same response
+  (resolved sequentially per commit, not via `asyncio.gather` — a single `AsyncSession` can't
+  run concurrent queries, a correctness bug caught before it ever ran). `WeightDiffPanel.tsx`
+  now makes one `fetchCommitsWithLayers` call instead of `fetchCommits` + N×`fetchCommit`;
+  `CHECKPOINT_FETCH_LIMIT` raised 30 → 100 now that it bounds one response's size, not a
+  request count.
+- **`Index.save()` made atomic**: mechanical swap from a raw `open()`+`json.dump` to the
+  existing `atomic_write_json` helper already used elsewhere in the codebase.
+- **Tests**: 14 new `tests/test_server.py` cases (auth header parsing edge cases,
+  health/docs exemption, `include_layers`), 12 new `tests/test_client.py` cases (token header,
+  every method raising `AuthenticationError` on 401), `tests/test_docker_runtime.py` (`.env`
+  read/write round-trip including a deliberately-awkward-characters case, the webui URL token
+  handoff), `tests/test_cli.py` (`av auth`, `av init`'s Protected/join-existing flow, and two
+  regression tests for the commit-queueing bug above), and a new
+  `webui/src/components/__tests__/TokenGate.test.tsx`. Full suite: 303 passed, 3 skipped
+  (Python); 79 passed (webui).
+- **Manually verified against the live Docker stack** (not just unit tests): rebuilt the server
+  image, confirmed Anonymous mode is byte-for-byte unchanged, confirmed `av auth set-token`
+  restarts the server and Protected mode correctly rejects/accepts requests (including the
+  `/api/health` and `/docs` exemptions), confirmed the CLI's own 401 message, and confirmed the
+  commit-queueing fix actually recovers a "lost" commit via `av push` once the right token is
+  restored.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

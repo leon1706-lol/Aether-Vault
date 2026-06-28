@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { TokenGate } from "@/components/TokenGate";
 
 export const metadata: Metadata = {
   title: "Aether-Vault Dashboard",
@@ -26,7 +27,9 @@ export default function RootLayout({
           rel="stylesheet"
         />
       </head>
-      <body>{children}</body>
+      <body>
+        <TokenGate>{children}</TokenGate>
+      </body>
     </html>
   );
 }

@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-249%2F249%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="249 of 249 tests passing">
+  <img src="https://img.shields.io/badge/tests-303%2F303%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="303 of 303 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -55,7 +55,7 @@ Split into two focused diagrams rather than one large one — what happens on yo
 ```mermaid
 graph TD
     Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-    CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file ·<br>unstage · stash · import-lightning · import-mlflow · import-transformers)")
+    CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file ·<br>unstage · stash · import-lightning · import-mlflow · import-transformers)")
     CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
     LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
     PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
@@ -83,7 +83,7 @@ graph TD
     WebUI("Web UI<br>(localhost:3000)")
 
     subgraph Remote [Dockerized Remote Registry]
-        FastAPI("FastAPI Server<br>(Upload/Download · Commit & Ref Sync ·<br>Dashboard API · Admin GC)")
+        FastAPI("FastAPI Server<br>(Upload/Download · Commit & Ref Sync ·<br>Dashboard API · Admin GC ·<br>Optional Token Gate — av auth)")
         Redis("RedisBloom Cache<br>(O(1) Existence Checks)")
         DB("PostgreSQL<br>(Merkle Trees · Project-Scoped Branches · Metrics)")
         Storage("Persistent Volume<br>(Deduplicated Model & Dataset Chunks)")
@@ -93,11 +93,11 @@ graph TD
         FastAPI -- "Streams Large Chunks,<br>Mark-and-Sweep Sweep" --> Storage
     end
 
-    CLI -- "Push: Uploads Objects, Trees & Refs" --> FastAPI
+    CLI -- "Push: Uploads Objects, Trees & Refs<br>(+ Bearer Token if Protected)" --> FastAPI
     CLI -- "Checkout: Downloads Missing Objects" --> FastAPI
     CLI -- "gc: Triggers Remote Garbage Collection" --> FastAPI
     PendingQ -- "Retried by av push" --> FastAPI
-    WebUI -- "Fetches Commits, Refs, Metrics & Per-Layer Hashes" --> FastAPI
+    WebUI -- "Fetches Commits, Refs, Metrics & Per-Layer Hashes<br>(TokenGate Prompts if 401)" --> FastAPI
 
     PyPI("PyPI<br>(pip install aether-vault · release.yml on git tag push)")
     GHCR("GHCR<br>(aether-vault-server/-webui images ·<br>:latest on tag push · :edge on every push to main)")
@@ -192,11 +192,39 @@ session afterward — type commands (still prefixed with `av`, e.g. `av status`)
 re-invoking the process each time; `exit`/`quit`/Ctrl+D leaves back to your normal shell.
 Running bare `av` (no subcommand) in an already-initialized repo does the same reconnect +
 session entry without needing `init` again.
+
+Choosing Local also asks whether to run **Anonymous** (no token, anyone reachable can use it —
+today's default) or **Protected** (every action requires a shared-secret access token — see
+`av auth` below). Protected has a second choice: generate a new token (you're standing this
+registry up for the first time) or enter an existing one (you're joining a registry a teammate
+already protected).
 ```bash
-av init                                   # interactive: asks Local/Enterprise, then opens the session
-av init --mode local --yes --no-repl      # non-interactive: for scripts/CI, skips the session
+av init                                   # interactive: asks Local/Enterprise, then Anonymous/Protected, then opens the session
+av init --mode local --yes --no-repl      # non-interactive: for scripts/CI, skips both prompts, defaults to Anonymous
+av init --mode local --protected          # non-interactive equivalent of Protected + generate a new token
+av init --mode local --token <token>      # non-interactive equivalent of Protected + join an existing registry
 av                                        # bare, in an initialized repo: reconnect + open the session
 ```
+
+### `av auth`
+Manage the optional shared-secret access token ("Protected" mode). Unset (the default) means
+every route behaves exactly as it always has — no credentials needed ("Anonymous"). Setting a
+token switches the server to "Protected" — every route, reads included, then requires it
+(except `GET /api/health`, always reachable so Docker healthchecks and the CLI's own
+reachability checks never need a token themselves).
+```bash
+av auth set-token              # generate a random token, write it, restart the server with it active
+av auth set-token <token>       # set a specific token instead (e.g. one a teammate already uses)
+av auth set-token <new-token>   # re-running this is also the "I forgot it" path — no separate reset flow
+av auth clear                   # remove the token everywhere — back to Anonymous
+av auth status                  # report whether a token is configured (masked), without printing it
+```
+If any CLI command hits a registry that's Protected and no/the-wrong token is configured, it
+prompts interactively for the token (saves it, then asks you to re-run) rather than failing
+with a generic error — or, non-interactively, prints exactly which command to run. The webui
+behaves the same way: opening it via `av webui` auto-fills the token if the CLI already has
+one configured; opened any other way (a bookmark, a teammate's own browser), it shows the same
+entry prompt once.
 
 ### `av update`
 Check PyPI for a newer release and optionally install it. `av init` also prints a one-line

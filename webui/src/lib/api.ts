@@ -3,6 +3,42 @@
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+// "Protected" mode support — see TokenGate.tsx. The token lives in localStorage (not a build-
+// time env var) because it's set at runtime via `av auth set-token`/`av init`, long after the
+// webui image has already been built and pulled from GHCR for real pip-install users — baking
+// it in at build time would mean every token change requires rebuilding the image.
+export const API_TOKEN_STORAGE_KEY = "aether-vault:api-token";
+
+export function getStoredApiToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(API_TOKEN_STORAGE_KEY);
+}
+
+export function setStoredApiToken(token: string): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+}
+
+export function clearStoredApiToken(): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.removeItem(API_TOKEN_STORAGE_KEY);
+}
+
+export class UnauthorizedError extends Error {
+  constructor() {
+    super("This registry is protected — a valid access token is required.");
+    this.name = "UnauthorizedError";
+  }
+}
+
+// Set once by TokenGate.tsx on mount — lets fetchJSON surface a 401 as "show the token entry
+// screen" without every call site needing to know about it individually.
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(fn: (() => void) | null): void {
+  onUnauthorized = fn;
+}
+
 export interface TreeLayer {
   name: string;
   hash: string;
@@ -61,10 +97,19 @@ export interface DashboardData {
 }
 
 async function fetchJSON<T>(path: string, options?: RequestInit): Promise<T> {
+  const token = getStoredApiToken();
+  const headers = new Headers(options?.headers);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
   const res = await fetch(`${API_BASE}${path}`, {
     next: { revalidate: 0 },
     ...options,
+    headers,
   });
+  if (res.status === 401) {
+    onUnauthorized?.();
+    throw new UnauthorizedError();
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
   return res.json() as Promise<T>;
 }
@@ -118,6 +163,20 @@ export interface CommitListResponse {
 export async function fetchCommits(limit = 40, projectId?: string | null): Promise<Commit[]> {
   const qs = projectId ? `&project_id=${encodeURIComponent(projectId)}` : "";
   const data = await fetchJSON<CommitListResponse>(`/api/commits?limit=${limit}${qs}`);
+  return data.commits ?? [];
+}
+
+// Same endpoint as fetchCommits, but with ?include_layers=true — returns full per-commit
+// trees (including split-safetensors layer data) in this ONE request, instead of the old
+// WeightDiffPanel pattern of fetchCommits() + N parallel fetchCommit() calls (see
+// development/Probleme.md's now-fixed "checkpoint list resolves N commits via N parallel
+// requests" entry). Capped lower than fetchCommits' default since each commit's response is
+// much heavier with its full tree attached.
+export async function fetchCommitsWithLayers(limit = 30, projectId?: string | null): Promise<Commit[]> {
+  const qs = projectId ? `&project_id=${encodeURIComponent(projectId)}` : "";
+  const data = await fetchJSON<CommitListResponse>(
+    `/api/commits?limit=${limit}&include_layers=true${qs}`
+  );
   return data.commits ?? [];
 }
 

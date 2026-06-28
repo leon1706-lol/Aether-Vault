@@ -18,6 +18,10 @@ services:
       - AV_DATA_DIR=/data
       - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db:5432/aether_vault
       - REDIS_URL=redis://redis:6379/0
+      # Optional shared-secret gate ("Protected" mode) — empty/unset means every route behaves
+      # exactly as before ("Anonymous"). Set via `av auth set-token`, which writes this to a
+      # .env file next to this compose file and restarts this service to pick it up.
+      - AV_API_TOKEN=${AV_API_TOKEN:-}
     depends_on:
       db:
         condition: service_healthy
@@ -49,6 +53,13 @@ services:
       timeout: 10s
       retries: 3
 
+  # Postgres/Redis are intentionally NOT port-mapped to the host here (unlike the dev
+  # docker-compose.yml, where contributors' tests/test_server.py need direct localhost
+  # access). Real end users have no need to reach these directly — the server reaches them by
+  # service name over the Docker-internal network regardless — and the credentials below are
+  # public (committed source), so leaving these ports open on a host reachable by others would
+  # hand out full DB/cache access to anyone who can reach it. Use `docker exec -it
+  # aether-vault-db psql -U av_user -d aether_vault` to inspect data directly if needed.
   db:
     image: postgres:15-alpine
     container_name: aether-vault-db
@@ -58,8 +69,6 @@ services:
       POSTGRES_DB: aether_vault
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - '5432:5432'
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U av_user -d aether_vault"]
       interval: 10s
@@ -70,8 +79,6 @@ services:
   redis:
     image: redis/redis-stack-server:latest
     container_name: aether-vault-redis
-    ports:
-      - '6379:6379'
     volumes:
       - redis_data:/data
     healthcheck:

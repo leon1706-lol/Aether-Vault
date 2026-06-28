@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+from .fsutil import atomic_write_json
+
 class Index:
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root
@@ -20,9 +22,7 @@ class Index:
             self.entries = {}
 
     def save(self) -> None:
-        self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.index_path, 'w', encoding='utf-8') as f:
-            json.dump({"entries": self.entries}, f, indent=2)
+        atomic_write_json(self.index_path, {"entries": self.entries})
 
     def add_entry(self, rel_path: str, hash: str, size: int, mtime_ns: int, file_type: str, pointer: str | None = None, auto_save: bool = True) -> None:
         existing = self.entries.get(rel_path)

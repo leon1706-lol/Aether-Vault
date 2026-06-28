@@ -12,6 +12,7 @@ import importlib.resources
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
@@ -183,15 +184,73 @@ def _image_id(image: str) -> str:
 
 
 def restart_service(compose_file: Path, service: str) -> bool:
-    """Recreates the container against whatever image is now cached locally for it."""
+    """Recreates the container against whatever image is now cached locally for it.
+
+    `docker compose up -d` starts the service fresh if it isn't running at all, and recreates
+    it if it is — so this doubles as "start" when called against a stopped stack (e.g. right
+    after `av auth set-token` writes a new .env value before anything has been started yet).
+    Returns False on any failure (Docker unreachable, compose error, timeout) — callers should
+    check this and report a clear message rather than assume the new config is live.
+    """
     try:
         proc = subprocess.run(
             ["docker", "compose", "-f", str(compose_file), "up", "-d", service],
             capture_output=False, timeout=300,
         )
-    except subprocess.TimeoutExpired:
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0
+
+
+def _quote_env_value(value: str) -> str:
+    """Wraps a .env value in double quotes, escaping embedded backslashes/quotes.
+
+    Tokens this project generates itself (secrets.token_urlsafe) never need this — they're
+    plain base64-urlsafe characters. A user-*supplied* token (`av auth set-token <value>`, or
+    the `--token` join-existing path) could contain anything, including `#` (a comment marker
+    in .env files if unquoted) or embedded quotes — always quoting, rather than only when
+    "needed", avoids having to detect every character that would otherwise require it.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _unquote_env_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return value
+
+
+def read_env_token(compose_file: Path, key: str = "AV_API_TOKEN") -> str | None:
+    """Reads a key's current value from the .env file next to `compose_file`, if any."""
+    env_path = compose_file.parent / ".env"
+    if not env_path.exists():
+        return None
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith(f"{key}="):
+            value = _unquote_env_value(line.split("=", 1)[1])
+            return value or None
+    return None
+
+
+def write_env_token(compose_file: Path, token: str | None, key: str = "AV_API_TOKEN") -> None:
+    """Read-modify-write the .env file next to `compose_file`, setting/removing `key`.
+
+    Preserves every other line already in the file (other env vars a user may have added) —
+    only the one matching line is replaced (or appended if absent, or dropped if `token` is
+    falsy). `token` must be a non-empty string to be written; an empty/None token removes the
+    line entirely rather than writing `KEY=""`, so `AV_API_TOKEN` being unset (the env var
+    server.py actually reads) stays the single source of truth for "Anonymous mode."
+    """
+    env_path = compose_file.parent / ".env"
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+
+    new_lines = [line for line in lines if not line.strip().startswith(f"{key}=")]
+    if token:
+        new_lines.append(f"{key}={_quote_env_value(token)}")
+
+    env_path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
 
 
 def remove_old_images(image_ids: list[str]) -> None:
@@ -251,8 +310,14 @@ def ensure_local_backend_running(
     container_name: str = "aether-vault-webui",
     service_name: str = "aether-vault-webui",
     url: str = "http://localhost:3000",
+    api_token: str | None = None,
 ) -> DockerOnboardingResult:
-    """Top-level orchestrator: not running -> image missing -> start -> wait -> connect."""
+    """Top-level orchestrator: not running -> image missing -> start -> wait -> connect.
+
+    `api_token`, when the caller already has one configured (`.av/config`'s
+    `remote_api_token`), is passed through to `_open_browser` so the webui never shows its
+    own manual token-entry prompt when launched this way — see `_open_browser`'s docstring.
+    """
     compose_file, _ = resolve_compose_file(source_root)
 
     ui.print_step("Checking Docker…", status="info")
@@ -273,7 +338,7 @@ def ensure_local_backend_running(
         if health == "healthy":
             ui.print_step("Backend already running and healthy", status="success")
             if open_browser:
-                _open_browser(url)
+                _open_browser(url, api_token)
             return DockerOnboardingResult(success=True, already_running=True, backend_url=url)
 
     if not image_exists(service_name):
@@ -302,14 +367,21 @@ def ensure_local_backend_running(
         ui.print_step("Backend did not respond in time.", status="warn")
 
     if open_browser:
-        _open_browser(url)
+        _open_browser(url, api_token)
 
     return DockerOnboardingResult(success=True, already_running=False, backend_url=url)
 
 
-def _open_browser(url: str) -> None:
+def _open_browser(url: str, token: str | None = None) -> None:
+    """Opens the webui. When `token` is given (the CLI already knows it — e.g. set via
+    `av init`/`av auth set-token`), appends it as a one-time `av_token` query param so
+    TokenGate.tsx can save it straight to localStorage and strip it from the URL on load,
+    instead of showing its manual entry prompt. Never shown again after that first load."""
+    full_url = url
+    if token:
+        full_url = f"{url}{'&' if '?' in url else '?'}av_token={urllib.parse.quote(token)}"
     ui.print_step(f"Opening {url} in your browser…", status="success")
     try:
-        webbrowser.open(url)
+        webbrowser.open(full_url)
     except Exception as exc:
         ui.print_step(f"Could not open browser automatically: {exc}", status="warn")

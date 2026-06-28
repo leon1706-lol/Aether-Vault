@@ -206,6 +206,59 @@ def save_config(repo_root: Path, config: dict) -> None:
     atomic_write_text(config_path, json.dumps(config, indent=2))
 
 
+class _AuthRetryGroup(click.Group):
+    """`cli`'s class (see `cli = click.group(..., cls=_AuthRetryGroup)` below) — catches
+    AuthenticationError from *any* subcommand in one place, rather than wrapping each of the
+    ~7 commands that talk to the server individually (push, commit, checkout, gc, doctor --fix,
+    stash push/pop). Click's MultiCommand.invoke() lets exceptions raised inside a subcommand's
+    callback propagate up through this call, which is the standard way to add a shared
+    error-handling layer across an entire Click command tree.
+
+    Re-runs the command from scratch after saving a token rather than silently retrying
+    mid-operation — several of the affected commands (push, commit, gc) make multiple
+    sequential server calls, and resuming a partially-completed multi-step operation with a
+    freshly swapped credential is riskier than just asking the user to re-invoke it.
+    """
+
+    def invoke(self, ctx: click.Context):
+        from .client import AuthenticationError
+        from . import ui
+
+        try:
+            return super().invoke(ctx)
+        except AuthenticationError:
+            if not ui.is_interactive():
+                click.secho(
+                    "Error: this registry is protected and needs a valid access token. Set "
+                    "one with `av auth set-token <token>` (ask whoever manages this registry "
+                    "for the current one), then retry.",
+                    fg="red",
+                )
+                sys.exit(1)
+
+            click.secho("This registry is protected — enter the access token to continue.", fg="yellow")
+            import questionary
+
+            token = questionary.password("Access token:").ask()
+            if not token:
+                click.secho("No token entered — aborting.", fg="red")
+                sys.exit(1)
+
+            repo_root = find_repo_root()
+            if repo_root is not None:
+                cfg = load_config(repo_root)
+                cfg["remote_api_token"] = token
+                save_config(repo_root, cfg)
+                click.secho("Token saved. Please re-run the command.", fg="green")
+            else:
+                click.secho(
+                    "Token entered, but no .av repository found here to save it in — "
+                    "re-run `av auth set-token` from inside the repo.",
+                    fg="yellow",
+                )
+            sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Atomic write helpers
 # ---------------------------------------------------------------------------
@@ -316,25 +369,42 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
 
 
 def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
-    """Retry pushing queued commits to the remote server. Returns the entries still pending."""
+    """Retry pushing queued commits to the remote server. Returns the entries still pending.
+
+    `client.server_available()` only proves the server process is up — it's exempt from the
+    auth gate (see server.py) specifically so it stays answerable with no credentials, which
+    means it does NOT prove this client's token is valid. A bad/stale token surfaces as
+    AuthenticationError from the calls below, not a False/None return — caught here and
+    treated exactly like "server unreachable" for queueing purposes (queue and retry later,
+    never lose the commit), since from a data-safety standpoint that's exactly what it is.
+    Stops retrying the rest of the queue on the first such failure, since the same bad token
+    would just fail identically for every remaining entry.
+    """
     pending = load_pending_push(repo_root)
     if not pending or not client.server_available():
         return pending
 
+    from .client import AuthenticationError
+
     still_pending: list[dict] = []
-    for entry in pending:
+    for i, entry in enumerate(pending):
         commit_path = repo_root / ".av" / "commits" / f"{entry['commit_hash']}.json"
         if not commit_path.exists():
             continue
         with open(commit_path, "r") as f:
             commit_data = json.load(f)
-        upload_commit_objects(repo_root, client, commit_data.get("tree", {}))
-        if client.push_commit(commit_data):
-            ref_ok = True
-            if entry.get("ref_name"):
-                ref_ok = client.update_ref(entry["ref_name"], entry["commit_hash"])
-            if ref_ok:
-                continue
+        try:
+            upload_commit_objects(repo_root, client, commit_data.get("tree", {}))
+            if client.push_commit(commit_data):
+                ref_ok = True
+                if entry.get("ref_name"):
+                    ref_ok = client.update_ref(entry["ref_name"], entry["commit_hash"])
+                if ref_ok:
+                    continue
+        except AuthenticationError:
+            still_pending.extend(pending[i:])  # this entry + everything not yet attempted
+            save_pending_push(repo_root, still_pending)
+            raise
         still_pending.append(entry)
 
     save_pending_push(repo_root, still_pending)
@@ -576,7 +646,7 @@ def stage_one_file(repo_root: Path, idx: Index, threshold_bytes: int, fpath: Pat
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-@click.group(invoke_without_command=True)
+@click.group(invoke_without_command=True, cls=_AuthRetryGroup)
 @click.option("--verbose", is_flag=True, default=False, help="Enable debug logging.")
 @click.option("--silent", is_flag=True, default=False, help="Suppress all output.")
 @click.pass_context
@@ -648,6 +718,71 @@ def _reconnect_existing_repo(repo_root: Path, cfg: dict) -> None:
         click.secho(f"[WARN] Could not reach the local backend: {exc}", fg="yellow")
 
 
+def _handle_init_protection_choice(
+    repo_root: Path, yes: bool, protected_flag: bool, join_token: str | None
+) -> None:
+    """The Anonymous/Protected prompt `av init` shows after choosing Local mode, plus its
+    "Generate a new token" vs "Enter an existing one" follow-up. Saves whatever was decided to
+    this repo's config (and, for "generate," writes/applies it via `av auth set-token`'s same
+    underlying helper) — never touched at all if the result is Anonymous, matching today's
+    behavior exactly.
+    """
+    from . import ui
+    from .client import AuthenticationError, VaultClient
+
+    if join_token:
+        choice, token_source = "protected", "existing"
+        existing_token = join_token
+    elif protected_flag:
+        choice, token_source = "protected", "generate"
+        existing_token = None
+    elif yes or not ui.is_interactive():
+        choice, token_source = "anonymous", None
+        existing_token = None
+    else:
+        choice = ui.select_protection_mode()
+        token_source = ui.select_token_source() if choice == "protected" else None
+        existing_token = ui.prompt_for_existing_token() if token_source == "existing" else None
+
+    if choice != "protected":
+        return
+
+    if token_source == "generate":
+        token = _generate_and_apply_token(repo_root)
+        click.secho(f"Token set: {token}", fg="green")
+        click.secho("Save this — it won't be shown again. Share it with teammates who need access.", fg="yellow")
+        return
+
+    # "existing" — joining a registry someone else already protected. Validate before saving:
+    # an unreachable server and a rejected token must not look the same to the user.
+    if not existing_token:
+        click.secho("No token entered — leaving this registry Anonymous.", fg="yellow")
+        return
+
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), existing_token)
+    if not client.server_available():
+        click.secho(
+            "Could not reach the server to verify this token right now — saved anyway; "
+            "you'll find out if it's wrong on your next command (`av auth status` to check).",
+            fg="yellow",
+        )
+    else:
+        try:
+            client.fetch_all_refs()
+        except AuthenticationError:
+            click.secho(
+                "That token was rejected by the server — leaving this registry Anonymous. "
+                "Run `av auth set-token <token>` once you have the correct one.",
+                fg="red",
+            )
+            return
+
+    cfg["remote_api_token"] = existing_token
+    save_config(repo_root, cfg)
+    click.secho("Token saved.", fg="green")
+
+
 @cli.command()
 @click.option(
     "--mode", "mode", type=click.Choice(["local", "enterprise"]), default=None,
@@ -658,7 +793,16 @@ def _reconnect_existing_repo(repo_root: Path, cfg: dict) -> None:
     "--no-repl", is_flag=True, default=False,
     help="Don't enter the interactive session after init (used by scripts/CI).",
 )
-def init(mode: str | None, yes: bool, no_repl: bool) -> None:
+@click.option(
+    "--protected", "protected_flag", is_flag=True, default=False,
+    help="Non-interactive equivalent of choosing Protected + Generate a new token.",
+)
+@click.option(
+    "--token", "join_token", default=None,
+    help="Non-interactive equivalent of choosing Protected + Enter an existing token — for "
+         "joining a registry someone else already protected.",
+)
+def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_token: str | None) -> None:
     """Initialize a new Aether-Vault repository in the current directory."""
     from . import ui
 
@@ -698,11 +842,20 @@ def init(mode: str | None, yes: bool, no_repl: bool) -> None:
     cfg["login_mode"] = login_mode
     save_config(repo_root, cfg)
 
+    # Anonymous-vs-Protected only applies to Local mode — Enterprise has its own (separate,
+    # not-yet-built) account-based auth system; this shared-secret token is the free/OSS-tier
+    # mechanism, not something to layer underneath Enterprise login too.
+    if login_mode == "local":
+        _handle_init_protection_choice(repo_root, yes, protected_flag, join_token)
+        cfg = load_config(repo_root)  # re-load: the protection-choice handler may have saved a token
+
     if login_mode == "local" and not no_repl:
         from . import docker_runtime
 
         try:
-            docker_runtime.ensure_local_backend_running(_find_source_root(), open_browser=False)
+            docker_runtime.ensure_local_backend_running(
+                _find_source_root(), open_browser=False, api_token=cfg.get("remote_api_token"),
+            )
         except Exception as exc:
             click.secho(
                 f"[WARN] Could not start the local backend ({exc}). Run `av webui` later once Docker is ready.",
@@ -1050,7 +1203,7 @@ def commit(
     repo_root = ensure_repo()
     idx = Index(repo_root)
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
 
     staged = idx.get_staged_entries()
     if not staged:
@@ -1140,23 +1293,43 @@ def commit(
     # can each have a branch named "main" without overwriting each other's ref.
     remote_ref_name = f"{cfg['project_id']}/{ref_path.name}" if ref_path else None
 
-    flush_pending_push(repo_root, client)
+    from .client import AuthenticationError
+
+    try:
+        flush_pending_push(repo_root, client)
+    except AuthenticationError:
+        pass  # already re-queued by flush_pending_push itself; this commit's own push attempt below still needs to happen
+
     if client.server_available():
-        # Objects must reach the server before the commit: the server's tree rows store each
-        # entry's object hash as a foreign key, so pushing the commit first makes that insert
-        # fail (previously misreported as a successful 409 "already exists" — see
-        # upload_commit_objects()'s docstring / development/Probleme.md).
-        upload_commit_objects(repo_root, client, tree)
-        if client.push_commit(commit_data):
-            ref_ok = True
-            if remote_ref_name:
-                ref_ok = client.update_ref(remote_ref_name, commit_hash)
-            if not ref_ok:
+        try:
+            # Objects must reach the server before the commit: the server's tree rows store
+            # each entry's object hash as a foreign key, so pushing the commit first makes
+            # that insert fail (previously misreported as a successful 409 "already exists" —
+            # see upload_commit_objects()'s docstring / development/Probleme.md).
+            upload_commit_objects(repo_root, client, tree)
+            if client.push_commit(commit_data):
+                ref_ok = True
+                if remote_ref_name:
+                    ref_ok = client.update_ref(remote_ref_name, commit_hash)
+                if not ref_ok:
+                    queue_pending_push(repo_root, commit_hash, remote_ref_name)
+                    click.secho("  Ref update failed — commit queued for retry (run `av push` later)", fg="yellow")
+            else:
                 queue_pending_push(repo_root, commit_hash, remote_ref_name)
-                click.secho("  Ref update failed — commit queued for retry (run `av push` later)", fg="yellow")
-        else:
+                click.secho("  Push failed — commit queued for retry (run `av push` later)", fg="yellow")
+        except AuthenticationError:
+            # client.server_available() only proves the server is up (it's exempt from the
+            # auth gate) — it does NOT prove this token is valid, so a bad/stale token surfaces
+            # here as an exception instead of push_commit's normal False return. Queue exactly
+            # like any other push failure — losing the commit because of a credential problem
+            # specifically, vs. a network problem, would be an arbitrary distinction the user
+            # shouldn't have to think about.
             queue_pending_push(repo_root, commit_hash, remote_ref_name)
-            click.secho("  Push failed — commit queued for retry (run `av push` later)", fg="yellow")
+            click.secho(
+                "  Server rejected the access token — commit queued for retry "
+                "(run `av auth set-token <token>` then `av push`)",
+                fg="yellow",
+            )
     else:
         queue_pending_push(repo_root, commit_hash, remote_ref_name)
         click.secho("  Server unreachable — commit queued for push (run `av push` later)", fg="yellow")
@@ -1209,7 +1382,7 @@ def checkout(target: str, force: bool) -> None:
 
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
 
     heads_dir = repo_root / ".av" / "refs" / "heads"
     commit_hash = target
@@ -1367,7 +1540,7 @@ def _stash_push(message: str | None) -> None:
     repo_root = ensure_repo()
     idx = Index(repo_root)
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
     threshold_bytes = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
 
     staged, modified, deleted, _untracked = compute_status(repo_root, idx)
@@ -1475,7 +1648,7 @@ def _stash_apply_or_pop(stash_id: str | None, delete_after: bool) -> None:
         record = json.load(f)
 
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
     idx = Index(repo_root)
     head_tree = resolve_head_tree(repo_root)  # only needed for was_staged=False entries below
 
@@ -1615,7 +1788,7 @@ def push() -> None:
 
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
 
     pending_before = load_pending_push(repo_root)
     if not pending_before:
@@ -1641,7 +1814,7 @@ def gc() -> None:
 
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
 
     if not client.server_available():
         click.secho("Error: Remote server is not reachable.", fg="red")
@@ -1657,6 +1830,113 @@ def gc() -> None:
         )
     else:
         click.secho("GC request failed. Check server logs.", fg="red")
+
+
+@cli.group()
+def auth() -> None:
+    """Manage the optional shared-secret access token ("Protected" mode).
+
+    Unset/empty (the default) means the registry is "Anonymous" — every route behaves exactly
+    as it always has, no credentials needed. Setting a token switches the server to
+    "Protected" — every route (reads included) then requires it. See `av init`'s
+    Anonymous/Protected prompt for the same choice at setup time.
+    """
+
+
+def _restart_server_for_token_change(repo_root: Path) -> bool:
+    """Best-effort restart of the running server after `.env`'s AV_API_TOKEN changes, so the
+    new value takes effect immediately instead of only on the next manual restart. Returns
+    False (with a clear message already printed) if Docker isn't reachable or the restart
+    itself fails — `write_env_token` has already succeeded by the time this runs, so a failed
+    restart here just means "takes effect next time the stack starts," not data loss.
+    """
+    from . import docker_runtime
+
+    if docker_runtime.check_docker_running() != docker_runtime.DockerCheckResult.RUNNING:
+        click.secho(
+            "Docker isn't running — saved, but it'll take effect next time the server starts.",
+            fg="yellow",
+        )
+        return False
+    compose_file, _ = docker_runtime.resolve_compose_file(_find_source_root())
+    if not docker_runtime.restart_service(compose_file, "aether-vault-server"):
+        click.secho(
+            "Saved, but restarting the server automatically failed — restart it manually "
+            "(`docker compose up -d aether-vault-server`) for the change to take effect.",
+            fg="yellow",
+        )
+        return False
+    return True
+
+
+def _generate_and_apply_token(repo_root: Path, token: str | None = None) -> str:
+    """Generates (if not given) and applies a token: writes it to .env next to whichever
+    compose file is in play, saves it to this repo's config, and restarts the running server
+    so it takes effect immediately. Shared by `av auth set-token` and `av init`'s "Generate a
+    new token" choice so the two don't duplicate this logic."""
+    import secrets as secrets_module
+
+    from . import docker_runtime
+
+    token = token or secrets_module.token_urlsafe(32)
+
+    compose_file, _ = docker_runtime.resolve_compose_file(_find_source_root())
+    docker_runtime.write_env_token(compose_file, token)
+
+    cfg = load_config(repo_root)
+    cfg["remote_api_token"] = token
+    save_config(repo_root, cfg)
+
+    _restart_server_for_token_change(repo_root)
+    return token
+
+
+@auth.command(name="set-token")
+@click.argument("token", required=False, default=None)
+def auth_set_token(token: str | None) -> None:
+    """Set (or rotate) the access token, generating one if TOKEN is omitted.
+
+    Writes it to the .env file next to whichever docker-compose file is in play, saves the
+    same value to this repo's local config so the CLI starts sending it immediately, and
+    restarts the running server so the change takes effect right away. Re-running this with a
+    new value (or none, to generate a fresh one) is also the "I forgot it" path — there's no
+    password-reset flow since this is a shared secret, not a real account: recovery is simply
+    "you have shell access to the machine running the server."
+    """
+    repo_root = ensure_repo()
+    token = _generate_and_apply_token(repo_root, token)
+    click.secho(f"Token set: {token}", fg="green")
+    click.secho("Save this — it won't be shown again. Share it with teammates who need access.", fg="yellow")
+
+
+@auth.command(name="clear")
+def auth_clear() -> None:
+    """Remove the access token everywhere — back to "Anonymous" mode."""
+    from . import docker_runtime
+
+    repo_root = ensure_repo()
+    compose_file, _ = docker_runtime.resolve_compose_file(_find_source_root())
+    docker_runtime.write_env_token(compose_file, None)
+
+    cfg = load_config(repo_root)
+    cfg.pop("remote_api_token", None)
+    save_config(repo_root, cfg)
+
+    _restart_server_for_token_change(repo_root)
+    click.secho("Token cleared — this registry is now Anonymous (no token required).", fg="green")
+
+
+@auth.command(name="status")
+def auth_status() -> None:
+    """Report whether an access token is currently configured, without printing it."""
+    repo_root = ensure_repo()
+    cfg = load_config(repo_root)
+    token = cfg.get("remote_api_token")
+    if not token:
+        click.secho("Anonymous — no token configured for this repo.", fg="yellow")
+        return
+    masked = f"{'*' * max(len(token) - 4, 0)}{token[-4:]}"
+    click.secho(f"Protected — token configured for this repo: {masked}", fg="green")
 
 
 def _print_real_repo_speed_diagnostics(repo_root: Path) -> None:
@@ -1689,7 +1969,7 @@ def doctor(fix: bool, dry_run: bool, speed: bool) -> None:
 
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"))
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
     av_dir = repo_root / ".av"
 
     click.secho("Aether-Vault Doctor", bold=True)

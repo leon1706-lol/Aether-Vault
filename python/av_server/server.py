@@ -1,8 +1,10 @@
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
@@ -42,6 +44,34 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "HEAD"],
     allow_headers=["*"],
 )
+
+# Optional shared-secret gate ("Protected" mode). Empty/unset (the default) means every route
+# behaves exactly as it always has — no auth at all ("Anonymous" mode). Read once at process
+# start, matching DATA_DIR below: `av auth set-token` writes the new value to .env and restarts
+# the container, so a fresh process always picks up changes — no need to re-read per request.
+AV_API_TOKEN = os.environ.get("AV_API_TOKEN", "").strip()
+
+# Always reachable even in Protected mode:
+# - /api/health: Docker healthchecks and VaultClient.server_available() depend on this being
+#   checkable with no credentials — docker_runtime.restart_service()'s own readiness wait calls
+#   server_available(), so gating health would make a freshly-protected server look perpetually
+#   unreachable to the very code restarting it.
+# - /docs, /openapi.json, /redoc: FastAPI's bundled Swagger/ReDoc UI has no way to attach our
+#   custom Bearer header, so gating them would just break the webui's "API Docs" link with no
+#   real security benefit — they expose the API's shape, not any actual data.
+_AUTH_EXEMPT_PATHS = {"/api/health", "/docs", "/openapi.json", "/redoc"}
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    if not AV_API_TOKEN or request.url.path in _AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+
+    scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not supplied or not secrets.compare_digest(supplied, AV_API_TOKEN):
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
+    return await call_next(request)
+
 
 DATA_DIR = Path(os.environ.get("AV_DATA_DIR", "/data"))
 storage = CASStorage(DATA_DIR)
@@ -342,6 +372,49 @@ async def push_commit(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+async def resolve_tree(db: AsyncSession, root_hash: str) -> dict:
+    """Rebuilds a commit's full file tree from the DB Merkle Tree.
+
+    Level-order traversal with one batched query per depth level (was one query per node, i.e.
+    N+1). Because identical subtrees are deduplicated, the same tree_hash can appear under
+    several paths, so we carry a list of path prefixes per hash for each level. Factored out of
+    `get_commit` (module-level, not nested) so `list_commits`'s `include_layers` option can
+    reuse the exact same logic instead of duplicating it.
+    """
+    tree_data: dict = {}
+    frontier: list[tuple[str, str]] = [(root_hash, "")]  # (tree_hash, path_prefix)
+    while frontier:
+        prefixes_by_hash: Dict[str, List[str]] = {}
+        for th, prefix in frontier:
+            prefixes_by_hash.setdefault(th, []).append(prefix)
+
+        rows = (
+            await db.execute(
+                select(DBTree).where(DBTree.tree_hash.in_(list(prefixes_by_hash.keys())))
+            )
+        ).scalars().all()
+        rows_by_hash: Dict[str, list] = {}
+        for r in rows:
+            rows_by_hash.setdefault(r.tree_hash, []).append(r)
+
+        next_frontier: list[tuple[str, str]] = []
+        for th, prefixes in prefixes_by_hash.items():
+            for prefix in prefixes:
+                for entry in rows_by_hash.get(th, []):
+                    full_path = f"{prefix}/{entry.path_name}" if prefix else entry.path_name
+                    if entry.child_tree_hash:
+                        next_frontier.append((entry.child_tree_hash, full_path))
+                    else:
+                        tree_data[full_path] = {
+                            "hash": entry.object_hash,
+                            "size": entry.size,
+                            "type": entry.type,
+                            "layers": entry.layers or [],
+                        }
+        frontier = next_frontier
+    return tree_data
+
+
 @app.get("/api/commits/{hash}")
 async def get_commit(
     hash: str, db: AsyncSession = Depends(get_session)
@@ -356,45 +429,8 @@ async def get_commit(
         if local:
             return local
         raise HTTPException(status_code=404, detail="Commit not found")
-    # Rebuild the tree from the DB Merkle Tree.
-    # Level-order traversal with one batched query per depth level (was one query per node,
-    # i.e. N+1). Because identical subtrees are deduplicated, the same tree_hash can appear
-    # under several paths, so we carry a list of path prefixes per hash for each level.
-    async def resolve_tree(root_hash: str) -> dict:
-        tree_data: dict = {}
-        frontier: list[tuple[str, str]] = [(root_hash, "")]  # (tree_hash, path_prefix)
-        while frontier:
-            prefixes_by_hash: Dict[str, List[str]] = {}
-            for th, prefix in frontier:
-                prefixes_by_hash.setdefault(th, []).append(prefix)
 
-            rows = (
-                await db.execute(
-                    select(DBTree).where(DBTree.tree_hash.in_(list(prefixes_by_hash.keys())))
-                )
-            ).scalars().all()
-            rows_by_hash: Dict[str, list] = {}
-            for r in rows:
-                rows_by_hash.setdefault(r.tree_hash, []).append(r)
-
-            next_frontier: list[tuple[str, str]] = []
-            for th, prefixes in prefixes_by_hash.items():
-                for prefix in prefixes:
-                    for entry in rows_by_hash.get(th, []):
-                        full_path = f"{prefix}/{entry.path_name}" if prefix else entry.path_name
-                        if entry.child_tree_hash:
-                            next_frontier.append((entry.child_tree_hash, full_path))
-                        else:
-                            tree_data[full_path] = {
-                                "hash": entry.object_hash,
-                                "size": entry.size,
-                                "type": entry.type,
-                                "layers": entry.layers or [],
-                            }
-            frontier = next_frontier
-        return tree_data
-
-    tree_data = await resolve_tree(commit.root_tree_hash) if commit.root_tree_hash else {}
+    tree_data = await resolve_tree(db, commit.root_tree_hash) if commit.root_tree_hash else {}
 
     return {
         "hash": commit.hash,
@@ -670,6 +706,7 @@ async def list_commits(
     limit: int = 50,
     offset: int = 0,
     project_id: Optional[str] = None,
+    include_layers: bool = False,
     db: AsyncSession = Depends(get_session)
 ) -> dict:
     """Paginated commit list for the Web UI dashboard, newest first.
@@ -677,6 +714,17 @@ async def list_commits(
     Optionally scoped to a single project via ?project_id= — without it, commits from every
     project on this shared registry are returned (matches the dashboard's pre-existing
     behavior so it doesn't break for callers that don't know about projects yet).
+
+    ?include_layers=true additionally resolves each returned commit's full tree (same shape
+    GET /api/commits/{hash} already returns) in this single response — added specifically to
+    replace WeightDiffPanel.tsx's old N-parallel-requests pattern (one GET /api/commits/{hash}
+    per candidate checkpoint) with one round trip. Trees are resolved sequentially here (NOT
+    via asyncio.gather) — get_session() hands out one AsyncSession per request, backed by a
+    single underlying connection, and concurrent queries on the same connection aren't safe
+    (asyncpg raises "another operation is in progress"). The win this endpoint provides is
+    collapsing N HTTP round trips into one; resolve_tree() itself already eliminated the
+    expensive per-node N+1 *within* a single tree, which is the part that actually scales with
+    tree size — sequential-but-one-request is still a large improvement over N full requests.
     """
     query = select(DBCommit)
     count_query = select(func.count(DBCommit.hash))
@@ -689,22 +737,26 @@ async def list_commits(
     total_result = await db.execute(count_query)
     total = total_result.scalar_one()
 
+    commit_dicts = []
+    for c in commits:
+        d = {
+            "hash": c.hash,
+            "message": c.message,
+            "author": c.author,
+            "timestamp": c.timestamp.isoformat() if c.timestamp else None,
+            "parent_hash": c.parent_hash,
+            "root_tree_hash": c.root_tree_hash,
+            "tags": c.tags or [],
+            "metrics": c.metrics or {},
+            "project_id": c.project_id,
+            "project_name": c.project_name,
+        }
+        if include_layers:
+            d["tree"] = await resolve_tree(db, c.root_tree_hash) if c.root_tree_hash else {}
+        commit_dicts.append(d)
+
     return {
-        "commits": [
-            {
-                "hash": c.hash,
-                "message": c.message,
-                "author": c.author,
-                "timestamp": c.timestamp.isoformat() if c.timestamp else None,
-                "parent_hash": c.parent_hash,
-                "root_tree_hash": c.root_tree_hash,
-                "tags": c.tags or [],
-                "metrics": c.metrics or {},
-                "project_id": c.project_id,
-                "project_name": c.project_name,
-            }
-            for c in commits
-        ],
+        "commits": commit_dicts,
         "total": total,
         "limit": limit,
         "offset": offset,

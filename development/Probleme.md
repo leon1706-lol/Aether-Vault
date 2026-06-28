@@ -96,23 +96,53 @@ errors, performance bottlenecks, security risks), each **rated 1–10** by sever
 
 ---
 
-## 🔸 Open — Deployment security (deliberately documented only)
-
-> Left unchanged in code/config by request. Should be fixed urgently before production use.
+## ✅ Fixed — Deployment security (2026-06-28)
 
 ### [7] No authentication + open attack surface
-- **Files:** `python/av_server/server.py`, `docker-compose.yml`.
-- **Points:**
-  - No auth/authz whatsoever on any endpoint.
-  - CORS `allow_origins=["*"]` (`server.py`, `add_middleware`).
-  - The **destructive** `POST /api/admin/gc` is unauthenticated — any reachable client can wipe
-    storage.
-  - Postgres port `5432` is mapped externally in Compose; default credentials
-    `av_user/av_password` are hardcoded.
-  - Redis port `6379` is also open, with no password.
-- **Recommendation:** API token/reverse proxy with auth, restrict CORS to known origins, secure
-  the admin/GC endpoint, don't bind DB/Redis ports externally, source secrets from an
-  environment/secret store instead of defaults.
+- **Files:** `python/av_server/server.py`, `docker-compose.yml`, `python/av_cli/docker/docker-compose.release.yml`, `python/av_cli/client.py`, `python/av_cli/main.py` (new `av auth` group + `av init` prompt), `webui/src/components/TokenGate.tsx`.
+- **Problem:** No auth/authz whatsoever on any endpoint; the **destructive** `POST
+  /api/admin/gc` was unauthenticated (any reachable client could wipe storage); Postgres
+  `5432`/Redis `6379` were mapped externally in Compose with hardcoded default credentials
+  (`av_user`/`av_password`) that are public the moment this repo is — meaning the port mapping
+  was the only thing standing between "public password" and full DB access for anyone who
+  could reach the host.
+- **Fix:** an optional shared-secret token ("Protected" mode, off by default — "Anonymous"
+  stays byte-for-byte identical to before for solo/local use). A `require_token` middleware
+  gates every route except `GET /api/health` and the FastAPI docs routes when a token is
+  configured; `av auth set-token`/`clear`/`status` manage it, `av init` offers it as a
+  Anonymous/Protected choice (with a "generate new" vs. "join an existing registry" sub-choice)
+  at setup time, and the CLI/webui both prompt for the token interactively on a 401 rather than
+  failing with a generic error. The externally-mapped DB/Redis ports were removed from
+  `docker-compose.release.yml` (the file real end users actually deploy) — kept in the **dev**
+  `docker-compose.yml` specifically because `tests/test_server.py` connects to them directly
+  from the host (verified by checking; removing it there would have silently degraded that
+  test file to skip-mode instead of a loud failure).
+- **Explicitly NOT fixed, by design — still open:** CORS remains `allow_origins=["*"]`. This
+  round's scope was specifically the auth gap, not CORS hardening; noted here so it doesn't
+  read as fully closed.
+- **A real bug found via manual debugging while building this fix:** `commit()`'s push-to-
+  remote logic assumed any push failure would surface as a `False`/`None` return (matching the
+  existing "queue it for `av push` later" fallback) — but `VaultClient`'s methods now *raise*
+  `AuthenticationError` on a 401 instead, since `server_available()`'s own health check is
+  deliberately exempt from the auth gate and so can't be used to infer "my token is valid."
+  That exception propagated straight out of `commit()`, skipping the queue-for-retry fallback
+  entirely — a commit made against a Protected registry with a stale/wrong token was created
+  locally but **silently never queued**, unlike every other kind of push failure. Reproduced
+  for real against the live Docker stack (not just unit tests): committed with a deliberately
+  wrong token, confirmed the commit was missing from both the server and `.av/pending_push`.
+  Fixed by catching `AuthenticationError` in `commit()`'s push block and in
+  `flush_pending_push()` (which now also preserves the rest of the queue before re-raising, so
+  a bad token hit partway through retrying several queued commits doesn't drop the untried
+  ones) and queueing exactly like any other push failure.
+- **Verified:** `tests/test_server.py` (14 new cases — header parsing edge cases, health/docs
+  exemption, reads+writes both gated), `tests/test_client.py` (token header + every method
+  raising `AuthenticationError` on 401), `tests/test_cli.py` (`av auth`, `av init`'s
+  Protected/join-existing flow, the commit-queueing regression), `tests/test_docker_runtime.py`
+  (`.env` read/write round-trip including awkward characters, the webui URL token handoff),
+  and a full manual pass against the live Docker stack: rebuilt the server image, confirmed
+  Anonymous is unchanged, confirmed `av auth set-token` restarts the server and Protected mode
+  rejects/accepts correctly, confirmed the CLI's own 401 retry message, and confirmed the
+  commit-queueing fix recovers a "lost" commit via `av push` once the correct token is restored.
 
 ---
 
@@ -268,26 +298,36 @@ would have made the feature (and partly also the already-shipped CLI function
 - **Fix:** `diffFile()` filters out layer entries named `__header__` before they flow into the
   UI diff structure (purely client-side, no change to the core/server/index format).
 
-### 🔸 Open — checkpoint list resolves N commits via N parallel requests
-- **File:** `webui/src/components/WeightDiffPanel.tsx`.
-- **Problem:** `GET /api/commits` (the list endpoint) returns **no** tree/layer data (metadata
-  only); to populate the checkpoint list with `rel_path`/layer info, `GET /api/commits/{hash}`
-  has to be called individually for each candidate commit. To avoid exactly repeating the N+1
-  request pattern that was already fixed once in this project for `fetchCommitsForBranches`,
-  these requests run **in parallel** (`Promise.all`, not serially) and are hard-capped at
-  `CHECKPOINT_FETCH_LIMIT = 30`.
-- **Why not fixed:** A real solution would require a new server endpoint (e.g.
-  `GET /api/commits?include_layers=true`), which the scope decision for this feature explicitly
-  meant to avoid (no server/API changes). Unproblematic for repos with only a few dozen commits;
-  a very long history with many checkpoints would need an aggregate endpoint.
+### ✅ Fixed — checkpoint list resolved N commits via N parallel requests (2026-06-28)
+- **Files:** `python/av_server/server.py` (`list_commits`, new module-level `resolve_tree`),
+  `webui/src/lib/api.ts` (`fetchCommitsWithLayers`), `webui/src/components/WeightDiffPanel.tsx`.
+- **Problem:** `GET /api/commits` (the list endpoint) returned **no** tree/layer data (metadata
+  only); populating the checkpoint list with `rel_path`/layer info required calling
+  `GET /api/commits/{hash}` individually for each candidate commit. These ran in parallel
+  (`Promise.all`) and were hard-capped at `CHECKPOINT_FETCH_LIMIT = 30` to bound the request
+  count, but it was still N requests for N commits.
+- **Fix:** `get_commit`'s tree-resolution helper was factored out to a module-level
+  `resolve_tree(db, root_hash)` so both endpoints share it. `GET /api/commits` gained an
+  `include_layers: bool = false` query param; when true, each returned commit's tree is
+  resolved and attached, matching `get_commit`'s existing shape — one request instead of N.
+  Resolution runs **sequentially** per commit, not via `asyncio.gather` — a single
+  `AsyncSession`/asyncpg connection can't safely run concurrent queries, so concurrent
+  resolution would have been a real (if subtle) correctness bug, caught and avoided before it
+  ever ran. `WeightDiffPanel.tsx` now calls `fetchCommitsWithLayers` once; `CHECKPOINT_FETCH_LIMIT`
+  raised from 30 to 100 now that it bounds one request's response size, not a request count.
+- **Verified:** `tests/test_server.py` (`include_layers=true` returns trees matching
+  `get_commit`'s output for the same commits), `webui/src/components/__tests__/WeightDiffPanel.test.tsx`
+  (updated to mock the single aggregate call).
 
-### 🔸 Open — `Index.save()` is not atomic
+### ✅ Fixed — `Index.save()` is not atomic (2026-06-28)
 - **File:** `python/av_cli/index.py` (`Index.save`).
-- **Problem:** Writes `.av/index` directly (`open(..., 'w')`), without the temp-file +
+- **Problem:** Wrote `.av/index` directly (`open(..., 'w')`), without the temp-file +
   `fsync` + `os.replace` pattern (`atomic_write_text`/`atomic_write_json`) already established
-  in `main.py`. A crash mid-write can leave a truncated/empty index file.
-- **Why not fixed:** Out of scope for this feature; consistent with the category of non-atomic
-  writes already listed elsewhere in this document under "Minor Items" — noted for a later fix.
+  in `main.py`. A crash mid-write could leave a truncated/empty index file.
+- **Fix:** mechanical swap to the existing `atomic_write_json` helper (`.fsutil`) — no
+  behavior change beyond atomicity.
+- **Verified:** `tests/test_vault.py::test_index_operations` and the rest of the existing
+  `Index` coverage pass unchanged.
 
 ---
 
