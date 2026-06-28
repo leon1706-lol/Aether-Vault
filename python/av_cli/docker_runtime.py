@@ -25,8 +25,8 @@ from . import ui
 # (rolling :edge builds from main) — keep these names in sync with both workflows and with
 # docker/docker-compose.release.yml, which references the same images by name.
 RELEASE_IMAGES = {
-    "aether-vault-server": "ghcr.io/leon1706/aether-vault-server:latest",
-    "aether-vault-webui": "ghcr.io/leon1706/aether-vault-webui:latest",
+    "aether-vault-server": "ghcr.io/leon1706-lol/aether-vault-server:latest",
+    "aether-vault-webui": "ghcr.io/leon1706-lol/aether-vault-webui:latest",
 }
 
 

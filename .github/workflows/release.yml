@@ -91,8 +91,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/leon1706/aether-vault-server:latest
-            ghcr.io/leon1706/aether-vault-server:${{ github.ref_name }}
+            ghcr.io/leon1706-lol/aether-vault-server:latest
+            ghcr.io/leon1706-lol/aether-vault-server:${{ github.ref_name }}
 
       - name: Build and push webui image
         uses: docker/build-push-action@v6
@@ -100,5 +100,5 @@ jobs:
           context: ./webui
           push: true
           tags: |
-            ghcr.io/leon1706/aether-vault-webui:latest
-            ghcr.io/leon1706/aether-vault-webui:${{ github.ref_name }}
+            ghcr.io/leon1706-lol/aether-vault-webui:latest
+            ghcr.io/leon1706-lol/aether-vault-webui:${{ github.ref_name }}

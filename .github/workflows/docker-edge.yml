@@ -37,11 +37,11 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/leon1706/aether-vault-server:edge
+          tags: ghcr.io/leon1706-lol/aether-vault-server:edge
 
       - name: Build and push webui image
         uses: docker/build-push-action@v6
         with:
           context: ./webui
           push: true
-          tags: ghcr.io/leon1706/aether-vault-webui:edge
+          tags: ghcr.io/leon1706-lol/aether-vault-webui:edge

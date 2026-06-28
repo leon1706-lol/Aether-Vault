@@ -8,7 +8,7 @@
 # `.github/workflows/docker-edge.yml`, which publish exactly these images.
 services:
   aether-vault-server:
-    image: ghcr.io/leon1706/aether-vault-server:latest
+    image: ghcr.io/leon1706-lol/aether-vault-server:latest
     container_name: aether-vault-server
     ports:
       - '8000:8000'
@@ -36,7 +36,7 @@ services:
       start_period: 40s
 
   aether-vault-webui:
-    image: ghcr.io/leon1706/aether-vault-webui:latest
+    image: ghcr.io/leon1706-lol/aether-vault-webui:latest
     container_name: aether-vault-webui
     ports:
       - '3000:3000'
