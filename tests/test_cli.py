@@ -541,7 +541,7 @@ def test_doctor_fix_downloads_missing_object_from_server(repo, monkeypatch):
     assert obj_path.exists()
 
 
-def test_doctor_fix_cannot_recover_truly_missing_object(repo):
+def test_doctor_fix_cannot_recover_truly_missing_object(repo, monkeypatch):
     invoke("config", "1")
     big = repo / "weights.pt"
     big.write_bytes(b"x" * (2 * 1024 * 1024))
@@ -552,7 +552,13 @@ def test_doctor_fix_cannot_recover_truly_missing_object(repo):
     obj_path = repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
     obj_path.unlink()
 
-    # No server running in this test environment, so the object genuinely cannot be recovered.
+    # Force "no server reachable" explicitly rather than relying on the test environment
+    # happening to have none running — a real av_server on localhost:8000 (e.g. for manual
+    # benchmark/webui testing) would otherwise make this object recoverable and flip the
+    # assertions below, exactly as it did when this test was last run with Docker up.
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.VaultClient, "server_available", lambda self: False)
+
     result = invoke("doctor", "--fix")
     assert result.exit_code == 0, result.output
     assert "[WARN]" in result.output
@@ -1019,10 +1025,85 @@ def test_benchmark_command_vs_filters_competitor_tools(repo, monkeypatch):
 
 def test_benchmark_command_markdown_writes_file(repo, monkeypatch, tmp_path):
     import python.av_cli.main as main_module
+    import benchmarks.tool_runner as tool_runner_module
+
     monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _FakeBenchModule(name))
+    # render_doc_header() shells out to detect real tool versions (slow, and one tool — mlflow
+    # — is known to hang under non-interactive subprocess invocation until its own internal
+    # timeout fires) — fake it so this test stays fast and deterministic. Patched via the real
+    # module object (imported above, before the importlib.import_module patch above takes
+    # effect) rather than monkeypatch's string-target form — that form calls
+    # importlib.import_module internally too, which the patch above would intercept and break.
+    monkeypatch.setattr(tool_runner_module, "render_doc_header", lambda *a, **k: "# fake header\n\n")
 
     out_path = tmp_path / "BENCHMARKS.md"
     result = invoke("benchmark", "--only", "hashing_throughput", "--markdown", str(out_path))
     assert result.exit_code == 0, result.output
     assert out_path.exists()
-    assert "Fake benchmarks.bench_hashing_throughput" in out_path.read_text()
+    text = out_path.read_text()
+    assert "# fake header" in text
+    assert "Fake benchmarks.bench_hashing_throughput" in text
+
+
+def test_benchmark_command_save_json_writes_a_snapshot(repo, monkeypatch, tmp_path):
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _FakeBenchModule(name))
+
+    out_path = tmp_path / "snapshot.json"
+    result = invoke("benchmark", "--only", "hashing_throughput", "--save-json", str(out_path))
+    assert result.exit_code == 0, result.output
+    assert out_path.exists()
+
+    snapshot = json.loads(out_path.read_text())
+    assert snapshot == {"benchmarks.bench_hashing_throughput": {"op": 1.0}}
+
+
+def test_benchmark_command_baseline_exits_nonzero_on_a_real_regression(repo, monkeypatch, tmp_path):
+    import python.av_cli.main as main_module
+
+    class _RegressedBenchModule(_FakeBenchModule):
+        def run(self, tool_order):
+            self.calls.append(tool_order)
+            from benchmarks.tool_runner import BenchmarkResult, Row, ToolStatus
+            return BenchmarkResult(
+                name=self.name,
+                title=f"Fake {self.name}",
+                description="fake",
+                tool_order=tool_order,
+                rows=[Row(operation="op", values={t: 100.0 for t in tool_order}, statuses={t: ToolStatus.AVAILABLE for t in tool_order})],
+            )
+
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _RegressedBenchModule(name))
+
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps({"benchmarks.bench_hashing_throughput": {"op": 10.0}}))
+
+    result = invoke("benchmark", "--only", "hashing_throughput", "--baseline", str(baseline_path))
+    assert result.exit_code != 0
+    assert "regress" in result.output.lower()
+
+
+def test_benchmark_command_baseline_passes_when_nothing_regressed(repo, monkeypatch, tmp_path):
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _FakeBenchModule(name))
+
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps({"benchmarks.bench_hashing_throughput": {"op": 1.0}}))
+
+    result = invoke("benchmark", "--only", "hashing_throughput", "--baseline", str(baseline_path))
+    assert result.exit_code == 0, result.output
+    assert "no regressions" in result.output.lower()
+
+
+def test_benchmark_command_accepts_gc_throughput_via_only(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    imported = []
+    monkeypatch.setattr(
+        main_module.importlib, "import_module",
+        lambda name: (imported.append(name), _FakeBenchModule(name))[1],
+    )
+
+    result = invoke("benchmark", "--only", "gc_throughput")
+    assert result.exit_code == 0, result.output
+    assert imported == ["benchmarks.bench_gc_throughput"]

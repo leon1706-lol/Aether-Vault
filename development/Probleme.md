@@ -824,3 +824,39 @@ implement, both rated 1–10.
 - **Verified:** re-ran the Playwright screenshot pass after the fix — the header now reads
   "Commits", "Branches", "Metrics", "Storage", "Weight Diff", "Projects", or "Dashboard" to match
   whichever sidebar tab is active.
+
+## ✅ Fixed — Two test-fragility bugs found while adding benchmark regression tracking (2026-06-28)
+
+### [3] `test_doctor_fix_cannot_recover_truly_missing_object` silently depended on no `av_server` being reachable
+- **Files:** `tests/test_cli.py`.
+- **Problem (Severity 3, Difficulty 1):** the test's only justification for expecting the
+  missing object to stay unrecoverable was a comment — "No server running in this test
+  environment" — not an explicit mock. That was true by environmental coincidence until this
+  session's real Docker stack (db/redis/server/webui) was left running to capture fresh
+  benchmark numbers; with a real `av_server` reachable on `localhost:8000`, `av doctor --fix`'s
+  recovery path could genuinely reach it, and the object was no longer truly unrecoverable —
+  breaking the test's `[WARN]`/"could not recover" assertions. Found via manual debugging (the
+  full pytest run after the benchmark work), not by reading the diff.
+- **Fix:** explicitly monkeypatch `VaultClient.server_available` to return `False`, mirroring
+  the adjacent `test_doctor_fix_downloads_missing_object_from_server` test's existing pattern
+  (which forces it `True` to test the opposite path) — neither test should depend on whatever a
+  real server happens to be doing on the machine running the suite.
+- **Verified:** re-ran with the real Docker stack still up — test now passes regardless.
+
+### [2] A new test's `monkeypatch.setattr("benchmarks.tool_runner.render_doc_header", ...)` broke under an adjacent `importlib.import_module` patch in the same test
+- **Files:** `tests/test_cli.py` (`test_benchmark_command_markdown_writes_file`).
+- **Problem (Severity 2, Difficulty 2):** the test patches `main_module.importlib.import_module`
+  to a fake (`importlib` is a shared global module object, so this patches the *real*
+  `importlib.import_module` for the whole process, not just `main_module`'s reference to it).
+  pytest's own `monkeypatch.setattr(<string>, ...)` form internally calls the real
+  `importlib.import_module` to resolve the dotted path — which was now the test's own fake,
+  returning a `_FakeBenchModule` instead of the real `benchmarks.tool_runner` module, and the
+  second `setattr` call crashed with `AttributeError: '_FakeBenchModule' object has no
+  attribute 'tool_runner'`.
+- **Fix:** import the real module via a plain `import benchmarks.tool_runner as tool_runner_module`
+  statement first (plain `import` statements use the import system's `__import__` machinery
+  directly, not `importlib.import_module`, so they're unaffected by the patch) and call
+  `monkeypatch.setattr(tool_runner_module, "render_doc_header", ...)` against that object
+  instead of the string-target form.
+- **Verified:** `pytest tests/test_cli.py -k benchmark` and the full suite (249 passed, 3
+  skipped) both green after the fix.

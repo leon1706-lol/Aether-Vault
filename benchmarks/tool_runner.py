@@ -8,6 +8,8 @@ doesn't map onto a given tool gets labeled NOT_APPLICABLE (set explicitly per-be
 never inferred), instead of guessing at a number for either case.
 """
 
+import datetime
+import platform
 import shutil
 import subprocess
 import time
@@ -152,3 +154,183 @@ def result_to_markdown(result: BenchmarkResult) -> str:
         lines.append(f"| {row.operation} | {cells} | {verdict.upper()} |")
     lines.append("")
     return "\n".join(lines)
+
+
+# Narrative, not data-derived — explains *why* certain cells are N/A or non-monotonic, not
+# something that changes between captures. Kept as a hand-edited constant (update by hand
+# when methodology genuinely changes) but always included by render_doc_header()'s caller,
+# so a `--markdown` run never again silently drops this section the way a bare-tables-only
+# write used to (the staleness that motivated this whole module).
+METHODOLOGY_NOTES = """## Methodology notes (resolved open questions)
+
+- **Hashing throughput, MLflow column:** MLflow has no exposed file-hashing primitive
+  comparable to `dvc add`/`git lfs clean`/`av`'s hasher — `log_artifact()` copies/uploads a
+  file but doesn't expose a hash step a caller can time independently. Marked N/A rather than
+  approximated, so as not to misrepresent what MLflow actually does.
+- **Concurrent push, competitor columns:** Aether has a real multi-tenant FastAPI server
+  (Postgres+Redis-backed) that N clients push to concurrently. DVC and Git LFS push to a
+  remote with no app-server tier (concurrency there is filesystem/object-store writes, not
+  server contention), and MLflow's tracking server maps onto a different workflow entirely.
+  Rather than approximate three non-equivalent setups, v1 scopes this to an Aether-only load
+  test; the other three columns are N/A.
+- **GC throughput, competitor columns:** same reasoning as concurrent push — `av gc` is a
+  remote-CAS-server operation with no equivalent in Git LFS/DVC/MLflow's storage models, so
+  all three competitor columns are N/A rather than approximated.
+- **Cold clone, `av` column:** a real product gap found while building this benchmark, not a
+  benchmark artifact — `av` has no `clone`/`pull` command at all today. Sync is currently
+  push-only from a single working repo; there's no flow for a second machine to materialize a
+  fresh copy of a project someone else pushed. Tracked as a roadmap item (see README), not a
+  bug — nothing is broken, the feature doesn't exist yet.
+- **Partial-checkpoint fetch, "fetch whole checkpoint" row:** MLflow's number here is a
+  local-filesystem artifact store, not a network round trip like av/Git LFS's real HTTP
+  fetch or DVC's local-dir remote pull — faster for that reason, not because MLflow's actual
+  remote-artifact-store fetch path would be.
+
+"""
+
+
+def _tool_version(which_path: str | None, version_args: list[str]) -> str:
+    """Runs `<tool> <version_args>` and extracts a bare X.Y.Z version number from whichever
+    of stdout/stderr has output — each tool's raw banner is noisy (e.g. git-lfs's includes
+    platform/go-toolchain info), so a regex pulls out just the number to match the doc's
+    existing "git-lfs 3.7.1, dvc 3.67.1, ..." style rather than dumping the whole banner."""
+    if which_path is None:
+        return "not installed"
+    import re
+    try:
+        result = subprocess.run([which_path, *version_args], capture_output=True, text=True, timeout=10)
+        raw = (result.stdout or result.stderr).strip()
+        match = re.search(r"\d+\.\d+\.\d+", raw)
+        return match.group(0) if match else (raw.splitlines()[0] if raw else "unknown version")
+    except Exception:
+        return "unknown version"
+
+
+def detect_tool_versions() -> dict[str, str]:
+    """Best-effort version string per tool for the doc header's Captured line.
+
+    Mirrors detect_tool()'s "skip and label, never fabricate" pattern — a tool not on PATH
+    reports "not installed" rather than an empty/guessed string. `av`'s own version comes
+    from its installed package metadata (it has no `--version` CLI flag), not a subprocess.
+    """
+    tools = detect_tools()
+    versions = {"av": "not installed"}
+    if tools["av"].status == ToolStatus.AVAILABLE:
+        try:
+            from av_cli import __version__ as av_version
+            versions["av"] = av_version
+        except ImportError:
+            versions["av"] = "unknown version"
+    version_args = {
+        "git-lfs": ["version"],
+        "dvc": ["--version"],
+        "mlflow": ["--version"],
+    }
+    for name in ("git-lfs", "dvc", "mlflow"):
+        versions[name] = _tool_version(tools[name].path, version_args[name])
+    return versions
+
+
+def _git_short_sha(repo_root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=repo_root, capture_output=True, text=True, timeout=10
+        )
+        sha = result.stdout.strip()
+        return sha if sha else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def render_doc_header(repo_root: Path, tool_versions: dict[str, str] | None = None) -> str:
+    """Generates the whole BENCHMARKS.md preamble (title, intro, Captured line, Caveat,
+    Legend) so `--markdown` can write a complete, ready-to-commit file in one shot instead
+    of bare tables that need the surrounding prose manually re-spliced in after every run —
+    the gap that let the committed numbers drift stale from the code they're supposed to
+    measure (see development/Probleme.md for the incident this fixed).
+    """
+    tool_versions = tool_versions if tool_versions is not None else detect_tool_versions()
+    today = datetime.date.today().isoformat()
+    sha = _git_short_sha(repo_root)
+    versions = ", ".join(f"{name} {ver}" for name, ver in tool_versions.items() if name != "av")
+    return f"""# Aether-Vault Benchmarks
+
+Reproducible cross-tool comparison against **Git LFS**, **DVC**, and **MLflow** — generated by
+`av benchmark --markdown development/BENCHMARKS.md` (see [`benchmarks/README.md`](../benchmarks/README.md)
+for how to re-run it yourself). These are real, measured numbers from real subprocess/HTTP
+calls to each tool — never fabricated. A tool that genuinely can't run a given benchmark
+(not installed, or the benchmark's primitive doesn't map onto it) is shown as such, not
+guessed at.
+
+**Captured:** {today}, on {platform.system()}. Aether-Vault @ `{sha}`, {versions}, Python {platform.python_version()}.
+
+**Caveat:** these are single-run, single-machine timings — disk/antivirus/OS-scheduler noise
+is real. Re-run before relying on any single number for a decision. Use `av benchmark --baseline`
+to track regressions across captures rather than eyeballing two snapshots of this file by hand.
+
+## Legend
+
+- **GOOD** — Aether is at least 1.5x better than the best real competitor number.
+- **OK** — within 1.5x either way, or no competitor produced a real number to compare against.
+- **BAD** — Aether is more than 1.5x worse than the best real competitor number.
+- **N/A** — the benchmark's primitive doesn't apply to that tool at all (footnoted why).
+- **not installed** — the tool wasn't found on `PATH` in the capturing environment.
+
+"""
+
+
+def results_to_json(results: list[BenchmarkResult]) -> dict:
+    """{benchmark_name: {operation: av_value_or_None}} — a flat snapshot for --save-json,
+    consumed later by compare_to_baseline() in a future run."""
+    return {
+        result.name: {row.operation: row.values.get("av") for row in result.rows}
+        for result in results
+    }
+
+
+def compare_to_baseline(results: list[BenchmarkResult], baseline: dict) -> list[dict]:
+    """Compares this run's `av` values against a prior results_to_json() snapshot.
+
+    Only flags a regression where BOTH this run and the baseline have a real `av` number —
+    a row that's None in either (server unreachable, tool not installed) is skipped rather
+    than treated as a regression, since that's a missing-data case, not a timing signal.
+    Uses the same VERDICT_THRESHOLD already used for GOOD/OK/BAD so "regression" means the
+    same thing here as it does in the normal competitor-comparison verdicts.
+    """
+    findings = []
+    for result in results:
+        baseline_ops = baseline.get(result.name, {})
+        for row in result.rows:
+            current = row.values.get("av")
+            prior = baseline_ops.get(row.operation)
+            if current is None or prior is None or prior <= 0:
+                continue
+            ratio = current / prior
+            findings.append({
+                "benchmark": result.name,
+                "operation": row.operation,
+                "baseline": prior,
+                "current": current,
+                "ratio": ratio,
+                "regressed": ratio > VERDICT_THRESHOLD,
+            })
+    return findings
+
+
+def print_regression_report(findings: list[dict], echo=print) -> bool:
+    """Prints a table of any row that regressed past VERDICT_THRESHOLD vs. the baseline.
+    Returns True if any regression was found (caller uses this to set the exit code)."""
+    regressed = [f for f in findings if f["regressed"]]
+    if not findings:
+        echo("\nNo comparable rows between this run and the baseline (nothing to report).")
+        return False
+    if not regressed:
+        echo(f"\nNo regressions vs baseline ({len(findings)} row(s) compared).")
+        return False
+    echo(f"\n=== Regressions vs baseline ({len(regressed)} of {len(findings)} row(s)) ===")
+    for f in regressed:
+        echo(
+            f"  [REGRESSED] {f['benchmark']} / {f['operation']}: "
+            f"{f['baseline']:,.1f} -> {f['current']:,.1f} ({f['ratio']:.2f}x slower)"
+        )
+    return True

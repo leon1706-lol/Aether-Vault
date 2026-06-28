@@ -2090,17 +2090,22 @@ BENCHMARK_NAMES = [
     "partial_checkpoint_fetch",
     "storage_footprint_curve",
     "concurrent_push",
+    "gc_throughput",
 ]
 
 
 @cli.command()
 @click.option("--only", "only", multiple=True,
-              help=f"Only run these benchmarks by name (repeatable). Default: run all 8. Names: {', '.join(BENCHMARK_NAMES)}.")
+              help=f"Only run these benchmarks by name (repeatable). Default: run all {len(BENCHMARK_NAMES)}. Names: {', '.join(BENCHMARK_NAMES)}.")
 @click.option("--vs", "vs_tools", multiple=True, default=("git-lfs", "dvc", "mlflow"),
               help="Competitor tools to include (repeatable). Default: all three. Aether-Vault itself always runs.")
 @click.option("--markdown", "markdown_out", type=click.Path(), default=None,
-              help="Also write a Markdown table for every benchmark run to this path (for regenerating BENCHMARKS.md).")
-def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None) -> None:
+              help="Write a complete, ready-to-commit Markdown report (header/legend/methodology notes + every benchmark's table) to this path — for regenerating BENCHMARKS.md.")
+@click.option("--save-json", "save_json_out", type=click.Path(), default=None,
+              help="Save this run's av-only numbers as a JSON snapshot, for a future --baseline comparison.")
+@click.option("--baseline", "baseline_path", type=click.Path(exists=True), default=None,
+              help="Compare this run's av numbers against a prior --save-json snapshot and report any row that regressed past the 1.5x verdict threshold. Exits non-zero if any regression is found.")
+def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_out: str | None, baseline_path: str | None) -> None:
     """(Development only) Run cross-tool benchmark comparisons against DVC, Git LFS, and MLflow.
 
     Requires an editable/dev install (`pip install -e .[dev,benchmarks]`) — see benchmarks/README.md
@@ -2124,7 +2129,15 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None) -> None:
 
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
-    from benchmarks.tool_runner import print_table, result_to_markdown
+    from benchmarks.tool_runner import (
+        compare_to_baseline,
+        print_regression_report,
+        print_table,
+        render_doc_header,
+        result_to_markdown,
+        results_to_json,
+        METHODOLOGY_NOTES,
+    )
 
     valid_competitors = {"git-lfs", "dvc", "mlflow"}
     invalid_tools = [t for t in vs_tools if t not in valid_competitors]
@@ -2133,16 +2146,30 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None) -> None:
         sys.exit(1)
     tool_order = ["av", *[t for t in vs_tools]]
 
+    results = []
     markdown_chunks = []
     for name in names:
         module = importlib.import_module(f"benchmarks.bench_{name}")
         result = module.run(tool_order=tool_order)
         print_table(result)
+        results.append(result)
         markdown_chunks.append(result_to_markdown(result))
 
     if markdown_out:
-        Path(markdown_out).write_text("\n".join(markdown_chunks), encoding="utf-8")
+        doc = render_doc_header(source_root) + METHODOLOGY_NOTES + "\n".join(markdown_chunks)
+        Path(markdown_out).write_text(doc, encoding="utf-8")
         click.echo(f"\nWrote {markdown_out}")
+
+    if save_json_out:
+        Path(save_json_out).write_text(json.dumps(results_to_json(results), indent=2), encoding="utf-8")
+        click.echo(f"Saved benchmark snapshot to {save_json_out}")
+
+    if baseline_path:
+        baseline = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
+        findings = compare_to_baseline(results, baseline)
+        regressed = print_regression_report(findings)
+        if regressed:
+            sys.exit(1)
 
 
 @cli.command()

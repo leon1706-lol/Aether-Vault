@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-178%2F178%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="178 of 178 tests passing">
+  <img src="https://img.shields.io/badge/tests-249%2F249%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="249 of 249 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -48,35 +48,40 @@ Aether-Vault bridges Python and C++ for maximum throughput:
 
 ### System Diagram
 
+Split into two focused diagrams rather than one large one — what happens on your machine, and how it talks to the network — so each stays compact and its labels stay legible instead of crowding together.
+
+#### Local CLI Architecture
+
 ```mermaid
 graph TD
-    %% Local Environment
-    subgraph Local [User Machine / Training Node]
-        Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-        CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file ·<br>unstage · stash · import-lightning · import-mlflow · import-transformers)")
-        CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
-        LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
-        PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
-        WebUI("Web UI<br>(Dashboard · Commits · Branches · Metrics · Storage ·<br>Weight Diff · Projects Tabs · localhost:3000)")
-        Vault("Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
-        Benchmarks("development/BENCHMARKS.md<br>(av benchmark vs Git LFS · DVC · MLflow)")
-        Session("Interactive Session<br>(av init / bare av → av status, av commit, ... · exit/quit)")
+    Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
+    CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file ·<br>unstage · stash · import-lightning · import-mlflow · import-transformers)")
+    CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
+    LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
+    PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
+    WebUI("Web UI<br>(Dashboard · Commits · Branches · Metrics · Storage ·<br>Weight Diff · Projects Tabs · localhost:3000)")
+    Vault("Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
+    Benchmarks("development/BENCHMARKS.md<br>(av benchmark vs Git LFS · DVC · MLflow)")
+    Session("Interactive Session<br>(av init / bare av → av status, av commit, ... · exit/quit)")
 
-        Plugins -- "Drives in-process (add/commit/push)" --> CLI
-        CLI -- "1. Reads & Hashes Files" --> CPP
-        CLI -- "2. Updates Staging & Pointers" --> LocalDAG
-        CLI -- "3. Reconstructs Files on Checkout" --> LocalDAG
-        CLI -- "4. Queues Commit if Server Unreachable" --> PendingQ
-        CLI -- "5. Starts Container & Opens Browser" --> WebUI
-        CLI -- "6. Generates Code Graph / Handoff Snapshot" --> Vault
-        CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> LocalDAG
-        CLI -- "7. Diagnoses & Repairs .av/ State (av doctor --fix)" --> PendingQ
-        CLI -- "8. Benchmarks Against Competitor Tools" --> Benchmarks
-        CLI -- "9. Opens Local/Enterprise Session After Init/Reconnect" --> Session
-        CLI -- "10. Shelves/Restores Uncommitted Changes (av stash)" --> LocalDAG
-    end
+    Plugins -- "Drives in-process (add/commit/push)" --> CLI
+    CLI -- "1. Reads & Hashes Files" --> CPP
+    CLI -- "2,3,7,10. Stages/Reconstructs Files,<br>Repairs State (doctor --fix), Shelves Changes (stash)" --> LocalDAG
+    CLI -- "4,7. Queues Commit if Unreachable,<br>Repairs Pending State (doctor --fix)" --> PendingQ
+    CLI -- "5. Starts Container & Opens Browser" --> WebUI
+    CLI -- "6. Generates Code Graph / Handoff Snapshot" --> Vault
+    CLI -- "8. Benchmarks Against Competitor Tools" --> Benchmarks
+    CLI -- "9. Opens Local/Enterprise Session After Init/Reconnect" --> Session
+```
 
-    %% Remote Environment
+#### Sync, Remote Registry & Release Pipeline
+
+```mermaid
+graph TD
+    CLI("av_cli")
+    PendingQ("pending_push queue")
+    WebUI("Web UI<br>(localhost:3000)")
+
     subgraph Remote [Dockerized Remote Registry]
         FastAPI("FastAPI Server<br>(Upload/Download · Commit & Ref Sync ·<br>Dashboard API · Admin GC)")
         Redis("RedisBloom Cache<br>(O(1) Existence Checks)")
@@ -85,25 +90,24 @@ graph TD
 
         FastAPI -- "Checks if Object Exists" --> Redis
         FastAPI -- "Writes Trees & Commits" --> DB
-        FastAPI -- "Streams Large Chunks" --> Storage
-        FastAPI -- "Mark-and-Sweep Sweep" --> Storage
-        WebUI -- "Fetches Commits, Refs, Metrics & Per-Layer Hashes" --> FastAPI
+        FastAPI -- "Streams Large Chunks,<br>Mark-and-Sweep Sweep" --> Storage
     end
 
     CLI -- "Push: Uploads Objects, Trees & Refs" --> FastAPI
     CLI -- "Checkout: Downloads Missing Objects" --> FastAPI
-    PendingQ -- "Retried by av push" --> FastAPI
     CLI -- "gc: Triggers Remote Garbage Collection" --> FastAPI
+    PendingQ -- "Retried by av push" --> FastAPI
+    WebUI -- "Fetches Commits, Refs, Metrics & Per-Layer Hashes" --> FastAPI
 
     PyPI("PyPI<br>(pip install aether-vault · release.yml on git tag push)")
-    CLI -- "update: Checks Latest Version (av init / av update)" --> PyPI
-
     GHCR("GHCR<br>(aether-vault-server/-webui images ·<br>:latest on tag push · :edge on every push to main)")
+    CLI -- "update: Checks Latest Version (av init / av update)" --> PyPI
     CLI -- "update --docker: Pulls Latest Image & Restarts Local Backend" --> GHCR
 ```
 
-> The "Local" box represents **any number** of independent `av init` repos on the same (or
-> different) machines — they all default to sharing the one Dockerized registry shown here.
+> The "Local CLI Architecture" diagram represents **any number** of independent `av init` repos
+> on the same (or different) machines — they all default to sharing the one Dockerized
+> registry shown in the second diagram.
 > Each repo gets its own `project_id` (see [Phase 14](development/CHANGELOG.md#phase-14--per-project-registry-separation--real-world-fixes)),
 > so the registry's commits/branches stay attributable per project even though the object store
 > is intentionally deduplicated across all of them. Use `av config --remote-url` to point a repo
@@ -416,10 +420,13 @@ npx playwright test                                 # runs against http://localh
 ### `av benchmark`
 **Development only.** Runs the cross-tool benchmark suite against **Git LFS**, **DVC**, and **MLflow** — see [`development/BENCHMARKS.md`](development/BENCHMARKS.md) for the latest captured numbers and [`benchmarks/README.md`](benchmarks/README.md) for the full flag reference. Requires `pip install -e .[dev,benchmarks]` to install DVC/MLflow as comparison targets (Git LFS is assumed already on `PATH`).
 ```bash
-av benchmark                                          # run all 8 benchmarks, console output
+av benchmark                                          # run all 9 benchmarks, console output
 av benchmark --only hashing_throughput                # scope to one benchmark (repeatable)
 av benchmark --vs git-lfs --vs dvc                    # scope competitor columns (repeatable)
-av benchmark --markdown development/BENCHMARKS.md     # regenerate the Markdown report
+av benchmark --markdown development/BENCHMARKS.md     # regenerate the full Markdown report
+av benchmark --baseline prior.json --save-json new.json   # regression-track av's own numbers
+                                                            # across captures, independent of
+                                                            # the competitor comparison below
 ```
 Every result is a real measured number from a real subprocess/HTTP call — a tool that isn't on `PATH`, or whose primitive doesn't apply to a given benchmark, is shown as `not installed`/`N/A` with a footnote, never guessed at.
 
@@ -484,30 +491,21 @@ More development-process documents will live under [`development/`](development/
 
 ## Benchmark Comparison
 
-`av benchmark` runs 8 reproducible benchmarks against **Git LFS**, **DVC**, and **MLflow**. Every number is measured from a real subprocess or HTTP call on the same fixture each tool actually has to process — nothing here is estimated or fabricated, and a tool that cannot run a given benchmark (not installed, or the operation does not apply to it) is reported as such rather than given a guessed value.
+`av benchmark` runs 9 reproducible benchmarks against **Git LFS**, **DVC**, and **MLflow**. Every number is measured from a real subprocess or HTTP call on the same fixture each tool actually has to process — nothing here is estimated or fabricated, and a tool that cannot run a given benchmark (not installed, or the operation does not apply to it) is reported as such rather than given a guessed value.
 
-**At a glance:** Aether wins outright on 5 of 8 benchmarks, has two honestly-labeled losses (no-op `status`/`add`; `commit` latency, by design — both explained below, not hidden), and one N/A (no `clone`/`pull` command yet). The table below summarizes each benchmark as a percentage/multiplier vs. the best competitor wherever that comparison is fair; the linked report at the bottom has the full methodology, every raw number, and the caveats that go with single-machine timings.
+**At a glance:** Aether wins decisively on raw hashing throughput and storage dedup (#1/#2/#7), trades blows on commit+push latency (#3 — push is faster, commit is slower by design: av uploads synchronously during `commit`, DVC defers all upload to a separate `push`), has one open weak spot (#4, no-op `status`/`add`), one capability gap (#5, no `clone`/`pull` yet), a unique capability no competitor can match at all (#6, partial-layer fetch), and two Aether-only server operations with no comparable competitor primitive (#8, #9). The table below summarizes each benchmark vs. the best competitor wherever that comparison is fair — see [`development/BENCHMARKS.md`](development/BENCHMARKS.md) for the full methodology, every raw number, and the caveats that go with single-machine timings.
 
 | # | Benchmark | vs. best competitor | Notes |
 |---|---|---|---|
-| 1 | Hashing Throughput at Scale | ~2–4x faster than Git LFS, up to 13x faster than DVC | fastest at every size tested (10–200MB) |
+| 1 | Hashing Throughput at Scale | ~2–3x faster than Git LFS, up to 17x faster than DVC | fastest at every size tested (10–200MB) |
 | 2 | Safetensors Layer-Dedup | **63% smaller** | 47MB vs. 126MB after 6 fine-tune commits |
-| 3 | Commit + Push Latency | init ~80% faster · push ~50% faster · commit ~10x slower *(by design, vs. DVC)* | av uploads objects synchronously during `commit`; DVC defers all upload to a separate `push` |
-| 4 | No-Op `status`/`add` | ~6.7x slower than Git LFS | open finding, not a hidden one — interpreter/import startup cost, not yet fixed |
+| 3 | Commit + Push Latency | push ~70% faster · commit ~6x slower *(by design, vs. DVC)* | see note above — different upload timing, not a raw speed gap |
+| 4 | No-Op `status`/`add` | ~15x slower than Git LFS | open finding, not a hidden one — interpreter/import startup cost, not yet fixed |
 | 5 | Cold Clone / First Pull | N/A | `av` has no `clone`/`pull` command yet (tracked on the roadmap) |
 | 6 | Partial-Checkpoint Fetch | unique capability | only one of the four tools that can fetch a single layer instead of the whole file |
 | 7 | Storage Footprint Curve | **63% smaller**, gap widens every commit | same dedup advantage as #2, sustained over time |
 | 8 | Concurrent Push Throughput | Aether-only | no competitor has a comparable concurrent-server primitive |
-
-`av add` + `av commit` quick sample (benchmark #3's first three steps, vs. equivalent Git LFS and DVC operations, on a 60-file mixed code/model fixture):
-
-| Operation | Aether-Vault | Git LFS | DVC | vs. Git LFS | vs. DVC |
-|---|---:|---:|---:|---:|---:|
-| init | 858.8 ms | 5167.6 ms | 4412.8 ms | 83% faster | 81% faster |
-| add (60 files) | 2683.6 ms | 1730.9 ms | 6871.7 ms | 55% slower | 61% faster |
-| commit | 2531.7 ms | 1276.1 ms | 256.9 ms | ~2x slower | ~10x slower* |
-
-\* by design — see row 3 above; DVC's `commit` never touches the network, av's intentionally does.
+| 9 | Garbage Collection Throughput | Aether-only | no competitor has a comparable server-side GC primitive |
 
 For the full results, the methodology behind each benchmark, and the rating legend, see [`development/BENCHMARKS.md`](development/BENCHMARKS.md).
 

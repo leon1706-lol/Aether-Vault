@@ -7,12 +7,11 @@ calls to each tool — never fabricated. A tool that genuinely can't run a given
 (not installed, or the benchmark's primitive doesn't map onto it) is shown as such, not
 guessed at.
 
-**Captured:** 2026-06-27, on Windows. Aether-Vault @ `b82e998`, git-lfs 3.7.1, dvc 3.67.1,
-mlflow 3.14.0, Python 3.14.0.
+**Captured:** 2026-06-28, on Windows. Aether-Vault @ `432b89c`, git-lfs 3.7.1, dvc 3.67.1, mlflow unknown version, Python 3.14.0.
 
 **Caveat:** these are single-run, single-machine timings — disk/antivirus/OS-scheduler noise
-is real (see the 200MB hashing row and the commit-latency row below, where that noise shows
-up as a non-monotonic result). Re-run before relying on any single number for a decision.
+is real. Re-run before relying on any single number for a decision. Use `av benchmark --baseline`
+to track regressions across captures rather than eyeballing two snapshots of this file by hand.
 
 ## Legend
 
@@ -34,6 +33,9 @@ up as a non-monotonic result). Re-run before relying on any single number for a 
   server contention), and MLflow's tracking server maps onto a different workflow entirely.
   Rather than approximate three non-equivalent setups, v1 scopes this to an Aether-only load
   test; the other three columns are N/A.
+- **GC throughput, competitor columns:** same reasoning as concurrent push — `av gc` is a
+  remote-CAS-server operation with no equivalent in Git LFS/DVC/MLflow's storage models, so
+  all three competitor columns are N/A rather than approximated.
 - **Cold clone, `av` column:** a real product gap found while building this benchmark, not a
   benchmark artifact — `av` has no `clone`/`pull` command at all today. Sync is currently
   push-only from a single working repo; there's no flow for a second machine to materialize a
@@ -50,10 +52,10 @@ SHA-256 (or each tool's equivalent content hash) over a single file at increasin
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| hash 10MB file | 296.7 ms | 1,159.0 ms | 3,980.2 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 50MB file | 946.9 ms | 2,012.7 ms | 5,889.7 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 100MB file | 1,659.9 ms | 3,310.1 ms | 7,639.1 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 200MB file | 4,144.4 ms | 9,429.3 ms | 7,739.9 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 10MB file | 335.9 ms | 1,141.8 ms | 5,730.2 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 50MB file | 845.5 ms | 2,629.4 ms | 11,838.8 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 100MB file | 1,722.3 ms | 3,857.2 ms | 7,087.5 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 200MB file | 3,222.6 ms | 6,283.3 ms | 13,232.8 ms | N/A (no exposed file-hashing primitive) | GOOD |
 
 ## Safetensors Layer-Dedup Storage Savings
 
@@ -69,10 +71,10 @@ init/add/commit/push on the same 60-file mixed fixture, across all four tools.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| init | 858.8 ms | 5,167.6 ms | 4,412.8 ms | 4,661.6 ms | GOOD |
-| add (60 files) | 2,683.6 ms | 1,730.9 ms | 6,871.7 ms | 0.0 ms | OK |
-| commit | 2,531.7 ms | 1,276.1 ms | 256.9 ms | 333.3 ms | BAD |
-| push | 1,742.5 ms | 3,907.4 ms | 3,444.0 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | GOOD |
+| init | 4,842.2 ms | 4,839.8 ms | 3,737.6 ms | 4,691.0 ms | OK |
+| add (60 files) | 2,300.4 ms | 1,811.4 ms | 6,817.4 ms | 0.0 ms | OK |
+| commit | 1,813.6 ms | 1,207.4 ms | 314.3 ms | 254.7 ms | BAD |
+| push | 1,078.4 ms | 3,571.3 ms | 3,665.7 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | GOOD |
 
 ## No-Op status/add Speed at Scale
 
@@ -80,7 +82,7 @@ Re-running the staging step a second time with nothing changed.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| re-add unchanged (60 files) | 552.5 ms | 82.9 ms | 7,527.4 ms | N/A (no incremental staging/status primitive) | BAD |
+| re-add unchanged (60 files) | 975.9 ms | 66.2 ms | 5,104.3 ms | N/A (no incremental staging/status primitive) | BAD |
 
 ## Cold Clone / First Pull Time
 
@@ -88,7 +90,7 @@ Fresh, empty-directory checkout of a project someone else already pushed.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| clone + pull (fresh checkout) | N/A (no clone/pull command exists yet — push-only sync today) | 4,253.0 ms | 5,560.4 ms | N/A (no project-level clone/pull concept) | OK |
+| clone + pull (fresh checkout) | N/A (no clone/pull command exists yet — push-only sync today) | 3,211.0 ms | 4,767.3 ms | N/A (no project-level clone/pull concept) | OK |
 
 ## Partial-Checkpoint Fetch (Layer-Level Pull)
 
@@ -96,12 +98,8 @@ Fetching one 5MB layer of a 20MB checkpoint vs the whole thing, from a real remo
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| fetch single layer | 88.8 ms | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | OK |
-| fetch whole checkpoint | 821.5 ms | 1,403.0 ms | 3,877.2 ms | 131.2 ms | BAD |
-
-Note: the BAD verdict here is driven entirely by MLflow's number being a local filesystem
-read rather than a real network fetch (see methodology note above), and the absolute av
-number moves run-to-run with local Docker/network conditions.
+| fetch single layer | 92.9 ms | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | OK |
+| fetch whole checkpoint | 401.3 ms | 1,474.6 ms | 5,220.0 ms | 553.2 ms | OK |
 
 ## Storage Footprint Over N Versions
 
@@ -122,11 +120,12 @@ Cumulative on-disk storage after each of 6 fine-tune commits (same scenario as t
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| 8 concurrent pushes | 2,689.5 ms | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | OK |
+| 8 concurrent pushes | 618.4 ms | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | OK |
 
-Note: this run's absolute number is noticeably higher than the prior capture (877.9 ms) —
-this benchmark ran 8th in sequence in a freshly-built Docker container during this capture,
-competing for the same container's resources as the other server-backed benchmarks that ran
-immediately before it; re-capture in isolation (`av benchmark --only concurrent_push`) before
-treating either number as canonical. Still OK regardless, since there's no real competitor
-baseline to compare against.
+## Garbage Collection Throughput
+
+Time to run `av gc` on the remote CAS server after committing and pushing 20 small objects from a real fixture. Aether-only — see methodology note for why the other three are N/A.
+
+| Operation | av | git-lfs | dvc | mlflow | Verdict |
+|---|---:|---:|---:|---:|---|
+| gc after 20 objects | 1,487.3 ms | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | OK |

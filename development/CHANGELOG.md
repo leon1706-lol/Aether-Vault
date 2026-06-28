@@ -663,4 +663,90 @@ findings (resolved and still-open).
   this repo's actual suite — confirmed colored output still streamed live, and the badge was
   rewritten to the real result (178/178 passing) with the correct URL-encoding and alt text.
 
+## Phase 32 — Benchmark Regression Tracking, `gc_throughput` Benchmark, Six New Test Files
+
+- **Motivation:** a read-only benchmark/test audit (Docker down at the time) found
+  `development/BENCHMARKS.md`'s captured numbers were stale — dated at the very commit that
+  *introduced* the benchmark suite, predating a later "Benchmark optimisations" commit entirely.
+  Re-running with Docker up confirmed several rows had drifted (`no-op status/add` got
+  meaningfully worse, `commit`'s init step lost its clear edge). Asked to fix the staleness at
+  the root, add the regression-tracking mode the audit recommended, and fill every test gap
+  the audit found.
+- **`av benchmark --markdown` now writes a complete, ready-to-commit file in one shot**: previously
+  it wrote bare per-benchmark tables only (`Path(markdown_out).write_text("\n".join(chunks))`),
+  silently dropping the header/Captured-line/Legend/Methodology-notes preamble that had to be
+  manually re-spliced in after every run — the actual root cause of the staleness. New
+  `benchmarks/tool_runner.render_doc_header()` generates that preamble fresh each run (today's
+  date, platform, git short-SHA, and each tool's real `--version` output — `av`'s own version
+  comes from its installed package metadata, since it has no `--version` flag), and a new
+  `METHODOLOGY_NOTES` constant (the narrative explanations, hand-edited when methodology
+  genuinely changes but now always included automatically) is appended alongside it.
+- **`av benchmark --save-json`/`--baseline`: regression tracking independent of the
+  competitor-comparison verdicts.** The existing GOOD/OK/BAD verdicts answer "is Aether faster
+  than DVC" — nothing answered "did Aether get slower since last time," which is exactly the
+  staleness this phase started from. New `results_to_json()`/`compare_to_baseline()`/
+  `print_regression_report()` in `tool_runner.py`: `--save-json` snapshots this run's `av`-only
+  numbers; a later `--baseline <snapshot>` run diffs against it using the same 1.5x
+  `VERDICT_THRESHOLD` already used for verdicts, and the command exits non-zero if anything
+  regressed past it. Manually verified against the real GC benchmark with both a deliberately
+  regressed fake baseline (correctly exited 1) and a genuine prior capture (correctly flagged a
+  real 1.55x single-run timing blip, confirming the math holds on live, noisy data too).
+- **New 9th benchmark, `gc_throughput`** (`benchmarks/bench_gc_throughput.py`): times `av gc`
+  against a real `av_server` after committing+pushing 20 small objects from a real fixture,
+  using the real CLI via subprocess (never the server's internal GC function directly).
+  Aether-only — no competitor has a comparable server-side GC primitive — following the same
+  N/A-with-footnote pattern already established by `bench_concurrent_push.py`.
+- **`benchmarks/README.md`**: documents the new flags/benchmark, and adds a "Future work" note
+  for a `doctor --speed`-shaped repo-size benchmark idea as a *documented manual exercise*
+  rather than a 10th automated benchmark — it doesn't fit the cross-tool comparison framing
+  this suite is built around (no competitor has an equivalent "diagnose my own repo" command).
+- **README**: refreshed the Benchmark Comparison section's numbers from a real, Docker-backed
+  capture (the stale numbers came from a `b82e998` capture where several server-backed rows
+  couldn't even run for real), cut the redundant raw-number "quick sample" table that duplicated
+  `BENCHMARKS.md` and needed re-syncing by hand forever, and updated `av benchmark`'s CLI
+  reference for the new flags and the 8→9 benchmark count.
+- **Large-file (GB-scale) hashing was explicitly NOT added**, despite being suggested in the
+  original audit — `benchmarks/fixtures.py` already has a deliberate prior decision against it
+  ("not literal GB, to stay practical to generate/run in a dev sandbox"); confirmed with the
+  user to leave that alone rather than override it.
+- **Six new test files filling every gap the audit found with zero direct coverage**:
+  `tests/test_fsutil.py` (atomic-write round-trip, full-overwrite, parent-dir creation, and a
+  simulated-crash-mid-write case via a monkeypatched `os.replace`), `tests/test_speedcheck.py`
+  (`run_synthetic_probes`/`_budget_for`/`storage_stats` directly, not just through the `av test
+  --speed` CLI wrapper), `tests/test_ui.py` (`print_banner`/`print_step`/`select_login_mode`/
+  `is_interactive` — complements the existing dependency-*absence* guard tests, which never
+  exercised what these functions render when the deps ARE present), `tests/test_graph.py`
+  (`CodeVisitor`/`resolve_targets`/`sanitize_name`/`is_ignored` against small in-memory ASTs,
+  independent of the existing end-to-end `av graph --update` test), `tests/test_tool_runner.py`
+  (`rate()`'s 1.5x threshold math at every boundary, `format_value`, the new regression-tracking
+  functions), and `webui/src/components/__tests__/{TopBar,WeightDiffPanel}.test.tsx` (the
+  former locks in Phase 30's topbar-title bug fix; the latter drives two real checkpoint-row
+  clicks through `CheckpointPicker` and asserts the per-layer diff stats/heatmap/drift chart all
+  render from mocked `fetchCommits`/`fetchCommit` data).
+- **Two real test-fragility bugs found via manual debugging (not unit tests) and fixed**:
+  1. `tests/test_cli.py::test_doctor_fix_cannot_recover_truly_missing_object` silently depended
+     on no `av_server` being reachable on `localhost:8000` in the test environment — true by
+     coincidence until this session's Docker stack was left running for the benchmark work,
+     at which point the object became genuinely recoverable and the test's `[WARN]`/"could not
+     recover" assertions broke. Fixed by explicitly monkeypatching
+     `VaultClient.server_available` to `False`, matching the existing pattern already used by
+     the adjacent `test_doctor_fix_downloads_missing_object_from_server` test (which forces
+     `True`) — neither test should depend on environmental chance either way.
+  2. A new `test_benchmark_command_markdown_writes_file` case initially used
+     `monkeypatch.setattr("benchmarks.tool_runner.render_doc_header", ...)` (the string-target
+     form) in the same test as `monkeypatch.setattr(main_module.importlib, "import_module", ...)`
+     — pytest's own string-target resolution calls the real `importlib.import_module`
+     internally, so the test's own `import_module` patch leaked into pytest's machinery and
+     broke the second patch with an `AttributeError` ("`_FakeBenchModule` object has no
+     attribute `tool_runner`"). Fixed by importing the real module object first
+     (`import benchmarks.tool_runner as tool_runner_module`, a plain `import` statement, which
+     doesn't route through `importlib.import_module` and so isn't affected by the patch) and
+     patching that object directly instead of using the string-target form.
+- **Manually verified**: ran the real `av benchmark --markdown development/BENCHMARKS.md
+  --save-json <snapshot>` against the live Docker stack (db/redis/server/webui all healthy) —
+  produced a complete, correctly-formatted file in one shot; drove the real webui in a headless
+  browser against the resulting live data (Dashboard, Weight Diff, Storage tabs) and confirmed
+  the per-tab topbar title and neon-orange theme render correctly with real commits/branches.
+  Full suite: 249 passed, 3 skipped (Python); 73 passed (webui).
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
