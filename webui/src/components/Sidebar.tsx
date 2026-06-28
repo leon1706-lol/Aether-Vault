@@ -1,5 +1,7 @@
 "use client";
 
+import Image from "next/image";
+
 type NavItem = {
   id: string;
   label: string;
@@ -94,7 +96,7 @@ export function Sidebar({ active, onSelect }: Props) {
   return (
     <aside className="sidebar">
       <div className="sidebar-logo">
-        <h1>🌌 Aether-Vault</h1>
+        <Image src="/logo.png" alt="Aether-Vault" width={140} height={91} priority />
         <p>ML Registry Dashboard</p>
       </div>
 

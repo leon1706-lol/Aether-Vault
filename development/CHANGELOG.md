@@ -566,4 +566,101 @@ findings (resolved and still-open).
   `av`-prefixed, and outside it with the `av` prefix required — per the existing,
   un-special-cased dispatch mechanism in `repl.py`.
 
+## Phase 30 — WebUI Logo, Neon-Orange Theme, Four Dedicated Sidebar Panels
+
+- **Real logo in the sidebar**: `Sidebar.tsx`'s top-left brand mark was emoji+text
+  (`🌌 Aether-Vault`) — replaced with the actual `development/logo.png` monogram via `next/image`
+  (`webui/public/logo.png`, 140×91 rendered), with the "ML Registry Dashboard" subtitle kept
+  underneath. Same image also added as `webui/src/app/icon.png` so the browser tab favicon
+  matches (Next.js App Router auto-serves a literal `app/icon.png`, zero config).
+- **Theme: single neon-orange brand accent, replacing black+blue/purple**: `globals.css`'s
+  `--accent-blue`/`--accent-purple` (and every selector deriving from them — nav active state,
+  commit dots/hashes, spinner, tag pills, branch icons/tips, project badge, checkpoint labels,
+  `--grad-brand`, `--border-accent`, `--shadow-glow`) collapsed into two shades of one hue:
+  `--accent-orange` (#ff7a1a) and `--accent-orange-soft` (#ffb380). `--accent-amber` shifted from
+  #f6ad55 to #ffd166 (more toward yellow) so it stays visually distinct from the new orange rather
+  than colliding — the two were only 6° apart in hue before the shift, 18° after. Hardcoded hex in
+  `MetricsChart.tsx`, `CommitGraph.tsx`, `LayerDriftChart.tsx`, and `BranchList.tsx`'s inline
+  styles were swept too, not just the CSS variables. The `accent-blue`/`accent-purple` *class*
+  names themselves (passed as literal strings from `StatsRow.tsx` and `WeightDiffPanel.tsx`) were
+  renamed to `accent-orange`/`accent-orange-soft` rather than left as a permanently misleading
+  "a class named blue renders orange" naming mismatch.
+- **Four sidebar tabs that used to alias the Dashboard now have real, distinct panels**: before
+  this phase, `page.tsx`'s `active` state only special-cased `weight-diff` and `projects` —
+  `commits`, `branches`, `metrics`, and `storage` all fell into the same catch-all `else`,
+  rendering the identical Dashboard teaser view. Each now has its own component:
+  - **`CommitsPanel.tsx`** — offset-aware pagination over `GET /api/commits` (new
+    `fetchCommitsPage()` in `lib/api.ts`, since the existing `fetchCommits()` only fetched a fixed
+    window for the dashboard hook), client-side search/filter over the loaded page, a branch
+    filter via a new shared reachability-walk helper (`lib/branchGraph.ts`), and click-to-expand
+    rows that lazily fetch full tree detail (cached per-hash) to show an added/removed/changed
+    file diff against the parent commit.
+  - **`BranchesPanel.tsx`** — full tip detail, a "commits ahead of main" count via the same
+    reachability walk (labeled "(of loaded history)" when the walk runs off the edge of the
+    loaded window rather than presenting it as exact), branch-row expand to see its commits, and
+    a working "branch from here" create action (new `createRef()` in `lib/api.ts`, since
+    `PUT /api/refs/{name}` already upserts). Branch *delete* has no backend route at all — not
+    added, with an explicit note in the UI that it isn't available yet rather than silently
+    omitting it.
+  - **`MetricsPanel.tsx`** — full-size metrics chart with per-metric show/hide toggles, a metrics
+    table (commit × metric, fully derived from already-loaded data), and a single-branch
+    comparison dropdown.
+  - **`StoragePanel.tsx`** — store-wide CAS stats reused from `data.stats`, plus a file-type
+    breakdown, largest-tracked-files list, and an approximate dedup ratio — all derived from only
+    the **latest commit's** hydrated tree (not summed across commits, to avoid double-counting
+    deduped content), and explicitly labeled as a latest-snapshot view, not a CAS-store-wide one.
+    A true store-wide file-type breakdown, growth-over-time, and a store-wide largest-objects list
+    all need new backend endpoints (no path/extension column on `DBObject`, no historical
+    snapshots, no listable object table) — noted as future work, not faked.
+  - `page.tsx`'s branch chain is now fully explicit (`dashboard` included) with a `null` fallback
+    for an unrecognized `active` value, instead of silently rendering the Dashboard for anything
+    unmatched.
+- **One real bug found via manual debugging (not unit tests) and fixed**: `TopBar.tsx`'s title
+  was hardcoded to the literal string `"Dashboard"` regardless of which sidebar tab was active —
+  harmless before this phase (every tab *was* the Dashboard), but confusing now that Commits/
+  Branches/Metrics/Storage are real distinct pages. Added a `title` prop to `TopBar` and a
+  `TAB_TITLES` lookup in `page.tsx` so the header always matches the active tab.
+- **New tests**: `CommitsPanel.test.tsx`, `BranchesPanel.test.tsx`, `MetricsPanel.test.tsx`,
+  `StoragePanel.test.tsx` (loading/empty states, the reachability-walk ahead-count, search/branch
+  filtering, lazy tree-detail fetch on expand, file-type bucketing). Full webui suite: 64 passed.
+- **Manually verified** by running `npm run dev` and driving the real browser with Playwright
+  (headless Chromium, no `chromium-cli` available in this environment) against an offline backend
+  to exercise every loading/empty state: clicked through all 7 sidebar tabs, confirmed the logo
+  and neon-orange theme render consistently, and confirmed the topbar-title fix above.
+
+## Phase 31 — `av test` Auto-Updates README's Test-Count Badge
+
+- **Motivation:** README.md's `tests-N%2FM passing` badge was a hand-edited literal string
+  (`161%2F164`) — it silently drifted from reality every time the suite gained/lost tests, with
+  nobody remembering to bump it. Asked to make it self-maintaining instead of manually edited.
+- **`test_cmd` (`av test`) now streams *and* captures pytest's output**: the Python suite
+  previously ran via a plain `subprocess.run(args, cwd=source_root)` that just inherited the
+  terminal. It now runs via `subprocess.Popen(..., stdout=PIPE, stderr=STDOUT, text=True)`,
+  echoing each line as it arrives (so the live experience is unchanged) while also collecting it
+  for parsing afterward — avoiding a second, redundant pytest invocation just to get the numbers.
+  `--color=yes` is forced on the pytest invocation since piping stdout makes pytest think it's
+  not a real terminal and silently drop all colorization otherwise.
+- **New `_update_readme_test_badge(passed, failed)`**: parses the captured output for pytest's
+  own `"N passed"` / `"N failed"` / `"N error"` summary counts (after stripping ANSI escapes,
+  which can otherwise sit between a number and its label and break the regex), then rewrites both
+  the badge URL and its `alt` text in `README.md` via a single regex substitution, using
+  `fsutil.atomic_write_text` (already used elsewhere in this codebase for crash-safe writes) so a
+  failure mid-write never leaves the README half-edited. The badge turns red instead of green
+  when any failures/errors are present, rather than just changing the numbers.
+- **Only updates on a full, unfiltered run**: gated on `test_filter is None` — `av test -k
+  <pattern>` never touches the badge, since a scoped subset's count would misrepresent the whole
+  suite. `--cov`/`--speed`/`--webui` don't restrict which Python tests run, so they don't gate it.
+- **New tests**: `tests/test_cli.py` — unit tests for `_update_readme_test_badge` itself (rewrites
+  URL+alt text, turns red on failures, no-ops when nothing parsed) plus integration tests driving
+  the real `test_cmd` against a fake source root with a fake README.md, confirming the badge
+  updates from a fake pytest summary line and that `-k` leaves it untouched. The existing
+  `test_test_command_*` tests all had to switch from faking `subprocess.run` to faking
+  `subprocess.Popen` for the pytest call specifically (npm/av-CLI calls inside the same command
+  are still real `subprocess.run` calls, faked the same way as before) — a `FakePytestPopen`
+  helper (`_fake_pytest_popen`) mimics just enough of the real interface (`.stdout` as an
+  iterable of lines, `.wait()`, `.returncode`) for `test_cmd`'s streaming loop.
+- **Manually verified**: ran the real `av test` end-to-end (not just the faked unit tests) against
+  this repo's actual suite — confirmed colored output still streamed live, and the badge was
+  rewritten to the real result (178/178 passing) with the correct URL-encoding and alt text.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

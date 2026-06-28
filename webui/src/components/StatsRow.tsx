@@ -39,13 +39,13 @@ export function StatsRow({ data, loading }: Props) {
       label: "Total Commits",
       value: loading ? "—" : totalCommits.toString(),
       sub: "in all branches",
-      accent: "accent-blue",
+      accent: "accent-orange",
     },
     {
       label: "Branches",
       value: loading ? "—" : totalBranches.toString(),
       sub: "active refs",
-      accent: "accent-purple",
+      accent: "accent-orange-soft",
     },
     {
       label: "Unique Tags",

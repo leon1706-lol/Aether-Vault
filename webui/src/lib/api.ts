@@ -83,6 +83,18 @@ export async function fetchProjects(): Promise<Project[]> {
   return data.projects ?? [];
 }
 
+// ref_name may itself contain a "/" (project_id/branch namespacing) — the server's
+// {ref_name:path} route expects that slash literal in the URL path, not percent-encoded,
+// so this intentionally does not encodeURIComponent the whole name (matches how
+// python/av_cli/client.py builds the same URL).
+export async function createRef(refName: string, commitHash: string): Promise<void> {
+  await fetchJSON(`/api/refs/${refName}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ commit_hash: commitHash }),
+  });
+}
+
 export async function fetchCommit(hash: string): Promise<Commit> {
   return fetchJSON<Commit>(`/api/commits/${hash}`);
 }
@@ -91,7 +103,7 @@ export async function fetchStats(): Promise<StorageStats> {
   return fetchJSON<StorageStats>("/api/stats");
 }
 
-interface CommitListResponse {
+export interface CommitListResponse {
   commits: Commit[];
   total: number;
   limit: number;
@@ -107,6 +119,18 @@ export async function fetchCommits(limit = 40, projectId?: string | null): Promi
   const qs = projectId ? `&project_id=${encodeURIComponent(projectId)}` : "";
   const data = await fetchJSON<CommitListResponse>(`/api/commits?limit=${limit}${qs}`);
   return data.commits ?? [];
+}
+
+// Same endpoint as fetchCommits, but offset-aware and returning the pagination envelope
+// (next_offset/total) so a panel can implement its own "Load more" without changing the
+// shared fixed-window fetchCommits used by the dashboard hook.
+export async function fetchCommitsPage(
+  limit = 40,
+  offset = 0,
+  projectId?: string | null
+): Promise<CommitListResponse> {
+  const qs = projectId ? `&project_id=${encodeURIComponent(projectId)}` : "";
+  return fetchJSON<CommitListResponse>(`/api/commits?limit=${limit}&offset=${offset}${qs}`);
 }
 
 // projectId is optional — when unset, the dashboard shows commits/refs from every project

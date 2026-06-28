@@ -19,10 +19,10 @@ interface Props {
 }
 
 const METRIC_COLORS: Record<number, string> = {
-  0: "#63b3ed",
-  1: "#b794f4",
+  0: "#ff7a1a",
+  1: "#ffb380",
   2: "#4fd1c5",
-  3: "#f6ad55",
+  3: "#ffd166",
   4: "#68d391",
   5: "#fc8181",
 };
@@ -144,7 +144,7 @@ export function MetricsChart({ commits, loading }: Props) {
                 fontSize: 12,
                 color: "#e2e8f0",
               }}
-              labelStyle={{ color: "#63b3ed", fontFamily: "JetBrains Mono", marginBottom: 4 }}
+              labelStyle={{ color: "#ff7a1a", fontFamily: "JetBrains Mono", marginBottom: 4 }}
             />
             <Legend
               wrapperStyle={{ fontSize: 12, color: "#718096", paddingTop: 8 }}

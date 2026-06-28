@@ -806,3 +806,21 @@ implement, both rated 1–10.
   not collide on in practice.
 - **Verified:** re-ran the previously-failing test 5 times in a row to rule out remaining
   flakiness (all passed) in addition to the full suite.
+
+## ✅ Fixed — WebUI logo/theme/panels manual debugging pass (2026-06-28)
+
+### [3] Top bar title stayed hardcoded to "Dashboard" on every sidebar tab
+- **Files:** `webui/src/components/TopBar.tsx`, `webui/src/app/page.tsx`.
+- **Problem (Severity 3, Difficulty 1):** `TopBar.tsx` rendered `<span className="top-bar-title">Dashboard</span>`
+  as a literal string, with no prop driving it. Harmless before this session — every sidebar tab
+  rendered the same Dashboard view, so the label was always correct by coincidence. Once Commits,
+  Branches, Metrics, and Storage became real, distinct panels (Phase 30), the header stayed stuck
+  on "Dashboard" while the sidebar's active-tab highlight correctly moved. Found via manual
+  debugging — driving the running `npm run dev` server with a headless Playwright browser and
+  screenshotting each tab — not from reading the diff.
+- **Fix:** Added an optional `title` prop to `TopBar` (defaulting to `"Dashboard"` to keep the
+  component's existing standalone behavior), and a `TAB_TITLES` lookup in `page.tsx` mapping each
+  `active` id to its display name, passed in as `title={TAB_TITLES[active] ?? active}`.
+- **Verified:** re-ran the Playwright screenshot pass after the fix — the header now reads
+  "Commits", "Branches", "Metrics", "Storage", "Weight Diff", "Projects", or "Dashboard" to match
+  whichever sidebar tab is active.

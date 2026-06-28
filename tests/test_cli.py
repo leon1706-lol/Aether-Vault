@@ -638,44 +638,49 @@ def test_doctor_dry_run_without_fix_is_a_noop(repo):
 # ---------------------------------------------------------------------------
 # av test
 # ---------------------------------------------------------------------------
+# The pytest invocation itself runs via subprocess.Popen (not subprocess.run) so its output can
+# be streamed live and captured for the README test-badge update (see _update_readme_test_badge)
+# — these tests fake Popen accordingly. npm/av-CLI calls inside `test_cmd` still go through
+# subprocess.run and are faked the same way as before.
+
+def _fake_pytest_popen(returncode=0, summary="5 passed in 0.01s\n", captured_calls=None):
+    """Build a fake replacement for subprocess.Popen that mimics just enough of the real
+    interface for test_cmd's `for line in process.stdout: ...; process.wait()` loop."""
+    def _popen(args, cwd=None, stdout=None, stderr=None, text=None, bufsize=None):
+        if captured_calls is not None:
+            captured_calls.append({"args": args, "cwd": cwd})
+        proc = type("FakePytestProcess", (), {})()
+        proc.stdout = iter([summary])
+        proc.returncode = returncode
+        proc.wait = lambda: returncode
+        return proc
+    return _popen
+
 
 def test_test_command_invokes_pytest(repo, monkeypatch):
-    calls = {}
-
-    class FakeCompleted:
-        returncode = 0
-
-    def fake_run(args, cwd=None):
-        calls["args"] = args
-        calls["cwd"] = cwd
-        return FakeCompleted()
+    calls = []
 
     import python.av_cli.main as main_module
-    monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(main_module.subprocess, "Popen", _fake_pytest_popen(captured_calls=calls), raising=False)
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: None)
 
     result = invoke("test")
     assert result.exit_code == 0, result.output
-    assert calls["args"][1:3] == ["-m", "pytest"]
-    assert calls["args"][0].endswith(("python", "python.exe"))
+    assert calls[0]["args"][1:3] == ["-m", "pytest"]
+    assert calls[0]["args"][0].endswith(("python", "python.exe"))
 
 
 def test_test_command_forwards_dash_k_and_cov(repo, monkeypatch):
-    calls = {}
-
-    class FakeCompleted:
-        returncode = 0
-
-    def fake_run(args, cwd=None):
-        calls["args"] = args
-        return FakeCompleted()
+    calls = []
 
     import python.av_cli.main as main_module
-    monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(main_module.subprocess, "Popen", _fake_pytest_popen(captured_calls=calls), raising=False)
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: None)
 
     result = invoke("test", "-k", "foo", "--cov")
     assert result.exit_code == 0, result.output
-    assert "-k" in calls["args"] and "foo" in calls["args"]
-    assert "--cov=python" in calls["args"]
+    assert "-k" in calls[0]["args"] and "foo" in calls[0]["args"]
+    assert "--cov=python" in calls[0]["args"]
 
 
 def test_test_command_missing_tests_dir_gives_clear_error(repo, monkeypatch, tmp_path):
@@ -691,56 +696,63 @@ def test_test_command_missing_tests_dir_gives_clear_error(repo, monkeypatch, tmp
 
 
 def test_test_command_webui_runs_npm_test_after_pytest(repo, monkeypatch):
-    calls = []
+    pytest_calls = []
+    run_calls = []
 
     class FakeCompleted:
         returncode = 0
 
     def fake_run(args, cwd=None):
-        calls.append({"args": args, "cwd": cwd})
+        run_calls.append({"args": args, "cwd": cwd})
         return FakeCompleted()
 
     import python.av_cli.main as main_module
     monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(main_module.subprocess, "Popen", _fake_pytest_popen(captured_calls=pytest_calls), raising=False)
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: None)
     # Don't depend on this machine/CI runner actually having npm on PATH — fix the resolved
     # path so the test is deterministic either way.
     monkeypatch.setattr(main_module.shutil, "which", lambda name: r"C:\fake\npm.cmd")
 
     result = invoke("test", "--webui")
     assert result.exit_code == 0, result.output
-    assert len(calls) == 2
-    assert calls[0]["args"][1:3] == ["-m", "pytest"]
-    assert calls[1]["args"] == [r"C:\fake\npm.cmd", "test"]
-    assert str(calls[1]["cwd"]).endswith("webui")
+    assert len(pytest_calls) == 1
+    assert pytest_calls[0]["args"][1:3] == ["-m", "pytest"]
+    assert len(run_calls) == 1
+    assert run_calls[0]["args"] == [r"C:\fake\npm.cmd", "test"]
+    assert str(run_calls[0]["cwd"]).endswith("webui")
 
 
 def test_test_command_without_webui_only_runs_pytest(repo, monkeypatch):
-    calls = []
+    pytest_calls = []
+    run_calls = []
 
     class FakeCompleted:
         returncode = 0
 
     def fake_run(args, cwd=None):
-        calls.append(args)
+        run_calls.append(args)
         return FakeCompleted()
 
     import python.av_cli.main as main_module
     monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(main_module.subprocess, "Popen", _fake_pytest_popen(captured_calls=pytest_calls), raising=False)
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: None)
 
     result = invoke("test")
     assert result.exit_code == 0, result.output
-    assert len(calls) == 1
+    assert len(pytest_calls) == 1
+    assert len(run_calls) == 0
 
 
 def test_test_command_webui_combines_nonzero_exit_code(repo, monkeypatch):
-    call_count = {"n": 0}
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module.subprocess, "Popen", _fake_pytest_popen(returncode=0), raising=False)
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: None)
 
     def fake_run(args, cwd=None):
-        call_count["n"] += 1
-        returncode = 0 if call_count["n"] == 1 else 1  # pytest passes, npm test fails
-        return type("FakeCompleted", (), {"returncode": returncode})()
+        return type("FakeCompleted", (), {"returncode": 1})()  # npm test fails
 
-    import python.av_cli.main as main_module
     monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
     monkeypatch.setattr(main_module.shutil, "which", lambda name: r"C:\fake\npm.cmd")
 
@@ -754,6 +766,8 @@ def test_test_command_webui_missing_webui_dir_gives_clear_error(repo, monkeypatc
 
     import python.av_cli.main as main_module
     monkeypatch.setattr(main_module, "_find_source_root", lambda: fake_source_root)
+    monkeypatch.setattr(main_module.subprocess, "Popen", _fake_pytest_popen(), raising=False)
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: None)
     monkeypatch.setattr(
         main_module.subprocess,
         "run",
@@ -767,17 +781,20 @@ def test_test_command_webui_missing_webui_dir_gives_clear_error(repo, monkeypatc
 
 
 def test_test_command_speed_runs_synthetic_probes_and_forwards_durations(repo, monkeypatch):
-    calls = []
+    pytest_calls = []
+    run_calls = []
 
     class FakeCompleted:
         returncode = 0
 
     def fake_run(args, cwd=None):
-        calls.append(args)
+        run_calls.append(args)
         return FakeCompleted()
 
     import python.av_cli.main as main_module
     monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(main_module.subprocess, "Popen", _fake_pytest_popen(captured_calls=pytest_calls), raising=False)
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: None)
     # Run with no real `av` on PATH, so the optional "av CLI, end-to-end" subsection is
     # skipped — this test is only about the internal synthetic probes and -k/--cov-style
     # flag forwarding to pytest, not the extra end-to-end subprocess timing.
@@ -785,8 +802,9 @@ def test_test_command_speed_runs_synthetic_probes_and_forwards_durations(repo, m
 
     result = invoke("test", "--speed")
     assert result.exit_code == 0, result.output
-    assert len(calls) == 1  # pytest only — no av CLI found
-    assert "--durations=20" in calls[0]
+    assert len(pytest_calls) == 1  # pytest only — no av CLI found
+    assert len(run_calls) == 0
+    assert "--durations=20" in pytest_calls[0]["args"]
     assert "Speed check (synthetic fixtures)" in result.output
     assert "Index.save()" in result.output
     assert "Storage stats" in result.output
@@ -794,6 +812,7 @@ def test_test_command_speed_runs_synthetic_probes_and_forwards_durations(repo, m
 
 
 def test_test_command_speed_webui_runs_bench_after_npm_test(repo, monkeypatch):
+    pytest_calls = []
     calls = []
 
     class FakeCompleted:
@@ -805,19 +824,104 @@ def test_test_command_speed_webui_runs_bench_after_npm_test(repo, monkeypatch):
 
     import python.av_cli.main as main_module
     monkeypatch.setattr(main_module.subprocess, "run", fake_run, raising=False)
+    monkeypatch.setattr(main_module.subprocess, "Popen", _fake_pytest_popen(captured_calls=pytest_calls), raising=False)
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: None)
     fake_paths = {"npm": r"C:\fake\npm.cmd", "av": r"C:\fake\av.cmd"}
     monkeypatch.setattr(main_module.shutil, "which", lambda name: fake_paths.get(name))
 
     result = invoke("test", "--speed", "--webui")
     assert result.exit_code == 0, result.output
-    # pytest, npm test, npm run bench, then av init/add/commit for the end-to-end subsection
-    assert len(calls) == 6
-    assert calls[1]["args"] == [r"C:\fake\npm.cmd", "test"]
-    assert calls[2]["args"] == [r"C:\fake\npm.cmd", "run", "bench"]
-    assert calls[3]["args"][0] == r"C:\fake\av.cmd" and calls[3]["args"][1] == "init"
-    assert calls[5]["args"][0] == r"C:\fake\av.cmd" and calls[5]["args"][1] == "commit"
+    assert len(pytest_calls) == 1
+    # npm test, npm run bench, then av init/add/commit for the end-to-end subsection
+    assert len(calls) == 5
+    assert calls[0]["args"] == [r"C:\fake\npm.cmd", "test"]
+    assert calls[1]["args"] == [r"C:\fake\npm.cmd", "run", "bench"]
+    assert calls[2]["args"][0] == r"C:\fake\av.cmd" and calls[2]["args"][1] == "init"
+    assert calls[4]["args"][0] == r"C:\fake\av.cmd" and calls[4]["args"][1] == "commit"
     assert "Web UI speed bench" in result.output
     assert "Speed check (av CLI, end-to-end)" in result.output
+
+
+_FAKE_BADGE_README = (
+    '<img src="https://img.shields.io/badge/tests-161%2F164%20passing-brightgreen'
+    '?style=flat-square&labelColor=1A1A1A" alt="161 of 164 tests passing">'
+)
+
+
+def test_update_readme_test_badge_rewrites_url_and_alt_text(tmp_path, monkeypatch):
+    import python.av_cli.main as main_module
+    (tmp_path / "README.md").write_text(_FAKE_BADGE_README, encoding="utf-8")
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+
+    main_module._update_readme_test_badge(173, 0)
+
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "tests-173%2F173%20passing-brightgreen" in text
+    assert 'alt="173 of 173 tests passing"' in text
+
+
+def test_update_readme_test_badge_turns_red_when_failures_present(tmp_path, monkeypatch):
+    import python.av_cli.main as main_module
+    (tmp_path / "README.md").write_text(_FAKE_BADGE_README, encoding="utf-8")
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+
+    main_module._update_readme_test_badge(170, 3)
+
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "tests-170%2F173%20passing-red" in text
+    assert 'alt="170 of 173 tests passing"' in text
+
+
+def test_update_readme_test_badge_is_a_noop_without_a_parsed_total(tmp_path, monkeypatch):
+    import python.av_cli.main as main_module
+    (tmp_path / "README.md").write_text(_FAKE_BADGE_README, encoding="utf-8")
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+
+    main_module._update_readme_test_badge(0, 0)
+
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == _FAKE_BADGE_README
+
+
+def test_test_command_updates_readme_badge_from_pytest_summary(tmp_path, monkeypatch):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "README.md").write_text(_FAKE_BADGE_README, encoding="utf-8")
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        main_module.subprocess,
+        "Popen",
+        _fake_pytest_popen(summary="2 failed, 171 passed, 5 skipped in 12.3s\n"),
+        raising=False,
+    )
+
+    result = invoke("test")
+    assert result.exit_code == 0, result.output  # the fake process's own returncode, not pytest's
+
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "tests-171%2F173%20passing-red" in text
+    assert 'alt="171 of 173 tests passing"' in text
+
+
+def test_test_command_with_dash_k_does_not_touch_readme_badge(tmp_path, monkeypatch):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "README.md").write_text(_FAKE_BADGE_README, encoding="utf-8")
+
+    import python.av_cli.main as main_module
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        main_module.subprocess,
+        "Popen",
+        _fake_pytest_popen(summary="3 passed in 0.4s\n"),
+        raising=False,
+    )
+
+    result = invoke("test", "-k", "foo")
+    assert result.exit_code == 0, result.output
+
+    # A -k-scoped run only exercises a subset of the suite — never let it overwrite the badge
+    # with a misleadingly small total.
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == _FAKE_BADGE_README
 
 
 # ---------------------------------------------------------------------------

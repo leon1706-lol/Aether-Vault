@@ -22,8 +22,8 @@ interface Props {
 const STATUS_COLOR: Record<LayerStatus, string> = {
   unchanged: "#68d391",
   changed: "#fc8181",
-  added: "#63b3ed",
-  removed: "#f6ad55",
+  added: "#ff7a1a",
+  removed: "#ffd166",
 };
 
 const STATUS_LABEL: Record<LayerStatus, string> = {

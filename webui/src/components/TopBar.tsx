@@ -8,16 +8,17 @@ interface Props {
   onRefresh: () => void;
   projectName?: string | null;
   onClearProject?: () => void;
+  title?: string;
 }
 
-export function TopBar({ health, loading, onRefresh, projectName, onClearProject }: Props) {
+export function TopBar({ health, loading, onRefresh, projectName, onClearProject, title = "Dashboard" }: Props) {
   const isOnline = health?.status === "ok";
   const apiUrl =
     process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
   return (
     <div className="top-bar">
-      <span className="top-bar-title">Dashboard</span>
+      <span className="top-bar-title">{title}</span>
 
       <div className="top-bar-right">
         {projectName && (

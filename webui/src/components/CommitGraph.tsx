@@ -10,10 +10,10 @@ interface Props {
 
 // Colors for different branch lanes
 const LANE_COLORS = [
-  "#63b3ed", // blue
-  "#b794f4", // purple
+  "#ff7a1a", // orange
+  "#ffb380", // orange-soft
   "#4fd1c5", // teal
-  "#f6ad55", // amber
+  "#ffd166", // amber
   "#68d391", // green
   "#fc8181", // red
 ];

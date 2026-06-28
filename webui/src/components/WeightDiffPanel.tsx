@@ -163,7 +163,7 @@ export function WeightDiffPanel({ projectId = null }: Props) {
                     </div>
                     <div className="stat-card">
                       <div className="stat-label">% Changed</div>
-                      <div className="stat-value accent-blue">
+                      <div className="stat-value accent-orange">
                         {fileDiff.totalCount > 0
                           ? Math.round((fileDiff.changedCount / fileDiff.totalCount) * 100)
                           : 0}

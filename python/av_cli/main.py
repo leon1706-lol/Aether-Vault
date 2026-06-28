@@ -5,6 +5,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1946,6 +1947,37 @@ def _print_synthetic_speed_check() -> None:
         click.echo(f"{label:<28} {elapsed_ms:>7.1f} ms")
 
 
+def _update_readme_test_badge(passed: int, failed: int) -> None:
+    """Keep README.md's `tests-N%2FM passing` badge in sync with the real pytest results.
+
+    Only called after a full, unfiltered `av test` run (no `-k`) — a scoped subset would
+    overwrite the badge with a misleadingly small total otherwise.
+    """
+    total = passed + failed
+    if total == 0:
+        return  # parse failed or nothing collected — leave the badge alone rather than zero it out
+    source_root = _find_source_root()
+    readme_path = source_root / "README.md"
+    if not readme_path.is_file():
+        return
+    text = readme_path.read_text(encoding="utf-8")
+    color = "brightgreen" if failed == 0 else "red"
+    pattern = re.compile(
+        r'https://img\.shields\.io/badge/tests-\d+%2F\d+%20passing-[a-z]+(\?[^"]*)"\s+alt="\d+ of \d+ tests passing"'
+    )
+
+    def _replace(m: "re.Match[str]") -> str:
+        return (
+            f'https://img.shields.io/badge/tests-{passed}%2F{total}%20passing-{color}{m.group(1)}"'
+            f' alt="{passed} of {total} tests passing"'
+        )
+
+    updated = pattern.sub(_replace, text, count=1)
+    if updated != text:
+        atomic_write_text(readme_path, updated)
+        click.secho(f"Updated README.md test badge: {passed}/{total} passing", fg="cyan")
+
+
 @cli.command(name="test")
 @click.option("-k", "test_filter", default=None, help="Only run tests matching this substring (forwarded to pytest -k).")
 @click.option("--cov", is_flag=True, default=False, help="Run with a coverage report (--cov=python --cov-report=term-missing).")
@@ -1970,6 +2002,9 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
         sys.exit(1)
 
     args = [sys.executable, "-m", "pytest", str(tests_dir)]
+    # Force color even though stdout is about to be piped (not a real tty) for output capture
+    # below — otherwise pytest auto-detects the pipe and silently drops all colorization.
+    args += ["--color=yes"]
     if test_filter:
         args += ["-k", test_filter]
     if cov:
@@ -1979,8 +2014,33 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
 
     click.secho("=== Python test suite ===", bold=True, fg="cyan")
     click.secho(f"Running Aether-Vault's test suite (pytest {' '.join(args[3:])})...", fg="cyan")
-    result = subprocess.run(args, cwd=source_root)
-    exit_code = result.returncode
+    # Stream pytest's output live (line by line, as it would print unbuffered) while also
+    # collecting it, so the final "N passed, M failed" summary can be parsed afterward to keep
+    # README.md's test-count badge honest without a second, redundant pytest run.
+    process = subprocess.Popen(
+        args, cwd=source_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    output_lines: list[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        click.echo(line, nl=False)
+        output_lines.append(line)
+    process.wait()
+    exit_code = process.returncode
+
+    if test_filter is None:
+        # Strip ANSI escapes (forced on above via --color=yes) before parsing — color codes can
+        # otherwise sit between a number and "passed"/"failed" and break the regex match.
+        captured = re.sub(r"\x1b\[[0-9;]*m", "", "".join(output_lines))
+        passed_match = re.search(r"(\d+) passed", captured)
+        failed_match = re.search(r"(\d+) failed", captured)
+        error_match = re.search(r"(\d+) error", captured)
+        if passed_match:
+            passed_n = int(passed_match.group(1))
+            failed_n = (int(failed_match.group(1)) if failed_match else 0) + (
+                int(error_match.group(1)) if error_match else 0
+            )
+            _update_readme_test_badge(passed_n, failed_n)
 
     if run_webui:
         webui_dir = source_root / "webui"

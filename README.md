@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-161%2F164%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="161 of 164 tests passing">
+  <img src="https://img.shields.io/badge/tests-178%2F178%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="178 of 178 tests passing">
 </p>
 
 Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
@@ -57,7 +57,7 @@ graph TD
         CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
         LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
         PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
-        WebUI("Web UI<br>(Dashboard + Weight Diff + Projects Tabs · localhost:3000)")
+        WebUI("Web UI<br>(Dashboard · Commits · Branches · Metrics · Storage ·<br>Weight Diff · Projects Tabs · localhost:3000)")
         Vault("Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
         Benchmarks("development/BENCHMARKS.md<br>(av benchmark vs Git LFS · DVC · MLflow)")
         Session("Interactive Session<br>(av init / bare av → av status, av commit, ... · exit/quit)")
@@ -324,11 +324,11 @@ av webui --rebuild   # force a fresh image build after changing webui/ source
 ```
 
 **Dashboard panels:**
-- **Experiment Graph** — SVG commit DAG with coloured branch lanes
-- **Commit Log** — Full history with authors, timestamps, tags & metrics pills
-- **Branch List** — All refs with tip commit details
-- **ML Metrics Chart** — Line chart plotting all numeric metrics over commits
-- **Stats Bar** — Live counts for commits, branches, CAS objects, and storage size
+- **Dashboard (overview)** — Stats bar, SVG commit DAG, branch teaser, metrics teaser, and commit-log teaser, all at a glance
+- **Commits** — Paginated, searchable commit log (filters the loaded page by message/author/tag and by branch), with click-to-expand rows showing the full file tree and an added/removed/changed diff vs. the parent commit
+- **Branches** — Full branch list with untruncated tip details, a "commits ahead of main" count, branch-row expand to see its commits, and a "branch from here" action
+- **Metrics** — Full-size ML metrics chart with per-metric show/hide toggles, a metrics table (commit × metric), and a single-branch comparison view
+- **Storage** — Store-wide CAS object/size stats plus a file-type breakdown, largest-tracked-files list, and an approximate dedup ratio derived from the latest commit's snapshot
 - **Weight Diff** — drag two checkpoints into comparison slots for a per-layer heatmap + drift chart
 - **Projects** — every project that has pushed to this registry, with an "Open" button to scope the whole dashboard to just that one
 
@@ -400,6 +400,8 @@ av test --speed          # also run a synthetic speed benchmark of av's hot path
 av test --speed --webui  # ...and the webui/ Vitest bench suite (npm run bench) too
 ```
 `--speed` runs the same hot paths as `av doctor --speed` against disposable, fixed-size synthetic fixtures (so results are repeatable across machines and runs, not dependent on whatever happens to be in a real repo), plus `pytest --durations=20` to surface the slowest tests. Each probe prints next to a soft advisory budget — exceeding it only flags the row `SLOW`, it never fails the command. Combined with `--webui`, it also runs a small Vitest `bench()` suite (`webui/src/components/__benchmarks__/speed.bench.ts`) covering the dashboard's graph-building and metrics-extraction logic. See `python/av_cli/speedcheck.py` to add probes or adjust budgets.
+
+A plain `av test` (no `-k`) also keeps this README's own `tests-N/M passing` badge above in sync with the real result — it parses pytest's own "N passed, M failed" summary line and rewrites the badge (and turns it red if anything failed) so the count is never manually edited or allowed to go stale. A `-k`-scoped run never touches it, since a subset's count would be misleading.
 
 `--webui` runs `webui/`'s pure-logic *and* component tests (Vitest + React Testing Library). The
 Playwright E2E suite below (Weight Diff + dashboard, against a real `docker compose` stack) is
