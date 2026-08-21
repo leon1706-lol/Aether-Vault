@@ -571,6 +571,42 @@ def test_checkout_refuses_with_uncommitted_changes_without_force(repo):
     assert (repo / "model.txt").read_text() == "version 1"
 
 
+def test_checkout_accepts_short_hash_prefix(repo):
+    (repo / "model.txt").write_text("version 1")
+    invoke("add", "model.txt")
+    invoke("commit", "-m", "v1")
+    commit1 = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    (repo / "model.txt").write_text("version 2")
+    invoke("add", "model.txt")
+    invoke("commit", "-m", "v2")
+
+    result = invoke("checkout", commit1[:7])
+    assert result.exit_code == 0, result.output
+    assert (repo / "model.txt").read_text() == "version 1"
+    head = (repo / ".av" / "HEAD").read_text().strip()
+    assert head == commit1
+
+
+def test_checkout_rejects_ambiguous_short_hash_prefix(repo):
+    (repo / "model.txt").write_text("version 1")
+    invoke("add", "model.txt")
+    invoke("commit", "-m", "v1")
+
+    commits_dir = repo / ".av" / "commits"
+    real_commit = commits_dir / (
+        (repo / ".av" / "refs" / "heads" / "main").read_text().strip() + ".json"
+    )
+    (commits_dir / ("deadbeef" + "0" * 56 + ".json")).write_text(real_commit.read_text())
+    (commits_dir / ("deadbeef" + "1" * 56 + ".json")).write_text(real_commit.read_text())
+
+    result = invoke("checkout", "deadbeef")
+    assert result.exit_code == 0, result.output
+    assert "ambiguous" in result.output.lower(), result.output
+
+
+
+
 # ---------------------------------------------------------------------------
 # av doctor
 # ---------------------------------------------------------------------------

@@ -900,3 +900,37 @@ implement, both rated 1–10.
   instead of the string-target form.
 - **Verified:** `pytest tests/test_cli.py -k benchmark` and the full suite (249 passed, 3
   skipped) both green after the fix.
+
+
+## ✅ Fixed — Short-hash checkout round (2026-08-21)
+
+### [4] `av checkout` rejected the short hashes `av commit` itself prints
+- **Files:** `python/av_cli/main.py` (`checkout`, short-hash print at line 1285),
+  `python/av_cli/handoff.py` (`load_commit`), new shared helper in
+  `python/av_cli/fsutil.py` (`find_commit_file`) + new `AmbiguousCommitHash` exception in
+  `python/av_cli/exceptions.py`.
+- **Problem:** `av commit` prints `[a54a0b2] <message>` (7-char prefix), but `checkout`
+  only resolved either an exact branch name or the full 64-char hash — no prefix matching
+  existed anywhere. Copying the hash av had just printed and running
+  `av checkout a54a0b2` failed with `Error: Commit 'a54a0b2' not found.` Same gap in
+  `av handoff --since <hash>`.
+- **How found:** manual debugging session against the real installed `av` binary in a scratch
+  repo (per `Aether-vault-Obsidian-Vault/Essential-Tasks.md` step 1) — committed twice, copied
+  the printed short hash into checkout, hit the error. Not caught by any unit test because all
+  existing checkout tests pass full hashes read from `.av/refs/heads/main`.
+- **Impact:** every user-facing flow that involves checking out a specific commit from av's own
+  console output (the most common copy-paste source) was broken on first use; users would have
+  to inspect `.av/refs/heads/` or guess that only the full hash works.
+- **Fix:** shared `fsutil.find_commit_file()` — exact match first, then a unique hex-prefix
+  match over `.av/commits/`; raises the new `AmbiguousCommitHash` (a ClickException subclass,
+  so both one-shot and REPL flows render it as a red `Error: ...` line) when a prefix matches
+  several commits, `FileNotFoundError` when nothing matches. `checkout()` resolves through it
+  and rewrites its internal `commit_hash` to the resolved full hash before writing HEAD's
+  detached entry; `handoff.load_commit()` uses the same helper so `--since` accepts prefixes
+  too. Minimum prefix length is 4 characters, mirroring git's own abbreviation floor.
+- **Verified:** real scratch-repo run — `av checkout a54a0b2` checks out the right commit,
+  restores correct file content, writes the full hash into detached HEAD; ambiguous prefix
+  rejected with a clear message; `av handoff --update --diff-weights --since d91bad3` resolves.
+  New tests: CLI-level short-hash checkout + ambiguous rejection (`tests/test_cli.py`),
+  resolver unit cases + `load_commit` prefix acceptance (`tests/test_vault.py`). Full suite:
+  see Phase 35 in `CHANGELOG.md`.

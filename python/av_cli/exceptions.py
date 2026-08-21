@@ -26,6 +26,11 @@ class ValidationError(AetherVaultException):
     pass
 
 
+class AmbiguousCommitHash(ValidationError):
+    """Raised when a short commit-hash prefix matches more than one commit."""
+    pass
+
+
 class StorageError(AetherVaultException):
     """Raised when local storage operations fail."""
     pass

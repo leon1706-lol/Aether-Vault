@@ -848,4 +848,36 @@ findings (resolved and still-open).
   account-level web steps. Once done, this closes the README roadmap's last open item
   ("First real tagged release").
 
+## Phase 35 — Short-Hash Checkout (`av checkout`/`av handoff --since` now accept commit prefixes)
+- **Files:** `python/av_cli/fsutil.py` (new `find_commit_file()`), `python/av_cli/exceptions.py`
+  (new `AmbiguousCommitHash`), `python/av_cli/main.py` (`checkout`),
+  `python/av_cli/handoff.py` (`load_commit`), `tests/test_cli.py`, `tests/test_vault.py`,
+  `README.md`.
+- **Problem (found via a manual debugging session against the real installed `av`, not unit
+  tests):** `av commit` prints the commit's short hash (`[a54a0b2] first commit`,
+  `main.py:1285`) — but `av checkout <hash>` only accepted either an exact branch name or the
+  *full* 64-character hash. Copying the short form av itself had just printed produced
+  `Error: Commit 'a54a0b2' not found.` Reproduced for real: committed twice in a scratch repo,
+  copied the first commit's printed short hash into `av checkout` → hard error. No prefix
+  resolution existed anywhere in the codebase (verified by grep — the only `[:7]` uses are the
+  printing sites).
+- **Fix:** new shared helper `fsutil.find_commit_file(repo_root, commit_hash)` — exact filename
+  match first; otherwise, if the target is a 4–63 char hex string, glob `.av/commits/` for a
+  unique prefix match and return it, raising the new `AmbiguousCommitHash`
+  (a `ValidationError`/`ClickException` subclass) when several commits share the prefix, and
+  plain `FileNotFoundError` when none does. `checkout` now resolves through the helper (and
+  rewrites `commit_hash` to the resolved full hash before writing HEAD's detached entry, so a
+  short-hash checkout still records the full hash); the remote-fetch fallback only kicks in when
+  local resolution finds nothing, exactly as before. `handoff.load_commit()` routes through the
+  same helper, so `av handoff --since <short-hash>` works too (it previously required the full
+  hash as well). Ambiguity surfaces as a clear red "ambiguous — use more characters" error
+  rather than a silent guess, matching git's behavior.
+- **Verified:** manual end-to-end in the scratch repo after the fix — `av checkout a54a0b2`
+  checks out the right commit, restores the correct file content, writes the full hash into
+  detached HEAD; `av handoff --update --diff-weights --since d91bad3` resolves and produces the
+  expected per-layer diff. New tests: CLI-level short-hash checkout (content restored + full
+  hash written to HEAD), ambiguous-prefix rejection via two fabricated colliding commits,
+  `find_commit_file` exact/prefix/not-found/ambiguous unit cases, and `load_commit` accepting a
+  7-char prefix.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

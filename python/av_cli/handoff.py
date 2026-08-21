@@ -38,8 +38,12 @@ def resolve_head(repo_root: Path) -> tuple[str, str | None]:
 
 
 def load_commit(repo_root: Path, commit_hash: str) -> dict | None:
-    commit_path = repo_root / ".av" / "commits" / f"{commit_hash}.json"
-    if not commit_path.exists():
+    from .exceptions import AmbiguousCommitHash
+    from .fsutil import find_commit_file
+
+    try:
+        commit_path = find_commit_file(repo_root, commit_hash)
+    except (FileNotFoundError, AmbiguousCommitHash):
         return None
     with open(commit_path, "r") as f:
         return json.load(f)

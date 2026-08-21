@@ -330,6 +330,9 @@ av branch feature-transformers
 av checkout feature-transformers
 av checkout main
 ```
+Commits can be checked out by their full hash or any unique prefix of it — including the
+7-character short form `av commit` itself prints (`av checkout a54a0b2`). An ambiguous prefix
+is rejected with an error asking for more characters rather than guessing.
 `checkout` refuses to run if you have uncommitted changes it would overwrite, unless you pass
 `--force` (which discards them) — `av stash` is the non-destructive alternative.
 

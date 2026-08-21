@@ -64,7 +64,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from . import speedcheck
 from . import __version__
-from .exceptions import AetherVaultException, NetworkError, StorageError, ValidationError
+from .exceptions import AetherVaultException, AmbiguousCommitHash, NetworkError, StorageError, ValidationError
 from .index import Index
 from .pointer import create_pointer, get_pointer_path, is_pointer_file, parse_pointer
 
@@ -263,7 +263,7 @@ class _AuthRetryGroup(click.Group):
 # Atomic write helpers
 # ---------------------------------------------------------------------------
 
-from .fsutil import atomic_write_json, atomic_write_text  # noqa: E402
+from .fsutil import atomic_write_json, atomic_write_text, find_commit_file  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1392,13 +1392,22 @@ def checkout(target: str, force: bool) -> None:
         commit_hash = (heads_dir / target).read_text().strip()
         ref_name = target
 
-    commit_file = repo_root / ".av" / "commits" / f"{commit_hash}.json"
+    commit_file = None
+    try:
+        commit_file = find_commit_file(repo_root, commit_hash)
+    except AmbiguousCommitHash as exc:
+        click.secho(f"Error: {exc.message}", fg="red")
+        return
+    except FileNotFoundError:
+        pass
     commit_data = None
 
-    if commit_file.exists():
+    if commit_file is not None:
+        commit_hash = commit_file.stem
         with open(commit_file, "r") as f:
             commit_data = json.load(f)
     elif client.server_available():
+        commit_file = repo_root / ".av" / "commits" / f"{commit_hash}.json"
         commit_data = client.get_commit(commit_hash)
         if commit_data:
             with open(commit_file, "w") as f:

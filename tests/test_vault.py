@@ -5,7 +5,9 @@ from pathlib import Path
 
 from python.av_cli.pointer import create_pointer, parse_pointer, is_pointer_file, get_pointer_path
 from python.av_cli.index import Index
-from python.av_cli.handoff import classify_lineage, diff_model_weights, generate_handoff
+from python.av_cli.handoff import classify_lineage, diff_model_weights, generate_handoff, load_commit
+from python.av_cli.fsutil import find_commit_file
+from python.av_cli.exceptions import AmbiguousCommitHash
 
 def test_create_and_parse_pointer(tmp_path):
     p = tmp_path / "model.pt"
@@ -61,6 +63,36 @@ def test_classify_lineage():
     assert classify_lineage("data/train.parquet") == "dataset"
     assert classify_lineage("data/labels.csv") == "dataset"
     assert classify_lineage("src/train.py") == "code"
+
+
+def test_find_commit_file_resolves_exact_and_prefix(tmp_path):
+    commits = tmp_path / ".av" / "commits"
+    commits.mkdir(parents=True)
+    full_hash = "a54a0b2" + "f" * 57
+    (commits / f"{full_hash}.json").write_text("{}")
+
+    assert find_commit_file(tmp_path, full_hash) == commits / f"{full_hash}.json"
+    assert find_commit_file(tmp_path, full_hash[:7]) == commits / f"{full_hash}.json"
+
+
+def test_find_commit_file_not_found_and_ambiguous(tmp_path):
+    commits = tmp_path / ".av" / "commits"
+    commits.mkdir(parents=True)
+
+    with pytest.raises(FileNotFoundError):
+        find_commit_file(tmp_path, "aaaa")
+
+    (commits / ("deadbeef" + "0" * 56 + ".json")).write_text("{}")
+    (commits / ("deadbeef" + "1" * 56 + ".json")).write_text("{}")
+    with pytest.raises(AmbiguousCommitHash):
+        find_commit_file(tmp_path, "deadbeef")
+
+
+def test_load_commit_accepts_short_hash(tmp_path):
+    commit_hash = _init_fake_repo(tmp_path)
+    loaded = load_commit(tmp_path, commit_hash[:7])
+    assert loaded is not None
+    assert loaded["message"] == "initial commit"
 
 
 def test_diff_model_weights_layers():

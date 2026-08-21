@@ -10,6 +10,8 @@ import os
 import uuid
 from pathlib import Path
 
+from .exceptions import AmbiguousCommitHash
+
 
 def atomic_write_text(path: Path, text: str) -> None:
     """Write text to `path` atomically (write to a temp file in the same dir, then replace).
@@ -36,3 +38,26 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 def atomic_write_json(path: Path, data) -> None:
     atomic_write_text(path, json.dumps(data, indent=2))
+
+
+def find_commit_file(repo_root: Path, commit_hash: str) -> Path:
+    """Resolve a commit identifier to its `.av/commits/<hash>.json` file.
+
+    Accepts the full 64-character hash or any unique hex prefix of one (the short
+    form `av commit` itself prints). Raises FileNotFoundError when nothing matches
+    and AmbiguousCommitHash when several commits share the given prefix.
+    """
+    commits_dir = repo_root / ".av" / "commits"
+    exact = commits_dir / f"{commit_hash}.json"
+    if exact.exists():
+        return exact
+    if 4 <= len(commit_hash) < 64 and all(c in "0123456789abcdef" for c in commit_hash.lower()):
+        matches = sorted(commits_dir.glob(f"{commit_hash.lower()}*.json"))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise AmbiguousCommitHash(
+                f"Commit '{commit_hash}' is ambiguous — {len(matches)} commits share this "
+                "prefix. Use more characters."
+            )
+    raise FileNotFoundError(f"Commit '{commit_hash}' not found.")
