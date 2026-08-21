@@ -552,7 +552,18 @@ For the full results, the methodology behind each benchmark, and the rating lege
 
 | Status | Feature |
 |---|---|
-| 🔲 | **First real tagged release** — `release.yml` exists and has been validated structurally, but no `vX.Y.Z` tag has been pushed yet; needs a TestPyPI dry run before pointing trusted publishing at the real `pypi.org` project (see `development/CHANGELOG.md`) |
+| ✅ | **First tagged releases shipped** — `v0.1.0` and `v0.1.1` are live on PyPI (wheels for Python 3.10–3.12 on Windows/Linux/macOS, published via trusted publishing on tag push); installed users pick updates up through `av update` / opt-in auto-update |
+| 🔲 | **`av log`** — a CLI commit-history view (today the commit log is only visible in the Web UI) |
+| 🔲 | **Branch merge** — branches and checkout exist, but there is no merge step yet |
+| 🔲 | **Database migrations** — the server schema is created via `create_all`; schema evolution still means manual `ALTER TABLE`s (Alembic adoption tracked here) |
+| 🔲 | **API hardening** — CORS is still `allow_origins=["*"]` and there is no rate limiting; both must close before any shared/public deployment |
+| 🔲 | **Python 3.13/3.14 wheels** — cibuildwheel currently targets cp310–cp312 only |
+
+## License
+
+Aether-Vault is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for
+personal use, research, education, and noncommercial organizations; commercial use requires a
+separate license from **Leon Schwarzkopf (Aether Quant)**.
 
 ---
 

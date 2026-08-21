@@ -4,6 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aether-vault"
+description = "High-performance, Git-like version control and registry for ML models, datasets, and code — in a single atomic commit."
+readme = "README.md"
+license = { text = "PolyForm Noncommercial License 1.0.0" }
+authors = [{ name = "Leon Schwarzkopf (Aether Quant)" }]
+keywords = ["machine-learning", "version-control", "mlops", "model-registry", "safetensors", "dataset-versioning", "reproducibility"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Software Development :: Version Control",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = [
@@ -30,6 +51,12 @@ benchmarks = ["dvc>=3.55,<4", "mlflow>=2.16"]
 
 [project.scripts]
 av = "av_cli.main:run"
+
+[project.urls]
+Homepage = "https://github.com/leon1706/aether-vault"
+Repository = "https://github.com/leon1706/aether-vault"
+Issues = "https://github.com/leon1706/aether-vault/issues"
+Changelog = "https://github.com/leon1706/aether-vault/blob/main/development/CHANGELOG.md"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

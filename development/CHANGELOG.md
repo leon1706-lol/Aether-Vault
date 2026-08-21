@@ -880,4 +880,42 @@ findings (resolved and still-open).
   `find_commit_file` exact/prefix/not-found/ambiguous unit cases, and `load_commit` accepting a
   7-char prefix.
 
+## Phase 36 — LICENSE, Real PyPI Metadata, sdist Slimmed 64.7 MB → 761 KB, Roadmap De-Staled
+- **Files:** `LICENSE` (new), `MANIFEST.in` (new), `pyproject.toml`, `README.md`, `.gitignore`,
+  `aether-vault-server.tar` (untracked).
+- **Problem (found by auditing the actual PyPI release + the built sdist, not the source):**
+  three packaging/release gaps that made the shipped `0.1.0`/`0.1.1` releases look abandoned:
+  1. **No LICENSE file existed anywhere in the repo**, and pyproject had no license field —
+     legally nobody could use or redistribute the published package.
+  2. **The published PyPI pages for 0.1.0/0.1.1 were empty**: no summary, no long description,
+     no classifiers, no project URLs, no keywords (`pypi.org/pypi/aether-vault/json` shows
+     `summary: null`). Root cause: `[project]` in `pyproject.toml` carried only
+     name/version/dependencies.
+  3. **The sdist was 64.7 MB** (~85x too big): setuptools-scm seeds sdist contents from all
+     git-tracked files, and the 64.5 MB `aether-vault-server.tar` Docker-image export was
+     git-tracked, so it shipped inside every source release. Verified by building the sdist and
+     listing its contents — the tar was right there.
+- **Fix:**
+  - `LICENSE`: PolyForm Noncommercial License 1.0.0 with the licensor's Required Notice line
+    (`Copyright Leon Schwarzkopf (Aether Quant)`). Noncommercial use is free; commercial use
+    requires a separate license — this is a deliberate business-model decision (source-available,
+    not OSI open source).
+  - `pyproject.toml [project]`: real one-line description, `readme = "README.md"` (so the full
+    README renders on the PyPI page), license text, author, keywords, 15 classifiers (Beta /
+    audiences / OSes / Python 3.10–3.12 / C++ / version-control + AI topics), and four
+    `[project.urls]` entries (Homepage/Repository/Issues/Changelog).
+  - New `MANIFEST.in` excluding the server-image tar (+ pyc/pycache hygiene); additionally
+    untracked `aether-vault-server.tar` from git entirely (`git rm --cached`, local copy kept)
+    and added it to `.gitignore` — it never belonged in version control and was bloating every
+    clone as well as the sdist.
+  - README: Open Source Roadmap de-staled — the "first tagged release" row is now ✅ (0.1.0 and
+    0.1.1 are live on PyPI via trusted publishing), plus new 🔲 rows for the gaps found during
+    this review (`av log`, branch merge, Alembic migrations, CORS/rate-limit hardening,
+    cp313/cp314 wheels). Added a short License section pointing at LICENSE.
+- **Verified:** rebuilt the sdist for real: 64.7 MB → **761 KB** (177 files), no `.tar` inside,
+  LICENSE + MANIFEST.in included; `twine check dist/*.tar.gz` → PASSED; PKG-INFO inspected and
+  now carries Summary/License/classifiers/URLs/keywords plus the full README as the long
+  description (which is what the next PyPI upload will render). Note for release: the *next*
+  tag push will publish this metadata; the already-published 0.1.x pages stay sparse until then.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

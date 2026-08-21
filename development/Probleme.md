@@ -934,3 +934,54 @@ implement, both rated 1–10.
   New tests: CLI-level short-hash checkout + ambiguous rejection (`tests/test_cli.py`),
   resolver unit cases + `load_commit` prefix acceptance (`tests/test_vault.py`). Full suite:
   see Phase 35 in `CHANGELOG.md`.
+
+
+## ✅ Fixed — Packaging & release-hygiene round (2026-08-21)
+
+### [4] sdist shipped a 64.5 MB Docker-image tar — 64.7 MB source release
+- **Files:** `aether-vault-server.tar` (untracked from git), new `MANIFEST.in`, `.gitignore`.
+- **Problem:** `aether-vault-server.tar` (a 64.5 MB `docker save` export) was git-tracked.
+  setuptools-scm seeds the sdist file list from all git-tracked files, so every source release
+  embedded the entire server image: the published `0.1.0`/`0.1.1` sdists were **64.7 MB** for a
+  package whose wheels are ~200–430 KB. It also made every `git clone` ~65 MB heavier and was
+  silently exempt from `.gitignore` because it had been committed before being listed there
+  (actually: it wasn't ignored at all until now).
+- **How found:** audited the real PyPI JSON metadata (`pypi.org/pypi/aether-vault/json`) during
+  the business-readiness review — sdist size 64,707,757 bytes vs. wheel sizes two orders of
+  magnitude smaller; then built a local sdist and found the tar sitting in its file list.
+- **Impact:** source installs took ~85x longer to download than necessary; PyPI has a 100 MB
+  per-file limit that a slightly larger image export would have blown through, breaking the
+  release pipeline mid-publish.
+- **Fix:** `git rm --cached aether-vault-server.tar` (local copy kept on disk), added it to
+  `.gitignore`, and added `MANIFEST.in` with `exclude aether-vault-server.tar` +
+  pyc/pycache hygiene excludes as defense-in-depth for any future tracked artifact.
+- **Verified:** rebuilt the sdist after the change — 761 KB total, no `.tar` member inside,
+  LICENSE/MANIFEST.in present, `twine check` PASSED.
+
+### [3] Published PyPI pages were empty — no summary, description, license, or URLs
+- **Files:** `pyproject.toml` (`[project]`, `[project.urls]`).
+- **Problem:** `[project]` carried only name/dynamic-version/dependencies. The published
+  `0.1.0`/`0.1.1` releases therefore rendered barebones PyPI pages: `summary: null`, empty long
+  description, zero classifiers, no repository link, no license — for anyone landing on PyPI,
+  the project looked abandoned or automated-spam.
+- **Fix:** full PEP 621 metadata: one-line description, `readme = "README.md"` (full README now
+  renders as the PyPI page body), PolyForm Noncommercial license text, author
+  ("Leon Schwarzkopf (Aether Quant)"), 7 keywords, 15 classifiers (Beta, audiences, OSes,
+  Python 3.10–3.12, C++, version-control/AI topics), and Homepage/Repository/Issues/Changelog
+  URLs.
+- **Verified:** `twine check dist/*.tar.gz` PASSED; PKG-INFO inspected directly — Summary,
+  License, all classifiers, all Project-URLs, Keywords, and the README long-description are
+  present in the built distribution. The next tag push publishes this metadata; existing
+  0.1.x pages update only when a yank/new upload happens.
+
+### [2] No LICENSE file anywhere in the repo or the published packages
+- **Files:** `LICENSE` (new), `README.md` (new License section).
+- **Problem:** neither the repo nor either PyPI release carried a license — default copyright
+  law applies, meaning technically nobody (including PyPI redistributors) was licensed to use
+  or redistribute the software at all. Also invisible on the PyPI page (`license: null`).
+- **Fix:** adopted the PolyForm Noncommercial License 1.0.0 (same license as the author's other
+  projects) with Required Notice `Copyright Leon Schwarzkopf (Aether Quant)`. Noncommercial use
+  (personal, research, education, nonprofits, government) is free; commercial use requires a
+  separate license — aligning the free tier with the planned open-core/commercial-split model.
+  setuptools auto-includes LICENSE in distributions by filename convention (confirmed present
+  in the rebuilt sdist). README gained a short License section linking to it.

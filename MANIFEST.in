@@ -1,0 +1,4 @@
+# sdist contents are seeded from git-tracked files (setuptools-scm); these
+# directives strip build artifacts that have no business in a source release.
+exclude aether-vault-server.tar
+global-exclude *.py[cod] __pycache__ .DS_Store
