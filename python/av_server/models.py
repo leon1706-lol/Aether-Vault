@@ -48,6 +48,10 @@ class DBTree(Base):
     size = Column(BigInteger, nullable=True)  # see DBObject.size — multi-GB artifacts
     type = Column(String)  # 'tree' | 'file' | 'artifact'
     layers = Column(JSON, default=list)
+    # CDC chunk manifests for opaque checkpoints (.pt/.pth/.ckpt): [{"hash","size","offset"}].
+    # Mirrors `layers` — same storage pattern, same create_all migration caveat for existing
+    # DBs (`ALTER TABLE trees ADD COLUMN chunks JSON;` or drop/recreate).
+    chunks = Column(JSON, default=list)
 
 
 class DBCommit(Base):
@@ -67,6 +71,12 @@ class DBCommit(Base):
     # missing parent must not raise an IntegrityError → HTTP 500. Integrity of the DAG is
     # still anchored by the content-addressed hashes themselves.
     parent_hash = Column(String, nullable=True, index=True)
+    # Merge commits have more than one parent; parent_hash keeps parents[0] and everything
+    # beyond it lands here as a JSON array string (e.g. '["abc..."]'). Nullable — normal
+    # commits are single-parent. NOTE (no-migrations caveat): existing databases created via
+    # create_all need a one-time `ALTER TABLE commits ADD COLUMN extra_parents TEXT;`
+    # (create_all only adds missing tables, never missing columns).
+    extra_parents = Column(String, nullable=True)
     root_tree_hash = Column(String, nullable=False)
     tags = Column(ARRAY(String), default=list)
     metrics = Column(JSON, default=dict)

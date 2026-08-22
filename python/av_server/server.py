@@ -149,6 +149,7 @@ async def build_merkle_tree(db: AsyncSession, tree_data: Dict[str, Any]) -> str:
                     "type": info.get("type", "file"),
                     "size": info.get("size", 0),
                     "layers": info.get("layers", []),
+                    "chunks": info.get("chunks", []),
                 }
             )
 
@@ -169,6 +170,7 @@ async def build_merkle_tree(db: AsyncSession, tree_data: Dict[str, Any]) -> str:
                     type=entry["type"],
                     size=entry["size"],
                     layers=entry.get("layers", []),
+                    chunks=entry.get("chunks", []),
                 )
             )
         await db.flush()
@@ -329,11 +331,16 @@ async def push_commit(
     try:
         root_tree_hash = await build_merkle_tree(db, raw_tree)
         parents: List[str] = commit_data.get("parents", [])
+        # Merge commits carry parents[1:] in extra_parents (JSON string); parent_hash stays
+        # parents[0] for backward compatibility with every existing consumer (webui graph,
+        # older clients) that only understands a single parent.
+        extra_parents = json.dumps(parents[1:]) if len(parents) > 1 else None
         new_commit = DBCommit(
             hash=commit_hash,
             message=commit_data.get("message", ""),
             author=commit_data.get("author", "anonymous"),
             parent_hash=parents[0] if parents else None,
+            extra_parents=extra_parents,
             root_tree_hash=root_tree_hash,
             tags=tags,
             metrics=metrics,
@@ -410,9 +417,28 @@ async def resolve_tree(db: AsyncSession, root_hash: str) -> dict:
                             "size": entry.size,
                             "type": entry.type,
                             "layers": entry.layers or [],
+                            "chunks": getattr(entry, "chunks", None) or [],
                         }
         frontier = next_frontier
     return tree_data
+
+
+def _full_parents(parent_hash: Optional[str], extra_parents_json: Optional[str]) -> List[str]:
+    """Reconstructs a commit's complete parents list from the DB columns.
+
+    parent_hash holds parents[0]; merge commits store the rest in extra_parents as a JSON
+    array string. Tolerates corrupt/absent JSON (returns just the primary parent) so one
+    bad row can't 500 the whole dashboard.
+    """
+    parents = [parent_hash] if parent_hash else []
+    if extra_parents_json:
+        try:
+            extras = json.loads(extra_parents_json)
+            if isinstance(extras, list):
+                parents.extend(extras)
+        except (ValueError, TypeError):
+            pass
+    return parents
 
 
 @app.get("/api/commits/{hash}")
@@ -438,6 +464,7 @@ async def get_commit(
         "author": commit.author,
         "timestamp": commit.timestamp.isoformat() if commit.timestamp else None,
         "parent_hash": commit.parent_hash,
+        "parents": _full_parents(commit.parent_hash, commit.extra_parents),
         "root_tree_hash": commit.root_tree_hash,
         "tags": commit.tags or [],
         "metrics": commit.metrics or {},
@@ -542,7 +569,7 @@ _GC_DELETE_BATCH = 500
 def _collect_alive_in_memory(
     root_hash: Optional[str], tree_map: Dict[str, list], visited: set, alive: set
 ) -> None:
-    """Iteratively mark every object/layer hash reachable from a root tree as alive.
+    """Iteratively mark every object/layer/chunk hash reachable from a root tree as alive.
 
     Operates over a pre-loaded {tree_hash: [entries]} map, so the whole GC mark phase costs
     a single DBTree query instead of one query per tree node (was N+1 and recursive).
@@ -562,6 +589,14 @@ def _collect_alive_in_memory(
                 for layer in entry.layers:
                     if isinstance(layer, dict) and "hash" in layer:
                         alive.add(layer["hash"])
+            # CDC chunk shards (opaque .pt/.pth/.ckpt checkpoints) live as their own objects,
+            # exactly like safetensors layer shards — unmarked here, GC would reap the pieces
+            # a chunked checkpoint needs to reassemble.
+            chunks = getattr(entry, "chunks", None) or []
+            for chunk in chunks:
+                if isinstance(chunk, dict) and "hash" in chunk:
+                    alive.add(chunk["hash"])
+
 
 
 @app.post("/api/admin/gc")
@@ -745,6 +780,7 @@ async def list_commits(
             "author": c.author,
             "timestamp": c.timestamp.isoformat() if c.timestamp else None,
             "parent_hash": c.parent_hash,
+            "parents": _full_parents(c.parent_hash, c.extra_parents),
             "root_tree_hash": c.root_tree_hash,
             "tags": c.tags or [],
             "metrics": c.metrics or {},

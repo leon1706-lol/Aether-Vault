@@ -81,3 +81,56 @@ def test_split_and_hash_safetensors_rejects_oversized_header(tmp_path):
     p.write_bytes(struct.pack("<Q", 10_000_000) + b"{}")
     with pytest.raises(RuntimeError):
         aether_core.split_and_hash_safetensors(str(p))
+
+
+def test_chunk_and_hash_file_produces_valid_chunks(tmp_path):
+    p = tmp_path / "checkpoint.pt"
+    data = os.urandom(6 * 1024 * 1024)  # 6 MB → several avg-2MB chunks
+    p.write_bytes(data)
+
+    chunks = aether_core.chunk_and_hash_file(str(p))
+    assert 2 <= len(chunks) <= 12
+    covered = 0
+    for c in chunks:
+        assert 512 * 1024 <= c["size"] <= 8 * 1024 * 1024
+        assert c["offset"] == covered          # consecutive, no gaps/overlaps
+        covered += c["size"]
+    assert covered == len(data)
+
+
+def test_chunk_and_hash_file_boundaries_stable_under_local_edit(tmp_path):
+    """The actual dedup claim: an edit inside one region must leave every chunk entirely
+    before the edit point byte-identical (same boundary offset AND hash).
+
+    Small explicit chunk params guarantee multiple cuts inside the first half of the file,
+    so the survivor assertion is deterministic instead of distribution-dependent.
+    """
+    p = tmp_path / "checkpoint.pt"
+    data = os.urandom(8 * 1024 * 1024)
+    p.write_bytes(data)
+    original = aether_core.chunk_and_hash_file(str(p), min_chunk=256 * 1024,
+                                               avg_chunk=512 * 1024, max_chunk=1024 * 1024)
+
+    mutated = bytearray(data)
+    edit_pos = len(data) // 2
+    mutated[edit_pos] ^= 0xFF           # flip one byte mid-file
+    p.write_bytes(bytes(mutated))
+    after = aether_core.chunk_and_hash_file(str(p), min_chunk=256 * 1024,
+                                            avg_chunk=512 * 1024, max_chunk=1024 * 1024)
+
+    # every chunk ending strictly before the edited byte must be untouched
+    survivors = [
+        b for b in after
+        if any(a["hash"] == b["hash"] and a["offset"] == b["offset"]
+               and b["offset"] + b["size"] <= edit_pos for a in original)
+    ]
+    assert len(survivors) >= 3, "chunks fully before the edit point must survive unchanged"
+
+
+def test_chunk_and_hash_file_rejects_bad_params(tmp_path):
+    p = tmp_path / "f.bin"
+    p.write_bytes(b"x" * 1024)
+    with pytest.raises(RuntimeError):
+        aether_core.chunk_and_hash_file(str(p), min_chunk=0)
+    with pytest.raises(RuntimeError):
+        aether_core.chunk_and_hash_file(str(p), min_chunk=4 * 1024 * 1024, avg_chunk=1024)

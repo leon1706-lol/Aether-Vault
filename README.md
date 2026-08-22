@@ -40,8 +40,8 @@ Aether-Vault solves the core challenge of ML reproducibility by versioning the *
 
 Aether-Vault bridges Python and C++ for maximum throughput:
 
-- **C++ Performance Core (`aether_core`)** — Reads multi-gigabyte files in 8MB chunks, hashing them in parallel with a C++11 ThreadPool. Layer-aware `.safetensors` parsing enables per-layer deduplication.
-- **Python CLI (`av_cli`)** — Familiar Git-like interface (`av add`, `av commit`, `av checkout`). Files above the LFS threshold are automatically replaced by lightweight pointer files.
+- **C++ Performance Core (`aether_core`)** — Reads multi-gigabyte files in 8MB chunks, hashing them in parallel with a C++11 ThreadPool. Layer-aware `.safetensors` parsing enables per-layer deduplication; content-defined chunking gives opaque checkpoints (`.pt`/`.pth`/`.ckpt`) chunk-level dedup without any framework dependency.
+- **Python CLI (`av_cli`)** — Familiar Git-like interface (`av add`, `av commit`, `av checkout`, plus `clone`/`pull`/`merge`/`log` for team workflows). Files above the LFS threshold are automatically replaced by lightweight pointer files.
 - **Framework Plugins (`av_plugins`)** — Optional native callbacks for PyTorch Lightning and HuggingFace Transformers that drive the CLI in-process to auto-commit checkpoints during training.
 - **FastAPI CAS Server (`av_server`)** — Dockerized Content-Addressable Storage backend, backed by PostgreSQL (Merkle Tree DAG) and RedisBloom (O(1) existence checks).
 - **Next.js Web UI (`webui`)** — Browser-based dashboard for visualizing the commit graph, branches, and ML metrics, plus a "Weight Diff" tab for visually comparing per-layer checkpoint changes. Launched with `av webui`.
@@ -55,8 +55,8 @@ Split into two focused diagrams rather than one large one — what happens on yo
 ```mermaid
 graph TD
     Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-    CLI("av_cli<br>(init · add · status · commit · branch · checkout ·<br>push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file ·<br>unstage · stash · import-lightning · import-mlflow · import-transformers)")
-    CPP("aether_core (C++)<br>(Splits Safetensors & Hashes in Parallel)")
+    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-transformers)")
+    CPP("aether_core (C++)<br>(Splits Safetensors & CDC-Chunks Checkpoints,<br>Hashes in Parallel)")
     LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
     PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
     WebUI("Web UI<br>(Dashboard · Commits · Branches · Metrics · Storage ·<br>Weight Diff · Projects Tabs · localhost:3000)")
@@ -95,6 +95,7 @@ graph TD
 
     CLI -- "Push: Uploads Objects, Trees & Refs<br>(+ Bearer Token if Protected)" --> FastAPI
     CLI -- "Checkout: Downloads Missing Objects" --> FastAPI
+    CLI -- "Clone/Pull: Discovers Projects, Fetches<br>History & Materializes Working Copies" --> FastAPI
     CLI -- "gc: Triggers Remote Garbage Collection" --> FastAPI
     PendingQ -- "Retried by av push" --> FastAPI
     WebUI -- "Fetches Commits, Refs, Metrics & Per-Layer Hashes<br>(TokenGate Prompts if 401)" --> FastAPI
@@ -124,9 +125,8 @@ pip install aether-vault
 av init
 ```
 
-That's it. `av init` walks you through choosing **Local** (Docker-backed, runs on this machine)
-or **Enterprise** (account login), and for Local mode checks whether the Docker backend is
-running, built, or missing and handles whichever applies automatically — no manual
+That's it. `av init` checks whether the Docker backend is running, built, or missing and
+handles whichever applies automatically — no manual
 `docker compose` step required.
 
 ### Prerequisites
@@ -183,24 +183,24 @@ the full Local/Enterprise/shell details.
 ### `av init`
 *(see [Quick Start](#quick-start-from-install-to-push) for the full install-to-push walkthrough)*
 
-Initialize an Aether-Vault repository in the current directory. On first run, shows a banner
-and asks whether to use **Local** (Docker-backed, runs on this machine) or **Enterprise**
-(account login — coming soon, currently falls back to Local). The choice is saved to
-`.av/config`; re-running `av init` in an already-initialized repo skips the prompt and
-reconnects straight to the stored mode. Either way, `av init` drops you into an interactive
-session afterward — type commands (still prefixed with `av`, e.g. `av status`) without
-re-invoking the process each time; `exit`/`quit`/Ctrl+D leaves back to your normal shell.
-Running bare `av` (no subcommand) in an already-initialized repo does the same reconnect +
-session entry without needing `init` again.
+Initialize an Aether-Vault repository in the current directory. `av init` drops you into an
+interactive session afterward — type commands (still prefixed with `av`, e.g. `av status`)
+without re-invoking the process each time; `exit`/`quit`/Ctrl+D leaves back to your normal
+shell. Running bare `av` (no subcommand) in an already-initialized repo does the same
+reconnect + session entry without needing `init` again.
 
-Choosing Local also asks whether to run **Anonymous** (no token, anyone reachable can use it —
-today's default) or **Protected** (every action requires a shared-secret access token — see
+Interactive init asks whether to run **Anonymous** (no token, anyone reachable can use it —
+the default) or **Protected** (every action requires a shared-secret access token — see
 `av auth` below). Protected has a second choice: generate a new token (you're standing this
-registry up for the first time) or enter an existing one (you're joining a registry a teammate
-already protected).
+registry up for the first time) or enter an existing one (you're joining a registry a
+teammate already protected).
+
+An **Enterprise** mode (account-based login, RBAC/SSO) exists as a seam for the commercial
+variant but is deliberately not offered interactively yet — it's reachable only via the
+explicit `--mode enterprise` flag and currently falls back to Local.
 ```bash
-av init                                   # interactive: asks Local/Enterprise, then Anonymous/Protected, then opens the session
-av init --mode local --yes --no-repl      # non-interactive: for scripts/CI, skips both prompts, defaults to Anonymous
+av init                                   # interactive: asks Anonymous/Protected, then opens the session
+av init --mode local --yes --no-repl      # non-interactive: for scripts/CI, skips prompts, defaults to Anonymous
 av init --mode local --protected          # non-interactive equivalent of Protected + generate a new token
 av init --mode local --token <token>      # non-interactive equivalent of Protected + join an existing registry
 av                                        # bare, in an initialized repo: reconnect + open the session
@@ -291,9 +291,18 @@ line) — see `av file --avignore` below to generate one.
 Generates scaffold files in the repo root. Each kind of generated file is its own flag, so more
 can be added later without restructuring the command.
 ```bash
-av file --avignore   # writes a .avignore template (gitignore-style — venv/, *.log, etc.)
+av file --avignore       # writes a .avignore template (gitignore-style — venv/, *.log, etc.)
+av file --avattributes   # writes a .avattributes template (per-path staging directives)
 ```
 Refuses to overwrite an existing file rather than silently clobbering edits you've already made.
+
+`.avattributes` is gitattributes-style: glob patterns with staging directives, last matching
+line wins. Supported flags: `no-chunk` (store an opaque checkpoint as a whole-file blob
+instead of CDC chunks) and `no-layer-split` (never split safetensors into per-layer shards).
+```gitattributes
+*.pt no-chunk
+models/frozen/*.safetensors no-layer-split
+```
 
 ### `av unstage`
 Undo `av add` — without touching the working-tree files. Reverts each staged entry back to its
@@ -323,6 +332,42 @@ Retry syncing locally committed commits that couldn't reach the remote registry 
 av push
 ```
 
+### `av clone`
+Materialize a fresh working copy of a project someone else already pushed — the team-collaboration
+entry point. Resolves the project by exact id, exact name, or unique name prefix from the
+registry's project list; the clone inherits the source project's identity, so pushes from either
+copy land in the same project on the shared registry.
+```bash
+av clone my-llm-finetune                 # into ./my-llm-finetune
+av clone my-llm-finetune work-copy       # explicit target directory (must be empty/new)
+av clone <project-id> --token <token>    # by id, joining a Protected registry
+```
+Full commit history comes down as cheap metadata; only the default branch's tip (`main`, else
+first) materializes its objects — older versions lazy-download on first checkout, so `av log`,
+`av handoff`, and `av checkout <old>` all work offline right after cloning.
+
+### `av pull`
+Fetch the current branch from the registry and fast-forward onto it.
+```bash
+av pull            # fast-forward only
+av pull --force    # discard uncommitted local changes instead of aborting
+```
+Pull is deliberately **fast-forward-only**: when local and remote histories have diverged it
+refuses instead of guessing a merge — but the fetched commits are stored locally first, so it
+prints the exact command to resolve: `av merge <remote-tip>`. Uncommitted changes are guarded
+the same way `checkout` guards them.
+
+### `av log`
+Show local commit history, newest first — no registry round trip, works fully offline.
+```bash
+av log                       # walk the parent chain from HEAD (default limit 30)
+av log --limit 100           # more history
+av log --branch feature-x    # start from another branch's tip
+av log --all                 # every local commit across branches, timestamp-ordered
+```
+Branch tips are annotated git-style (`[a54a0b2] (HEAD, main) message`), with an indented detail
+line for author/timestamp when present plus tags and metrics.
+
 ### `av branch` / `av checkout`
 Create and switch between experiment branches. Missing model weights are automatically downloaded from the remote.
 ```bash
@@ -335,6 +380,21 @@ Commits can be checked out by their full hash or any unique prefix of it — inc
 is rejected with an error asking for more characters rather than guessing.
 `checkout` refuses to run if you have uncommitted changes it would overwrite, unless you pass
 `--force` (which discards them) — `av stash` is the non-destructive alternative.
+
+### `av merge`
+Merge another branch or commit into the current branch — tree-level three-way merge against the
+nearest common ancestor. Per file, whichever side changed wins; if BOTH sides changed the same
+file differently the merge aborts cleanly (nothing touched) and lists the conflicts.
+```bash
+av merge feature-transformers           # fast-forward when possible, else a two-parent merge commit
+av merge feature-transformers -m "msg"  # custom merge commit message
+av merge <commit-hash> --ours           # auto-resolve conflicts keeping this branch's versions
+av merge <commit-hash> --theirs         # ... or taking the target's versions
+av merge <target> --no-ff               # force a merge commit even when a fast-forward would do
+```
+Successful merges create a real two-parent commit that syncs to the registry (servers ≥ v1.1.1
+store both parents) and shows up in `av log`. Content-level line merging is intentionally out of
+scope — versioned payloads are binary artifacts; an honest abort beats a corrupt merge.
 
 ### `av stash`
 Git-stash-style temporary shelving of uncommitted changes (staged + modified tracked files —
@@ -538,7 +598,7 @@ More development-process documents will live under [`development/`](development/
 | 2 | Safetensors Layer-Dedup | **63% smaller** | 47MB vs. 126MB after 6 fine-tune commits |
 | 3 | Commit + Push Latency | push ~70% faster · commit ~6x slower *(by design, vs. DVC)* | see note above — different upload timing, not a raw speed gap |
 | 4 | No-Op `status`/`add` | ~15x slower than Git LFS | open finding, not a hidden one — interpreter/import startup cost, not yet fixed |
-| 5 | Cold Clone / First Pull | N/A | `av` has no `clone`/`pull` command yet (tracked on the roadmap) |
+| 5 | Cold Clone / First Pull | shipped — capture pending | `av clone` exists as of v1.1.1; the table refreshes with a measured number on the next `av benchmark` run against a live registry |
 | 6 | Partial-Checkpoint Fetch | unique capability | only one of the four tools that can fetch a single layer instead of the whole file |
 | 7 | Storage Footprint Curve | **63% smaller**, gap widens every commit | same dedup advantage as #2, sustained over time |
 | 8 | Concurrent Push Throughput | Aether-only | no competitor has a comparable concurrent-server primitive |
@@ -553,11 +613,14 @@ For the full results, the methodology behind each benchmark, and the rating lege
 | Status | Feature |
 |---|---|
 | ✅ | **First tagged releases shipped** — `v0.1.0` and `v0.1.1` are live on PyPI (wheels for Python 3.10–3.12 on Windows/Linux/macOS, published via trusted publishing on tag push); installed users pick updates up through `av update` / opt-in auto-update |
-| 🔲 | **`av log`** — a CLI commit-history view (today the commit log is only visible in the Web UI) |
-| 🔲 | **Branch merge** — branches and checkout exist, but there is no merge step yet |
+| ✅ | **`av clone` / `av pull`** — fresh-machine working copies from the registry, fast-forward pulls with a diverged-history handoff to `av merge` (v1.1.1) |
+| ✅ | **`av log`** — offline CLI commit history with branch decorations, tags/metrics (v1.1.1) |
+| ✅ | **Branch merge** — tree-level three-way merge with abort-on-conflict + `--ours`/`--theirs`, two-parent merge commits synced through the registry (v1.1.1) |
+| ✅ | **`.pt`/`.pth`/`.ckpt` chunk dedup** — content-defined chunking in the C++ core: opaque checkpoints now get cross-version storage savings like safetensors layers (v1.1.1) |
 | 🔲 | **Database migrations** — the server schema is created via `create_all`; schema evolution still means manual `ALTER TABLE`s (Alembic adoption tracked here) |
 | 🔲 | **API hardening** — CORS is still `allow_origins=["*"]` and there is no rate limiting; both must close before any shared/public deployment |
 | 🔲 | **Python 3.13/3.14 wheels** — cibuildwheel currently targets cp310–cp312 only |
+| 🔲 | **Benchmark #5 recapture** — cold-clone row needs one `av benchmark` run against a live registry |
 
 ## License
 
@@ -573,8 +636,8 @@ For enterprise research teams and institutional algorithmic trading firms:
 
 | Feature | Description |
 |---|---|
-| **Enterprise Login** (🔲 not yet built) | `av init`/`av update` already expose an "Enterprise" mode choice and a stable `EnterpriseAuthProvider` seam (`python/av_cli/enterprise.py`) — selecting it today shows a "coming soon" message and falls back to Local. The real account-based login (the items below) plugs into that seam without changing the CLI surface |
-| **Multi-User Collaboration: `av clone`/`av pull`** | Fresh-machine checkout of a project someone else already pushed — today's sync model is push-only from a single working repo. Real multi-user collaboration (not just a shared registry one person pushes to) is an Enterprise-tier feature |
+| **Enterprise Login** (🔲 not yet built) | A stable `EnterpriseAuthProvider` seam exists (`python/av_cli/enterprise.py`); the mode is deliberately hidden from interactive `av init` until the real account-based login ships. The items below plug into that seam without changing the CLI surface |
+| **Multi-User Collaboration hardening** | The OSS baseline shipped in v1.1.1 (`av clone`/`av pull`/`av merge`, per-project refs). Enterprise tier adds what shared registries need at team scale: server-side branch protection, review/approval flows, and quota management |
 | **RBAC** | Fine-grained read/write permissions for teams, users, and repositories |
 | **SSO** | OAuth2, SAML, and Active Directory integration |
 | **Audit Logging** | Immutable, cryptographically signed logs for regulatory compliance |

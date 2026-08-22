@@ -78,25 +78,6 @@ def print_step(msg: str, status: str = "info") -> None:
     click.secho(f"{tag} {msg}", fg=color)
 
 
-def select_login_mode() -> str:
-    """Prompt the user to choose Local or Enterprise. Returns "local" or "enterprise"."""
-    local_choice = questionary.Choice("Local — Docker-backed, runs on this machine", value="local")
-    console.print()  # blank line between the banner above and the prompt
-    choice = questionary.select(
-        "How would you like to use Aether-Vault?",
-        choices=[
-            local_choice,
-            questionary.Choice("Enterprise — sign in with your account", value="enterprise"),
-        ],
-        default=local_choice,
-        instruction="",
-    ).ask()
-    if choice is None:
-        # Ctrl+C / Ctrl+D during the prompt — default to local rather than crashing.
-        return "local"
-    return choice
-
-
 def select_protection_mode() -> str:
     """Prompt the user to choose Anonymous or Protected (the shared-secret access token).
     Returns "anonymous" or "protected"."""

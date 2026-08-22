@@ -341,12 +341,15 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
     """
     candidates: dict[str, Path] = {}  # hash -> object file on disk, dedup'd
     for info in tree.values():
-        for layer in info.get("layers", []):
-            l_hash = layer["hash"]
-            l_obj = repo_root / ".av" / "objects" / l_hash[:2] / l_hash[2:]
-            if l_obj.exists():
-                candidates.setdefault(l_hash, l_obj)
-        if not info.get("layers"):
+        parts = list(info.get("layers", [])) + list(info.get("chunks", []))
+        for part in parts:
+            p_hash = part["hash"]
+            p_obj = repo_root / ".av" / "objects" / p_hash[:2] / p_hash[2:]
+            if p_obj.exists():
+                candidates.setdefault(p_hash, p_obj)
+        # Layer-split safetensors and CDC-chunked checkpoints deliberately never upload a
+        # whole-file blob (the shards carry all the bytes); only unsplit files do.
+        if not parts:
             obj_file = repo_root / ".av" / "objects" / info["hash"][:2] / info["hash"][2:]
             if obj_file.exists():
                 candidates.setdefault(info["hash"], obj_file)
@@ -455,15 +458,26 @@ def compare_meta_safe(path: str, exp_size: int, exp_mtime: int) -> bool:
     return meta["exists"] and meta["size"] == exp_size and meta["mtime_ns"] == exp_mtime
 
 
-def materialize_file(repo_root: Path, client: "VaultClient", rel_path: str, h: str, layers: list) -> None:
-    """Writes a tracked path's content to the working tree from the CAS (or from the layers
-    it's split into), downloading from the remote if the local object is missing.
+def materialize_file(
+    repo_root: Path,
+    client: "VaultClient",
+    rel_path: str,
+    h: str,
+    layers: list | None = None,
+    chunks: list | None = None,
+) -> None:
+    """Writes a tracked path's content to the working tree from the CAS — whole-object,
+    reassembled from safetensors layers (`layers`), or reassembled from CDC chunks
+    (`chunks`, see the .pt/.ckpt dedup), downloading missing pieces from the remote.
 
-    Extracted from `checkout()`'s per-entry restore logic so `av stash pop`/`apply` can
-    materialize a stashed file's content the exact same way `checkout` restores a commit's —
-    reusing this instead of reimplementing it avoids re-introducing the safetensors
-    reconstruction bug this exact code path already had fixed once (development/Probleme.md).
+    Extracted from `checkout()`'s per-entry restore logic so `av stash pop`/`apply`,
+    clone/pull, and merge can materialize a file the exact same way checkout restores a
+    commit's — reusing this instead of reimplementing it avoids re-introducing the
+    safetensors reconstruction bug this exact code path already had fixed once
+    (development/Probleme.md).
     """
+    layers = layers or []
+    chunks = chunks or []
     obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
     dest = repo_root / rel_path
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -482,6 +496,28 @@ def materialize_file(repo_root: Path, client: "VaultClient", rel_path: str, h: s
                             f"Missing layer {lh} for {rel_path}; aborted to avoid a corrupt artifact"
                         )
                     with open(l_obj, "rb") as f_in:
+                        shutil.copyfileobj(f_in, f_out)
+        except click.ClickException:
+            dest.unlink(missing_ok=True)
+            raise
+
+        obj_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dest, obj_path)
+    elif chunks and not obj_path.exists():
+        ordered = sorted(chunks, key=lambda c: c.get("offset", 0))
+        click.echo(f"Reassembling {rel_path} from {len(ordered)} chunks...")
+        try:
+            with open(dest, "wb") as f_out:
+                for chunk in ordered:
+                    ch = chunk["hash"]
+                    c_obj = repo_root / ".av" / "objects" / ch[:2] / ch[2:]
+                    if not c_obj.exists() and client.server_available():
+                        client.download_object(ch, c_obj)
+                    if not c_obj.exists():
+                        raise click.ClickException(
+                            f"Missing chunk {ch} for {rel_path}; aborted to avoid a corrupt artifact"
+                        )
+                    with open(c_obj, "rb") as f_in:
                         shutil.copyfileobj(f_in, f_out)
         except click.ClickException:
             dest.unlink(missing_ok=True)
@@ -559,15 +595,32 @@ def resolve_head_tree(repo_root: Path) -> dict:
     return tree
 
 
-def stage_one_file(repo_root: Path, idx: Index, threshold_bytes: int, fpath: Path, rel_path: str) -> bool:
+# Opaque checkpoint formats that get content-defined chunking instead of whole-file blobs
+# (safetensors gets precise layer-splitting above; everything else stays whole-file).
+CHUNKABLE_EXTS = {".pt", ".pth", ".ckpt"}
+
+
+def stage_one_file(
+    repo_root: Path,
+    idx: Index,
+    threshold_bytes: int,
+    fpath: Path,
+    rel_path: str,
+    attr_flags: set | None = None,
+) -> bool:
     """Hashes and stores a single file's current content (LFS threshold check, safetensors
-    layer-split if applicable, pointer creation) and records it in the index. Returns whether
-    anything actually changed (False = already up to date in the index).
+    layer-split if applicable, CDC chunking for opaque checkpoint formats, pointer creation)
+    and records it in the index. Returns whether anything actually changed (False = already
+    up to date in the index).
+
+    `attr_flags` carries this path's `.avattributes` directives (`no-chunk`,
+    `no-layer-split`) — resolved once per invocation by the caller via attributes.flags_for.
 
     Extracted from `add()`'s per-file loop body so `av stash push` can get a modified-but-not-
     yet-staged file's content safely into the CAS before reverting the working copy, using
     exactly the same logic `add()` already uses — not a reimplementation of it.
     """
+    attr_flags = attr_flags or set()
     meta = get_file_meta_safe(str(fpath))
 
     existing = idx.get_entry(rel_path)
@@ -584,9 +637,15 @@ def stage_one_file(repo_root: Path, idx: Index, threshold_bytes: int, fpath: Pat
 
     if file_type == "artifact" and meta["size"] > threshold_bytes:
         layers: list[dict] = []
+        chunks: list[dict] = []
 
         aether_core = _get_aether_core()
-        if rel_path.endswith(".safetensors") and aether_core and hasattr(aether_core, "split_and_hash_safetensors"):
+        if (
+            rel_path.endswith(".safetensors")
+            and "no-layer-split" not in attr_flags
+            and aether_core
+            and hasattr(aether_core, "split_and_hash_safetensors")
+        ):
             logger.info(f"Splitting safetensors layers for {rel_path}...")
             try:
                 layer_results = aether_core.split_and_hash_safetensors(str(fpath))
@@ -613,6 +672,41 @@ def stage_one_file(repo_root: Path, idx: Index, threshold_bytes: int, fpath: Pat
                 logger.warning(f"Layer splitting failed for {rel_path}, falling back to whole-file: {exc}")
 
         if not layers:
+            suffix = Path(rel_path).suffix.lower()
+            core_cdc = _get_aether_core()
+            if (
+                suffix in CHUNKABLE_EXTS
+                and "no-chunk" not in attr_flags
+                and core_cdc is not None
+                and hasattr(core_cdc, "chunk_and_hash_file")
+            ):
+                logger.info(f"Content-defined chunking for {rel_path}...")
+                try:
+                    chunk_results = core_cdc.chunk_and_hash_file(str(fpath))
+                    for cr in chunk_results:
+                        c_hash = cr["hash"]
+                        c_size = cr["size"]
+                        c_offset = cr["offset"]
+                        c_obj_dir = repo_root / ".av" / "objects" / c_hash[:2]
+                        c_obj_dir.mkdir(parents=True, exist_ok=True)
+                        c_obj_path = c_obj_dir / c_hash[2:]
+                        if not c_obj_path.exists():
+                            with open(fpath, "rb") as src_f:
+                                src_f.seek(c_offset)
+                                with open(c_obj_path, "wb") as dst_f:
+                                    remaining = c_size
+                                    while remaining > 0:
+                                        block = src_f.read(min(8 * 1024 * 1024, remaining))
+                                        if not block:
+                                            break
+                                        dst_f.write(block)
+                                        remaining -= len(block)
+                        chunks.append({"hash": c_hash, "size": c_size, "offset": c_offset})
+                except Exception as exc:
+                    logger.warning(f"Chunking failed for {rel_path}, falling back to whole-file: {exc}")
+                    chunks = []
+
+        if not layers and not chunks:
             obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
             obj_dir.mkdir(parents=True, exist_ok=True)
             obj_path = obj_dir / file_hash[2:]
@@ -628,7 +722,13 @@ def stage_one_file(repo_root: Path, idx: Index, threshold_bytes: int, fpath: Pat
         idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, pointer_rel_path, auto_save=False)
         if layers:
             idx.entries[rel_path]["layers"] = layers
-        click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {len(layers)} layers)", fg="green")
+        if chunks:
+            idx.entries[rel_path]["chunks"] = chunks
+        split_desc = (
+            f"{len(layers)} layers" if layers
+            else (f"{len(chunks)} chunks" if chunks else "whole-file")
+        )
+        click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {split_desc})", fg="green")
     else:
         obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
         obj_dir.mkdir(parents=True, exist_ok=True)
@@ -821,12 +921,14 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
 
     ui.print_banner("Aether-Vault", "version control for ML models & datasets")
 
+    # Enterprise mode is intentionally not offered interactively yet (the account-login flow
+    # is unbuilt; selecting it today just falls back to Local) — the choice stays reachable
+    # only via the explicit `--mode enterprise` flag so scripts keep working and the
+    # enterprise.py seam stays wired for the real implementation.
     if mode is not None:
         login_mode = mode
-    elif yes or not ui.is_interactive():
-        login_mode = "local"
     else:
-        login_mode = ui.select_login_mode()
+        login_mode = "local"
 
     _init_repo_structure(repo_root)
     click.secho(f"Initialized empty Aether-Vault repository in {av_dir}", fg="green")
@@ -998,12 +1100,16 @@ def add(paths: tuple) -> None:
         elif path_obj.is_dir():
             files_to_process.extend(iter_working_files(path_obj))
 
+    from . import attributes
+
+    attr_rules = attributes.load_attributes(repo_root)
     any_changed = False
     for fpath in files_to_process:
         rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
         if is_pointer_file(fpath):
             continue
-        if stage_one_file(repo_root, idx, threshold_bytes, fpath, rel_path):
+        if stage_one_file(repo_root, idx, threshold_bytes, fpath, rel_path,
+                          attributes.flags_for(attr_rules, rel_path)):
             any_changed = True
 
     if any_changed:
@@ -1023,25 +1129,41 @@ _AVIGNORE_TEMPLATE = """\
 @cli.command()
 @click.option("--avignore", "make_avignore", is_flag=True, default=False,
               help="Generate a .avignore template in the repo root.")
-def file(make_avignore: bool) -> None:
-    """Generate scaffold files (e.g. .avignore) in the repo root.
+@click.option("--avattributes", "make_avattributes", is_flag=True, default=False,
+              help="Generate a .avattributes template (per-path staging directives, "
+                   "e.g. no-chunk / no-layer-split) in the repo root.")
+def file(make_avignore: bool, make_avattributes: bool) -> None:
+    """Generate scaffold files (.avignore, .avattributes) in the repo root.
 
     Each kind of generated file is its own flag, so more can be added later without
     restructuring this command.
     """
+    from .attributes import ATTRIBUTES_TEMPLATE
+
     repo_root = ensure_repo()
 
-    if not make_avignore:
-        click.secho("Nothing to do — pass a flag, e.g. `av file --avignore`.", fg="yellow")
+    if not make_avignore and not make_avattributes:
+        click.secho(
+            "Nothing to do — pass a flag, e.g. `av file --avignore` or `av file --avattributes`.",
+            fg="yellow",
+        )
         return
 
-    avignore_path = repo_root / ".avignore"
-    if avignore_path.exists():
-        click.secho(f".avignore already exists at {avignore_path} — not overwriting.", fg="yellow")
-        return
+    if make_avignore:
+        avignore_path = repo_root / ".avignore"
+        if avignore_path.exists():
+            click.secho(f".avignore already exists at {avignore_path} — not overwriting.", fg="yellow")
+        else:
+            avignore_path.write_text(_AVIGNORE_TEMPLATE, encoding="utf-8")
+            click.secho(f"Wrote {avignore_path}", fg="green")
 
-    avignore_path.write_text(_AVIGNORE_TEMPLATE, encoding="utf-8")
-    click.secho(f"Wrote {avignore_path}", fg="green")
+    if make_avattributes:
+        attrs_path = repo_root / ".avattributes"
+        if attrs_path.exists():
+            click.secho(f".avattributes already exists at {attrs_path} — not overwriting.", fg="yellow")
+        else:
+            attrs_path.write_text(ATTRIBUTES_TEMPLATE, encoding="utf-8")
+            click.secho(f"Wrote {attrs_path}", fg="green")
 
 
 @cli.command()
@@ -1235,6 +1357,7 @@ def commit(
             "size": e["size"],
             "type": e["type"],
             "layers": e.get("layers", []),
+            "chunks": e.get("chunks", []),
         }
 
     # --- Resolve parent commit ---
@@ -1266,14 +1389,47 @@ def commit(
         "project_name": cfg["project_name"],
     }
 
-    # Deterministic hash over sorted JSON (preserves DAG integrity)
+    # Deterministic hash over sorted JSON (preserves DAG integrity), atomic local persist,
+    # ref advance, and remote push/queue — shared with `av merge` via _finalize_commit.
+    return _finalize_commit(
+        repo_root, cfg, client,
+        commit_data=commit_data, tree=tree, ref_path=ref_path, head_path=head_path,
+        idx=idx, tags=tags, metrics=metrics,
+    )
+
+
+def _finalize_commit(
+    repo_root: Path,
+    cfg: dict,
+    client: "VaultClient",
+    *,
+    commit_data: dict,
+    tree: dict,
+    ref_path: Path | None,
+    head_path: Path,
+    idx: Index,
+    tags: tuple = (),
+    metrics: dict | None = None,
+) -> str:
+    """Everything `av commit` does after its tree snapshot and parents are resolved: hash
+    the payload deterministically over sorted JSON (preserves DAG integrity — two projects
+    can never collide on the same hash even with byte-identical trees/messages/timestamps),
+    persist atomically (commit object before ref move; temp+replace writes so a crash can't
+    leave a half-written commit behind a moved ref), advance the branch ref (or HEAD when
+    detached), clear the staged flags, print the summary, and push to the registry with the
+    standard offline-queue fallbacks.
+
+    Extracted verbatim from commit()'s tail so `av merge` creates its two-parent commits
+    through exactly the same code path instead of duplicating it.
+    """
+    metrics = metrics or {}
+    message = commit_data.get("message", "")
+
     commit_str = json.dumps(commit_data, sort_keys=True)
     commit_hash = hashlib.sha256(commit_str.encode()).hexdigest()
     commit_data["hash"] = commit_hash
 
-    # --- Persist locally (atomically: write the commit object before moving the ref, and
-    # write each file via temp+replace so a crash can't leave a ref pointing at a half-written
-    # or missing commit) ---
+    # --- Persist locally ---
     atomic_write_json(repo_root / ".av" / "commits" / f"{commit_hash}.json", commit_data)
 
     if ref_path:
@@ -1333,6 +1489,8 @@ def commit(
     else:
         queue_pending_push(repo_root, commit_hash, remote_ref_name)
         click.secho("  Server unreachable — commit queued for push (run `av push` later)", fg="yellow")
+
+    return commit_hash
 
 
 @cli.command()
@@ -1423,15 +1581,7 @@ def checkout(target: str, force: bool) -> None:
     # Refuse to proceed if there are uncommitted changes (modified/deleted tracked files
     # or staged-but-uncommitted edits) unless the user explicitly passes --force.
     if not force:
-        dirty: list[str] = []
-        for rel_path, entry in idx.entries.items():
-            fpath = repo_root / rel_path
-            if not fpath.exists():
-                dirty.append(rel_path)
-            elif entry.get("staged") or not compare_meta_safe(
-                str(fpath), entry["size"], entry["mtime_ns"]
-            ):
-                dirty.append(rel_path)
+        dirty = _collect_dirty_paths(repo_root, idx)
         if dirty:
             click.secho(
                 "Error: You have uncommitted changes that would be overwritten by checkout:",
@@ -1444,10 +1594,49 @@ def checkout(target: str, force: bool) -> None:
             click.secho("Commit them, or re-run with --force to discard.", fg="yellow")
             return
 
+    _materialize_tree(repo_root, client, commit_data.get("tree", {}), idx)
+
+    head_path = repo_root / ".av" / "HEAD"
+    with open(head_path, "w") as f:
+        if ref_name:
+            f.write(f"ref: refs/heads/{ref_name}\n")
+        else:
+            f.write(f"{commit_hash}\n")
+
+    click.secho(f"Checked out '{target}'", fg="green")
+
+
+def _collect_dirty_paths(repo_root: Path, idx: Index) -> list[str]:
+    """Tracked paths whose working-tree state would be lost by a tree switch — deleted from
+    disk, staged-but-uncommitted, or stat-different from the index. Shared by `checkout`,
+    `av pull`, and `av merge` so all three refuse destructive switches under exactly the
+    same conditions.
+    """
+    dirty: list[str] = []
+    for rel_path, entry in idx.entries.items():
+        fpath = repo_root / rel_path
+        if not fpath.exists():
+            dirty.append(rel_path)
+        elif entry.get("staged") or not compare_meta_safe(
+            str(fpath), entry["size"], entry["mtime_ns"]
+        ):
+            dirty.append(rel_path)
+    return dirty
+
+
+def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: Index) -> None:
+    """Makes the index and the working tree match a flat commit tree.
+
+    The one shared restore path behind `checkout`, `av clone`, and `av pull`: replaces
+    idx.entries with the tree's entries (downloading any object the remote has but this
+    machine doesn't), deletes working files the tree no longer contains, then re-stats
+    every entry and clears its staged flag so `av status` reads clean immediately after.
+    Extracted verbatim from checkout's body — behavior-preserving, verified by the existing
+    checkout/stash suites.
+    """
     old_entries = dict(idx.entries)
     idx.entries.clear()
 
-    tree = commit_data.get("tree", {})
     if "code" in tree or "artifacts" in tree:
         for rel_path, h in tree.get("code", {}).items():
             idx.add_entry(rel_path, h, 0, 0, "code", auto_save=False)
@@ -1473,18 +1662,21 @@ def checkout(target: str, force: bool) -> None:
             size = info.get("size", 0)
             file_type = info.get("type", "file")
             layers = info.get("layers", [])
+            chunks = info.get("chunks", [])
             pointer = rel_path + ".av-pointer" if file_type == "artifact" else None
 
             idx.add_entry(rel_path, h, size, 0, file_type, pointer, auto_save=False)
             if layers:
                 idx.entries[rel_path]["layers"] = layers
+            if chunks:
+                idx.entries[rel_path]["chunks"] = chunks
 
             # Restore every tracked file's content from the CAS, not just artifacts — `code`
             # files are written to .av/objects by `add()` too (see its comment there), so an
             # older commit's code must be materialized here the same way, or `av checkout`
             # would silently leave the working tree's code untouched while still claiming
             # success (development/Probleme.md).
-            materialize_file(repo_root, client, rel_path, h, layers)
+            materialize_file(repo_root, client, rel_path, h, layers, chunks)
 
     for rel_path in old_entries:
         if rel_path not in idx.entries:
@@ -1504,14 +1696,424 @@ def checkout(target: str, force: bool) -> None:
 
     idx.save()
 
-    head_path = repo_root / ".av" / "HEAD"
-    with open(head_path, "w") as f:
-        if ref_name:
-            f.write(f"ref: refs/heads/{ref_name}\n")
-        else:
-            f.write(f"{commit_hash}\n")
 
-    click.secho(f"Checked out '{target}'", fg="green")
+# ---------------------------------------------------------------------------
+# av log
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--limit", default=30, show_default=True, help="Maximum commits to show.")
+@click.option("--branch", default=None,
+              help="Start from this branch's tip instead of HEAD.")
+@click.option("--all", "show_all", is_flag=True,
+              help="List every local commit across all branches (newest first).")
+def log(limit: int, branch: str | None, show_all: bool) -> None:
+    """Show local commit history, newest first."""
+    from . import history
+
+    repo_root = ensure_repo()
+
+    if show_all:
+        commits = history.collect_all_commits(repo_root, limit)
+        if not commits:
+            click.secho("No commits yet.", fg="yellow")
+            return
+        decorations = history.collect_branch_decorations(repo_root)
+        head_hash = None
+    else:
+        start, err = history.resolve_start_hash(repo_root, branch)
+        if err:
+            click.secho(f"Error: {err}", fg="red")
+            return
+        if start is None:
+            click.secho("No commits yet.", fg="yellow")
+            return
+        commits = history.walk_history(repo_root, start, limit)
+        decorations = history.collect_branch_decorations(repo_root)
+        head_hash = start
+
+    for commit in commits:
+        h = commit["hash"]
+        is_head = bool(head_hash) and h == head_hash
+        click.echo(history.format_log_line(commit, decorations.get(h, []), is_head))
+        meta = history.format_meta_line(commit)
+        if meta:
+            click.echo(meta)
+
+
+# ---------------------------------------------------------------------------
+# av clone / av pull
+# ---------------------------------------------------------------------------
+
+@cli.command("clone")
+@click.argument("project")
+@click.argument("directory", required=False)
+@click.option("--remote-url", default=None, metavar="URL",
+              help="Registry to clone from (default: $AV_REMOTE_URL, else http://localhost:8000).")
+@click.option("--token", default=None, help="Access token for a Protected registry.")
+def clone(project: str, directory: str | None, remote_url: str | None, token: str | None) -> None:
+    """Clone an existing project from a registry into a new directory.
+
+    Downloads the project's full commit history (metadata — cheap) and materializes the
+    default branch's tip; older versions' large objects lazy-download on first checkout.
+    The cloned repo inherits the source project's identity, so pushes from either copy
+    land in the same project on the shared registry.
+    """
+    from .client import VaultClient
+    from . import sync
+
+    target = Path(directory).resolve() if directory else Path.cwd() / project
+    if target.exists() and any(target.iterdir()):
+        click.secho(f"Error: '{target}' already exists and is not empty.", fg="red")
+        return
+
+    url = remote_url or os.environ.get("AV_REMOTE_URL") or "http://localhost:8000"
+    api_token = token or os.environ.get("AV_API_TOKEN")
+    client = VaultClient(url, api_token)
+    if not client.server_available():
+        click.secho(f"Error: Registry unreachable at {url} — is the backend running?", fg="red")
+        return
+
+    try:
+        proj = sync.resolve_project(client, project)
+    except ValidationError as exc:
+        click.secho(f"Error: {exc.message}", fg="red")
+        return
+
+    pid = proj["project_id"]
+    refs = client.list_refs(project_id=pid)
+    branch = sync.pick_default_branch(refs, pid)
+    commits = sync.fetch_project_commits(client, pid)
+    if not commits:
+        click.secho(f"Error: Project '{proj.get('project_name')}' has no commits yet.", fg="red")
+        return
+    if branch is None:
+        # No refs pushed (e.g. only queued/offline commits): fall back to the newest commit.
+        branch = "main"
+        tip_hash = commits[0]["hash"]
+    else:
+        tip_hash = refs[f"{pid}/{branch}"]
+
+    target.mkdir(parents=True, exist_ok=True)
+    _init_repo_structure(target)
+    cfg = load_config(target)
+    cfg.update({
+        "remote_url": url,
+        "login_mode": "local",
+        "project_id": pid,
+        "project_name": proj.get("project_name") or target.name,
+    })
+    if api_token:
+        cfg["remote_api_token"] = api_token
+    save_config(target, cfg)
+
+    for c in commits:
+        sync.write_fetched_commit(target, c)
+
+    heads_dir = target / ".av" / "refs" / "heads"
+    atomic_write_text(heads_dir / branch, tip_hash)
+    atomic_write_text(target / ".av" / "HEAD", f"ref: refs/heads/{branch}\n")
+    for stale in heads_dir.iterdir():
+        if stale.name != branch and not stale.read_text().strip():
+            stale.unlink()
+
+    tip_tree = next((c.get("tree", {}) for c in commits if c["hash"] == tip_hash), {})
+    downloaded = sync.ensure_objects_local(target, client, tip_tree)
+    _materialize_tree(target, client, tip_tree, Index(target))
+
+    msg = f"Cloned '{proj.get('project_name')}' ({len(commits)} commit(s)) into {target}"
+    click.secho(msg, fg="green")
+    detail = f"  branch {branch} @ [{tip_hash[:7]}]"
+    if downloaded:
+        detail += f" — downloaded {downloaded} object(s)"
+    click.echo(detail)
+
+
+@cli.command()
+@click.option("--force", "-f", is_flag=True, default=False,
+              help="Discard uncommitted local changes instead of aborting.")
+def pull(force: bool) -> None:
+    """Fetch the current branch from the registry and fast-forward onto it.
+
+    Pull is deliberately fast-forward-only: when local and remote histories have diverged
+    it refuses instead of guessing a merge — the fetched commits are stored locally first,
+    so `av merge <remote-tip>` resolves it explicitly.
+    """
+    from .client import VaultClient
+    from . import sync
+
+    repo_root = ensure_repo()
+    cfg = load_config(repo_root)
+
+    head_content = (repo_root / ".av" / "HEAD").read_text().strip()
+    if not head_content.startswith("ref: refs/heads/"):
+        click.secho("Error: HEAD is detached — check out a branch before pulling.", fg="red")
+        return
+    branch = head_content.split("refs/heads/", 1)[1]
+    ref_path = repo_root / ".av" / "refs" / "heads" / branch
+    local_tip = ref_path.read_text().strip() if ref_path.exists() else ""
+
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
+    if not client.server_available():
+        click.secho(f"Error: Registry unreachable at {cfg.get('remote_url')}.", fg="red")
+        return
+
+    remote_ref = f"{cfg['project_id']}/{branch}"
+    remote_tip = client.get_ref(remote_ref)
+    if not remote_tip:
+        click.secho(f"No remote branch '{branch}' on the registry — nothing to pull.", fg="yellow")
+        return
+    if remote_tip == local_tip:
+        click.secho("Already up to date.")
+        return
+
+    # Walk the remote chain back until it joins history we already have, storing every new
+    # commit locally as we go — so even a diverged pull leaves the full picture on disk.
+    fetched: list[dict] = []
+    cursor: str | None = remote_tip
+    join_found = False
+    while cursor:
+        if cursor == local_tip:
+            join_found = True
+            break
+        existing = sync.load_local_commit(repo_root, cursor)
+        if existing is not None:
+            join_found = True
+            break
+        row = client.get_commit(cursor)
+        if not row:
+            click.secho(
+                f"Error: Remote history is broken — commit {cursor[:7]}… is referenced but "
+                "missing from the registry.",
+                fg="red",
+            )
+            return
+        data = sync.normalize_commit_row(row)
+        sync.write_fetched_commit(repo_root, data)
+        fetched.append(data)
+        parents = data["parents"]
+        cursor = parents[0] if parents else None
+
+    # Fast-forwarding is only safe when the local tip is an ANCESTOR of the remote tip.
+    # Joining the walked chain somewhere below the local tip isn't enough: a repo with its
+    # own unpushed commits would otherwise have them silently overwritten by the remote
+    # tree. Not-an-ancestor = diverged → hand off to `av merge`.
+    ff_allowed = (not local_tip) or (
+        join_found and sync.is_ancestor(lambda h: sync.load_local_commit(repo_root, h),
+                                        local_tip, remote_tip)
+    )
+    if not ff_allowed:
+        click.secho(
+            f"Local and remote '{branch}' have diverged.\n"
+            f"The remote tip [{remote_tip[:7]}] and its history are now local — resolve with:\n"
+            f"  av merge {remote_tip[:7]}",
+            fg="yellow",
+        )
+        return
+
+    idx = Index(repo_root)
+    if not force:
+        dirty = _collect_dirty_paths(repo_root, idx)
+        if dirty:
+            click.secho(
+                "Error: You have uncommitted changes that would be overwritten by pull:",
+                fg="red",
+            )
+            for d in dirty[:20]:
+                click.echo(f"  {d}")
+            click.secho("Commit them (or use --force to discard), then pull again.", fg="yellow")
+            return
+
+    tip_data = sync.load_local_commit(repo_root, remote_tip)
+    tree = tip_data.get("tree", {}) if tip_data else {}
+    sync.ensure_objects_local(repo_root, client, tree)
+    _materialize_tree(repo_root, client, tree, idx)
+    atomic_write_text(ref_path, remote_tip)
+
+    click.secho(
+        f"Fast-forwarded {branch}: {local_tip[:7] or '(empty)'} → {remote_tip[:7]} "
+        f"({len(fetched)} new commit(s))",
+        fg="green",
+    )
+
+
+@cli.command()
+@click.argument("target")
+@click.option("-m", "--message", default=None, help="Override the default merge commit message.")
+@click.option("--ours", "policy_ours", is_flag=True, default=False,
+              help="Resolve conflicting files by keeping THIS branch's version.")
+@click.option("--theirs", "policy_theirs", is_flag=True, default=False,
+              help="Resolve conflicting files by taking TARGET's version.")
+@click.option("--no-ff", is_flag=True, default=False,
+              help="Create a merge commit even when a fast-forward would do.")
+def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bool,
+          no_ff: bool) -> None:
+    """Merge another branch or commit into the current branch.
+
+    Tree-level three-way merge against the nearest common ancestor: per file, whichever
+    side changed wins; if BOTH sides changed the same file differently the merge aborts
+    cleanly (nothing touched) and lists the conflicts — resolve with --ours/--theirs.
+    Successful non-fast-forward merges create a two-parent merge commit that syncs to the
+    registry (v1.1.1 servers store both parents).
+    """
+    from .client import VaultClient
+    from . import sync
+    from .merge import find_merge_base, three_way_tree_merge, tree_is_flat, summarize_changes
+
+    repo_root = ensure_repo()
+    cfg = load_config(repo_root)
+    idx = Index(repo_root)
+
+    head_content = (repo_root / ".av" / "HEAD").read_text().strip()
+    if not head_content.startswith("ref: refs/heads/"):
+        click.secho("Error: HEAD is detached — check out a branch before merging.", fg="red")
+        return
+    branch = head_content.split("refs/heads/", 1)[1]
+    our_ref_path = repo_root / ".av" / "refs" / "heads" / branch
+    ours = our_ref_path.read_text().strip() if our_ref_path.exists() else ""
+    if not ours:
+        click.secho(f"Error: Branch '{branch}' has no commits yet — commit first.", fg="red")
+        return
+    if policy_ours and policy_theirs:
+        click.secho("Error: --ours and --theirs are mutually exclusive.", fg="red")
+        return
+
+    heads_dir = repo_root / ".av" / "refs" / "heads"
+
+    def _resolve_target() -> str | None:
+        if (heads_dir / target).exists():
+            return (heads_dir / target).read_text().strip()
+        try:
+            resolved = find_commit_file(repo_root, target)
+            return resolved.stem
+        except FileNotFoundError:
+            return None
+        except AmbiguousCommitHash as exc:
+            click.secho(f"Error: {exc.message}", fg="red")
+            return None
+
+    theirs = _resolve_target()
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
+    if theirs is None and client.server_available():
+        row = client.get_commit(target)
+        if row:
+            data = sync.normalize_commit_row(row)
+            sync.write_fetched_commit(repo_root, data)
+            theirs = data["hash"]
+    if not theirs:
+        click.secho(f"Error: Branch or commit '{target}' not found.", fg="red")
+        return
+    if theirs == ours:
+        click.secho("Already up to date.")
+        return
+
+    load = lambda h: sync.load_local_commit(repo_root, h)
+
+    # Make sure both sides' full trees are readable locally before computing anything;
+    # fetched remote history (via av pull) already lands here, but a hand-given hash may not.
+    for h in {theirs}:
+        if load(h) is None and client.server_available():
+            row = client.get_commit(h)
+            if row:
+                sync.write_fetched_commit(repo_root, sync.normalize_commit_row(row))
+
+    base = find_merge_base(load, ours, theirs)
+    if base == theirs:
+        click.secho("Already up to date.")
+        return
+
+    dirty = _collect_dirty_paths(repo_root, idx)
+    fast_forward = base == ours
+    if fast_forward and not no_ff and not dirty:
+        tip_data = load(theirs) or {}
+        tree = tip_data.get("tree", {})
+        sync.ensure_objects_local(repo_root, client, tree)
+        _materialize_tree(repo_root, client, tree, idx)
+        atomic_write_text(our_ref_path, theirs)
+        click.secho(f"Fast-forwarded {branch}: {ours[:7]} → {theirs[:7]}", fg="green")
+        return
+
+    if dirty:
+        click.secho(
+            "Error: You have uncommitted changes that would be overwritten by merge:",
+            fg="red",
+        )
+        for d in dirty[:20]:
+            click.echo(f"  {d}")
+        click.secho("Commit them (or stash them), then merge again.", fg="yellow")
+        return
+
+    base_tree = (load(base) or {}).get("tree", {}) if base else {}
+    ours_tree = (load(ours) or {}).get("tree", {})
+    theirs_data = load(theirs) or {}
+    theirs_tree = theirs_data.get("tree", {})
+
+    if not all(tree_is_flat(t) for t in (base_tree, ours_tree, theirs_tree)):
+        click.secho(
+            "Error: Merge targets a legacy-format commit ({code/artifacts} tree); "
+            "only unified flat-tree commits (post-PR #8) can be merged.",
+            fg="red",
+        )
+        return
+
+    merged, conflicts = three_way_tree_merge(base_tree, ours_tree, theirs_tree)
+    if conflicts and not (policy_ours or policy_theirs):
+        click.secho(
+            f"Merge conflicts in {len(conflicts)} file(s) — both branches changed them "
+            "differently. Nothing was modified. Resolve with:",
+            fg="red",
+        )
+        for p in conflicts[:20]:
+            click.echo(f"  {p}")
+        if len(conflicts) > 20:
+            click.echo(f"  … and {len(conflicts) - 20} more")
+        click.secho(
+            '  av merge <target> --ours     keep this branch\'s versions\n'
+            '  av merge <target> --theirs   take the target\'s versions',
+            fg="yellow",
+        )
+        return
+
+    policy_side = ours_tree if policy_ours else theirs_tree
+    resolved_conflicts = 0
+    if conflicts:
+        for p in conflicts:
+            entry = policy_side.get(p)
+            if entry is None:
+                merged.pop(p, None)
+            else:
+                merged[p] = entry
+        resolved_conflicts = len(conflicts)
+
+    sync.ensure_objects_local(repo_root, client, merged)
+    _materialize_tree(repo_root, client, merged, Index(repo_root))
+
+    head_path = repo_root / ".av" / "HEAD"
+    commit_data: dict = {
+        "parents": [ours, theirs],
+        "author": os.environ.get("AV_AUTHOR", "anonymous"),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "message": message or f"Merge {target} into {branch}",
+        "tree": merged,
+        "tags": [],
+        "metrics": {},
+        "project_id": cfg["project_id"],
+        "project_name": cfg["project_name"],
+    }
+    merge_hash = _finalize_commit(
+        repo_root, cfg, client,
+        commit_data=commit_data, tree=merged, ref_path=our_ref_path,
+        head_path=head_path, idx=Index(repo_root),
+    )
+
+    added, removed, changed = summarize_changes(ours_tree, merged)
+    note = f", {resolved_conflicts} conflict(s) auto-resolved via --{'ours' if policy_ours else 'theirs'}" \
+        if resolved_conflicts else ""
+    click.secho(
+        f"Merged {target} into {branch}: +{added} -{removed} ~{changed} file(s)"
+        f"{note} [{merge_hash[:7]}]",
+        fg="green",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1567,13 +2169,17 @@ def _stash_push(message: str | None) -> None:
     head_tree = resolve_head_tree(repo_root)
     stash_entries = []
 
+    from . import attributes
+
+    attr_rules = attributes.load_attributes(repo_root)
     for rel_path in dirty_paths:
         was_staged = rel_path in staged
         if not was_staged:
             # Modified-but-unstaged: get its current content safely into the CAS first,
             # exactly the way `av add` would — so reverting the working copy below doesn't
             # lose it.
-            stage_one_file(repo_root, idx, threshold_bytes, repo_root / rel_path, rel_path)
+            stage_one_file(repo_root, idx, threshold_bytes, repo_root / rel_path, rel_path,
+                           attributes.flags_for(attr_rules, rel_path))
 
         entry = idx.entries[rel_path]
         stash_entries.append({
@@ -2024,15 +2630,21 @@ def doctor(fix: bool, dry_run: bool, speed: bool) -> None:
 
     # --- Orphaned pointer entries: index entry has a pointer but its CAS object is missing ---
     # An entry with a pointer but no matching CAS object means `av checkout` would silently
-    # fail to materialize that file's real content. Layer-split artifacts (.safetensors) don't
-    # store a whole-file blob at all (see add()'s comment) — for those, "missing content"
-    # means a missing *layer*, not the absent-by-design whole-file object.
-    def _missing_layers(entry: dict) -> list[dict]:
-        return [l for l in entry["layers"] if not (av_dir / "objects" / l["hash"][:2] / l["hash"][2:]).exists()]
+    # fail to materialize that file's real content. Split artifacts don't store a whole-file
+    # blob at all (see add()'s comment) — for those, "missing content" means a missing
+    # *layer* (safetensors) or *chunk* (.pt/.pth/.ckpt CDC), not the absent-by-design
+    # whole-file object.
+    def _missing_parts(entry: dict, key: str) -> list[dict]:
+        return [
+            part for part in entry.get(key) or []
+            if not (av_dir / "objects" / part["hash"][:2] / part["hash"][2:]).exists()
+        ]
 
     def _artifact_content_missing(entry: dict) -> bool:
         if entry.get("layers"):
-            return bool(_missing_layers(entry))
+            return bool(_missing_parts(entry, "layers"))
+        if entry.get("chunks"):
+            return bool(_missing_parts(entry, "chunks"))
         return not (av_dir / "objects" / entry["hash"][:2] / entry["hash"][2:]).exists()
 
     orphaned = [
@@ -2045,14 +2657,15 @@ def doctor(fix: bool, dry_run: bool, speed: bool) -> None:
     for rel_path in orphaned:
         entry = idx.entries[rel_path]
         can_recover = False
-        if entry.get("layers"):
-            missing = _missing_layers(entry)
+        parts_key = "layers" if entry.get("layers") else ("chunks" if entry.get("chunks") else None)
+        if parts_key:
+            missing = _missing_parts(entry, parts_key)
             if fix and preview:
-                can_recover = all(client.object_exists(l["hash"]) for l in missing)
+                can_recover = all(client.object_exists(p["hash"]) for p in missing)
             elif fix:
                 can_recover = client.server_available() and all(
-                    client.download_object(l["hash"], av_dir / "objects" / l["hash"][:2] / l["hash"][2:])
-                    for l in missing
+                    client.download_object(p["hash"], av_dir / "objects" / p["hash"][:2] / p["hash"][2:])
+                    for p in missing
                 )
         else:
             h = entry["hash"]

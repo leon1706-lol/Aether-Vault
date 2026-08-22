@@ -918,4 +918,140 @@ findings (resolved and still-open).
   description (which is what the next PyPI upload will render). Note for release: the *next*
   tag push will publish this metadata; the already-published 0.1.x pages stay sparse until then.
 
+## Phase 37 — `av log` (offline commit history) — v1.1.1 cycle
+- **Files:** `python/av_cli/history.py` (new), `python/av_cli/main.py` (`log` command),
+  `tests/test_cli.py` (4 tests).
+- **What:** new `av log` — walks the first-parent chain from HEAD (or `--branch <name>`) and
+  prints git-style lines `[shorthash] (HEAD, main) message` with an indented author/timestamp/
+  tags/metrics detail line. Flags: `--limit N` (default 30), `--branch`, `--all` (every local
+  commit across branches, timestamp-descending). Pure-local module: reads only `.av/commits`
+  + `.av/refs/heads`, zero network cost even when a registry is configured; cloned repos see
+  full upstream history because clone stores every commit's metadata locally.
+- **Why modular:** walking/rendering logic lives in `history.py`, the Click wrapper in
+  `main.py` stays ~40 lines — keeps the growing CLI surface out of one monolith.
+- **Verified:** 4 new tests (ordering/decorations, limit+empty-repo, branch flag incl.
+  shared-history walk + bad-branch error, detached HEAD). Manual: real binary in a scratch
+  repo — decorations, limit, tags/metrics line all render as documented.
+
+## Phase 38 — Enterprise mode hidden from interactive init — v1.1.1 cycle
+- **Files:** `python/av_cli/ui.py`, `python/av_cli/main.py` (`init`), `tests/test_ui.py`,
+  `README.md`.
+- **What:** interactive `av init` no longer offers Local-vs-Enterprise — it always picks Local
+  (then goes straight to the Anonymous/Protected question). `ui.select_login_mode()` deleted;
+  a guard test asserts it stays gone so the unbuilt flow can't quietly resurface. The
+  `--mode enterprise` flag is still accepted (scripts/replays keep working) and still falls
+  back to Local through the untouched `enterprise.py` seam; existing repos with
+  `login_mode=enterprise` reconnect unchanged. README init docs updated to match.
+- **Rationale:** the stub told every new user "coming soon" on first contact — worse than not
+  offering it. The seam stays wired for the real commercial login.
+
+## Phase 39 — `av clone` / `av pull` (team collaboration baseline) — v1.1.1 cycle
+- **Files:** `python/av_cli/sync.py` (new), `python/av_cli/client.py`
+  (`list_projects`, `list_commits`, `list_refs`), `python/av_cli/main.py`
+  (`clone`, `pull`, `_materialize_tree` extraction, `_collect_dirty_paths`),
+  `tests/test_sync.py` (new, 9 tests), `tests/test_server.py`
+  (`test_live_two_repo_clone_pull_flow`), `benchmarks/bench_cold_clone.py`.
+- **What:**
+  - `av clone <project> [dir] [--remote-url] [--token]`: resolves the project by exact id,
+    exact name, or unique name prefix against `/api/projects` (ambiguity lists candidates);
+    bootstraps `.av/`; **writes the remote project's `project_id` into config** so pushes from
+    any clone attribute to the same project; fetches ALL commits as metadata via paginated
+    `/api/commits?include_layers=true` (500/page — clones are fully self-sufficient offline);
+    picks the default branch (main → master → alphabetical); materializes tip objects with one
+    batch-check round trip then parallel downloads (8 workers); refuses non-empty targets.
+  - `av pull [--force]`: fast-forward-only onto `<project_id>/<branch>`. Walks the remote
+    chain back until it joins local history, storing every fetched commit locally (so even a
+    diverged pull leaves `av merge <remote-tip>` ready to run). FF requires the local tip to
+    be a strict ANCESTOR of the remote tip — a repo with its own unpushed commits gets the
+    diverged handoff instead of silently losing them. Dirty-tree guard identical to checkout.
+  - Refactor (behavior-preserving): checkout's inline restore loop extracted as shared
+    `_materialize_tree(repo_root, client, tree, idx)` + `_collect_dirty_paths()` — one restore
+    path behind checkout/clone/pull/merge, verified by the untouched checkout/stash suites.
+- **Latency design:** discovery/ref/history are single round trips (pagination, batched
+  existence checks, parallel downloads); no server schema change needed for the base flow.
+- **Verified:** FakeRemoteClient suite drives real clone/pull code paths offline (materialize,
+  identity inheritance, ambiguity, non-empty refusal, FF, up-to-date, diverged, detached,
+  dirty-guard). Live two-repo Docker E2E added (push→clone→push→pull) — lazily skipped when
+  the stack is down. bench_cold_clone.py's av column un-N/A'd: pushes the standard fixture
+  untimed, times `av clone` (reports "registry unreachable" honestly without a stack).
+
+## Phase 40 — `av merge` (three-way merge, two-parent commits) — v1.1.1 cycle
+- **Files:** `python/av_cli/merge.py` (new), `python/av_cli/main.py`
+  (`merge` command, `_finalize_commit` extraction, commit() tail refactor),
+  `python/av_server/models.py` (`DBCommit.extra_parents`), `python/av_server/server.py`
+  (`_full_parents`, push/get/list endpoints return `parents`),
+  `tests/test_merge.py` (new, 17 tests), `tests/test_server.py` (2 parent-round-trip tests).
+- **Server:** merge commits need both parents persisted — `parent_hash` keeps `parents[0]`
+  (every existing consumer unchanged) and new nullable `extra_parents` TEXT column stores
+  `json(parents[1:])`. GET /api/commits/{hash} AND /api/commits now return a reconstructed
+  full `parents` array (corrupt JSON tolerated → primary parent only). Existing DBs need a
+  one-time `ALTER TABLE commits ADD COLUMN extra_parents TEXT;` (same create_all caveat as
+  the BigInteger fix).
+- **Client:** pure algorithms isolated in `merge.py` (no I/O): nearest-common-ancestor via
+  ancestor-set + generation-order BFS (merge-aware, follows every parent edge), and per-path
+  three-way tree merge where entry absence = deletion and full-dict equality means a re-split
+  that preserves content counts as unchanged. Command semantics: already-up-to-date /
+  fast-forward (no commit created, `--no-ff` overrides) / true three-way producing a two-parent
+  merge commit; BOTH-changed-differently conflicts abort before touching anything, listing
+  paths with `--ours`/`--theirs` escape hatches (whole-merge policy; no content-level text
+  merging — payloads are binary artifacts, honest abort beats corrupt merge). Missing
+  theirs-side objects batch-checked then parallel-downloaded before materializing; dirty tree
+  refused; detached HEAD refused. `commit()`'s tail (deterministic hash over sorted JSON →
+  atomic persist → ref move → echo → push/queue block) extracted verbatim as
+  `_finalize_commit` so normal commits and merges share exactly one creation path.
+- **Known limitation (documented):** the Web UI graph renders `parent_hash` only — merge
+  commits appear linear there for now.
+- **Verified:** 17 tests (pure merge/base cases incl. delete-vs-keep, add/add-same,
+  modify-vs-delete conflict; CLI FF, two-parent creation verified in the commit JSON +
+  `av log` render, abort-immutability, `--theirs`, dirty/detached/unknown guards) plus live
+  server round-trip tests proving both parents survive a push→fetch cycle. Manual scratch
+  session: diverged branches merged (+2 parents confirmed in the commit file), conflict abort
+  listed train.py and touched nothing, `--theirs` resolved with the noted auto-resolve count.
+
+## Phase 41 — CDC chunk dedup for `.pt`/`.pth`/`.ckpt` — v1.1.1 cycle
+- **Files:** `src/core.cpp` (`chunk_and_hash_file` + gear table),
+  `python/av_cli/main.py` (`CHUNKABLE_EXTS`, stage/upload/materialize/doctor wiring),
+  `python/av_server/models.py` (`DBTree.chunks`), `python/av_server/server.py`
+  (build_merkle_tree persists chunks, resolve_tree returns them, GC marks chunk hashes alive),
+  `tests/test_core.py` (3), `tests/test_cli.py` (4), `tests/test_sync.py` (1).
+- **C++ core:** new export `chunk_and_hash_file(path, min=512KB, avg=2MB, max=8MB)` — pass 1
+  streams the file once computing gear-hash rolling cut points (deterministic splitmix64
+  table; mask = avg rounded down to power of two), pass 2 SHA-256s each [offset_i, offset_{i+1})
+  range in parallel on the existing ThreadPool. Two boundary bugs caught by the fuzz probe
+  during development and fixed: tiny final chunks (a cut with <min bytes remaining produced a
+  sub-minimum tail) and post-overflow tails (hard-cap cut leaving a sliver) — both now guarded
+  by requiring ≥min bytes to remain AFTER any cut, making max a soft cap of max+min-1 in rare
+  edge cases (verified across 60 random files, 2–13 MB). Canonical `hash_file` untouched.
+- **Python wiring:** artifacts above the LFS threshold with chunkable extensions are chunked
+  when safetensors splitting doesn't apply (graceful whole-file fallback if the native core is
+  missing/fails, mirroring the layers fallback). Tree entries carry `"chunks"` alongside
+  `"layers"`; uploads send shard hashes instead of a whole-file blob; checkout/pull/merge
+  reassemble byte-identical files from shards (downloading missing ones); doctor treats a
+  missing *chunk* like a missing layer (intact chunked artifacts are NOT orphaned-pointer
+  false positives); server GC marks chunk hashes alive (unmarked shards would be reaped);
+  Weight Diff needs no change — chunked entries have no layers and fall back to whole-file
+  comparison automatically.
+- **Verified:** binding tests (validity/consecutiveness, stability under a mid-file byte flip
+  with deterministic small-chunk params, param validation); CLI tests: staging produces shards
+  and NO whole-file blob, re-add after a mid-file mutation reuses all-but-the-edited chunks,
+  checkout of the old commit restores bytes exactly, doctor detects a deleted shard; sync test:
+  chunked checkpoint survives a fake-registry clone byte-identically with the whole-file hash
+  absent everywhere. Manual: real binary — 6/6 chunks staged, mid-file edit reused 5/6,
+  reassembly byte-identical.
+
+## Phase 42 — `.avattributes` (per-path staging directives) — v1.1.1 cycle
+- **Files:** `python/av_cli/attributes.py` (new), `python/av_cli/main.py`
+  (`file --avattributes`, stage_one_file attr_flags param, add/stash call sites),
+  `tests/test_cli.py` (4).
+- **What:** gitattributes-style repo file parsed once per invocation (one small read, then
+  fnmatch per path — negligible latency): `<glob> <flag>...`, last matching line wins, unknown
+  flags ignored (forward-compatible). Flags honored by staging: `no-chunk` (opaque checkpoints
+  stored as whole-file blobs instead of CDC chunks) and `no-layer-split` (safetensors stored
+  whole instead of per-layer shards). `av file --avattributes` writes the documented template,
+  refusing to overwrite like `--avignore`. Absent file = zero rules = behavior identical to
+  before.
+- **Verified:** scaffold create/no-clobber; `*.pt no-chunk` suppresses chunking and stores the
+  blob; `no-layer-split` stores safetensors whole; pattern scoping + last-match-wins unit
+  checks. Manual: template written once, second call refused, directive honored live.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

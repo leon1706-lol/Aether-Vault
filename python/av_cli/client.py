@@ -157,6 +157,20 @@ class VaultClient:
         except requests.exceptions.RequestException:
             return None
 
+    def list_refs(self, project_id: str | None = None) -> dict:
+        """{ref_name: commit_hash} — optionally scoped to one project's `<id>/<branch>` refs."""
+        url = f"{self.server_url}/api/refs"
+        params = {"project_id": project_id} if project_id else None
+        try:
+            resp = self.session.get(url, params=params)
+            self._raise_for_auth(resp)
+            if resp.status_code == 200:
+                return resp.json()
+            return {}
+        except requests.exceptions.RequestException as e:
+            print(f"Error listing refs: {e}")
+            return {}
+
     def server_available(self) -> bool:
         # /api/health is always exempt from auth (server.py's require_token middleware), even
         # in Protected mode — never raises AuthenticationError, deliberately: this is the one
@@ -205,3 +219,46 @@ class VaultClient:
                 print(f"Error syncing refs: {e}")
                 break
         return refs
+
+    def list_projects(self) -> list[dict]:
+        """Every project that has pushed to this registry.
+
+        Returns the raw `/api/projects` rows: {project_id, project_name, commit_count,
+        last_push}. Empty list on any failure — callers (av clone) surface a clear
+        "project not found" rather than a stack trace.
+        """
+        url = f"{self.server_url}/api/projects"
+        try:
+            resp = self.session.get(url)
+            self._raise_for_auth(resp)
+            if resp.status_code == 200:
+                return resp.json().get("projects", [])
+            return []
+        except requests.exceptions.RequestException as e:
+            print(f"Error listing projects: {e}")
+            return []
+
+    def list_commits(self, project_id: str, limit: int = 500, offset: int = 0,
+                     include_layers: bool = False) -> dict | None:
+        """One page of a project's commits, newest first (`/api/commits`).
+
+        Returns the raw envelope {commits, total, limit, offset, next_offset} or None on
+        failure. `include_layers=True` attaches each commit's fully-resolved tree so clones
+        are self-sufficient offline — one paginated request stream instead of one
+        `/api/commits/{hash}` round trip per commit.
+        """
+        url = f"{self.server_url}/api/commits"
+        try:
+            resp = self.session.get(url, params={
+                "project_id": project_id,
+                "limit": limit,
+                "offset": offset,
+                "include_layers": "true" if include_layers else "false",
+            })
+            self._raise_for_auth(resp)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"Error listing commits: {e}")
+            return None

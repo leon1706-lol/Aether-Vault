@@ -484,3 +484,101 @@ def test_cli_commit_pushes_to_a_live_server(tmp_path, monkeypatch):
     resp = httpx.get(f"http://localhost:8000/api/commits/{commit_hash}")
     assert resp.status_code == 200
     assert resp.json()["message"] == "live wire test"
+
+
+# ---------------------------------------------------------------------------
+# Merge commits: parents round-trip + live clone/pull collaboration flow
+# ---------------------------------------------------------------------------
+
+def test_merge_commit_round_trips_both_parents(db):
+    parent_a = _hex_hash("pa")
+    parent_b = _hex_hash("pb")
+    merge_hash = _hex_hash("merge1")
+    payload = _make_commit("merge1", parents=[parent_a, parent_b], message="Merge feature")
+    # parents[0] need not exist server-side (no FK by design); push the merge directly.
+    resp = db.post("/api/commits", json=payload)
+    assert resp.status_code == 201, resp.text
+
+    got = db.get(f"/api/commits/{merge_hash}")
+    assert got.status_code == 200
+    body = got.json()
+    assert body["parent_hash"] == parent_a          # backward-compatible field
+    assert body["parents"] == [parent_a, parent_b]   # full list reconstructed
+
+    listing = db.get("/api/commits", params={"limit": 10})
+    row = next(c for c in listing.json()["commits"] if c["hash"] == merge_hash)
+    assert row["parents"] == [parent_a, parent_b]
+
+
+def test_single_parent_commit_reports_one_parent(db):
+    c1 = _make_commit("single-parent", parents=[_hex_hash("only")])
+    db.post("/api/commits", json=c1)
+    body = db.get(f"/api/commits/{c1['hash']}").json()
+    assert body["parents"] == [_hex_hash("only")]
+
+
+def test_live_two_repo_clone_pull_flow(tmp_path, monkeypatch):
+    """The team-collaboration proof, end to end on a real Docker stack:
+
+    repo A init/add/commit/push -> repo B av clone -> B edits/commits/pushes ->
+    A av pull fast-forwards onto B's work. Skips (lazily) when the stack is down.
+    """
+    import httpx
+
+    if not _real_server_reachable():
+        pytest.skip(
+            "Live aether-vault-server not reachable on :8000; run "
+            "`docker compose up -d db redis aether-vault-server`"
+        )
+
+    from click.testing import CliRunner
+
+    from python.av_cli.main import cli
+
+    runner = CliRunner()
+
+    def _in(path, *args):
+        monkeypatch.chdir(path)
+        result = runner.invoke(cli, list(args))
+        assert result.exit_code == 0, result.output
+        return result
+
+    repo_a = tmp_path / "repo_a"
+    repo_a.mkdir()
+    _in(repo_a, "init", "--mode", "local", "--yes", "--no-repl")
+    _in(repo_a, "config", "--remote-url", "http://localhost:8000")
+    project_name = "collab-live-" + os.urandom(3).hex()
+    _in(repo_a, "config", "--name", project_name)
+
+    (repo_a / "train.py").write_text("print('from A')")
+    _in(repo_a, "add", "train.py")
+    _in(repo_a, "commit", "-m", "a1")
+
+    # --- B clones A's project from the registry ---
+    monkeypatch.chdir(tmp_path)
+    clone_result = runner.invoke(cli, ["clone", project_name])
+    assert clone_result.exit_code == 0, clone_result.output
+    cloned = tmp_path / project_name
+    assert (cloned / "train.py").read_text() == "print('from A')"
+
+    cfg_b = json.loads((cloned / ".av" / "config").read_text())
+    cfg_a = json.loads((repo_a / ".av" / "config").read_text())
+    assert cfg_b["project_id"] == cfg_a["project_id"]
+
+    # --- B edits and pushes; the remote tip moves ---
+    (cloned / "from_b.py").write_text("print('from B')")
+    _in(cloned, "add", "from_b.py")
+    _in(cloned, "commit", "-m", "b1")
+
+    pid = cfg_a["project_id"]
+    ref_resp = httpx.get(f"http://localhost:8000/api/refs/{pid}/main", timeout=5)
+    assert ref_resp.status_code == 200
+    remote_tip = ref_resp.json()["commit_hash"]
+
+    # --- A pulls: fast-forwards onto B's commit; sees B's file ---
+    _in(repo_a, "pull")
+    assert (repo_a / "from_b.py").read_text() == "print('from B')"
+    assert (repo_a / ".av" / "refs" / "heads" / "main").read_text().strip() == remote_tip
+
+    status = _in(repo_a, "status")
+    assert "Nothing to commit" in status.output

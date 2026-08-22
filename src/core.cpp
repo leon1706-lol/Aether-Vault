@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <array>
 #include "sha256.h"
 #include "thread_pool.h"
 #include "json.hpp"
@@ -252,6 +253,144 @@ py::list split_and_hash_safetensors(const std::string& path) {
     return results;
 }
 
+// ---------------------------------------------------------------------------
+// Content-Defined Chunking (CDC) for opaque checkpoint formats (.pt/.pth/.ckpt)
+// ---------------------------------------------------------------------------
+
+// Deterministic 256-entry gear table (splitmix64 from a fixed seed). The exact values
+// don't matter — only that they're stable across machines and versions, since chunk
+// boundaries (and therefore chunk hashes) must reproduce identically for dedup to work.
+static std::array<uint64_t, 256> make_gear_table() {
+    std::array<uint64_t, 256> table{};
+    uint64_t state = 0x9E3779B97F4A7C15ULL;
+    for (auto& v : table) {
+        state += 0x9E3779B97F4A7C15ULL;
+        uint64_t z = state;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        v = z ^ (z >> 31);
+    }
+    return table;
+}
+
+struct ChunkResult {
+    std::string hash;
+    uint64_t size;
+    uint64_t offset;
+};
+
+py::list chunk_and_hash_file(const std::string& path,
+                             uint64_t min_chunk = 512 * 1024,
+                             uint64_t avg_chunk = 2ULL * 1024 * 1024,
+                             uint64_t max_chunk = 8ULL * 1024 * 1024) {
+    if (!fs::exists(path)) throw std::runtime_error("File not found: " + path);
+    if (min_chunk == 0 || avg_chunk < min_chunk || max_chunk < avg_chunk)
+        throw std::runtime_error("Invalid chunk sizes: require min <= avg <= max, min > 0");
+    uint64_t file_size = static_cast<uint64_t>(fs::file_size(path));
+
+    // Boundary mask: cut when (rolling & mask) == 0. avg_chunk must be a power of two for
+    // the mask form; round down to the nearest power of two so callers can pass round MBs.
+    uint64_t pow2 = 1;
+    while (pow2 * 2 <= avg_chunk) pow2 *= 2;
+    uint64_t mask = pow2 - 1;
+
+    static const std::array<uint64_t, 256> GEAR = make_gear_table();
+    const size_t WINDOW = 48;
+
+    // Pass 1 (sequential, unavoidable — each boundary depends on all prior bytes): find
+    // content-defined cut points with a gear rolling hash. One streaming read of the file.
+    std::vector<uint64_t> offsets{0};
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) throw std::runtime_error("Cannot open file: " + path);
+
+        uint64_t hash = 0;
+        uint64_t chunk_start = 0;
+        uint64_t pos = 0;
+        std::vector<char> buffer(1024 * 1024);
+        while (file) {
+            file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            std::streamsize got = file.gcount();
+            for (std::streamsize i = 0; i < got; ++i) {
+                hash = (hash << 1) + GEAR[static_cast<uint8_t>(buffer[static_cast<size_t>(i)])];
+                pos++;
+                uint64_t size_so_far = pos - chunk_start;
+                // Any cut requires min bytes to remain AFTER it — otherwise the tail chunk
+                // would violate the minimum. This makes max_chunk a soft cap: a file just
+                // over k*max yields one chunk of up to max+min-1 rather than a tiny tail
+                // (both edge cases were observed before the guard existed).
+                bool enough_left_after_cut = (file_size - pos >= min_chunk);
+                bool boundary = ((hash & mask) == 0) &&
+                                (size_so_far >= min_chunk) &&
+                                (size_so_far < max_chunk);
+                bool overflow = size_so_far >= max_chunk;   // hard cap: never exceed max
+                if ((boundary || overflow) && enough_left_after_cut && pos < file_size) {
+                    offsets.push_back(pos);
+                    chunk_start = pos;
+                    hash = 0;  // reset the window at the boundary
+                }
+            }
+        }
+    }
+
+    // Pass 2 (parallel): SHA-256 each [offset[i], offset[i+1]) range independently.
+    size_t threads_to_use = std::thread::hardware_concurrency();
+    ThreadPool pool(threads_to_use);
+    std::vector<std::future<ChunkResult>> futures;
+    auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
+
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        uint64_t start = offsets[i];
+        uint64_t end = (i + 1 < offsets.size()) ? offsets[i + 1] : file_size;
+        futures.push_back(pool.enqueue([path, start, end, cancel_flag]() {
+            if (cancel_flag->load()) return ChunkResult{};
+            std::ifstream f(path, std::ios::binary);
+            if (!f) {
+                cancel_flag->store(true);
+                throw std::runtime_error("Cannot open file: " + path);
+            }
+            f.seekg(static_cast<std::streamoff>(start));
+            SHA256 sha;
+            const size_t buf_size = 8 * 1024 * 1024;
+            std::vector<char> buffer(buf_size);
+            uint64_t remaining = end - start;
+            while (remaining > 0) {
+                uint64_t to_read = std::min<uint64_t>(buf_size, remaining);
+                f.read(buffer.data(), static_cast<std::streamsize>(to_read));
+                if (f.gcount() == 0) break;
+                sha.update(reinterpret_cast<const uint8_t*>(buffer.data()),
+                           static_cast<size_t>(f.gcount()));
+                remaining -= static_cast<uint64_t>(f.gcount());
+            }
+            if (remaining > 0) {
+                cancel_flag->store(true);
+                throw std::runtime_error("Truncated read in chunk at offset " + std::to_string(start));
+            }
+            ChunkResult r;
+            r.hash = sha.hexdigest();
+            r.size = end - start;
+            r.offset = start;
+            return r;
+        }));
+    }
+
+    py::list results;
+    for (auto& fut : futures) {
+        try {
+            auto cr = fut.get();
+            py::dict d;
+            d["hash"] = cr.hash;
+            d["size"] = cr.size;
+            d["offset"] = cr.offset;
+            results.append(d);
+        } catch (...) {
+            cancel_flag->store(true);
+            throw;
+        }
+    }
+    return results;
+}
+
 
 PYBIND11_MODULE(aether_core, m) {
     m.doc() = "Aether-Vault C++ performance core";
@@ -267,4 +406,10 @@ PYBIND11_MODULE(aether_core, m) {
     m.def("compare_metadata", &compare_metadata, py::arg("path"), py::arg("expected_size"), py::arg("expected_mtime_ns"), "Fast comparison of file size and modification time");
     m.def("get_file_metadata", &get_file_metadata, py::arg("path"), "Get file size and modification time (nanoseconds)");
     m.def("split_and_hash_safetensors", &split_and_hash_safetensors, py::arg("path"), "Parse and hash Safetensors layers");
+    m.def("chunk_and_hash_file", &chunk_and_hash_file, py::arg("path"),
+          py::arg("min_chunk") = 512 * 1024, py::arg("avg_chunk") = 2ULL * 1024 * 1024,
+          py::arg("max_chunk") = 8ULL * 1024 * 1024,
+          "Content-defined chunking (gear-hash cut points) + parallel SHA-256 per chunk. "
+          "Format-agnostic dedup for opaque checkpoint files (.pt/.pth/.ckpt). Returns "
+          "[{hash, size, offset}] in file order.");
 }

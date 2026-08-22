@@ -53,24 +53,12 @@ def test_print_banner_omits_subtitle_line_when_not_given(monkeypatch):
     assert "Aether-Vault" in text
 
 
-def test_select_login_mode_returns_the_users_choice(monkeypatch):
-    class _FakeQuery:
-        def ask(self):
-            return "enterprise"
-
-    monkeypatch.setattr(ui.questionary, "select", lambda *a, **k: _FakeQuery())
-
-    assert ui.select_login_mode() == "enterprise"
-
-
-def test_select_login_mode_defaults_to_local_on_ctrl_c(monkeypatch):
-    class _FakeQuery:
-        def ask(self):
-            return None  # questionary returns None on Ctrl+C/Ctrl+D
-
-    monkeypatch.setattr(ui.questionary, "select", lambda *a, **k: _FakeQuery())
-
-    assert ui.select_login_mode() == "local"
+def test_select_login_mode_was_removed_from_the_interactive_flow():
+    """Enterprise login is unbuilt, so `av init` must not offer it interactively anymore:
+    ui.select_login_mode (the Local/Enterprise question) is deleted — init always picks
+    Local unless `--mode enterprise` is passed explicitly. Guards against the prompt
+    quietly coming back."""
+    assert not hasattr(ui, "select_login_mode")
 
 
 def test_is_interactive_true_only_when_both_streams_are_a_tty(monkeypatch):

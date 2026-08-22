@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 from click.testing import CliRunner
@@ -1442,3 +1443,268 @@ def test_run_swallows_a_failing_auto_update_check_without_changing_exit_code(mon
         main_module.run()
 
     assert exc_info.value.code == 3  # the real command's exit code is untouched
+
+
+# ---------------------------------------------------------------------------
+# CDC chunk dedup for opaque checkpoints (.pt/.pth/.ckpt)
+# ---------------------------------------------------------------------------
+
+def _chunk_roundtrip_repo(repo):
+    """Seeds a repo with a deterministic 12 MB checkpoint staged as CDC chunks.
+
+    12 MB (not smaller): the CDC hard cap (max_chunk=8 MB) then FORCES at least one
+    boundary, so ">= 2 chunks" holds deterministically — random ~3 MB blobs occasionally
+    produced a single chunk when no gear-hash mask fired inside [min, max], which made
+    count assertions flaky.
+    """
+    pytest.importorskip("aether_core")
+    invoke("config", "1")  # 1 MB LFS threshold
+    import random
+
+    rng = random.Random(101)
+    blob = rng.randbytes(12 * 1024 * 1024)
+    (repo / "checkpoint.pt").write_bytes(blob)
+    return blob
+
+
+def test_add_pt_file_chunks_instead_of_whole_blob(repo):
+    import aether_core  # noqa: F401
+    blob = _chunk_roundtrip_repo(repo)
+
+    result = invoke("add", "checkpoint.pt")
+    assert result.exit_code == 0, result.output
+    assert "(LFS," in result.output and "chunks)" in result.output
+
+    idx = Index(repo)
+    entry = idx.get_entry("checkpoint.pt")
+    chunks = entry.get("chunks") or []
+    assert len(chunks) >= 2
+    # every chunk shard exists; the whole-file blob deliberately does not
+    for c in chunks:
+        assert (repo / ".av" / "objects" / c["hash"][:2] / c["hash"][2:]).exists()
+    assert not (repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]).exists()
+
+    r = invoke("commit", "-m", "ckpt v1")
+    assert r.exit_code == 0, r.output
+
+
+def test_pt_readd_reuses_unchanged_chunks(repo):
+    import aether_core  # noqa: F401
+    _chunk_roundtrip_repo(repo)
+    assert invoke("add", "checkpoint.pt").exit_code == 0
+    assert invoke("commit", "-m", "v1").exit_code == 0
+
+    before = {c["hash"] for c in Index(repo).get_entry("checkpoint.pt")["chunks"]}
+    # mutate one region in the middle → most chunks must be reused
+    data = bytearray((repo / "checkpoint.pt").read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    (repo / "checkpoint.pt").write_bytes(bytes(data))
+
+    assert invoke("add", "checkpoint.pt").exit_code == 0
+    after_list = Index(repo).get_entry("checkpoint.pt")["chunks"]
+    after = {c["hash"]: c for c in after_list}
+
+    reused = before & set(after.keys())
+    assert len(reused) >= len(before) - 2  # only chunks touching the edit may change
+    assert len(after) >= len(before) - 1   # total size barely changed → similar count
+
+
+def test_checkout_reassembles_chunked_checkpoint(repo):
+    import aether_core  # noqa: F401
+    blob = _chunk_roundtrip_repo(repo)
+    assert invoke("add", "checkpoint.pt").exit_code == 0
+    assert invoke("commit", "-m", "v1").exit_code == 0
+    v1_hash = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    # overwrite with a different checkpoint, commit, then go back
+    (repo / "checkpoint.pt").write_bytes(os.urandom(3 * 1024 * 1024))
+    invoke("add", "checkpoint.pt")
+    assert invoke("commit", "-m", "v2").exit_code == 0
+
+    (repo / "checkpoint.pt").unlink()
+    result = invoke("checkout", v1_hash[:7], "--force")
+    assert result.exit_code == 0, result.output
+    assert (repo / "checkpoint.pt").read_bytes() == blob
+    status = invoke("status")
+    assert "Nothing to commit" in status.output
+
+
+def test_doctor_chunked_artifact_not_orphaned_but_missing_chunk_detected(repo):
+    import aether_core  # noqa: F401
+    _chunk_roundtrip_repo(repo)
+    assert invoke("add", "checkpoint.pt").exit_code == 0
+
+    # intact chunked artifact must NOT be flagged as orphaned
+    ok_result = invoke("doctor")
+    assert ok_result.exit_code == 0, ok_result.output
+    assert "No orphaned pointer entries" in ok_result.output
+
+    # deleting one chunk shard IS a detected, fixable problem
+    chunks = Index(repo).get_entry("checkpoint.pt")["chunks"]
+    victim = chunks[0]
+    (repo / ".av" / "objects" / victim["hash"][:2] / victim["hash"][2:]).unlink()
+
+    bad_result = invoke("doctor")
+    assert "missing their object" in bad_result.output
+    assert "checkpoint.pt" in bad_result.output
+
+
+# ---------------------------------------------------------------------------
+# .avattributes — per-path staging directives
+# ---------------------------------------------------------------------------
+
+def test_file_avattributes_scaffold_created_once(repo):
+    result = invoke("file", "--avattributes")
+    assert result.exit_code == 0, result.output
+    assert "Wrote" in result.output
+    attrs = repo / ".avattributes"
+    assert attrs.exists()
+    assert "# .avattributes" in attrs.read_text(encoding="utf-8")
+
+    again = invoke("file", "--avattributes")
+    assert "not overwriting" in again.output
+    assert "Wrote" not in again.output
+
+
+def test_attributes_no_chunk_disables_cdc_chunking(repo):
+    pytest.importorskip("aether_core")
+    (repo / ".avattributes").write_text("*.pt no-chunk\n", encoding="utf-8")
+    blob = _chunk_roundtrip_repo(repo)
+
+    assert invoke("add", "checkpoint.pt").exit_code == 0
+    entry = Index(repo).get_entry("checkpoint.pt")
+    assert not entry.get("chunks"), ".avattributes no-chunk must suppress CDC chunking"
+    # whole-file blob stored instead
+    assert (repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]).exists()
+    assert (repo / "checkpoint.pt").read_bytes() == blob
+
+
+def test_attributes_no_layer_split_stores_safetensors_whole(repo):
+    pytest.importorskip("aether_core")
+    from tests.test_cli import _make_safetensors
+
+    (repo / ".avattributes").write_text(
+        "*.safetensors no-layer-split\n", encoding="utf-8"
+    )
+    invoke("config", "1")
+    blob = _make_safetensors({"layer1": b"A" * (600 * 1024), "layer2": b"B" * (600 * 1024)})
+    (repo / "model.safetensors").write_bytes(blob)
+
+    result = invoke("add", "model.safetensors")
+    assert result.exit_code == 0, result.output
+
+    entry = Index(repo).get_entry("model.safetensors")
+    assert not entry.get("layers"), "no-layer-split must suppress the safetensors split"
+    # whole-file object present (split files deliberately omit it)
+    obj = repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
+    assert obj.exists() and obj.read_bytes() == blob
+
+
+def test_attributes_pattern_scoping_last_match_wins(repo):
+    from python.av_cli import attributes as attrs_mod
+
+    rules = attrs_mod.load_attributes(repo)
+    assert rules == []  # absent file → no rules, zero cost
+
+    (repo / ".avattributes").write_text(
+        "*.pt no-chunk\nmodels/*.pt\n", encoding="utf-8"  # second line matches but sets nothing
+    )
+    rules = attrs_mod.load_attributes(repo)
+    assert attrs_mod.flags_for(rules, "checkpoint.pt") == {"no-chunk"}
+    # models/ckpt.pt matched both lines; last match wins → flags cleared
+    assert attrs_mod.flags_for(rules, "models/ckpt.pt") == set()
+    assert attrs_mod.flags_for(rules, "other.bin") == set()
+
+
+# ---------------------------------------------------------------------------
+# av log
+# ---------------------------------------------------------------------------
+
+def test_log_lists_commits_newest_first(repo):
+    (repo / "f.txt").write_text("1")
+    invoke("add", "f.txt")
+    invoke("commit", "-m", "first")
+    (repo / "f.txt").write_text("2")
+    invoke("add", "f.txt")
+    invoke("commit", "-m", "second", "--tag", "rel")
+    (repo / "f.txt").write_text("3")
+    invoke("add", "f.txt")
+    invoke("commit", "-m", "third")
+
+    result = invoke("log")
+    assert result.exit_code == 0, result.output
+    lines = [ln for ln in result.output.splitlines() if ln.startswith("[")]
+    assert len(lines) == 3
+    assert "third" in lines[0]
+    assert "second" in lines[1]
+    assert "first" in lines[2]
+    # decorations: HEAD + current branch annotate the tip; branch annotates every tip it owns
+    assert "(HEAD, main)" in lines[0] or "(main, HEAD)" in lines[0]
+    # only branch tips are decorated: the root commit has no annotation
+    assert "(" not in lines[2]
+
+
+def test_log_limit_and_empty_repo(repo):
+    result = invoke("log")
+    assert result.exit_code == 0, result.output
+    assert "No commits yet" in result.output
+
+    (repo / "f.txt").write_text("1")
+    invoke("add", "f.txt")
+    for i in range(4):
+        (repo / "f.txt").write_text(str(i))
+        invoke("add", "f.txt")
+        invoke("commit", "-m", f"c{i}")
+    result = invoke("log", "--limit", "2")
+    assert result.exit_code == 0, result.output
+    shown = [ln for ln in result.output.splitlines() if ln.startswith("[")]
+    assert len(shown) == 2
+    assert "c3" in result.output and "c2" in result.output
+    assert "c1" not in result.output
+
+
+def test_log_branch_flag_and_bad_branch(repo):
+    (repo / "f.txt").write_text("main-work")
+    invoke("add", "f.txt")
+    invoke("commit", "-m", "on main")
+    hash_main = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    invoke("branch", "feature")
+    result = invoke("checkout", "feature")
+    assert result.exit_code == 0, result.output
+    (repo / "f.txt").write_text("feature-work")
+    invoke("add", "f.txt")
+    invoke("commit", "-m", "on feature")
+    hash_feature = (repo / ".av" / "refs" / "heads" / "feature").read_text().strip()
+    assert hash_feature != hash_main
+
+    result = invoke("checkout", "main")
+    assert result.exit_code == 0, result.output
+
+    result = invoke("log", "--branch", "feature")
+    assert result.exit_code == 0, result.output
+    first_line = [ln for ln in result.output.splitlines() if ln.startswith("[")][0]
+    assert "(feature)" in first_line or "feature" in first_line.split("(")[1]
+    assert "on feature" in first_line
+    # the walk follows shared history: main's commit appears as the parent
+    assert "on main" in result.output
+
+    result = invoke("log", "--branch", "nope")
+    assert "No such branch" in result.output
+
+
+def test_log_detached_head(repo):
+    (repo / "f.txt").write_text("1")
+    invoke("add", "f.txt")
+    invoke("commit", "-m", "v1")
+    h1 = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+    (repo / "f.txt").write_text("2")
+    invoke("add", "f.txt")
+    invoke("commit", "-m", "v2")
+
+    result = invoke("checkout", h1[:7])
+    assert result.exit_code == 0, result.output
+    result = invoke("log", "--limit", "1")
+    assert result.exit_code == 0, result.output
+    assert "HEAD" in result.output.splitlines()[0]
+    assert "(main)" not in result.output.splitlines()[0]
