@@ -9,9 +9,9 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
@@ -25,9 +25,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
@@ -41,9 +41,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
 
@@ -86,9 +86,9 @@ jobs:
       AV_TEST_REDIS_URL: redis://localhost:6379/0
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
@@ -99,6 +99,10 @@ jobs:
         env:
           DATABASE_URL: ${{ env.AV_TEST_DATABASE_URL }}
           REDIS_URL: ${{ env.AV_TEST_REDIS_URL }}
+          # Bare-metal uvicorn on the runner has no Docker volume mounted at /data — without
+          # a writable CAS dir every object upload fails with PermissionError and the
+          # real-wire commit silently queues offline instead of syncing.
+          AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: |
           nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
           for i in $(seq 1 30); do
@@ -136,9 +140,9 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
@@ -149,6 +153,10 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault
           REDIS_URL: redis://localhost:6379/0
+          # Bare-metal uvicorn has no Docker volume at /data — without a writable CAS dir
+          # object uploads 500, seed_data's pushes queue offline, and the dashboard renders
+          # empty (Playwright then fails with element-not-found).
+          AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: |
           nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
           for i in $(seq 1 30); do
@@ -159,7 +167,7 @@ jobs:
       - name: Seed checkpoint data via the real av CLI
         run: python webui/e2e/seed_data.py
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
 
@@ -193,7 +201,7 @@ jobs:
 
       - name: Upload Playwright report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: webui/playwright-report/

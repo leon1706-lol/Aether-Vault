@@ -24,6 +24,7 @@ Aether-Vault solves the core challenge of ML reproducibility by versioning the *
 ## Table of Contents
 
 - [Architecture](#architecture)
+- [Repository Map](#repository-map)
 - [Installation](#installation)
 - [Quick Start: From Install to Push](#quick-start-from-install-to-push)
 - [CLI Reference](#cli-reference)
@@ -113,6 +114,29 @@ graph TD
 > so the registry's commits/branches stay attributable per project even though the object store
 > is intentionally deduplicated across all of them. Use `av config --remote-url` to point a repo
 > at a different registry instead.
+
+---
+
+## Repository Map
+
+Every folder documents itself — each has its own `README.md` with contents, conventions,
+and pointers deeper into the project:
+
+| Folder | What it is | Details |
+|---|---|---|
+| [`python/av_cli/`](python/av_cli/README.md) | The `av` CLI: commands, local DAG/CAS, sync, merge, log, chunking, doctor | [package overview](python/README.md) |
+| [`python/av_server/`](python/av_server/README.md) | FastAPI CAS registry (PostgreSQL + RedisBloom) | [package overview](python/README.md) |
+| [`python/av_plugins/`](python/av_plugins/README.md) | Lightning / Transformers / MLflow auto-commit callbacks | [package overview](python/README.md) |
+| [`src/`](src/README.md) | C++ performance core (`aether_core`): hashing, safetensors split, CDC chunker | — |
+| [`tests/`](tests/README.md) | ~330-test suite across 20 files (CLI, core, server, plugins) | — |
+| [`benchmarks/`](benchmarks/README.md) | The nine cross-tool benchmarks vs Git LFS / DVC / MLflow | — |
+| [`webui/`](webui/README.md) | Next.js dashboard incl. Weight Diff + Playwright E2E | — |
+| [`development/`](development/README.md) | Phase-by-phase CHANGELOG, the Probleme.md audit log, captured BENCHMARKS.md | — |
+| [`.github/`](.github/README.md) | CI workflows (5 test jobs), PyPI release pipeline, GHCR edge images | — |
+| [`scripts/`](scripts/README.md) | Checkout-local developer utilities | — |
+
+The Obsidian vault (`Aether-vault-Obsidian-Vault/`) is a locally generated knowledge base
+(code graph, handoff log, wrap-up checklist) and intentionally gitignored.
 
 ---
 

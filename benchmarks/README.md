@@ -1,80 +1,34 @@
-# `av benchmark` — cross-tool benchmark suite
+# `benchmarks/` — Cross-Tool Benchmark Suite
 
-Dev-only tooling that times Aether-Vault against **Git LFS**, **DVC**, and **MLflow** on
-the same synthetic fixtures, for the numbers in [`development/BENCHMARKS.md`](../development/BENCHMARKS.md).
+Nine reproducible benchmarks comparing **Aether-Vault** against **Git LFS**, **DVC**, and
+**MLflow** — every number is a real subprocess/HTTP measurement, never estimated. Run via
+`av benchmark`; the captured report lives in [`development/BENCHMARKS.md`](../development/BENCHMARKS.md).
+See the [main README](../README.md) for the project overview.
 
-Not to be confused with `av doctor --speed` (real-repo diagnostics) or `av test --speed`
-(synthetic regression probes for av's own internal hot paths) — those track *av's own*
-performance over time; this suite exists to compare *against other tools*.
+## Contents
 
-## Install the comparison targets
+| File | Benchmark |
+|---|---|
+| `tool_runner.py` | Shared runner: tool detection, timing, verdicts (GOOD/OK/BAD), Markdown rendering |
+| `fixtures.py` | Deterministic synthetic fixtures shared across benchmarks |
+| `bench_hashing_throughput.py` | #1 SHA-256 throughput at 10–200 MB |
+| `bench_safetensors_dedup.py` | #2 storage after 6 fine-tune commits |
+| `bench_commit_push_latency.py` | #3 end-to-end init/add/commit/push |
+| `bench_noop_status_speed.py` | #4 no-op `status`/`add` at scale |
+| `bench_cold_clone.py` | #5 fresh clone from a registry (`av clone`, v1.1.1+) |
+| `bench_partial_checkpoint_fetch.py` | #6 single-layer fetch vs whole file |
+| `bench_storage_footprint_curve.py` | #7 cumulative storage over N versions |
+| `bench_concurrent_push.py` | #8 eight concurrent pushes against av_server |
+| `bench_gc_throughput.py` | #9 server-side mark-and-sweep GC |
 
-Git LFS is assumed to already be on `PATH` (it's also used by `scripts/run_benchmark_comparison.py`).
-DVC and MLflow are optional extras, not runtime dependencies:
-
-```bash
-pip install -e .[dev,benchmarks]
-```
-
-If a tool still isn't found on `PATH` when a benchmark runs, its column prints `not installed`
-— never a fabricated number.
-
-## Running it
-
-```bash
-av benchmark                                  # run all 9 benchmarks, console output
-av benchmark --only hashing_throughput        # scope to one (repeatable)
-av benchmark --vs git-lfs --vs dvc            # scope competitor columns (repeatable; default: all 3)
-av benchmark --markdown development/BENCHMARKS.md   # write a complete, ready-to-commit report
-                                                      # (header/Captured-line/legend/methodology
-                                                      # notes + every benchmark's table, in one shot)
-av benchmark --save-json snapshot.json        # save this run's av-only numbers for later comparison
-av benchmark --baseline snapshot.json         # compare this run against a prior --save-json
-                                               # snapshot; exits non-zero if any row regressed
-                                               # past the 1.5x verdict threshold
-```
-
-`--save-json` and `--baseline` compose: e.g. `av benchmark --baseline last-week.json --save-json
-this-week.json` checks for regressions against last week's numbers while also saving today's
-for next time. This is the regression-tracking mode that the *competitor*-comparison verdicts
-above don't cover — it answers "did *Aether* get slower since last time," not "is Aether faster
-than DVC."
-
-Benchmark names (for `--only`): `hashing_throughput`, `safetensors_dedup`,
-`commit_push_latency`, `noop_status_speed`, `cold_clone`, `partial_checkpoint_fetch`,
-`storage_footprint_curve`, `concurrent_push`, `gc_throughput`.
-
-Each script can also be run directly for faster iteration on one benchmark:
+## Usage
 
 ```bash
-python -m benchmarks.bench_hashing_throughput
+av benchmark --only hashing_throughput --vs dvc     # scope one benchmark / competitor
+av benchmark --markdown development/BENCHMARKS.md   # regenerate the full report
+av benchmark --baseline prior.json --save-json new.json   # regression tracking
 ```
 
-## Future work: a `doctor --speed`-shaped repo-size benchmark
-
-`av doctor --speed` diagnoses how slow a *real* repo's hot paths are, but there's currently
-nothing establishing what "fast" looks like at a few repo sizes (e.g. 100 vs. 10,000 tracked
-files) for a user to compare their own numbers against. This doesn't fit the cross-tool
-comparison framing this suite is built around (Git LFS/DVC/MLflow don't have an equivalent
-"diagnose my real repo" command to compare against), so it's noted here as a manual exercise
-rather than a 10th automated `bench_*.py` — run `av doctor --speed` against repos of a few
-sizes yourself and compare the printed numbers if you need this.
-
-## Interpreting results
-
-Every row shows a real absolute number per tool, plus a **verdict**:
-
-- **GOOD** — Aether is at least 1.5x better than the best real competitor number.
-- **OK** — within 1.5x either way, or no competitor produced a real number to compare against.
-- **BAD** — Aether is more than 1.5x worse than the best real competitor number.
-
-1.5x (not 1.0x) accounts for single-run, single-machine noise. **`N/A`** means the
-benchmark's primitive doesn't map onto that tool at all (e.g. MLflow has no file-hashing
-primitive) — set explicitly per-benchmark, never inferred, with a footnote explaining why.
-`not installed` means the tool simply isn't on `PATH` in the environment the suite ran in.
-
-## Adding a 10th benchmark
-
-Drop a new `bench_<name>.py` exposing `run(tool_order: list[str]) -> BenchmarkResult` (see
-`tool_runner.py` for the dataclasses) and add `<name>` to `BENCHMARK_NAMES` in
-`python/av_cli/main.py`'s `benchmark` command — no other registry to update.
+Tools that aren't installed are reported as `not installed`/N/A with a footnote — never
+guessed at. Benchmarks #8/#9 need the Docker registry stack running; #5's `av` column needs
+it too and otherwise reports "registry unreachable".

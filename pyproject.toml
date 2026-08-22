@@ -60,6 +60,12 @@ Changelog = "https://github.com/leon1706/aether-vault/blob/main/development/CHAN
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests import the repo as `python.av_cli.*` (namespace package from the checkout root).
+# Without this, bare `pytest ...` (console-script invocation — exactly what CI uses) never
+# puts the repo root on sys.path and every job dies at conftest with
+# "ModuleNotFoundError: No module named 'python'". `python -m pytest` masked this locally
+# because `-m` injects CWD into sys.path.
+pythonpath = ["."]
 
 [tool.setuptools]
 include-package-data = true

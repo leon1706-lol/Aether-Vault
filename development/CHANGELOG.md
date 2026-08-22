@@ -1054,4 +1054,43 @@ findings (resolved and still-open).
   blob; `no-layer-split` stores safetensors whole; pattern scoping + last-match-wins unit
   checks. Manual: template written once, second call refused, directive honored live.
 
+## Phase 43 — CI green again: conftest import fix, writable CAS in CI, Node-24 actions, folder READMEs
+- **Files:** `pyproject.toml`, `.github/workflows/tests.yml`,
+  `.github/workflows/release.yml`, `.github/workflows/docker-edge.yml`,
+  `README.md` (Repository Map + TOC), new folder READMEs (11×), `tests/README.md` links.
+- **Problem (diagnosed from the actual failed-run logs of the v1.1.0 push, not guessed):**
+  three independent CI failures:
+  1. **Every pytest job died at collection** (`ModuleNotFoundError: No module named
+     'python'` loading `tests/conftest.py`): tests import `python.av_cli.*` as a namespace
+     package from the checkout root, but bare console-script `pytest` never puts the repo
+     root on `sys.path`. Local runs masked it because `python -m pytest` injects CWD.
+     Reproduced locally by stashing the fix and running the console-script binary — exact
+     same error; this also explains why the v0.1.1-era master pushes failed identically.
+  2. **webui-e2e rendered an empty dashboard** → Playwright element-not-found: the
+     bare-metal uvicorn processes default their CAS directory to `/data`
+     (`server.py`'s `AV_DATA_DIR` default is container-oriented) and got
+     `PermissionError: '/data'`; object uploads then failed while `/api/health` stayed
+     green, so seed_data's pushes queued offline and nothing appeared in the UI.
+  3. Node-20 deprecation annotations on every pinned action.
+- **Fixes:**
+  1. `[tool.pytest.ini_options] pythonpath = ["."]` in `pyproject.toml` — one line fixes
+     every job and any local invocation style, no workflow churn.
+  2. `AV_DATA_DIR: ${{ runner.temp }}/av-data` on both uvicorn-starting jobs
+     (server-tests, webui-e2e), with comments explaining the failure mode so it doesn't
+     get "cleaned up" later.
+  3. All workflows bumped to the Node-24 action majors:
+     `checkout@v5`, `setup-python@v6`, `setup-node@v6`, `upload-artifact@v7`,
+     `download-artifact@v7` (versions verified against each action's releases before
+     bumping; release/docker-edge included for consistency).
+- **Docs structure:** new self-documenting `README.md` for every tracked top-level folder
+  (`.github/`, `benchmarks/`, `development/`, `python/` plus its three packages, `scripts/`,
+  `src/`, `tests/`, `webui/`) covering purpose, per-file tables, and module-specific
+  invariants (e.g. canonical-hash and CDC-determinism rules in `src/`, the single
+  restore/commit path in `av_cli`). The main README gained a **Repository Map** section
+  (and TOC entry) linking all of them.
+- **Verified:** full suite collects cleanly via console-script `pytest tests/
+  --collect-only -q` (365 tests — previously impossible outside `python -m`);
+  `test_registry.py` passes through the same invocation; workflow diffs are version-bumps
+  and env additions only.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
