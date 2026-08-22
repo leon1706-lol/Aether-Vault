@@ -119,8 +119,9 @@ graph TD
 
 ## Repository Map
 
-Every folder documents itself — each has its own `README.md` with contents, conventions,
-and pointers deeper into the project:
+Every folder documents itself with its own `README.md` — contents, conventions, and
+pointers deeper into the project (`.github/` is the exception: it's CI plumbing, see its
+workflows directly):
 
 | Folder | What it is | Details |
 |---|---|---|
@@ -132,7 +133,7 @@ and pointers deeper into the project:
 | [`benchmarks/`](benchmarks/README.md) | The nine cross-tool benchmarks vs Git LFS / DVC / MLflow | — |
 | [`webui/`](webui/README.md) | Next.js dashboard incl. Weight Diff + Playwright E2E | — |
 | [`development/`](development/README.md) | Phase-by-phase CHANGELOG, the Probleme.md audit log, captured BENCHMARKS.md | — |
-| [`.github/`](.github/README.md) | CI workflows (5 test jobs), PyPI release pipeline, GHCR edge images | — |
+| [`.github/`](.github/workflows/tests.yml) | CI workflows (5 test jobs), PyPI release pipeline, GHCR edge images, issue/PR templates | — |
 | [`scripts/`](scripts/README.md) | Checkout-local developer utilities | — |
 
 The Obsidian vault (`Aether-vault-Obsidian-Vault/`) is a locally generated knowledge base

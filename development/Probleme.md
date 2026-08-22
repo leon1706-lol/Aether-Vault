@@ -985,3 +985,51 @@ implement, both rated 1–10.
   separate license — aligning the free tier with the planned open-core/commercial-split model.
   setuptools auto-includes LICENSE in distributions by filename convention (confirmed present
   in the rebuilt sdist). README gained a short License section linking to it.
+
+
+## ✅ Fixed — CI-caught test defects (2026-08-22)
+
+### [4] `tests/test_merge.py` failed collection on Python ≤3.12 — annotation referenced an import defined 9 lines later
+- **Files:** `tests/test_merge.py`.
+- **Problem:** `def _commit_file(repo: Path, ...)` (line 184) used `Path` in a parameter
+  annotation, but `from pathlib import Path` sat at line 193, *below* it. On Python ≤3.12
+  function annotations evaluate **eagerly at def time** → `NameError: name 'Path' is not
+  defined`, aborting the ENTIRE suite at collection (`1 error during collection`). The
+  `test` job (windows, py3.10) died this way.
+- **Why invisible locally:** the dev machine runs Python 3.14, where PEP 649 defers
+  annotation evaluation — the same file collected fine. A version-dependent failure mode,
+  not a logic bug.
+- **Fix:** moved `from pathlib import Path` into the top import block; deleted the
+  mid-file import.
+- **Systemic fix:** new `scripts/check_eager_annotations.py` — AST scan that flags any
+  module-level annotation referencing a name whose import/definition appears later in the
+  file (builtins exempted, `from __future__ import annotations` files skipped). Proven both
+  ways: 0 problems on the fixed tree, exit 1 with exact lines on the stashed pre-fix
+  version. Run before pushing when editing tests from a ≥3.13 machine.
+
+### [3] Live E2E crashed after succeeding — `json` used without import in `tests/test_server.py`
+- **Files:** `tests/test_server.py`.
+- **Problem:** `test_live_two_repo_clone_pull_flow` called `json.loads(...)` but the module
+  never imported `json`. The test got all the way through init/push/clone against the real
+  Docker stack and THEN crashed — so the collaboration flow itself worked; only the
+  assertions were unreachable. (The adjacent `os.urandom` call was fine: `os` was already
+  imported.)
+- **Fix:** added `import json` to the module's import block. 47/48 other server tests
+  passed on CI, confirming the Phase 39–42 server changes work live.
+
+### [2] `dashboard.spec.ts` asserted a hero heading that no longer exists in the UI
+- **Files:** `webui/e2e/dashboard.spec.ts`.
+- **Problem:** the spec's boot assertion waited for `getByRole("heading", { name:
+  "🌌 Aether-Vault" })` — no element with that role/name exists anywhere in the current UI
+  (the brand is a sidebar `<Image>` logo + "ML Registry Dashboard" text). Every previous
+  E2E failure had died at this exact line and was misread as "empty seeded data"; once the
+  `AV_DATA_DIR` fix let seeding succeed, weight-diff PASSED while dashboard still timed out
+  here — proving the selector, not the data, was wrong.
+- **Fix:** replaced the stale assertion with two that reflect the real DOM and keep the
+  intent (app shell mounted): sidebar brand text "ML Registry Dashboard" + the
+  `#nav-dashboard` nav item. Both verified present in `Sidebar.tsx`; spec compiles via
+  `tsc --noEmit`.
+
+**How found:** GitHub Actions runs of the v1.1.1 cycle push — logs read directly via
+`gh run view --log-failed` rather than reproduced blind. All three are test-infrastructure
+defects; zero product-code changes were required.

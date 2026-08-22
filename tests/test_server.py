@@ -11,6 +11,7 @@ with a clear message, if they're not reachable — same philosophy as test_core.
 """
 import asyncio
 import hashlib
+import json
 import os
 import socket
 import tempfile

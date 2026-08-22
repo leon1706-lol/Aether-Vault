@@ -6,7 +6,11 @@ import { expect, test } from "@playwright/test";
 test("dashboard loads and shows the seeded commits", async ({ page }) => {
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "🌌 Aether-Vault" })).toBeVisible();
+  // Boot assertion: the sidebar brand block ("ML Registry Dashboard") plus the Dashboard
+  // nav item prove the app shell mounted. (An older layout had a "🌌 Aether-Vault" hero
+  // heading; the brand is now an image + text in the sidebar, so role=heading never matches.)
+  await expect(page.getByText("ML Registry Dashboard")).toBeVisible();
+  await expect(page.locator("#nav-dashboard")).toBeVisible();
 
   // The dashboard polls /api/dashboard data on mount — wait for a seeded commit message rather
   // than asserting immediately, since the initial render is the loading state. `.first()`

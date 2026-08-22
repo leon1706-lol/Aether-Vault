@@ -1130,4 +1130,28 @@ findings (resolved and still-open).
   fast test slice green (10 passed). The GitHub-Releases flow itself activates on the next
   real tag push.
 
+## Phase 45 — CI-caught test defects fixed + eager-annotation guard script
+- **Files:** `tests/test_merge.py`, `tests/test_server.py`, `webui/e2e/dashboard.spec.ts`,
+  `scripts/check_eager_annotations.py` (new), `development/Probleme.md`.
+- **Problem:** the first CI run of the v1.1.1 cycle surfaced three test-infrastructure
+  defects (all diagnosed from `gh run view --log-failed`; zero product-code changes needed):
+  1. `tests/test_merge.py` used `Path` in an annotation nine lines above its import —
+     eager annotation evaluation on CI's Python 3.10 aborted the whole `test` job at
+     collection, while Python 3.14 dev machines (PEP 649 lazy annotations) never saw it.
+  2. The new live clone/pull E2E in `tests/test_server.py` called `json.loads` without a
+     module-level `import json` — crashed *after* proving the whole flow worked on the
+     real stack (47/48 other server tests passed).
+  3. `webui/e2e/dashboard.spec.ts` asserted a `🌌 Aether-Vault` hero heading removed from
+     the UI long ago; every prior E2E red had died at this line and been misread as empty
+     seed data. With seeding now working, weight-diff passed while dashboard still timed
+     out here — isolating the stale selector.
+- **Fixes:** imports hoisted to the top of both files; dashboard boot assertion replaced
+  with real-DOM selectors (sidebar brand text + `#nav-dashboard`). New
+  `scripts/check_eager_annotations.py`: AST guard flagging annotations that reference
+  names imported later — the exact py3.14-vs-3.10 trap, proven to catch the pre-fix file
+  (exit 1 with line numbers) and clean on the fixed tree.
+- **Verified:** `pytest tests/test_merge.py -q` → 22 passed; `test_server.py` collects all
+  48; both e2e specs compile (`tsc --noEmit` exit 0); checker run documented above. Live
+  confirmation of the two-repo flow arrives with the next Docker-backed CI run.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

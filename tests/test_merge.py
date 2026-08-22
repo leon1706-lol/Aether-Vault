@@ -7,6 +7,7 @@ commits is covered in tests/test_server.py.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -188,9 +189,6 @@ def _commit_file(repo: Path, name: str, content: str):
 
 def _ref(repo: Path, branch="main"):
     return (repo / ".av" / "refs" / "heads" / branch).read_text().strip()
-
-
-from pathlib import Path
 
 
 @pytest.fixture
