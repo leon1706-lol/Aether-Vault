@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/leon1706/aether-vault/security/advisories/new
+    about: >-
+      Please report security issues privately via GitHub security advisories —
+      never in public issues. See SECURITY.md for scope and response expectations.
+  - name: Question or usage help
+    url: https://github.com/leon1706/aether-vault/discussions
+    about: Ask how something works before filing an issue — many questions are answered by `av --help`, the CLI Reference in the README, and development/BENCHMARKS.md.

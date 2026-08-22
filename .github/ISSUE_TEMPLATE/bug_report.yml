@@ -1,0 +1,66 @@
+name: Bug report
+description: Report something in Aether-Vault that is broken or behaves contrary to its documentation.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this! Please fill in the details below —
+        the more reproducible, the faster the fix. Security issues do NOT belong here:
+        use [private security advisories](https://github.com/leon1706/aether-vault/security/advisories/new).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Also tell us what you expected to happen instead.
+      placeholder: "av checkout <shorthash> said 'Commit not found' although av commit printed exactly that hash..."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands in order, ideally against a fresh `av init` scratch repo.
+      placeholder: |
+        av init --mode local --yes --no-repl
+        av add train.py
+        av commit -m x
+        av checkout <hash>   # <- fails
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Aether-Vault version
+      description: Output of `av --version` (or the git commit if running from source).
+      placeholder: "1.1.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+    validations:
+      required: true
+  - type: checkboxes
+    id: context
+    attributes:
+      label: Environment context
+      description: Tick everything that was involved (helps route the report).
+      options:
+        - label: Docker registry stack was running
+        - label: Registry in Protected mode (`av auth set-token`)
+        - label: Involves `.safetensors` / `.pt` / `.ckpt` artifacts
+        - label: Involves a cloned repo (`av clone`)
+        - label: Web UI involved
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Console output, `av doctor` results, or screenshots. Redact tokens!
+      render: shell

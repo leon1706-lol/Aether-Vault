@@ -1093,4 +1093,41 @@ findings (resolved and still-open).
   `test_registry.py` passes through the same invocation; workflow diffs are version-bumps
   and env additions only.
 
+## Phase 44 — Project governance: contribution docs, security policy, issue/PR templates, versioning policy, per-tag GitHub Releases
+- **Files:** `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `VERSIONING.md` (all new),
+  `.github/ISSUE_TEMPLATE/config.yml` + `bug_report.yml` + `feature_request.yml` (new),
+  `.github/PULL_REQUEST_TEMPLATE.md` (new), `.github/workflows/release.yml`,
+  `.github/README.md`, `README.md` (Contributing section rewritten).
+- **What:**
+  - `CONTRIBUTING.md`: dev setup, the Essential-Tasks wrap-up workflow, code conventions
+    (module-per-feature, lazy imports, the single restore/commit-path invariants), PR style,
+    and the licensing note — contributions are accepted under the same PolyForm
+    Noncommercial terms as the project.
+  - `CODE_OF_CONDUCT.md`: Contributor Covenant v2.1 with enforcement routed to the
+    maintainer via private channels.
+  - `SECURITY.md`: private reporting via GitHub security advisories (never public issues),
+    72h-ack/weekly-update expectations, supported-versions table (latest line only),
+    explicit in/out-of-scope guidance, and honest pointers to the known open hardening
+    items (CORS wildcard, no rate limiting, shared-secret auth) so they're reportable but
+    not "discoveries".
+  - Issue templates: YAML forms for bugs (repro/version/OS/environment checkboxes) and
+    features (motivation/proposal/alternatives); blank issues disabled with contact links
+    routing security → advisories and questions → Discussions.
+  - `PULL_REQUEST_TEMPLATE.md`: mirrors the wrap-up checklist (tests, manual debug session,
+    docs-moved-with-code, latency discipline).
+  - `VERSIONING.md`: SemVer mapped to each compatibility surface (CLI, `.av/` on-disk
+    format, HTTP API, config files, Python imports) with concrete MAJOR/MINOR/PATCH
+    examples from real shipped changes; a binding deprecation policy (announce in release
+    notes + CHANGELOG, ≥1 minor grace window, removal only at MAJOR) effective since
+    v1.1.1; DB-schema migration caveats until Alembic lands; and the full release runbook.
+  - `release.yml` gained a `github-release` job: on tag push it creates a GitHub Release
+    with auto-generated notes (GitHub diffs against the previous tag automatically) and
+    attaches every wheel/sdist — closing the "Releases with changelogs per tag" gap. The
+    curated long-form history stays in `development/CHANGELOG.md`; job guarded to tag refs
+    only and needs no third-party action (`gh release create --generate-notes`).
+- **Verified:** all new YAML parses cleanly (pyyaml round-trip on templates + workflows);
+  release.yml's five jobs confirmed structurally intact with correct `if:`/permissions;
+  fast test slice green (10 passed). The GitHub-Releases flow itself activates on the next
+  real tag push.
+
 > See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).

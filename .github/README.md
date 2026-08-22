@@ -1,15 +1,19 @@
-# `.github/` — Repository Automation
+# `.github/` — Repository Automation & Community Templates
 
-GitHub Actions workflows and repository-level configuration. See the
+GitHub Actions workflows, issue/PR templates, and repository-level configuration. See the
 [main README](../README.md) for the project overview.
 
 ## Contents
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| [`workflows/tests.yml`](workflows/tests.yml) | CI on every push/PR — five jobs: full suite on Windows (`test`), framework-plugin extras on Ubuntu (`plugin-tests`), webui Vitest (`webui-tests`), live Postgres+Redis server suite (`server-tests`), and a real-browser Playwright E2E against a freshly built dashboard (`webui-e2e`) |
-| [`workflows/release.yml`](workflows/release.yml) | Tag push (`vX.Y.Z`) → sdist + cibuildwheel wheels (cp310–cp312, Windows/Linux/macOS) published to PyPI via trusted publishing |
-| [`workflows/docker-edge.yml`](workflows/docker-edge.yml) | Every push to master → `:edge` images of server and webui on GHCR |
+| `workflows/tests.yml` | CI on every push/PR — five jobs: full suite on Windows (`test`), framework-plugin extras on Ubuntu (`plugin-tests`), webui Vitest (`webui-tests`), live Postgres+Redis server suite (`server-tests`), and a real-browser Playwright E2E against a freshly built dashboard (`webui-e2e`) |
+| `workflows/release.yml` | Tag push (`vX.Y.Z`) → sdist + cibuildwheel wheels → PyPI (trusted publishing) → **GitHub Release with auto-generated per-tag notes + attached artifacts** → GHCR images |
+| `workflows/docker-edge.yml` | Every push to master → `:edge` images of server and webui on GHCR |
+| `ISSUE_TEMPLATE/bug_report.yml` | Structured bug reports: repro steps, version, OS, environment checkboxes |
+| `ISSUE_TEMPLATE/feature_request.yml` | Motivation/proposal/alternatives form; points at the roadmap first |
+| `ISSUE_TEMPLATE/config.yml` | Blank issues off; routes security reports to private advisories and questions to Discussions |
+| [`PULL_REQUEST_TEMPLATE.md`](PULL_REQUEST_TEMPLATE.md) | The Essential-Tasks checklist as a PR form (tests, manual debug session, docs moved with code) |
 
 ## Notes for maintainers
 

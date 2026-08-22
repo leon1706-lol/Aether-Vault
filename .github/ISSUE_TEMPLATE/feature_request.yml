@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a capability for Aether-Vault.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: check the README's **Open Source Roadmap** and the existing
+        issues — your idea may already be tracked. Enterprise-tier ideas (RBAC, SSO,
+        audit logging) are welcome but note they land in the commercial variant first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what's missing or painful today?
+      placeholder: "After cloning a project on a second machine, I can't see which teammate pushed what without opening the web UI..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to happen? Sketch CLI syntax if it's a command (`av ...`).
+      placeholder: "av log --author alice"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other tools' approaches (DVC, Git LFS, MLflow) or workarounds you've tried.
+  - type: checkboxes
+    id: willingness
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to help implement this (see CONTRIBUTING.md)

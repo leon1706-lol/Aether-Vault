@@ -70,6 +70,40 @@ jobs:
 
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  github-release:
+    name: Create GitHub Release with changelog
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write # create the Release and attach artifacts
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: sdist
+          path: dist
+
+      # Auto-generated notes (commit highlights, contributors, full-changelog link; GitHub
+      # diffs against the previous tag automatically) plus every wheel/sdist attached.
+      # The curated long-form history lives in development/CHANGELOG.md — link it in the
+      # Release description when tagging.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "aether-vault $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*
+
   build-and-push-docker:
     name: Build and push Docker images (GHCR)
     runs-on: ubuntu-latest
