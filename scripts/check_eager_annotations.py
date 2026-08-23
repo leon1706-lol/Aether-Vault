@@ -18,6 +18,45 @@ from pathlib import Path
 _BUILTIN_NAMES = set(dir(builtins))
 
 
+def _star_surface(node: ast.ImportFrom, path: Path) -> set[str]:
+    """Public top-level names exported by a star-imported sibling module.
+
+    The av_cli command modules use `from .core import *` as their shared prelude; core
+    binds `Path`/`click`/`json`/... publicly, so annotations referencing them are safe on
+    every Python version. Without this resolution the checker false-positives on them.
+    """
+    if node.module is None or node.level != 1:
+        return set()
+    target = (path.parent / f"{node.module.replace('.', '/')}.py")
+    if not target.exists():
+        return set()
+    try:
+        tree = ast.parse(target.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for sub in tree.body:
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not sub.name.startswith("_"):
+                names.add(sub.name)
+        elif isinstance(sub, ast.Assign):
+            for t in sub.targets:
+                if isinstance(t, ast.Name) and not t.id.startswith("_"):
+                    names.add(t.id)
+        elif isinstance(sub, ast.Import):
+            for a in sub.names:
+                n = (a.asname or a.name).split(".")[0]
+                if not n.startswith("_"):
+                    names.add(n)
+        elif isinstance(sub, ast.ImportFrom):
+            if sub.module and sub.module != "__future__":
+                for a in sub.names:
+                    n = a.asname or a.name
+                    if not n.startswith("_"):
+                        names.add(n)
+    return names
+
+
 def check_file(path: Path) -> list[str]:
     problems: list[str] = []
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -25,16 +64,22 @@ def check_file(path: Path) -> list[str]:
     available: dict[str, int] = {}
     future_annotations = False
     body = list(tree.body)
+    star_names: set[str] = set()
     for node in body:
         if isinstance(node, ast.ImportFrom) and node.module == "__future__":
             future_annotations = True
     if future_annotations:
         return problems  # stringified annotations defer everything
 
+    # Pre-resolve star-imports so shared-prelude names count as available everywhere.
+    for node in body:
+        if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+            star_names |= _star_surface(node, path)
+
     def ann_names(node) -> None:
         for sub in ast.walk(node):
             if isinstance(sub, ast.Name) and sub.id not in _BUILTIN_NAMES \
-                    and sub.id not in available:
+                    and sub.id not in available and sub.id not in star_names:
                 problems.append(
                     f"{path}:{node.lineno}: annotation uses '{sub.id}' before its "
                     f"import/definition (eager NameError on Python <=3.12)"

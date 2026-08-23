@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import get_session, init_db
+from . import rate_limit
 from .models import DBCommit, DBObject, DBRef, DBTree, utcnow_naive
 from .redis_cache import cache
 from .storage import CASStorage
@@ -38,9 +39,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Aether-Vault Server", version="1.4.0", lifespan=lifespan)
+
+# CORS is env-driven and locked to the webui's origin by default — the old blanket
+# allow_origins=["*"] let any page a developer visited fire credentialed-less requests at
+# a reachable registry (drive-by GC/uploads). "*" remains available explicitly for
+# genuinely open deployments via AV_CORS_ORIGINS="*"; multiple origins are comma-separated.
+_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("AV_CORS_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+if not _CORS_ORIGINS:
+    _CORS_ORIGINS = ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "HEAD"],
     allow_headers=["*"],
 )
@@ -70,6 +83,41 @@ async def require_token(request: Request, call_next):
     scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not supplied or not secrets.compare_digest(supplied, AV_API_TOKEN):
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    if not AV_API_TOKEN or request.url.path in _AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+
+    scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not supplied or not secrets.compare_digest(supplied, AV_API_TOKEN):
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
+    return await call_next(request)
+
+
+# --- Rate limiting (outermost middleware: floods are rejected before any other work) ---
+# Defaults close the one destructive unauthenticated endpoint (GC) while leaving the data
+# plane unlimited — legitimate clients burst (8-worker object uploads, thousand-file
+# commits) and fixed global caps would false-positive on them. Operators opt the data
+# plane in via AV_RATE_LIMIT_DEFAULT; see python/av_server/rate_limit.py.
+_RATE_LIMITER = rate_limit.build_limiter_from_env()
+
+
+@app.middleware("http")
+async def limit_request_rate(request: Request, call_next):
+    bucket = rate_limit.bucket_class_for(request.url.path)
+    if bucket is None:
+        return await call_next(request)
+    client = request.client.host if request.client else "unknown"
+    retry_after = _RATE_LIMITER.check(client, bucket)
+    if retry_after is not None:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": f"Rate limit exceeded for '{bucket}' operations"},
+            headers={"Retry-After": str(retry_after)},
+        )
     return await call_next(request)
 
 

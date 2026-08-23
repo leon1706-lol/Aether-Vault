@@ -71,6 +71,12 @@ AV_DATA_DIR    /data   (default)
                Container-oriented default backed by the vault_data volume.
 AV_API_TOKEN   (empty/unset = Anonymous mode)
                Set → every route except the auth-exempt paths requires Bearer auth.
+AV_CORS_ORIGINS http://localhost:3000   (default; comma-separated; "*" reopens all)
+               Anything not listed gets no Access-Control-Allow-Origin on responses.
+AV_RATE_LIMIT_GC  10/minute   (default)
+               Hard cap on the destructive GC endpoint, Anonymous mode included.
+AV_RATE_LIMIT_DEFAULT  (empty = data plane unlimited)
+               Opt-in cap for every other /api route; bulk uploads burst by design.
 AV_REMOTE_URL  (CLI-side) default registry for av clone; else http://localhost:8000.
 AV_AUTHOR      (CLI-side) commit author string; defaults to "anonymous".
 ```
@@ -122,6 +128,24 @@ npx playwright test                     # dashboard.spec.ts + weight-diff.spec.t
 ```
 
 **Standing rule:** never seed E2E data against a registry holding real work — `seed_data.py` creates its own throwaway repos but still talks to whatever registry is listening on :8000.
+
+## Database Migrations
+
+The schema is owned by Alembic (`python/av_server/migrations/`); `create_all` is gone. Server startup runs the chain programmatically (`python/av_server/database.py::init_db`) — no alembic.ini, no manual step:
+
+1. Fresh database → migration `0001_baseline` creates every table exactly as `models.py` defines them (including `commits.extra_parents`, `trees.chunks`), then records itself in `alembic_version`.
+2. Legacy database (a pre-Alembic create_all volume: `commits` exists, `alembic_version` doesn't) → startup heals the known post-adoption column drift in place and stamps the chain applied. Zero-touch; only future revisions ever execute on it.
+
+Authoring a new migration:
+
+```sql
+-- 1. change python/av_server/models.py
+-- 2. generate + review:
+--    alembic revision --autogenerate -m "add X"   (run from a checkout with DATABASE_URL set)
+-- 3. restart the server — init_db() upgrades to head on boot
+```
+
+**Caution:** never edit an already-applied migration in place; append a new revision instead. Volumes that predate the v1.1.x FK removals may still carry `trees_object_hash_fkey`-style constraints — drop those manually once if inserts fail on such a volume (documented per-phase in [CHANGELOG.md](CHANGELOG.md)).
 
 ## Inspecting PostgreSQL
 

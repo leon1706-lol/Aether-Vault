@@ -7,13 +7,21 @@ on:
 jobs:
   test:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor (3.10: eager annotations, oldest supported) + ceiling (3.14: newest stable,
+        # PEP 649 lazy-annotation semantics). The in-between versions add Windows-runner
+        # minutes without covering new failure modes — the static eager-annotation checker
+        # covers ≤3.12 semantics.
+        python-version: ["3.10", "3.14"]
 
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
         run: pip install -e .[dev]
@@ -50,6 +58,14 @@ jobs:
       - name: Install webui dependencies
         working-directory: webui
         run: npm ci
+
+      - name: Lint webui
+        working-directory: webui
+        run: npm run lint
+
+      - name: Typecheck webui
+        working-directory: webui
+        run: npm run typecheck
 
       - name: Run webui Vitest suite
         working-directory: webui

@@ -50,6 +50,7 @@ venv.bak/
 # Web UI
 webui/node_modules/
 webui/.next/
+webui/*.tsbuildinfo
 webui/test-results/
 webui/playwright-report/
 webui/blob-report/

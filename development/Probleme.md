@@ -766,3 +766,27 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** Replaced the stale assertion with two that reflect the real DOM and keep the intent (app shell mounted): sidebar brand text "ML Registry Dashboard" + the `#nav-dashboard` nav item. Both verified present in `Sidebar.tsx`; spec compiles via `tsc --noEmit`.
 
 **Verification:** Spec compiles via `tsc --noEmit`; replacement selectors confirmed present in `Sidebar.tsx`.
+
+
+
+
+## ✅ Fixed — Point-13 split regression class + limiter off-by-one (2026-08-22)
+
+### [3] Star-import blind spot in the eager-annotation checker produced 13 false positives on the new cmd modules
+- **Files:** `scripts/check_eager_annotations.py`, `python/av_cli/cmd_*.py`.
+- **Problem:** the v1.1.1 CLI split introduced `from .core import *` as the command modules' shared prelude. The checker resolves only explicit imports, so annotations referencing public core names (`Path`, `click`) flagged as pre-import uses — while at runtime star-imports surface them on every Python version. Left alone, either the checker cries wolf 13× or someone "fixes" it by disabling the guard.
+- **Fix:** the checker now resolves star-imports one level deep: a relative `from .core import *` pulls that file's public top-level bindings (defs/classes/assigns/imports) into the available set. Underscore names still require explicit imports — which is exactly the discipline the split needs.
+- **Verified:** 13 false positives eliminated; the original true-positive (stashed pre-fix test_merge.py) still detected with exit 1.
+
+### [2] Rate limiter's Retry-After overshot by one second
+- **Files:** `python/av_server/rate_limit.py`.
+- **Problem:** denial path returned `int(remaining) + 1` — a client denied at window start got `Retry-After: 61` on a 60-second window. Caught immediately by the limiter's own unit suite (`1 <= retry <= 60` assertion).
+- **Fix:** `max(1, ceil(remaining))`.
+
+### [2] Split-time splice dropped the `_aether_core` module globals
+- **Files:** `python/av_cli/core.py`.
+- **Problem:** the mechanical extraction of `_get_aether_core()` sliced from `def` onward, orphaning its two module-level globals (`_aether_core`, `_aether_core_load_attempted`). Surfaced at runtime as `NameError` inside `stage_one_file` → every `av add` failed in scratch-repo verification.
+- **How found:** manual debugging session per Essential-Tasks step 1 (scratch add flow), not by reading diffs.
+- **Fix:** globals restored above the def; full stash+sync suites green immediately after.
+
+**Standing note:** the same scratch-repo pass also caught two missing cross-module imports (`_init_repo_structure`, `AsyncSession`) during the split — all fixed before any gate run was declared green. The lesson recorded for future refactors: the AST missing-name scanner (`missing_names_scan.py` pattern, kept in session tooling) plus compile gates catch these classes mechanically; eyeballing diffs does not.

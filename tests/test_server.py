@@ -583,3 +583,144 @@ def test_live_two_repo_clone_pull_flow(tmp_path, monkeypatch):
 
     status = _in(repo_a, "status")
     assert "Nothing to commit" in status.output
+
+
+# ---------------------------------------------------------------------------
+# Alembic adoption — live schema assertions against Postgres
+# ---------------------------------------------------------------------------
+
+def _pg_columns(table: str) -> set[str]:
+    """Column names of `table`, probed over a direct asyncpg connection."""
+    import asyncpg
+
+    async def _run():
+        conn = await asyncpg.connect(
+            AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+        )
+        try:
+            rows = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+                table,
+            )
+            return {r["column_name"] for r in rows}
+        finally:
+            await conn.close()
+
+    return asyncio.run(_run())
+
+
+async def init_db_with_engine(engine):
+    from python.av_server.database import _apply_schema
+
+    return _apply_schema(engine)
+
+
+def test_alembic_brings_schema_to_head(db):
+    """The lifespan's init_db() must have run the migration chain, not create_all."""
+    import asyncpg
+
+    async def _probe():
+        conn = await asyncpg.connect(
+            AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+        )
+        try:
+            version = await conn.fetchval("SELECT version_num FROM alembic_version")
+            tables = {
+                r["tablename"]
+                for r in await conn.fetch(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                )
+            }
+            return version, tables
+        finally:
+            await conn.close()
+
+    version, tables = asyncio.run(_probe())
+    assert version == "0001"
+    assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
+    assert {"extra_parents"} <= _pg_columns("commits")
+    assert {"chunks"} <= _pg_columns("trees")
+
+
+def test_legacy_database_is_healed_and_stamped(db):
+    """Simulates a pre-Alembic volume (missing post-adoption columns, no alembic_version)
+    and proves startup heals it zero-touch (Phase: DB migrations)."""
+    import asyncpg
+
+    from python.av_server.database import init_db_with_engine
+
+    url_sync = AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+
+    async def _make_legacy():
+        conn = await asyncpg.connect(url_sync)
+        try:
+            await conn.execute("ALTER TABLE commits DROP COLUMN IF EXISTS extra_parents")
+            await conn.execute("ALTER TABLE trees DROP COLUMN IF EXISTS chunks")
+            await conn.execute("DELETE FROM alembic_version")
+        finally:
+            await conn.close()
+
+    asyncio.run(_make_legacy())
+    assert "extra_parents" not in _pg_columns("commits")
+    assert "chunks" not in _pg_columns("trees")
+
+    # A fresh engine (own event loop) — never reuse the TestClient's pooled one across loops.
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    legacy_engine = create_async_engine(AV_TEST_DATABASE_URL)
+    try:
+        asyncio.run(init_db_with_engine(legacy_engine))
+    finally:
+        asyncio.run(legacy_engine.dispose())
+
+    assert "extra_parents" in _pg_columns("commits")
+    assert "chunks" in _pg_columns("trees")
+
+    async def _version():
+        conn = await asyncpg.connect(url_sync)
+        try:
+            return await conn.fetchval("SELECT version_num FROM alembic_version")
+        finally:
+            await conn.close()
+
+    assert asyncio.run(_version()) == "0001"
+
+
+
+# ---------------------------------------------------------------------------
+# API hardening — rate limiting + CORS defaults (live-server assertions)
+# ---------------------------------------------------------------------------
+
+def test_rate_limit_blocks_gc_burst_but_data_plane_stays_open(db, monkeypatch):
+    """Destructive GC gets a hard default cap; the data plane stays unlimited so bulk
+    uploads never false-positive (Phase: API hardening)."""
+    import hashlib
+
+    from python.av_server import server as server_module
+    from python.av_server.rate_limit import build_limiter_from_env
+
+    monkeypatch.setattr(
+        server_module,
+        "_RATE_LIMITER",
+        build_limiter_from_env({"AV_RATE_LIMIT_GC": "2/minute"}),
+    )
+    try:
+        codes = [db.post("/api/admin/gc").status_code for _ in range(3)]
+        assert codes[2] == 429
+        assert int(db.post("/api/admin/gc").headers["retry-after"]) >= 1
+
+        # Data plane untouched by the default policy: five rapid identical uploads.
+        content = b"rate-limit data plane probe"
+        h = hashlib.sha256(content).hexdigest()
+        codes = [db.post(f"/api/objects/{h}", content=content).status_code for _ in range(5)]
+        assert all(c in (201, 409) for c in codes)
+    finally:
+        server_module._RATE_LIMITER.reset()
+
+
+def test_cors_defaults_lock_to_webui_origin(db):
+    allowed = db.get("/api/health", headers={"Origin": "http://localhost:3000"})
+    assert allowed.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+    foreign = db.get("/api/health", headers={"Origin": "https://drive-by.example"})
+    assert "access-control-allow-origin" not in foreign.headers

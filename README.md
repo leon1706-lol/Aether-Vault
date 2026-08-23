@@ -604,8 +604,11 @@ Each import commits the checkpoint/run artifacts plus any metrics found alongsid
 
 ## Development Progress
 
-- [`development/CHANGELOG.md`](development/CHANGELOG.md) — full build-phase history: what was built, when, and why, across all 15 development phases.
-- [`development/Probleme.md`](development/Probleme.md) — full audit log of correctness, performance and security findings, resolved and still-open, with severity ratings.
+- [`development/architecture.md`](development/architecture.md) — what the system **is**: one contract section per subsystem (staging, commit, sync, merge, restore, GC, auth, webui, plugins, release), system/tech-stack diagrams, and the testing map.
+- [`development/infrastructure.md`](development/infrastructure.md) — how to **run** it: the Docker compose stack, environment variables, Protected mode, database migrations, releases, inspection SQL.
+- [`development/CHANGELOG.md`](development/CHANGELOG.md) — full build-phase history: what was built, when, and why, across all development phases.
+- [`development/Probleme.md`](development/Probleme.md) — the audit log of correctness, performance and security findings, with severity ratings and fix status.
+- [`VERSIONING.md`](VERSIONING.md) — SemVer per compatibility surface, deprecation policy, release runbook.
 
 More development-process documents will live under [`development/`](development/) over time.
 
@@ -635,17 +638,15 @@ For the full results, the methodology behind each benchmark, and the rating lege
 
 ## Open Source Roadmap
 
+Shipped milestones (v1.0/v1.1.1 releases, clone/pull, log, merge, chunk dedup, Alembic
+migrations, CORS + rate-limit hardening, cp310–cp314 wheels) live in the
+[CHANGELOG](development/CHANGELOG.md) and GitHub Releases. What's still open:
+
 | Status | Feature |
 |---|---|
-| ✅ | **First tagged releases shipped** — `v0.1.0` and `v0.1.1` are live on PyPI (wheels for Python 3.10–3.12 on Windows/Linux/macOS, published via trusted publishing on tag push); installed users pick updates up through `av update` / opt-in auto-update |
-| ✅ | **`av clone` / `av pull`** — fresh-machine working copies from the registry, fast-forward pulls with a diverged-history handoff to `av merge` (v1.1.1) |
-| ✅ | **`av log`** — offline CLI commit history with branch decorations, tags/metrics (v1.1.1) |
-| ✅ | **Branch merge** — tree-level three-way merge with abort-on-conflict + `--ours`/`--theirs`, two-parent merge commits synced through the registry (v1.1.1) |
-| ✅ | **`.pt`/`.pth`/`.ckpt` chunk dedup** — content-defined chunking in the C++ core: opaque checkpoints now get cross-version storage savings like safetensors layers (v1.1.1) |
-| 🔲 | **Database migrations** — the server schema is created via `create_all`; schema evolution still means manual `ALTER TABLE`s (Alembic adoption tracked here) |
-| 🔲 | **API hardening** — CORS is still `allow_origins=["*"]` and there is no rate limiting; both must close before any shared/public deployment |
-| 🔲 | **Python 3.13/3.14 wheels** — cibuildwheel currently targets cp310–cp312 only |
 | 🔲 | **Benchmark #5 recapture** — cold-clone row needs one `av benchmark` run against a live registry |
+| 🔲 | **Web UI merge visualization** — the commit graph renders `parent_hash` only, so merge commits appear linear; draw both parents |
+| 🔲 | **Per-user auth** — Protected mode is a single shared secret; RBAC/SSO are tracked on the enterprise tier |
 
 ## License
 

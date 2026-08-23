@@ -38,11 +38,19 @@ Known standing deprecation candidates (tracked, not yet scheduled): none current
 
 ## Database schema compatibility
 
-The server still creates its schema via `create_all` (Alembic adoption is roadmap). Until
-then, every schema change ships with a documented one-time statement for existing
-databases (e.g. `ALTER TABLE commits ADD COLUMN extra_parents TEXT;`) in its CHANGELOG
-phase entry. Operators running persistent registries should read the changelog before
-upgrading the server image — new columns are always additive and nullable/default-safe.
+The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades
+to head automatically; databases created before the Alembic adoption are detected and
+healed + stamped zero-touch on first boot with a v1.1.x-or-newer server image. New schema
+changes append reviewed migrations — never edit an applied one. Operators running
+persistent registries should still read the changelog before upgrading: new columns are
+always additive and nullable/default-safe.
+
+## Transport defaults (behavior note)
+
+Since the v1.1.x hardening cycle, the server's CORS allow-list defaults to the webui
+origin (`http://localhost:3000`) instead of `*`, and `POST /api/admin/gc` is rate-limited
+to 10/minute by default. Both pre-1.1.x behaviors remain available explicitly via
+`AV_CORS_ORIGINS="*"` and `AV_RATE_LIMIT_GC=off` for deployments that want them.
 
 ## How a release happens
 

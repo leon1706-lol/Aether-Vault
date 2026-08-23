@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm AS builder
+FROM python:3.12-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y build-essential cmake g++
 COPY requirements.txt setup.py pyproject.toml /build/
 COPY src /build/src

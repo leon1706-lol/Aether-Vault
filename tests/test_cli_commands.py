@@ -64,6 +64,7 @@ def test_push_with_pending_and_unreachable_server_reports_error(repo, monkeypatc
 
 
 def test_push_flushes_pending_when_server_reachable(repo, monkeypatch):
+    import python.av_cli.cmd_history as cmd_history
     import python.av_cli.main as main_module
 
     # Force unreachable during the commit so it actually queues .av/pending_push (regardless of
@@ -75,7 +76,9 @@ def test_push_flushes_pending_when_server_reachable(repo, monkeypatch):
     invoke("commit", "-m", "first")
 
     monkeypatch.setattr(main_module.VaultClient, "server_available", lambda self: True)
-    monkeypatch.setattr(main_module, "flush_pending_push", lambda repo_root, client: [])
+    # flush_pending_push moved to core in the Point-13 split; `push` resolves it from its
+    # own command module's namespace, so the patch target follows the new owner.
+    monkeypatch.setattr(cmd_history, "flush_pending_push", lambda repo_root, client: [])
 
     result = invoke("push")
     assert result.exit_code == 0, result.output

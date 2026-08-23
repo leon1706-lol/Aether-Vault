@@ -34,11 +34,12 @@ destroy repository data; path traversal in ref/hash handling; hash-verification 
 unsafe deserialization; supply-chain issues in our published artifacts; credential leakage
 in logs, config files, or the token handoff flow.
 
-**Known, tracked limitations** (reports welcome, but please reference these so we can link
-them): the registry currently ships with permissive CORS (`allow_origins=["*"]`) and no API
-rate limiting, and the optional "Protected" mode is a single shared secret rather than
-per-user auth. All three are explicit roadmap items (see the README's Open Source Roadmap)
-intended to close before any shared/public deployment.
+**Hardening status:** CORS is locked to the webui origin by default (`AV_CORS_ORIGINS` to
+widen) and the destructive GC endpoint is rate-limited by default (`AV_RATE_LIMIT_GC`,
+`10/minute`) — both shipped in the v1.1.x hardening cycle. The remaining known limitation:
+"Protected" mode is a single shared secret rather than per-user auth; RBAC/SSO are
+enterprise-tier roadmap items. Reports about the shipped defaults are still welcome —
+reference them so we can link.
 
 **Out of scope:** social engineering, brute-force against deployments you don't own,
 vulnerabilities in Docker/Postgres/Redis themselves (report upstream), and self-hosted
@@ -48,4 +49,6 @@ misconfigurations that expose ports publicly without Protected mode enabled.
 
 Until per-user auth ships: run registries with `av auth set-token` ("Protected" mode),
 keep Postgres/Redis off the host network (the release compose file already omits their
-port mappings), and put TLS termination in front of uvicorn for any non-localhost use.
+port mappings), keep the default CORS lock and GC rate limit in place (widen
+`AV_CORS_ORIGINS` only for deployments that actually need it), and put TLS termination
+in front of uvicorn for any non-localhost use.

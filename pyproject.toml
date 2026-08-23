@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm>=8", "pybind11>=2.11.0"]
+requires = ["setuptools>=68.0", "setuptools-scm>=8", "pybind11>=3.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -21,6 +21,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: C++",
     "Topic :: Software Development :: Version Control",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -32,9 +34,10 @@ dependencies = [
     "uvicorn[standard]>=0.24.0",
     "requests>=2.31.0",
     "click>=8.1.0",
-    "pybind11>=2.11.0",
+    "pybind11>=3.0.0",
     "sqlalchemy>=2.0.0",
     "asyncpg>=0.29.0",
+    "alembic>=1.13",
     "redis>=5.0.0",
     "rich>=13.7.0",
     "questionary>=2.0.0",
@@ -78,5 +81,5 @@ write_to = "python/av_cli/_version.py"
 fallback_version = "0.0.0.dev0"
 
 [tool.cibuildwheel]
-build = "cp310-* cp311-* cp312-*"
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
 skip = "*-musllinux* pp*"
