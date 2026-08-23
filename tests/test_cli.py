@@ -1404,6 +1404,167 @@ def test_auth_status_reports_protected_without_printing_the_token(repo, monkeypa
 
 
 # ---------------------------------------------------------------------------
+# av auth add-user / list-users / remove-user — per-user tokens (v1.1.8)
+# ---------------------------------------------------------------------------
+# Same sandbox convention as the single-token tests above: a dummy compose file makes
+# resolve_compose_file() treat the tmp repo as the dev checkout, so every .env read/write
+# lands in tmp_path; Docker itself is always mocked.
+
+def _stored_auth_users(repo):
+    import json as json_module
+
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    raw = docker_runtime_module.read_env_token(repo / "docker-compose.yml", key="AV_AUTH_USERS")
+    return json_module.loads(raw) if raw else {}
+
+
+def test_auth_add_user_generates_and_stores_a_token(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    result = invoke("auth", "add-user", "alice")
+    assert result.exit_code == 0, result.output
+    assert "User 'alice' added" in result.output
+
+    stored = _stored_auth_users(repo)
+    generated = stored["alice"]
+    assert len(generated) >= 32  # secrets.token_urlsafe(32) default
+    # Token printed exactly once for sharing...
+    assert generated in result.output
+
+
+def test_auth_add_user_with_explicit_token(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    result = invoke("auth", "add-user", "bob", "bobs-fixed-token")
+    assert result.exit_code == 0, result.output
+    assert _stored_auth_users(repo) == {"bob": "bobs-fixed-token"}
+
+
+def test_auth_add_user_merges_into_existing_map_and_restarts(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    restart_calls = []
+    monkeypatch.setattr(
+        docker_runtime_module, "restart_service",
+        lambda compose_file, service: (restart_calls.append(service), True)[1],
+    )
+
+    invoke("auth", "add-user", "alice", "tok-a")
+    invoke("auth", "add-user", "bob", "tok-b")
+
+    assert _stored_auth_users(repo) == {"alice": "tok-a", "bob": "tok-b"}
+    assert restart_calls == ["aether-vault-server", "aether-vault-server"]
+
+
+def test_auth_add_user_duplicate_warns_without_clobbering(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    invoke("auth", "add-user", "alice", "original-token")
+    result = invoke("auth", "add-user", "alice", "replacement-token")
+    assert result.exit_code == 0, result.output
+    assert "already exists" in result.output
+    assert _stored_auth_users(repo) == {"alice": "original-token"}
+
+
+def test_auth_add_user_when_docker_not_running_warns_but_still_saves(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.NOT_RUNNING)
+
+    result = invoke("auth", "add-user", "carol", "carols-token")
+    assert result.exit_code == 0, result.output
+    assert "take effect next time" in result.output.lower()
+    assert _stored_auth_users(repo) == {"carol": "carols-token"}
+
+
+def test_auth_add_user_refuses_corrupted_json_in_env(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    (repo / ".env").write_text("AV_AUTH_USERS=not-json-at-all\n", encoding="utf-8")
+
+    result = invoke("auth", "add-user", "alice", "tok-a")
+    assert result.exit_code != 0
+    assert "not valid JSON" in result.output
+    # The broken line is left for the human to fix — no silent overwrite of unknown state.
+    assert "AV_AUTH_USERS=not-json-at-all" in (repo / ".env").read_text(encoding="utf-8")
+
+
+def test_auth_list_users_masks_tokens(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+
+    invoke("auth", "add-user", "alice", "alice-super-long-token")
+    result = invoke("auth", "list-users")
+    assert result.exit_code == 0, result.output
+    assert "alice" in result.output
+    assert "oken" in result.output  # masked tail visible
+    assert "alice-super-long-token" not in result.output  # never printed in full
+
+
+def test_auth_list_users_reports_empty_map(repo, monkeypatch):
+    _sandbox_compose_dir(repo, monkeypatch)
+
+    result = invoke("auth", "list-users")
+    assert result.exit_code == 0, result.output
+    assert "No per-user tokens" in result.output
+
+
+def test_auth_remove_user_revokes_only_that_user(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    invoke("auth", "add-user", "alice", "tok-a")
+    invoke("auth", "add-user", "bob", "tok-b")
+    result = invoke("auth", "remove-user", "alice")
+    assert result.exit_code == 0, result.output
+    assert "revoked" in result.output
+    assert _stored_auth_users(repo) == {"bob": "tok-b"}
+
+
+def test_auth_remove_last_user_removes_the_env_line(repo, monkeypatch):
+    import python.av_cli.docker_runtime as docker_runtime_module
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    invoke("auth", "add-user", "solo", "solo-token")
+    result = invoke("auth", "remove-user", "solo")
+    assert result.exit_code == 0, result.output
+    # Empty map drops the line entirely — compose interpolation stays "" (= Anonymous).
+    assert "AV_AUTH_USERS" not in (repo / ".env").read_text(encoding="utf-8")
+
+
+def test_auth_remove_unknown_user_warns(repo, monkeypatch):
+    _sandbox_compose_dir(repo, monkeypatch)
+
+    result = invoke("auth", "remove-user", "nobody")
+    assert result.exit_code == 0, result.output
+    assert "No such user 'nobody'" in result.output
+
+
+# ---------------------------------------------------------------------------
 # main.run() — the console-script entry point wraps cli() with a one-shot
 # auto-update check at process exit (see python/av_cli/main.py's run() docstring)
 # ---------------------------------------------------------------------------

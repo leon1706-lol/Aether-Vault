@@ -51,6 +51,10 @@ export interface Commit {
   author: string;
   timestamp: string | null;
   parent_hash: string | null;
+  // Merge commits list every parent here (the server reconstructs parent_hash +
+  // extra_parents into one array); optional so fixtures/older payloads without it still
+  // render through the parent_hash fallback.
+  parents?: string[];
   root_tree_hash: string | null;
   tags: string[];
   metrics: Record<string, number | string>;

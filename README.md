@@ -232,24 +232,40 @@ av                                        # bare, in an initialized repo: reconn
 ```
 
 ### `av auth`
-Manage the optional shared-secret access token ("Protected" mode). Unset (the default) means
-every route behaves exactly as it always has — no credentials needed ("Anonymous"). Setting a
-token switches the server to "Protected" — every route, reads included, then requires it
-(except `GET /api/health`, always reachable so Docker healthchecks and the CLI's own
-reachability checks never need a token themselves).
+Manage the optional access-token gate ("Protected" mode). Unset (the default) means every
+route behaves exactly as it always has — no credentials needed ("Anonymous"). Setting any
+token switches the server to "Protected" — every route, reads included, then requires a
+valid Bearer token (except `GET /api/health`, always reachable so Docker healthchecks and
+the CLI's own reachability checks never need a token themselves).
+
+Two credential sources coexist: the owner's shared secret (`AV_API_TOKEN`) and optional
+**per-user tokens** (`AV_AUTH_USERS`, a `{username: token}` map managed by the commands
+below). A request authenticates against either; per-user teammates who push with the
+default `anonymous` author get their username stamped as the commit author automatically,
+while an explicit `AV_AUTHOR` is always respected.
 ```bash
 av auth set-token              # generate a random token, write it, restart the server with it active
 av auth set-token <token>       # set a specific token instead (e.g. one a teammate already uses)
 av auth set-token <new-token>   # re-running this is also the "I forgot it" path — no separate reset flow
 av auth clear                   # remove the token everywhere — back to Anonymous
 av auth status                  # report whether a token is configured (masked), without printing it
+
+av auth add-user <name>         # grant NAME its own token (generated + printed once)
+av auth add-user <name> <token> # ...or with a specific token
+av auth list-users              # masked list of per-user tokens
+av auth remove-user <name>      # revoke NAME's personal token
 ```
+Per-user flow: run `av auth add-user alice`, share Alice her token over a trusted channel;
+she puts it in her own repo via `av auth set-token <her-token>` and pushes as usual — her
+commits show up attributed to `alice` in the log and webui without any shared secret ever
+leaving your machine.
 If any CLI command hits a registry that's Protected and no/the-wrong token is configured, it
 prompts interactively for the token (saves it, then asks you to re-run) rather than failing
 with a generic error — or, non-interactively, prints exactly which command to run. The webui
 behaves the same way: opening it via `av webui` auto-fills the token if the CLI already has
 one configured; opened any other way (a bookmark, a teammate's own browser), it shows the same
-entry prompt once.
+entry prompt once. Per-user tokens work everywhere the shared secret does, including the
+webui's token prompt.
 
 ### `av update`
 Check PyPI for a newer release and optionally install it. `av init` also prints a one-line
@@ -618,7 +634,14 @@ More development-process documents will live under [`development/`](development/
 
 `av benchmark` runs 9 reproducible benchmarks against **Git LFS**, **DVC**, and **MLflow**. Every number is measured from a real subprocess or HTTP call on the same fixture each tool actually has to process — nothing here is estimated or fabricated, and a tool that cannot run a given benchmark (not installed, or the operation does not apply to it) is reported as such rather than given a guessed value.
 
-**At a glance:** Aether wins decisively on raw hashing throughput and storage dedup (#1/#2/#7), trades blows on commit+push latency (#3 — push is faster, commit is slower by design: av uploads synchronously during `commit`, DVC defers all upload to a separate `push`), has one open weak spot (#4, no-op `status`/`add`), one capability gap (#5, no `clone`/`pull` yet), a unique capability no competitor can match at all (#6, partial-layer fetch), and two Aether-only server operations with no comparable competitor primitive (#8, #9). The table below summarizes each benchmark vs. the best competitor wherever that comparison is fair — see [`development/BENCHMARKS.md`](development/BENCHMARKS.md) for the full methodology, every raw number, and the caveats that go with single-machine timings.
+**At a glance:** Aether wins decisively on raw hashing throughput and storage dedup (#1/#2/#7), trades blows on
+commit+push latency (#3 — push is faster, commit is slower by design: av uploads synchronously during `commit`, DVC
+defers all upload to a separate `push`), has one open weak spot (#4, no-op `status`/`add`), one metric capture still
+pending (#5 — `av clone`/`av pull` shipped in v1.1.1; the measured number lands on the next live-registry benchmark
+run), a unique capability no competitor can match at all (#6, partial-layer fetch), and two Aether-only server
+operations with no comparable competitor primitive (#8, #9). The table below summarizes each benchmark vs.
+the best competitor wherever that comparison is fair — see [`development/BENCHMARKS.md`](development/BENCHMARKS.md) for
+the full methodology, every raw number, and the caveats that go with single-machine timings.
 
 | # | Benchmark | vs. best competitor | Notes |
 |---|---|---|---|
@@ -638,15 +661,12 @@ For the full results, the methodology behind each benchmark, and the rating lege
 
 ## Open Source Roadmap
 
-Shipped milestones (v1.0/v1.1.1 releases, clone/pull, log, merge, chunk dedup, Alembic
-migrations, CORS + rate-limit hardening, cp310–cp314 wheels) live in the
-[CHANGELOG](development/CHANGELOG.md) and GitHub Releases. What's still open:
-
-| Status | Feature |
-|---|---|
-| 🔲 | **Benchmark #5 recapture** — cold-clone row needs one `av benchmark` run against a live registry |
-| 🔲 | **Web UI merge visualization** — the commit graph renders `parent_hash` only, so merge commits appear linear; draw both parents |
-| 🔲 | **Per-user auth** — Protected mode is a single shared secret; RBAC/SSO are tracked on the enterprise tier |
+No open items — shipped milestones (v1.0/v1.1.x releases, clone/pull, log, merge, chunk
+dedup, Alembic migrations, CORS + rate-limit hardening, cp310–cp314 wheels, per-user auth,
+merge visualization) live in the [CHANGELOG](development/CHANGELOG.md) and GitHub Releases.
+The one operational follow-up that isn't a feature — capturing benchmark #5's measured row
+against a live registry (`av benchmark --markdown` in the next Docker session) — is tracked
+as an ops note in [`development/infrastructure.md`](development/infrastructure.md).
 
 ## License
 

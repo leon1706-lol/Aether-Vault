@@ -32,6 +32,13 @@ interface GraphNode {
   y: number;
 }
 
+// parents[] when the server sent it (merge commits carry every parent), falling back to
+// the single-parent field for payloads/fixtures that predate the merge-viz change.
+function commitParents(c: Commit): string[] {
+  if (c.parents && c.parents.length > 0) return c.parents;
+  return c.parent_hash ? [c.parent_hash] : [];
+}
+
 export function buildGraph(commits: Commit[]): { nodes: GraphNode[]; edges: { x1: number; y1: number; x2: number; y2: number; color: string }[] } {
   const sorted = [...commits].sort((a, b) => {
     const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
@@ -53,9 +60,12 @@ export function buildGraph(commits: Commit[]): { nodes: GraphNode[]; edges: { x1
       occupiedCols.add(nextCol);
       nextCol = Math.min(nextCol + 1, 4); // max 5 lanes
     }
-    // Propagate column to parent (if not already assigned)
-    if (c.parent_hash && colByHash[c.parent_hash] === undefined) {
-      colByHash[c.parent_hash] = colByHash[c.hash];
+    // Lane inheritance follows the FIRST parent only (git-graph convention): the merged
+    // branch's own lane continues through the merge into its first parent, while second
+    // parents keep whatever lane they already have.
+    const firstParent = commitParents(c)[0];
+    if (firstParent && colByHash[firstParent] === undefined) {
+      colByHash[firstParent] = colByHash[c.hash];
     }
   });
 
@@ -73,13 +83,23 @@ export function buildGraph(commits: Commit[]): { nodes: GraphNode[]; edges: { x1
   const nodeByHash: Record<string, GraphNode> = {};
   nodes.forEach((n) => { nodeByHash[n.commit.hash] = n; });
 
-  const edges = nodes
-    .filter((n) => n.commit.parent_hash && nodeByHash[n.commit.parent_hash])
-    .map((n) => {
-      const parent = nodeByHash[n.commit.parent_hash!];
-      const color = LANE_COLORS[n.col % LANE_COLORS.length];
-      return { x1: n.x, y1: n.y, x2: parent.x, y2: parent.y, color };
-    });
+  // One edge per parent — this is what makes merges actually fork on screen instead of
+  // appearing linear. Parents outside the loaded window simply draw no edge (same rule
+  // the single-parent renderer always had).
+  const edges: { x1: number; y1: number; x2: number; y2: number; color: string }[] = [];
+  for (const n of nodes) {
+    for (const parentHash of commitParents(n.commit)) {
+      const parent = nodeByHash[parentHash];
+      if (!parent) continue;
+      edges.push({
+        x1: n.x,
+        y1: n.y,
+        x2: parent.x,
+        y2: parent.y,
+        color: LANE_COLORS[n.col % LANE_COLORS.length],
+      });
+    }
+  }
 
   return { nodes, edges };
 }

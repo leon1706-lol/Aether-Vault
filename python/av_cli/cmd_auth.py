@@ -12,12 +12,13 @@ from . import main as _root
 
 @click.group()
 def auth() -> None:
-    """Manage the optional shared-secret access token ("Protected" mode).
+    """Manage the optional access-token gate ("Protected" mode).
 
     Unset/empty (the default) means the registry is "Anonymous" — every route behaves exactly
     as it always has, no credentials needed. Setting a token switches the server to
-    "Protected" — every route (reads included) then requires it. See `av init`'s
-    Anonymous/Protected prompt for the same choice at setup time.
+    "Protected" — every route (reads included) then requires it. The owner uses a shared
+    secret (`set-token`); teammates get their own revocable tokens via `add-user`. See
+    `av init`'s Anonymous/Protected prompt for the same choice at setup time.
     """
 
 
@@ -115,3 +116,103 @@ def auth_status() -> None:
         return
     masked = f"{'*' * max(len(token) - 4, 0)}{token[-4:]}"
     click.secho(f"Protected — token configured for this repo: {masked}", fg="green")
+
+
+# ---------------------------------------------------------------------------
+# Per-user access tokens (AV_AUTH_USERS JSON map in .env)
+# ---------------------------------------------------------------------------
+
+def _read_auth_users(compose_file: Path) -> dict[str, str]:
+    """Reads the AV_AUTH_USERS JSON map from .env; empty dict when absent/unset."""
+    from . import docker_runtime
+
+    raw = docker_runtime.read_env_token(compose_file, key="AV_AUTH_USERS")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise click.ClickException(
+            "AV_AUTH_USERS in .env is not valid JSON — fix or remove that line by hand."
+        )
+    if not isinstance(parsed, dict):
+        raise click.ClickException("AV_AUTH_USERS must be a JSON object of {username: token}.")
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
+def _write_auth_users(compose_file: Path, users: dict[str, str]) -> None:
+    """Writes the merged map back; an empty map removes the line entirely (Anonymous)."""
+    from . import docker_runtime
+
+    docker_runtime.write_env_token(
+        compose_file, json.dumps(users) if users else None, key="AV_AUTH_USERS"
+    )
+
+
+@auth.command(name="add-user")
+@click.argument("name")
+@click.argument("token", required=False, default=None)
+def auth_add_user(name: str, token: str | None) -> None:
+    """Grant NAME its own access token (generating one if TOKEN is omitted).
+
+    Per-user tokens work alongside the owner's shared secret: each teammate puts their
+    personal token into their own repo (`av auth set-token <their-token>` on their
+    machine) and their pushes are attributed to NAME when they don't set a custom
+    AV_AUTHOR. The token prints once — share it over a trusted channel.
+    """
+    import secrets as secrets_module
+
+    from . import docker_runtime
+
+    repo_root = ensure_repo()
+    token = token or secrets_module.token_urlsafe(32)
+    compose_file, _ = docker_runtime.resolve_compose_file(_root._find_source_root())
+    users = _read_auth_users(compose_file)
+    if name in users:
+        click.secho(
+            f"User '{name}' already exists — revoke with `av auth remove-user {name}` "
+            "and re-add to rotate.",
+            fg="yellow",
+        )
+        return
+    users[name] = token
+    _write_auth_users(compose_file, users)
+    _restart_server_for_token_change(repo_root)
+    click.secho(f"User '{name}' added. Token: {token}", fg="green")
+    click.secho(
+        "Share it with them — they enable it via `av auth set-token <token>` in their repo.",
+        fg="yellow",
+    )
+
+
+@auth.command(name="list-users")
+def auth_list_users() -> None:
+    """List per-user access tokens (masked, never printed in full)."""
+    from . import docker_runtime
+
+    compose_file, _ = docker_runtime.resolve_compose_file(_root._find_source_root())
+    users = _read_auth_users(compose_file)
+    if not users:
+        click.secho("No per-user tokens configured (the owner shared secret may still apply).", fg="yellow")
+        return
+    for name, tok in sorted(users.items()):
+        masked = f"{'*' * max(len(tok) - 4, 0)}{tok[-4:]}"
+        click.echo(f"  {name}: {masked}")
+
+
+@auth.command(name="remove-user")
+@click.argument("name")
+def auth_remove_user(name: str) -> None:
+    """Revoke NAME's personal access token."""
+    from . import docker_runtime
+
+    repo_root = ensure_repo()
+    compose_file, _ = docker_runtime.resolve_compose_file(_root._find_source_root())
+    users = _read_auth_users(compose_file)
+    if name not in users:
+        click.secho(f"No such user '{name}'.", fg="yellow")
+        return
+    del users[name]
+    _write_auth_users(compose_file, users)
+    _restart_server_for_token_change(repo_root)
+    click.secho(f"User '{name}' revoked.", fg="green")

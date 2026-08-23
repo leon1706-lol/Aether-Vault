@@ -31,5 +31,9 @@ npx playwright test      # E2E against a seeded live stack (docker compose up)
 
 - Auth: when the registry is in Protected mode, `av webui` hands the token over via a
   one-time `?av_token=` URL; any other entry point shows the `TokenGate` prompt once.
-- Known limitation: the commit graph renders `parent_hash` only — merge commits appear
-  linear until the graph learns to draw both parents.
+  Per-user tokens work identically — any valid credential issued by `av auth add-user`
+  passes the same gate.
+- Merge visualization: the commit graph draws one edge per parent from the server's
+  reconstructed `parents` array (first-parent lane inheritance), so merge commits fork
+  on screen; payloads without `parents` fall back to `parent_hash`. Covered by
+  `src/components/__tests__/CommitGraph.test.tsx`.

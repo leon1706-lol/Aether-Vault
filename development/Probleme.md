@@ -329,7 +329,7 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 **Severity:** 10/10 · **Status:** 🟢 `fixed` (2026-06-24)
 
-**Problem:** Four compounding bugs across `python/av_cli/main.py` (`commit`, `flush_pending_push`), `python/av_server/server.py` (`push_commit`), and `python/av_server/models.py` (`DBTree`): (1) Wrong order — `commit` called `client.push_commit(commit_data)` **before** the referenced objects/layer shards were uploaded (`flush_pending_push` never uploaded them at all — the upload code only existed inline in the live-commit path). However, the server stores each tree entry's `object_hash` as a **foreign key** into `objects.hash` ([models.py:41](python/av_server/models.py#L41) before the fix). The insert into `trees` therefore practically **always** failed with `ForeignKeyViolationError`. (2) Misattributed error handling — `push_commit` caught *every* `IntegrityError` and blanket-returned `409 "Commit already exists"` ([server.py:307](python/av_server/server.py#L307) before the fix), regardless of whether the commit truly already existed or (as here) a completely different constraint was violated (tree→object FK, later also ref→commit FK). The client deliberately treats 409 as idempotent success (designed for concurrent pushes of the same hash) — and was thereby fooled into masking a total failure: `av commit`/`av push` consistently reported success, but **commits and refs never made it into the database** (`SELECT * FROM commits` → 0 rows, despite "✓ Pushed 2 commit(s)" on the console). (3) Deeper root cause — even with the correct order, the insert still fails for **every** layer-split `.safetensors` file: when layer-splitting, the whole file (`object_hash`) is deliberately **never** uploaded as its own object (only the layer shards, to avoid duplicate storage) — but the FK on `objects.hash` requires exactly that. (4) Additionally, the return value of `client.update_ref(...)` was never checked anywhere — a failed ref update was treated as "done" instead of being re-queued into the pending queue. Impact: every commit containing a `.safetensors` file above the LFS threshold (i.e. exactly this tool's core use case) could **never sync successfully** — neither live nor via the offline pending queue. The entire "Weight Diffing" feature (both CLI **and** the new Web UI) ran on empty, because no second version of a model ever actually reached the server.
+**Problem:** Four compounding bugs across `python/av_cli/main.py` (`commit`, `flush_pending_push`), `python/av_server/server.py` (`push_commit`), and `python/av_server/models.py` (`DBTree`): (1) Wrong order — `commit` called `client.push_commit(commit_data)` **before** the referenced objects/layer shards were uploaded (`flush_pending_push` never uploaded them at all — the upload code only existed inline in the live-commit path). However, the server stores each tree entry's `object_hash` as a **foreign key** into `objects.hash` ([models.py:41](../python/av_server/models.py#L41) before the fix). The insert into `trees` therefore practically **always** failed with `ForeignKeyViolationError`. (2) Misattributed error handling — `push_commit` caught *every* `IntegrityError` and blanket-returned `409 "Commit already exists"` ([server.py:307](../python/av_server/server.py#L307) before the fix), regardless of whether the commit truly already existed or (as here) a completely different constraint was violated (tree→object FK, later also ref→commit FK). The client deliberately treats 409 as idempotent success (designed for concurrent pushes of the same hash) — and was thereby fooled into masking a total failure: `av commit`/`av push` consistently reported success, but **commits and refs never made it into the database** (`SELECT * FROM commits` → 0 rows, despite "✓ Pushed 2 commit(s)" on the console). (3) Deeper root cause — even with the correct order, the insert still fails for **every** layer-split `.safetensors` file: when layer-splitting, the whole file (`object_hash`) is deliberately **never** uploaded as its own object (only the layer shards, to avoid duplicate storage) — but the FK on `objects.hash` requires exactly that. (4) Additionally, the return value of `client.update_ref(...)` was never checked anywhere — a failed ref update was treated as "done" instead of being re-queued into the pending queue. Impact: every commit containing a `.safetensors` file above the LFS threshold (i.e. exactly this tool's core use case) could **never sync successfully** — neither live nor via the offline pending queue. The entire "Weight Diffing" feature (both CLI **and** the new Web UI) ran on empty, because no second version of a model ever actually reached the server.
 
 **Fix:** Shared helper `upload_commit_objects()` (instead of duplicated inline code), called **before** `push_commit()` — both in the live-commit path and in `flush_pending_push()` (previously: objects were never uploaded during queue replay). `DBTree.object_hash` loses its `ForeignKey("objects.hash")` (analogous to the already previously-removed `parent_hash` FK) — the hash remains intact as a content identity, without forcing a physical object row that never exists for layer-split files. `push_commit` now, after an `IntegrityError`, re-checks **by hash** whether the commit actually exists before returning 409; otherwise 500 with a genuine error message (no more false "success" reported to the client). `flush_pending_push`/`commit` now check the result of `update_ref()` and keep the commit in the pending queue if the ref update fails.
 
@@ -770,35 +770,60 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 
 
-## ✅ Fixed — Point-13 split regression class + limiter off-by-one (2026-08-22)
+### 64. Star-import blind spot in the eager-annotation checker produced 13 false positives on the new cmd modules
 
-### [3] Star-import blind spot in the eager-annotation checker produced 13 false positives on the new cmd modules
-- **Files:** `scripts/check_eager_annotations.py`, `python/av_cli/cmd_*.py`.
-- **Problem:** the v1.1.1 CLI split introduced `from .core import *` as the command modules' shared prelude. The checker resolves only explicit imports, so annotations referencing public core names (`Path`, `click`) flagged as pre-import uses — while at runtime star-imports surface them on every Python version. Left alone, either the checker cries wolf 13× or someone "fixes" it by disabling the guard.
-- **Fix:** the checker now resolves star-imports one level deep: a relative `from .core import *` pulls that file's public top-level bindings (defs/classes/assigns/imports) into the available set. Underscore names still require explicit imports — which is exactly the discipline the split needs.
-- **Verified:** 13 false positives eliminated; the original true-positive (stashed pre-fix test_merge.py) still detected with exit 1.
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-08-22)
 
-### [2] Rate limiter's Retry-After overshot by one second
-- **Files:** `python/av_server/rate_limit.py`.
-- **Problem:** denial path returned `int(remaining) + 1` — a client denied at window start got `Retry-After: 61` on a 60-second window. Caught immediately by the limiter's own unit suite (`1 <= retry <= 60` assertion).
-- **Fix:** `max(1, ceil(remaining))`.
+**Problem:** The v1.1.1 CLI split introduced `from .core import *` as the command modules' shared prelude. `scripts/check_eager_annotations.py` resolves only explicit imports, so annotations referencing public core names (`Path`, `click`) flagged as pre-import uses — while at runtime star-imports surface them on every Python version. Left alone, either the checker cries wolf 13× or someone "fixes" it by disabling the guard.
 
-### [2] Split-time splice dropped the `_aether_core` module globals
-- **Files:** `python/av_cli/core.py`.
-- **Problem:** the mechanical extraction of `_get_aether_core()` sliced from `def` onward, orphaning its two module-level globals (`_aether_core`, `_aether_core_load_attempted`). Surfaced at runtime as `NameError` inside `stage_one_file` → every `av add` failed in scratch-repo verification.
-- **How found:** manual debugging session per Essential-Tasks step 1 (scratch add flow), not by reading diffs.
-- **Fix:** globals restored above the def; full stash+sync suites green immediately after.
+**Fix:** The checker now resolves star-imports one level deep: a relative `from .core import *` pulls that file's public top-level bindings (defs/classes/assigns/imports) into the available set. Underscore names still require explicit imports — which is exactly the discipline the split needs.
 
-**Standing note:** the same scratch-repo pass also caught two missing cross-module imports (`_init_repo_structure`, `AsyncSession`) during the split — all fixed before any gate run was declared green. The lesson recorded for future refactors: the AST missing-name scanner (`missing_names_scan.py` pattern, kept in session tooling) plus compile gates catch these classes mechanically; eyeballing diffs does not.
+**Verification:** 13 false positives eliminated; the original true-positive (stashed pre-fix test_merge.py) still detected with exit 1.
 
+---
 
+### 65. Rate limiter's Retry-After overshot by one second
 
+**Severity:** 2/10 · **Status:** 🟢 `fixed` (2026-08-22)
 
-## ✅ Fixed — compile-stage guard gap + banner formatting pass (2026-08-23)
+**Problem:** `python/av_server/rate_limit.py`'s denial path returned `int(remaining) + 1` — a client denied at window start got `Retry-After: 61` on a 60-second window.
 
-### [4] `ast.parse` guard accepted what `compile()` rejects — env.py shipped a startup SyntaxError to CI
-- **Files:** `python/av_server/migrations/env.py`, `tests/test_migrations.py::test_env_py_is_valid_python`.
-- **Problem:** the Alembic env.py defined its online-migration runner as a plain `def` containing `async with`/`await`. That is syntactically valid to `ast.parse` (the guard's only check) but fails at **compile** stage with `SyntaxError: 'async with' outside async function`. The failure stayed invisible locally — Docker-down skips every DB-backed test, so nothing ever imported/executed env.py — and detonated on the first real run: server lifespan → `init_db` → `command.upgrade` → executes env.py → *"Application startup failed"*; server-tests ERRORed wholesale and webui-e2e rendered an empty dashboard against a dead server.
-- **How found:** GitHub Actions logs (`gh run view --log-failed`) for the v1.1.6 push, not local reproduction.
-- **Fix:** `async def run_migrations_online()` (matching Alembic's official asyncio template), plus the guard now additionally runs `compile(source, str(path), "exec")` after parsing — closing the parse-vs-compile gap for every future edit to this file.
-- **Lesson recorded:** validation-tool strength must match or exceed the strictest interpreter stage that will consume the artifact; "parses" ≠ "compiles" ≠ "runs".
+**Fix:** `max(1, ceil(remaining))`.
+
+**Verification:** Caught immediately by the limiter's own unit suite (`1 <= retry <= 60` assertion) once the off-by-one was in place; green after the fix.
+
+---
+
+### 66. Split-time splice dropped the `_aether_core` module globals
+
+**Severity:** 2/10 · **Status:** 🟢 `fixed` (2026-08-22)
+
+**Problem:** The mechanical extraction of `_get_aether_core()` from main.py into `python/av_cli/core.py` sliced from `def` onward, orphaning its two module-level globals (`_aether_core`, `_aether_core_load_attempted`). Surfaced at runtime as `NameError` inside `stage_one_file` → every `av add` failed in scratch-repo verification.
+
+**Fix:** Globals restored above the def; full stash+sync suites green immediately after.
+
+**Verification:** Found by manual debugging per Essential-Tasks step 1 (scratch add flow), not by reading diffs; the same scratch-repo pass caught two missing cross-module imports (`_init_repo_structure`, `AsyncSession`) during the split — all fixed before any gate run was declared green.
+
+---
+
+### 67. `ast.parse` guard accepted what `compile()` rejects — env.py shipped a startup SyntaxError to CI
+
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-08-23)
+
+**Problem:** The Alembic `env.py` defined its online-migration runner as a plain `def` containing `async with`/`await`. That is syntactically valid to `ast.parse` (the guard's only check) but fails at **compile** stage with `SyntaxError: 'async with' outside async function`. The failure stayed invisible locally — Docker-down skips every DB-backed test, so nothing ever imported/executed env.py — and detonated on the first real run: server lifespan → `init_db` → `command.upgrade` → executes env.py → *"Application startup failed"*; server-tests ERRORed wholesale and webui-e2e rendered an empty dashboard against a dead server.
+
+**Fix:** `async def run_migrations_online()` (matching Alembic's official asyncio template), plus `test_env_py_is_valid_python` now additionally runs `compile(source, str(path), "exec")` after parsing — closing the parse-vs-compile gap for every future edit to this file.
+
+**Verification:** Guard proven both ways on the v1.1.6 CI logs (`gh run view --log-failed`, not local reproduction); extended guard green on the fixed tree. Lesson recorded: validation-tool strength must match or exceed the strictest interpreter stage that will consume the artifact — "parses" ≠ "compiles" ≠ "runs".
+
+---
+
+### 68. CDC chunk-count test asserted a probabilistic outcome as a hard bound — ~7% flake on random data
+
+**Severity:** 2/10 · **Status:** 🟢 `fixed` (2026-08-23)
+
+**Problem:** `tests/test_core.py::test_chunk_and_hash_file_produces_valid_chunks` hashed 6 MB of `os.urandom` data and asserted `2 <= len(chunks)` — but with the default avg-2MB mask, content-defined chunking lands cut points at probability 1/2²¹ per byte, so the chance of ZERO boundaries in ~5.5 MB of eligible bytes is ≈ e^-2.6 ≈ **7%** per run. When a blob drew no boundary, the core correctly returned one 8-MB-capped chunk and the test failed — observed once in a full-suite run (1 failed / 389 passed), invisible across six consecutive single-test reruns. A distribution-dependent assertion masquerading as a deterministic invariant; the product code was never wrong.
+
+**Fix:** Test input raised to 32 MB (no-boundary probability drops to ≈ e^-15 ≈ 3×10⁻⁷) with the upper bound rescaled to the structural cap (64 = file_size/min_chunk), plus a comment deriving the probability so nobody re-tightens it to 6 MB.
+
+**Verification:** Found during the v1.1.8 manual-debugging pass (full-suite run), not by reading diffs; 4× consecutive full-module runs green after the fix (~3 s each), failure math documented in the test body.

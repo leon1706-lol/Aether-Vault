@@ -18,6 +18,9 @@ services:
       # docker-compose.release.yml (the one real end users run) for the hardened version of
       # this same stack, which removes those mappings.
       - AV_API_TOKEN=${AV_API_TOKEN:-}
+      # Optional per-user token map ({"username": "token", ...} JSON) managed by
+      # `av auth add-user/list-users/remove-user` via the same .env + restart plumbing.
+      - AV_AUTH_USERS=${AV_AUTH_USERS:-}
     depends_on:
       db:
         condition: service_healthy

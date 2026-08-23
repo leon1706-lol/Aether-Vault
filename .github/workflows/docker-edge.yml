@@ -1,11 +1,13 @@
 name: Docker Edge Build
 
-# Rolling ":edge" build tracking `main` — for visibility/testing between tagged releases.
+# Rolling ":edge" build tracking `master` — for visibility/testing between tagged releases.
 # Never touches `:latest`, which stays exclusively tied to tagged releases (see release.yml).
+# (Was `main` — this repo's default branch has always been `master`, so the trigger never
+# fired; caught in the v1.1.8 doc/config sweep.)
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - 'Dockerfile'
       - 'webui/**'

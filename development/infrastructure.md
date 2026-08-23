@@ -41,6 +41,8 @@ A JSON response here means the registry is up: schema created, bloom filter init
 
 End users on Local mode never run any of this by hand — `av init` detects whether the backend is missing, unbuilt, or stopped and starts it automatically.
 
+**Ops measurement task (not a feature):** benchmark #5 (cold clone / first pull) shipped with v1.1.1 but its measured row still reads "capture pending" in the README comparison table — capture it by running `av benchmark --markdown` against this live stack during the next Docker session and pasting the result into [BENCHMARKS.md](BENCHMARKS.md). CI now automates most other formerly-deferred verifications (server-tests/webui-e2e run the live-path suites on every push), so this manual capture is the only remaining one-off.
+
 ## Starting the Web UI
 
 Prefer the CLI entry point; it checks before it rebuilds:
@@ -71,6 +73,9 @@ AV_DATA_DIR    /data   (default)
                Container-oriented default backed by the vault_data volume.
 AV_API_TOKEN   (empty/unset = Anonymous mode)
                Set → every route except the auth-exempt paths requires Bearer auth.
+AV_AUTH_USERS  (empty/unset = no per-user tokens)
+               JSON map {"username": "token", ...}; a Bearer match here authenticates too.
+               Invalid JSON fails server STARTUP loudly (never silently Anonymous).
 AV_CORS_ORIGINS http://localhost:3000   (default; comma-separated; "*" reopens all)
                Anything not listed gets no Access-Control-Allow-Origin on responses.
 AV_RATE_LIMIT_GC  10/minute   (default)
@@ -85,7 +90,7 @@ AV_AUTHOR      (CLI-side) commit author string; defaults to "anonymous".
 
 ## Protected Mode
 
-Protected mode gates every route behind a shared secret. Manage it entirely from the CLI:
+Protected mode gates every route behind a credential. Manage it entirely from the CLI:
 
 ```bash
 av auth set-token            # generate + apply + restart the server with it active
@@ -94,9 +99,24 @@ av auth clear                # back to Anonymous everywhere
 av auth status               # masked report, never prints the token
 ```
 
+Per-user tokens (v1.1.8) live beside the owner's shared secret as `AV_AUTH_USERS` — a JSON
+map written to the same `.env` by the same plumbing:
+
+```bash
+av auth add-user alice            # generate alice's token, print it once, restart
+av auth add-user bob <token>      # specific token instead of a generated one
+av auth list-users                # masked overview
+av auth remove-user bob           # revoke; last removal drops the line entirely
+```
+
+A Bearer token matching EITHER source authenticates; the resolved identity (`owner` for the
+shared secret) stamps commits pushed with the default `anonymous` author — explicit
+`AV_AUTHOR` values are never overwritten. Both maps are read once at process start; the CLI
+restarts `aether-vault-server` after every change so a fresh process picks them up.
+
 Setting a token writes `.env` next to the compose file and restarts `aether-vault-server` so the new process picks it up. Restart behavior is safe by construction: `/api/health` stays exempt, so the restarting CLI's own readiness wait never deadlocks behind the gate it just enabled.
 
-Forgot the token? There is no reset flow — re-running `av auth set-token <new-token>` IS the recovery path.
+Forgot the token? There is no reset flow — re-running `av auth set-token <new-token>` IS the recovery path (per-user tokens rotate via remove-user + add-user).
 
 ## Running the Test Suite
 
@@ -205,7 +225,7 @@ Cutting a release is a tag push; everything else is pipeline:
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-4. `release.yml` then builds wheels (cp310–cp312 × Windows/Linux/macOS via cibuildwheel) plus sdist.
+4. `release.yml` then builds wheels (cp310–cp314 × Windows/Linux/macOS via cibuildwheel) plus sdist.
 5. PyPI publishes via trusted publishing (OIDC, environment `pypi`) — no stored tokens.
 6. A GitHub Release appears with auto-generated notes and all artifacts attached.
 7. GHCR receives `:latest` + version-tagged images for both server and webui.

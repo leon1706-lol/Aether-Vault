@@ -58,10 +58,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Optional shared-secret gate ("Protected" mode). Empty/unset (the default) means every route
-# behaves exactly as it always has — no auth at all ("Anonymous" mode). Read once at process
-# start, matching DATA_DIR below: `av auth set-token` writes the new value to .env and restarts
-# the container, so a fresh process always picks up changes — no need to re-read per request.
+# --- Authentication ("Protected" mode) ------------------------------------------
+# Two credential sources, both optional, both read once at process start (matching
+# DATA_DIR below: `av auth ...` writes .env and restarts the service, so a fresh process
+# always picks up changes — no per-request re-read needed):
+#
+#   AV_API_TOKEN   the owner's shared secret (legacy single-key mode, still fully valid)
+#   AV_AUTH_USERS  JSON map {"username": "token", ...} — per-user access tokens
+#                  (managed by `av auth add-user/list-users/remove-user`)
+#
+# A request is authenticated when its Bearer token matches EITHER source; the resolved
+# username ("owner" for the shared secret) is stored on request.state.username and used
+# by push_commit to attribute commits whose client sent author="anonymous". Both empty
+# = Anonymous mode: every route behaves exactly as it always has — no auth at all.
 AV_API_TOKEN = os.environ.get("AV_API_TOKEN", "").strip()
 
 # Always reachable even in Protected mode:
@@ -75,25 +84,54 @@ AV_API_TOKEN = os.environ.get("AV_API_TOKEN", "").strip()
 _AUTH_EXEMPT_PATHS = {"/api/health", "/docs", "/openapi.json", "/redoc"}
 
 
+def _parse_auth_users(raw: str | None) -> dict[str, str]:
+    """Parses the AV_AUTH_USERS JSON map. Invalid payloads fail startup loudly — a
+    silently ignored auth map would look exactly like Anonymous mode."""
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"AV_AUTH_USERS is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("AV_AUTH_USERS must be a JSON object of {username: token}.")
+    users: dict[str, str] = {}
+    for name, tok in parsed.items():
+        name, tok = str(name).strip(), str(tok).strip()
+        if not name or not tok:
+            raise RuntimeError("AV_AUTH_USERS entries need non-empty username and token.")
+        users[name] = tok
+    return users
+
+
+_AUTH_USERS = _parse_auth_users(os.environ.get("AV_AUTH_USERS"))
+
+
+def _resolve_identity(supplied_token: str) -> str | None:
+    """Bearer token → username ("owner" for the shared secret), or None when unknown.
+
+    compare_digest on every candidate — timing-safe even though the map is small.
+    """
+    if AV_API_TOKEN and secrets.compare_digest(supplied_token, AV_API_TOKEN):
+        return "owner"
+    for name, tok in _AUTH_USERS.items():
+        if secrets.compare_digest(supplied_token, tok):
+            return name
+    return None
+
+
 @app.middleware("http")
 async def require_token(request: Request, call_next):
-    if not AV_API_TOKEN or request.url.path in _AUTH_EXEMPT_PATHS:
+    if request.url.path in _AUTH_EXEMPT_PATHS:
         return await call_next(request)
+    if not AV_API_TOKEN and not _AUTH_USERS:
+        return await call_next(request)  # Anonymous mode
 
     scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not supplied or not secrets.compare_digest(supplied, AV_API_TOKEN):
+    identity = _resolve_identity(supplied) if scheme.lower() == "bearer" and supplied else None
+    if identity is None:
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def require_token(request: Request, call_next):
-    if not AV_API_TOKEN or request.url.path in _AUTH_EXEMPT_PATHS:
-        return await call_next(request)
-
-    scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not supplied or not secrets.compare_digest(supplied, AV_API_TOKEN):
-        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
+    request.state.username = identity
     return await call_next(request)
 
 
@@ -317,7 +355,7 @@ async def head_object(
 
 @app.post("/api/commits")
 async def push_commit(
-    commit_data: Dict[str, Any], db: AsyncSession = Depends(get_session)
+    request: Request, commit_data: Dict[str, Any], db: AsyncSession = Depends(get_session)
 ) -> Response:
     commit_hash = commit_data.get("hash", "")
     if not re.match(r"^[a-f0-9]{64}$", commit_hash):
@@ -383,10 +421,17 @@ async def push_commit(
         # parents[0] for backward compatibility with every existing consumer (webui graph,
         # older clients) that only understands a single parent.
         extra_parents = json.dumps(parents[1:]) if len(parents) > 1 else None
+        # Per-user attribution: an authenticated user pushing with the default "anonymous"
+        # author gets their username stamped; explicit client-set authors (AV_AUTHOR) are
+        # respected — scripts own their attribution. Anonymous mode has no identity.
+        author = commit_data.get("author", "anonymous")
+        username = getattr(request.state, "username", None)
+        if author == "anonymous" and username:
+            author = username
         new_commit = DBCommit(
             hash=commit_hash,
             message=commit_data.get("message", ""),
-            author=commit_data.get("author", "anonymous"),
+            author=author,
             parent_hash=parents[0] if parents else None,
             extra_parents=extra_parents,
             root_tree_hash=root_tree_hash,

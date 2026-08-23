@@ -27,6 +27,10 @@ python/av_cli/_version.py
 # We don't want to sync local Aether-Vault databases to Git!
 .av/
 
+# Local Docker-stack secrets — `av auth set-token`/`add-user` write the owner token and
+# per-user token map here (next to docker-compose.yml) on a dev checkout. Never commit.
+.env
+
 # CMake / C++ Builds
 CMakeCache.txt
 CMakeFiles/

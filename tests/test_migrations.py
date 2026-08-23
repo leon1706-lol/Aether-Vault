@@ -122,3 +122,56 @@ def test_heal_is_idempotent(tmp_path):
         cols = {c["name"] for c in sa.inspect(conn).get_columns("commits")}
     engine.dispose()
     assert "extra_parents" in cols
+
+
+# ---------------------------------------------------------------------------
+# Stack-free execution proof (v1.1.8): render the full chain to Postgres DDL offline
+# ---------------------------------------------------------------------------
+# Real-PG execution of the chain debuts on CI's server-tests run — until then nothing has
+# ever executed 0001_baseline's op.* calls against a live database. Alembic's offline
+# ("--sql") mode executes every op for real and renders the dialect DDL instead of hitting
+# a server: any op-level runtime error (bad column type, wrong constraint signature) still
+# raises here, so this catches the whole class without a database.
+
+def test_chain_renders_complete_postgres_ddl_offline():
+    import contextlib
+    import io
+
+    from alembic import command
+
+    cfg = _alembic_config()
+    # A sync postgres URL gives clean Postgres-dialect rendering. Offline mode never opens
+    # a connection, so pointing at localhost is safe; a real dev DATABASE_URL env must not
+    # leak into what gets rendered.
+    cfg.set_main_option("sqlalchemy.url", "postgresql://av_user:av_password@localhost/aether_vault")
+    assert cfg.attributes.get("connection") is None  # offline path, not the startup path
+
+    buf = io.StringIO()
+    # Both capture mechanisms at once: alembic versions differ in whether they honor
+    # Config.output_buffer or resolve sys.stdout when env.py configures its context.
+    cfg.output_buffer = buf
+    with contextlib.redirect_stdout(buf):
+        command.upgrade(cfg, "head", sql=True)
+    ddl = buf.getvalue()
+
+    # The chain actually executed end-to-end and stamped itself as its final act:
+    assert "CREATE TABLE alembic_version" in ddl
+    assert "INSERT INTO alembic_version" in ddl
+
+    # Every table from 0001_baseline exists in the rendered schema.
+    for table in ("objects", "trees", "commits", "refs"):
+        assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
+
+    # The columns that define post-create_all-era state (and the legacy heal map).
+    for col in ("extra_parents", "chunks", "project_id", "root_tree_hash"):
+        assert col in ddl, f"offline DDL missing column {col}"
+
+    # Every index baseline declares — CREATE INDEX lines prove the op.f(...) calls ran.
+    assert "CREATE INDEX ix_commits_parent_hash" in ddl
+    assert "CREATE INDEX ix_commits_project_id" in ddl
+
+    # Postgres-specific typing survived rendering: tags uses postgresql.ARRAY(String).
+    assert "VARCHAR[]" in ddl
+
+    # The refs → commits FK (the one deliberate FK in the schema) is present.
+    assert "FOREIGN KEY" in ddl

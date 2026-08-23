@@ -84,12 +84,16 @@ def test_split_and_hash_safetensors_rejects_oversized_header(tmp_path):
 
 
 def test_chunk_and_hash_file_produces_valid_chunks(tmp_path):
+    # 32 MB: with the default avg-2MB mask the chance of ZERO cut points in random data
+    # is ~e^-15 (vs ~7% at the 6 MB this test used before, which flaked once in CI-style
+    # full runs when a blob happened to produce a single chunk). Deterministic enough to
+    # assert a lower bound of 2 while staying sub-second.
     p = tmp_path / "checkpoint.pt"
-    data = os.urandom(6 * 1024 * 1024)  # 6 MB → several avg-2MB chunks
+    data = os.urandom(32 * 1024 * 1024)
     p.write_bytes(data)
 
     chunks = aether_core.chunk_and_hash_file(str(p))
-    assert 2 <= len(chunks) <= 12
+    assert 2 <= len(chunks) <= 64
     covered = 0
     for c in chunks:
         assert 512 * 1024 <= c["size"] <= 8 * 1024 * 1024

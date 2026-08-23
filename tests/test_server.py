@@ -266,6 +266,90 @@ def test_protected_mode_gates_writes_too_not_just_reads(db, protected_token):
     assert resp.status_code == 200
 
 
+@pytest.fixture
+def auth_users(db):
+    """Turns on per-user tokens ("Protected" mode via AV_AUTH_USERS) for one test.
+
+    Same mechanics as protected_token above: _resolve_identity reads the module global at
+    call time, so reassigning it here is picked up by every request through `db`, and the
+    finally-restore keeps every other test in Anonymous mode.
+    """
+    users = {"alice": "alice-token-12345", "bob": "bob-token-67890"}
+    server_module._AUTH_USERS = users
+    try:
+        yield users
+    finally:
+        server_module._AUTH_USERS = {}
+
+
+# ---------------------------------------------------------------------------
+# Per-user access tokens (AV_AUTH_USERS) — live attribution round-trips
+# ---------------------------------------------------------------------------
+
+def test_per_user_token_grants_access_with_no_shared_secret(db, auth_users):
+    # The v1.1.8 headline mode: teammates authenticate while AV_API_TOKEN stays unset.
+    resp = db.get("/api/refs", headers={"Authorization": "Bearer alice-token-12345"})
+    assert resp.status_code == 200
+
+
+def test_per_user_token_rejects_unknown_token(db, auth_users):
+    resp = db.get("/api/refs", headers={"Authorization": "Bearer mallory-token"})
+    assert resp.status_code == 401
+
+
+def test_push_commit_stamps_authenticated_username_as_author(db, auth_users):
+    commit = _make_commit("user-attributed", author="anonymous")
+    resp = db.post(
+        "/api/commits",
+        json=commit,
+        headers={"Authorization": "Bearer alice-token-12345"},
+    )
+    assert resp.status_code == 201
+
+    body = db.get(f"/api/commits/{commit['hash']}").json()
+    assert body["author"] == "alice"
+
+
+def test_push_commit_respects_explicit_author_from_authenticated_user(db, auth_users):
+    # Scripts own their attribution: an authenticated user pushing with a client-set
+    # AV_AUTHOR must NOT get silently re-stamped.
+    commit = _make_commit("explicit-author", author="ci-bot")
+    resp = db.post(
+        "/api/commits",
+        json=commit,
+        headers={"Authorization": "Bearer bob-token-67890"},
+    )
+    assert resp.status_code == 201
+
+    body = db.get(f"/api/commits/{commit['hash']}").json()
+    assert body["author"] == "ci-bot"
+
+
+def test_owner_shared_secret_stamps_owner_as_author(db):
+    server_module.AV_API_TOKEN = "owner-token-xyz"
+    try:
+        commit = _make_commit("owner-attributed", author="anonymous")
+        resp = db.post(
+            "/api/commits",
+            json=commit,
+            headers={"Authorization": "Bearer owner-token-xyz"},
+        )
+        assert resp.status_code == 201
+        body = db.get(f"/api/commits/{commit['hash']}").json()
+        assert body["author"] == "owner"
+    finally:
+        server_module.AV_API_TOKEN = ""
+
+
+def test_anonymous_mode_keeps_author_untouched(db):
+    # No credentials configured ⇒ no identity exists ⇒ author passes through verbatim
+    # (the pre-v1.1.8 behavior, byte-compatible).
+    commit = _make_commit("anon-mode-author", author="anonymous")
+    assert db.post("/api/commits", json=commit).status_code == 201
+    body = db.get(f"/api/commits/{commit['hash']}").json()
+    assert body["author"] == "anonymous"
+
+
 def test_upload_then_download_object_roundtrip(db):
     content = b"hello aether-vault" * 100
     h = hashlib.sha256(content).hexdigest()

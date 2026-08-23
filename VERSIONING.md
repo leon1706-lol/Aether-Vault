@@ -18,7 +18,7 @@ when things may break, and how releases are cut.
 | **CLI surface** (`av ...`) | Removing/renaming a command or flag; changing a command's output format in a way scripts parse | New commands (`log`, `clone`, `pull`, `merge`), new flags, richer human-readable output | Bug fixes, performance, docs |
 | **`.av/` on-disk format** | Changing existing file layouts/index entry semantics so an older binary misreads them | Adding keys readers must tolerate as absent (`layers`, `chunks`) — old binaries stay functional | Fixes to writers only |
 | **Registry HTTP API** (`/api/*`) | Removing endpoints/fields clients rely on; changing response shapes incompatibly | New endpoints (`/api/projects`, `/sync/batch-objects`), new optional request params, new response fields (`parents`, `chunks`) — old clients ignore unknown fields | Server-side fixes with identical wire behavior |
-| **Config files** (`.av/config`, `.env`) | Removing/renaming keys | New optional keys (`project_id`, `remote_api_token`, `login_mode`) | — |
+| **Config files** (`.av/config`, `.env`) | Removing/renaming keys | New optional keys (`project_id`, `remote_api_token`, `login_mode`, `AV_AUTH_USERS` — v1.1.8's per-user token map is additive; unset keeps Anonymous/single-token behavior byte-identical) | — |
 | **Python package** (`import av_cli...`) | Moving/removing public modules/functions | New modules/functions | Internal fixes |
 
 Rule of thumb for reviewers: *if an upgrade would make a previously working script, repo,

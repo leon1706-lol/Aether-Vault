@@ -36,10 +36,12 @@ in logs, config files, or the token handoff flow.
 
 **Hardening status:** CORS is locked to the webui origin by default (`AV_CORS_ORIGINS` to
 widen) and the destructive GC endpoint is rate-limited by default (`AV_RATE_LIMIT_GC`,
-`10/minute`) — both shipped in the v1.1.x hardening cycle. The remaining known limitation:
-"Protected" mode is a single shared secret rather than per-user auth; RBAC/SSO are
-enterprise-tier roadmap items. Reports about the shipped defaults are still welcome —
-reference them so we can link.
+`10/minute`) — both shipped in the v1.1.x hardening cycle. Per-user access tokens
+(`AV_AUTH_USERS` via `av auth add-user`, v1.1.8) now exist alongside the owner's shared
+secret — each teammate revokes/rotates independently and commits attribute to their username.
+Still on the enterprise tier: RBAC (per-route/per-branch permissions), SSO, and audit
+logging. Reports about the shipped defaults are still welcome — reference them so we can
+link.
 
 **Out of scope:** social engineering, brute-force against deployments you don't own,
 vulnerabilities in Docker/Postgres/Redis themselves (report upstream), and self-hosted
@@ -47,8 +49,9 @@ misconfigurations that expose ports publicly without Protected mode enabled.
 
 ## Hardening recommendations for operators
 
-Until per-user auth ships: run registries with `av auth set-token` ("Protected" mode),
-keep Postgres/Redis off the host network (the release compose file already omits their
-port mappings), keep the default CORS lock and GC rate limit in place (widen
+Run registries with `av auth set-token` ("Protected" mode) and issue per-user tokens via
+`av auth add-user` so teammates never share the owner secret and can be revoked
+individually; keep Postgres/Redis off the host network (the release compose file already
+omits their port mappings), keep the default CORS lock and GC rate limit in place (widen
 `AV_CORS_ORIGINS` only for deployments that actually need it), and put TLS termination
 in front of uvicorn for any non-localhost use.
