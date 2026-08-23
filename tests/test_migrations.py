@@ -38,6 +38,11 @@ def test_migration_chain_resolves_to_single_head():
 def test_env_py_is_valid_python():
     source = (_MIGRATIONS / "env.py").read_text(encoding="utf-8")
     ast.parse(source)  # raises on syntax errors
+    # ast.parse alone accepts constructs that fail at compile stage — notably
+    # 'async with'/'await' inside a plain def ("SyntaxError: 'async with' outside async
+    # function"), which is exactly how env.py once shipped to CI and killed the server
+    # at startup on every fresh database. compile() enforces those semantics here.
+    compile(source, str(_MIGRATIONS / "env.py"), "exec")
     # The programmatic-startup contract: env.py must honor an injected connection.
     assert 'attributes.get("connection")' in source
 

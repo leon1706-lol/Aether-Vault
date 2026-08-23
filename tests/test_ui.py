@@ -37,10 +37,27 @@ def test_print_banner_renders_title_subtitle_and_logo(monkeypatch):
     ui.print_banner("Aether-Vault", "version control for ML models & datasets")
 
     text = recorder.export_text()
-    assert "Aether-Vault" in text
+    assert "Aether-Vault" in text.replace(" ", "") or "A E T H E R" in text
     assert "version control for ML models & datasets" in text
-    # The ANSI block-art logo lines should render too, not just the title/subtitle text.
-    assert "█" in text
+    # The dash-stroke bolt and signature rule are the logo's anchor glyphs now.
+    assert "━" in text
+
+
+def test_print_banner_embeds_version_in_frame_corner(monkeypatch):
+    recorder = Console(record=True, width=120)
+    monkeypatch.setattr(ui, "console", recorder)
+    monkeypatch.setattr(ui, "_get_version", lambda: "9.9.9")
+
+    ui.print_banner("Aether-Vault")
+
+    assert "v9.9.9" in recorder.export_text()
+
+
+def test_get_version_returns_displayable_string():
+    """Contract: whatever the resolution chain yields (_version.py → importlib.metadata
+    → 'dev'), it must be a non-empty displayable string for the frame corner."""
+    version = ui._get_version()
+    assert isinstance(version, str) and version.strip()
 
 
 def test_print_banner_omits_subtitle_line_when_not_given(monkeypatch):
@@ -50,7 +67,8 @@ def test_print_banner_omits_subtitle_line_when_not_given(monkeypatch):
     ui.print_banner("Aether-Vault")
 
     text = recorder.export_text()
-    assert "Aether-Vault" in text
+    # The wordmark renders letter-spaced in the new banner design.
+    assert "A E T H E R - V A U L T" in text
 
 
 def test_select_login_mode_was_removed_from_the_interactive_flow():

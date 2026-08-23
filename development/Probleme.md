@@ -790,3 +790,15 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 - **Fix:** globals restored above the def; full stash+sync suites green immediately after.
 
 **Standing note:** the same scratch-repo pass also caught two missing cross-module imports (`_init_repo_structure`, `AsyncSession`) during the split — all fixed before any gate run was declared green. The lesson recorded for future refactors: the AST missing-name scanner (`missing_names_scan.py` pattern, kept in session tooling) plus compile gates catch these classes mechanically; eyeballing diffs does not.
+
+
+
+
+## ✅ Fixed — compile-stage guard gap + banner formatting pass (2026-08-23)
+
+### [4] `ast.parse` guard accepted what `compile()` rejects — env.py shipped a startup SyntaxError to CI
+- **Files:** `python/av_server/migrations/env.py`, `tests/test_migrations.py::test_env_py_is_valid_python`.
+- **Problem:** the Alembic env.py defined its online-migration runner as a plain `def` containing `async with`/`await`. That is syntactically valid to `ast.parse` (the guard's only check) but fails at **compile** stage with `SyntaxError: 'async with' outside async function`. The failure stayed invisible locally — Docker-down skips every DB-backed test, so nothing ever imported/executed env.py — and detonated on the first real run: server lifespan → `init_db` → `command.upgrade` → executes env.py → *"Application startup failed"*; server-tests ERRORed wholesale and webui-e2e rendered an empty dashboard against a dead server.
+- **How found:** GitHub Actions logs (`gh run view --log-failed`) for the v1.1.6 push, not local reproduction.
+- **Fix:** `async def run_migrations_online()` (matching Alembic's official asyncio template), plus the guard now additionally runs `compile(source, str(path), "exec")` after parsing — closing the parse-vs-compile gap for every future edit to this file.
+- **Lesson recorded:** validation-tool strength must match or exceed the strictest interpreter stage that will consume the artifact; "parses" ≠ "compiles" ≠ "runs".

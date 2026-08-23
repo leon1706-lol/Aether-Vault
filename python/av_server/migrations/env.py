@@ -59,7 +59,7 @@ def _run_sync_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-def run_migrations_online() -> None:
+async def run_migrations_online() -> None:
     """Manual CLI runs without a shared connection: build our own async engine."""
     connectable = async_engine_from_config(
         {"sqlalchemy.url": _database_url()},

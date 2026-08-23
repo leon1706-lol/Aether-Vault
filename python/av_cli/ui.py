@@ -44,31 +44,97 @@ _STATUS_STYLE = {
     "warn": ("yellow", "[WARN]"),
 }
 
-# Same two-tone palette as development/logo.png's "AV" monogram (graphite "A", copper/gold "V" +
-# tail) — TrueColor RGB values, not approximated hex, so the terminal rendering matches exactly.
-_LOGO_GRAY = "rgb(90,90,90)"
-_LOGO_GOLD = "rgb(230,160,40)"
-_LOGO_LINES = [
-    f"       [{_LOGO_GRAY}]▄▄███▄▄[/]",
-    f"      [{_LOGO_GRAY}]▄█▀▀[/]█[{_LOGO_GRAY}]▀▀█▄[/]                 [{_LOGO_GOLD}]▄▄[/]",
-    f"     [{_LOGO_GRAY}]▄█▀[/]  █  [{_LOGO_GRAY}]▀█▄[/]               [{_LOGO_GOLD}]▄█▀[/]",
-    f"    [{_LOGO_GRAY}]███████████[/][{_LOGO_GOLD}]▄▄▄[/]           [{_LOGO_GOLD}]▄█▀[/]",
-    f"   [{_LOGO_GRAY}]██▀[/]    █    [{_LOGO_GRAY}]▀██[/][{_LOGO_GOLD}]█▄▄▄[/]     [{_LOGO_GOLD}]▄█▀[/]",
-    f"  [{_LOGO_GRAY}]██▀[/]     █      [{_LOGO_GOLD}]▀█████████▀[/]",
-    f" [{_LOGO_GRAY}]▀▀[/]       █         [{_LOGO_GOLD}]▀████▀[/]",
-]
+# Shell banner derived from development/logo.png's beveled mark: a graphite wireframe "A"
+# pierced by a copper dash-bolt, above the signature rule with the ▲ glyph, the spaced
+# wordmark, and the tagline — all inside a rounded, dim-copper frame. Colors are TrueColor
+# RGB via rich markup so they degrade gracefully on legacy consoles.
+_COPPER = "rgb(230,140,60)"
+_COPPER_DIM = "rgb(150,95,35)"
+_EDGE = "rgb(170,170,175)"
+_WORDMARK = "bold white"
+
+
+def _get_version() -> str:
+    """Banner version, resolved locally with zero network cost.
+
+    setuptools-scm regenerates `av_cli/_version.py` on every build/reinstall, so a fresh
+    tag automatically flows into the banner on the next installed run; metadata and a
+    literal fallback cover source-checkouts without that file.
+    """
+    try:
+        from ._version import __version__
+
+        return __version__
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version
+
+        return version("aether-vault")
+    except Exception:
+        return "dev"
+
+
+def _render_logo_art() -> list[str]:
+    """The art lines with rich color markup applied per stroke group."""
+    C, CD, E = _COPPER, _COPPER_DIM, _EDGE
+    g_open, g_close = f"[{_EDGE}]", "[/]"
+    c_open, c_close = f"[{C}]", "[/]"
+    cd_open, cd_close = f"[{CD}]", "[/]"
+    return [
+        "",
+        f"        {g_open}╱╲[/]",
+        f"       {g_open}╱  ╲[/]"
+        + " " * 24
+        + f"{c_open}━━━━━━[/]{cd_open}╸[/]",
+        f"      {g_open}╱ [/]{c_open}━╸[/]{g_open} ╲[/]"
+        + " " * 16
+        + f"{c_open}━━━━[/]{cd_open}╯[/]",
+        f"     {g_open}╱ [/]{c_open}━━━╸[/]{g_open} ╲[/]"
+        + " " * 9
+        + f"{c_open}━━[/]{cd_open}╯[/]",
+        f"     {g_open}╱__╱  ╲__╲╱[/]"
+        + " " * 4
+        + f"{cd_open}━━╯[/]",
+        "",
+        f"     {c_open}━━━━━━━━[/]  [{E}]▲[/]  {c_open}━━━━━━━━[/]",
+    ]
 
 
 def print_banner(title: str, subtitle: str | None = None) -> None:
-    """Render the AV monogram logo (ANSI block art, matching development/logo.png's two-tone
-    graphite/copper palette), with the title/subtitle printed as plain text underneath it."""
+    """Render the framed shell banner: beveled-mark art + signature rule + spaced
+    wordmark + tagline, inside a rounded dim-copper panel with the package version in
+    the top-right corner (auto-derived from the build metadata).
+
+    `title` is letter-spaced into the wordmark line; `subtitle` becomes the dim tagline
+    beneath it (omitted entirely when None).
+    """
+    from rich import box
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.text import Text
+
+    art = Group(*[Text.from_markup(line) for line in _render_logo_art()])
+    wordmark_text = " ".join(list((title or "Aether-Vault").upper()))
+    wordmark = Text.from_markup(f"  ⬡  [{_WORDMARK}]{wordmark_text}[/]")
+    body = Group(
+        art,
+        Text(""),
+        wordmark,
+        Text.from_markup(f"   [dim]{subtitle}[/]" if subtitle else ""),
+    )
+
     console.print()
-    for line in _LOGO_LINES:
-        console.print(line)
-    console.print()
-    console.print(f"  [bold]{title}[/bold]")
-    if subtitle:
-        console.print(f"  [dim]{subtitle}[/dim]")
+    console.print(
+        Panel(
+            body,
+            box=box.ROUNDED,
+            border_style=f"dim {_COPPER_DIM}",
+            title=f"[dim]v{_get_version()}[/]",
+            title_align="right",
+            padding=(0, 2),
+        )
+    )
 
 
 def print_step(msg: str, status: str = "info") -> None:

@@ -679,15 +679,11 @@ dev setup, the project's manual-debugging-first workflow, and code conventions. 
 [PR template](.github/PULL_REQUEST_TEMPLATE.md) walks through every step a complete
 change needs (tests, CHANGELOG phase entry, README updates).
 
-- 🐞 **Bugs** → [GitHub Issues](https://github.com/leon1706/aether-vault/issues) with the
-  bug-report form
-- 💡 **Ideas** → the feature-request form (check the roadmap above first)
-- 🔒 **Security** → [private security advisories](https://github.com/leon1706/aether-vault/security/advisories/new)
-  only — see [`SECURITY.md`](SECURITY.md)
-- 🤝 **Conduct** → [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
-- 🏷️ **Versioning & releases** → [`VERSIONING.md`](VERSIONING.md): SemVer per surface,
-  deprecation grace windows, and how tags become PyPI releases + GitHub Releases with
-  per-tag changelogs
+- **Bugs** → [GitHub Issues](https://github.com/leon1706/aether-vault/issues) with the bug-report form
+- **Ideas** → the feature-request form (check the roadmap above first)
+- **Security** → [private security advisories](https://github.com/leon1706/aether-vault/security/advisories/new) only — see [`SECURITY.md`](SECURITY.md)
+- **Conduct** → [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+- **Versioning & releases** → [`VERSIONING.md`](VERSIONING.md): SemVer per surface, deprecation grace windows, and how tags become PyPI releases + GitHub Releases with per-tag changelogs
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/my-feature`
