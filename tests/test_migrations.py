@@ -175,3 +175,21 @@ def test_chain_renders_complete_postgres_ddl_offline():
 
     # The refs → commits FK (the one deliberate FK in the schema) is present.
     assert "FOREIGN KEY" in ddl
+
+
+def test_apply_schema_runs_inside_a_committing_transaction():
+    """Guard for Probleme.md #70: `_apply_schema` must use engine.begin(), never
+    engine.connect(). SQLAlchemy 2.0's commit-as-you-go means connect() ROLLS BACK at
+    context exit, and Postgres honours that for DDL — four CI cycles executed every
+    migration statement faithfully into a transaction that was then discarded. The
+    SQLite-based suites cannot catch this class (the pysqlite driver auto-commits DDL),
+    so this source-level invariant is the only stack-free guard available."""
+    import inspect
+
+    from python.av_server import database
+
+    src = inspect.getsource(database._apply_schema)
+    assert "engine.begin()" in src or "target_engine.begin()" in src, \
+        "_apply_schema lost its committing transaction wrapper — migrations will roll back on Postgres"
+    assert ".connect(" not in src, \
+        "_apply_schema opened a plain connection; its implicit transaction rolls back on exit"

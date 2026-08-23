@@ -7,7 +7,7 @@ Usage:
 import json
 from pathlib import Path
 
-from ._shared import build_metric_args, resolve_repo_root, run_av
+from ._shared import build_metric_args, commit_scoped, resolve_repo_root, run_av
 
 try:
     from transformers import TrainerCallback
@@ -50,8 +50,13 @@ class AetherVaultTrainerCallback(TrainerCallback):
         if not self.dataset_paths:
             return
         repo_root = resolve_repo_root(Path(self.dataset_paths[0]).parent)
-        run_av(repo_root, ["add", *self.dataset_paths])
-        run_av(repo_root, ["commit", "-m", f"datasets for {self.tag or 'run'}", "--tag", "dataset"])
+        # Scoped: a dataset commit must not sweep unrelated staged files into the tree
+        # (Probleme.md #38).
+        commit_scoped(
+            repo_root,
+            list(self.dataset_paths),
+            ["commit", "-m", f"datasets for {self.tag or 'run'}", "--tag", "dataset"],
+        )
 
     def on_save(self, args, state, control, **kwargs) -> None:
         ckpt_dir = self._checkpoint_dir(args, state)
@@ -59,13 +64,12 @@ class AetherVaultTrainerCallback(TrainerCallback):
             return
 
         repo_root = resolve_repo_root(Path(ckpt_dir))
-        run_av(repo_root, ["add", ckpt_dir])
 
         metrics = self._latest_numeric_metrics(state)
         commit_args = ["commit", "-m", f"step={state.global_step}", *build_metric_args(metrics)]
         if self.tag:
             commit_args.extend(["--tag", self.tag])
-        run_av(repo_root, commit_args)
+        commit_scoped(repo_root, [ckpt_dir], commit_args)
 
     def on_train_end(self, args, state, control, **kwargs) -> None:
         repo_root = resolve_repo_root(Path(args.output_dir))
@@ -93,7 +97,6 @@ def import_checkpoint(checkpoint_dir: str, repo_root: Path | None = None, tag: s
         except Exception:
             metrics = {}
 
-    run_av(resolved_root, ["add", checkpoint_dir])
     commit_args = [
         "commit",
         "-m",
@@ -104,4 +107,4 @@ def import_checkpoint(checkpoint_dir: str, repo_root: Path | None = None, tag: s
     ]
     if tag:
         commit_args.extend(["--tag", tag])
-    run_av(resolved_root, commit_args)
+    commit_scoped(resolved_root, [checkpoint_dir], commit_args)

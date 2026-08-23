@@ -167,6 +167,8 @@ Authoring a new migration:
 
 **Caution:** never edit an already-applied migration in place; append a new revision instead. Volumes that predate the v1.1.x FK removals may still carry `trees_object_hash_fkey`-style constraints — drop those manually once if inserts fail on such a volume (documented per-phase in [CHANGELOG.md](CHANGELOG.md)).
 
+**Invariant:** `_apply_schema` MUST run the chain inside `engine.begin()` (committing), never `engine.connect()`. Postgres DDL is transactional — a plain connect() rolls the entire freshly-built schema back at context exit while startup logs stay green (Probleme.md #70, four CI cycles undetected). SQLite can't catch regressions here: its driver auto-commits DDL.
+
 ## Inspecting PostgreSQL
 
 Drop into psql inside the db container:

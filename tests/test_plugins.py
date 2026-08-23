@@ -276,3 +276,92 @@ def test_mlflow_import_run_raises_when_no_artifacts(tmp_path, monkeypatch):
 
     with pytest.raises(AetherVaultException):
         import_run(run_id, repo_root=repo_root, tracking_uri=tracking_uri)
+
+
+# ---------------------------------------------------------------------------
+# Scoped plugin commits (Probleme.md #38 fix): imports/callbacks must commit ONLY
+# their own paths — unrelated staged work neither enters the commit nor loses its
+# pending state.
+# ---------------------------------------------------------------------------
+
+def _stage_unrelated(repo_root):
+    """A file the user staged for their OWN next commit, before any import runs."""
+    unrelated = repo_root / "notes.py"
+    unrelated.write_text("user's in-progress work")
+    run_av(repo_root, ["add", str(unrelated)])
+    return unrelated
+
+
+def _commit_trees(repo_root):
+    commits_dir = repo_root / ".av" / "commits"
+    return [json.loads(p.read_text()) for p in commits_dir.glob("*.json")]
+
+
+def test_commit_scoped_commits_only_target_paths(tmp_path):
+    from python.av_plugins._shared import commit_scoped
+
+    repo_root = _init_repo(tmp_path)
+    unrelated = _stage_unrelated(repo_root)
+    ckpt = repo_root / "model.pt"
+    ckpt.write_text("dummy weights")
+
+    commit_scoped(repo_root, [str(ckpt)], ["commit", "-m", "imported checkpoint"])
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    assert "model.pt" in trees[0]["tree"]
+    assert "notes.py" not in trees[0]["tree"], \
+        "the import swept the user's unrelated staged file into its commit (#38)"
+
+    # ...and the unrelated file keeps its pending state for the user's own commit.
+    from av_cli.index import Index
+    idx = Index(repo_root)
+    assert idx.get_entry("notes.py")["staged"] is True
+
+
+def test_commit_scoped_restore_survives_add_failure(tmp_path):
+    from python.av_plugins._shared import commit_scoped
+
+    repo_root = _init_repo(tmp_path)
+    unrelated = _stage_unrelated(repo_root)
+
+    with pytest.raises(Exception):
+        commit_scoped(repo_root, [str(repo_root / "does-not-exist.pt")], ["commit", "-m", "x"])
+
+    # Nothing committed, and the user's staging area is byte-identical to before.
+    assert len(_commit_trees(repo_root)) == 0
+    from av_cli.index import Index
+    idx = Index(repo_root)
+    assert idx.get_entry("notes.py")["staged"] is True
+
+
+@pytest.mark.skipif(not _HAS_LIGHTNING, reason="lightning not installed")
+def test_lightning_checkpoint_commit_does_not_sweep_staged_files(tmp_path):
+    from python.av_plugins.lightning import AetherVaultCallback
+
+    repo_root = _init_repo(tmp_path)
+    unrelated = _stage_unrelated(repo_root)
+    ckpt_path = repo_root / "best.ckpt"
+    ckpt_path.write_text("dummy")
+
+    class FakeCheckpointCallback:
+        best_model_path = str(ckpt_path)
+        last_model_path = ""
+
+    class FakeTrainer:
+        checkpoint_callback = FakeCheckpointCallback()
+        current_epoch = 0
+        global_step = 10
+        callback_metrics = {"loss": 0.1}
+
+    cb = AetherVaultCallback(tag="unit-test")
+    cb.on_save_checkpoint(FakeTrainer(), None, {})
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    assert "best.ckpt" in trees[0]["tree"]
+    assert "notes.py" not in trees[0]["tree"]
+
+    from av_cli.index import Index
+    idx = Index(repo_root)
+    assert idx.get_entry("notes.py")["staged"] is True

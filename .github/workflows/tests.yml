@@ -125,6 +125,12 @@ jobs:
             curl -sf http://localhost:8000/api/health && break
             sleep 1
           done
+          # Fail THIS step loudly instead of letting every later test ERROR confusingly —
+          # /api/health is auth-exempt and DB-free, so success here means the lifespan ran.
+          curl -sf http://localhost:8000/api/health > /dev/null || {
+            echo "::error::aether-vault-server did not become healthy in 30s"
+            exit 1
+          }
 
       - name: Run av_server tests (TestClient + real-wire) against live Postgres + Redis
         run: pytest tests/test_server.py -v
@@ -179,6 +185,19 @@ jobs:
             curl -sf http://localhost:8000/api/health && break
             sleep 1
           done
+          # Fail THIS step loudly instead of letting seed/E2E fail with misleading symptoms —
+          # the v1.1.6–v1.1.8 runs showed "Seeded N commits" against a schema-less server.
+          curl -sf http://localhost:8000/api/health > /dev/null || {
+            echo "::error::aether-vault-server did not become healthy in 30s"
+            exit 1
+          }
+          # The health endpoint is DB-free; also assert the SCHEMA actually came up (the
+          # Probleme.md #70 rollback class fails startup cleanly but leaves health green).
+          psql "postgresql://av_user:av_password@localhost:5432/aether_vault" \
+            -c "SELECT 1 FROM alembic_version" > /dev/null || {
+            echo "::error::server up but migration chain did not commit (schema missing)"
+            exit 1
+          }
 
       - name: Seed checkpoint data via the real av CLI
         run: python webui/e2e/seed_data.py

@@ -6,7 +6,10 @@ COPY python /build/python
 WORKDIR /build
 RUN pip install pybind11 && pip wheel . -w /wheels --no-deps
 
-FROM python:3.11-slim-bookworm
+# Runtime MUST match the builder's Python minor (cp-tag of the built wheel): a cp312 wheel
+# is rejected by a 3.11 interpreter — this exact mismatch broke docker-edge and would have
+# broken the release.yml image job at the next tag (Probleme.md #69). Keep them in sync.
+FROM python:3.12-slim-bookworm
 COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir /wheels/*.whl && \
     pip install --no-cache-dir fastapi uvicorn requests click && \

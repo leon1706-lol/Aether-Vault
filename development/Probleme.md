@@ -459,13 +459,13 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 38. Imports commit everything currently staged, not just the imported path
 
-**Severity:** 3/10 · **Status:** 🔴 `closed`
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-08-23, v1.1.9 — reopened by owner after initially being closed as intentional)
 
 **Problem:** Observed during manual testing of `python/av_plugins/lightning.py`, `python/av_plugins/transformers.py`, and `python/av_plugins/mlflow.py` (all three `import_*`/callback functions): staging an unrelated file (`av add notes.py`) and then calling `import_checkpoint()` produces a commit containing **both** the unrelated file and the imported checkpoint.
 
-**Fix:** None — declared intentional behavior, not a bug. This is the existing, deliberate behavior of `av commit` everywhere else in the tool (it commits the full staging area, mirroring `git commit`'s model) — the plugins reuse `commit` as-is rather than duplicating its logic (see the in-process CLI-invocation design note in `Aether-vault-Obsidian-Vault/ARCHITECTURE.md`). Changing it would mean the plugins' commits behave differently from every other `av commit` in the tool, which would be more surprising, not less. Documented as a usage caveat in `README.md` instead of "fixed."
+**Fix (v1.1.9):** Originally declared intentional (the full-index tree snapshot mirrors `git commit`'s model) and documented as a usage caveat. Reopened in v1.1.9: plugin imports are machine-driven events, and silently absorbing whatever a human happened to have staged breaks attribution for training runs. New `_shared.py::commit_scoped()` snapshots the index, empties it, drives the real CLI (`add` + `commit`, same single code path) for exactly the import's paths, then merges every other entry back with its staged flag untouched — so unrelated pending work stays pending. All three plugins' import functions AND their live callbacks (`on_save_checkpoint` / `on_save` / dataset commits) use it. A plain `av commit` keeps its full-snapshot semantics; only machine-driven imports are scoped.
 
-**Verification:** Decision documented in the README usage caveat; no code change to verify.
+**Verification:** Regression tests in `tests/test_plugins.py`: scoped commit's tree contains only the target path while an unrelated staged file survives staged (`test_commit_scoped_commits_only_target_paths`); an `add` failure mid-import restores the user's staging byte-identically and commits nothing (`test_commit_scoped_restore_survives_add_failure`); the live Lightning callback path asserted identically (runs in CI's plugin-tests job where extras are installed).
 
 ---
 
@@ -827,3 +827,27 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** Test input raised to 32 MB (no-boundary probability drops to ≈ e^-15 ≈ 3×10⁻⁷) with the upper bound rescaled to the structural cap (64 = file_size/min_chunk), plus a comment deriving the probability so nobody re-tightens it to 6 MB.
 
 **Verification:** Found during the v1.1.8 manual-debugging pass (full-suite run), not by reading diffs; 4× consecutive full-module runs green after the fix (~3 s each), failure math documented in the test body.
+
+---
+
+### 69. Dockerfile built a cp312 wheel onto a py3.11 runtime — every image build rejected it
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-08-23)
+
+**Problem:** The root `Dockerfile`'s builder stage ran `python:3.12-slim-bookworm` while the runtime stage ran `python:3.11-slim-bookworm`. `pip install /wheels/*.whl` therefore failed with *"aether_vault-0.0.0.dev0-cp312-cp312-linux_x86_64.whl is not a supported wheel on this platform"* — the Docker Edge Build job died after ~50 s, and `release.yml`'s `build-and-push-docker` job shares this exact file, so the next tagged release's GHCR images would have failed identically. Latent since the file was written because `docker-edge.yml` triggered on `main` while the repo branches to `master` (Probleme.md-adjacent config bug fixed in v1.1.8) — the workflow never once fired until that trigger fix, so the mismatch had zero chances to surface.
+
+**Fix:** Runtime stage aligned to `python:3.12-slim-bookworm`, with a comment pinning the invariant: builder and runtime Python minors must match, or the cp-tag rejects the wheel.
+
+**Verification:** Root-caused from the failed run's logs (`gh run view --log-failed`): the error line names the cp312 tag explicitly. Fix verified structurally (both FROM lines now 3.12); live proof arrives via the docker-edge run on the next push.
+
+---
+
+### 70. Migration chain executed faithfully — then rolled back: `engine.connect()` instead of `engine.begin()`
+
+**Severity:** 9/10 · **Status:** 🟢 `fixed` (2026-08-23)
+
+**Problem:** `database.py::_apply_schema()` wrapped the programmatic Alembic upgrade in `async with engine.connect() as conn:`. SQLAlchemy 2.0 is commit-as-you-go: a plain connection rolls back at context exit, and **Postgres has fully transactional DDL** — so on CI's server-tests/webui-e2e runs, uvicorn logged "Application startup complete", every `CREATE TABLE`/index of `0001_baseline` actually executed against the live database... and was then discarded wholesale. Result: schema-less database behind a healthy server; all ~46 DB-backed tests ERRORed with `UndefinedTableError: relation "objects"/"commits"/"alembic_version" does not exist`; E2E seeding silently queued offline ("Seeded 2 commits" printed against a dead-schema registry). Three compounding reasons it survived four CI cycles: (1) local dev runs Docker-down, so no DB test ever imported the path; (2) v1.1.6's red was attributed entirely to the env.py SyntaxError, and v1.1.7's identical signature was read as "needs live validation" rather than re-diagnosed; (3) the SQLite-based migration tests PASS because the pysqlite driver auto-commits DDL — the stack-free suite structurally could not see a rollback-only failure.
+
+**How found:** full offline reproduction — installed embedded PostgreSQL 15 binaries locally, pointed `DATABASE_URL` at it, and instrumented env.py/`_ensure_schema_sync`/`0001_baseline.upgrade()` step by step: the revision fn executed, `command.upgrade` returned cleanly, and `pg_tables` stayed empty — isolating commit semantics as the only remaining variable.
+
+**Fix:** `engine.begin()` (commits at context exit) — which is exactly what the pre-Alembic `create_all` code used; the Phase-46 rewrite changed both the schema mechanism and the transaction wrapper in one motion. Verified locally against real Postgres: fresh DB reaches `{alembic_version, commits, objects, refs, trees}` after startup, second startup idempotent.

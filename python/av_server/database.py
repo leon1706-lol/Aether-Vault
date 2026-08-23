@@ -68,16 +68,21 @@ def _ensure_schema_sync(sync_conn, cfg) -> None:
         _heal_legacy_columns(sync_conn, tables)
         MigrationContext.configure(sync_conn).stamp(script, script.get_current_head())
 
-    # Migrations execute through env.py on this same connection (passed via attributes),
-    # keeping everything inside the caller's transaction/connection semantics.
     cfg.attributes["connection"] = sync_conn
     command.upgrade(cfg, "head")
 
 
 async def _apply_schema(target_engine: AsyncEngine) -> None:
-    """Brings `target_engine`'s database to the latest migration."""
+    """Brings `target_engine`'s database to the latest migration.
+
+    MUST be `engine.begin()`, not a plain `connect()` context: SQLAlchemy 2.0's
+    commit-as-you-go means a plain connection rolls everything back at context exit,
+    and Postgres (unlike the pysqlite driver, whose DDL auto-commits) honours that —
+    the v1.1.6–v1.1.8 CI runs executed every migration statement faithfully and then
+    threw the whole schema away, silently. See Probleme.md #70.
+    """
     cfg = _alembic_config()
-    async with target_engine.connect() as conn:
+    async with target_engine.begin() as conn:
         await conn.run_sync(_ensure_schema_sync, cfg)
 
 

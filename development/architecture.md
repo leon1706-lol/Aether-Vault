@@ -329,6 +329,8 @@ Plugins drive the CLI IN-PROCESS through `python/av_plugins/_shared.py::run_av()
 
 Callbacks commit with the current step or epoch as the message, attach numeric training metrics as `--metric` flags, and flush a final `av push` when training ends — so an interrupted run still leaves every intermediate checkpoint committed and queued. `dataset_paths` stages once at training start, tagged `dataset`, because there is no reliable way to auto-detect a dataset's on-disk path from a generic `Dataset`/`DataLoader` object; opt-in beats wrong-guess.
 
+**Scoped commits (v1.1.9):** every plugin add+commit pair (callbacks AND import backfills) runs through `_shared.py::commit_scoped()`, which snapshots the index, empties it for exactly one commit, drives the real CLI, then merges everything else back with its staged flag untouched — an import or checkpoint commit therefore never sweeps unrelated human-staged files into its tree (Probleme.md #38). Plain `av commit` keeps full-snapshot semantics; only machine-driven plugin events are scoped.
+
 Backfill runs through matching import paths, each available as both a Python function and a CLI command: `av import-lightning`, `av import-transformers`, `av import-mlflow`. Imports read metrics found alongside the checkpoint (Lightning's `callback_metrics`, Transformers' `trainer_state.json` log history, MLflow's own run metrics), tag commits `lightning-import` / `transformers-import` / `mlflow-import`, and re-importing unchanged content is a no-op.
 
 ## Release Contract

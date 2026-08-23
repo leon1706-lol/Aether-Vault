@@ -51,3 +51,45 @@ def build_metric_args(metrics: dict) -> list[str]:
         if isinstance(value, (int, float)):
             args.extend(["--metric", f"{key}={value}"])
     return args
+
+
+def commit_scoped(repo_root: Path, paths: list[str], commit_args: list[str]) -> None:
+    """Stages `paths` and commits ONLY them, leaving unrelated staged work alone.
+
+    Fixes Probleme.md #38: `av commit` snapshots the whole index, so an import firing
+    while the user had unrelated files staged used to sweep them into the import's
+    commit under the import's message/tags. Since the tree IS the full index, isolation
+    means scoping the staging area for exactly one commit: snapshot every entry, empty
+    the index, let the real CLI re-add just the target paths and run the normal
+    single-code-path commit, then merge everything else back with its staged flag
+    untouched — so whatever the user had pending stays pending for their own next
+    commit.
+
+    Still drives the actual add/commit through the CLI (same in-process invocation as
+    `run_av`) — zero duplicated commit logic; only the staging scope is managed here.
+    Crash-safety: the pre-import snapshot is written atomically away in step 1 and the
+    restore runs in `finally`, so every ordinary exception path (including `add`
+    rejecting a bad path) leaves the user's staging area byte-identical.
+    """
+    import copy
+
+    from av_cli.index import Index
+
+    previous_cwd = Path.cwd()
+    os.chdir(repo_root)
+    idx = Index(repo_root)
+    saved = copy.deepcopy(idx.entries)
+    idx.entries = {}
+    idx.save()
+    try:
+        cli.main(args=["add", *paths], prog_name="av", standalone_mode=False)
+        cli.main(args=commit_args, prog_name="av", standalone_mode=False)
+    finally:
+        os.chdir(previous_cwd)
+        # Post-commit index: the import's targets present with staged flags cleared by
+        # _finalize_commit. Everything the user had staged before comes back unchanged.
+        fresh = Index(repo_root)
+        for rel_path, entry in saved.items():
+            if rel_path not in fresh.entries:
+                fresh.entries[rel_path] = entry
+        fresh.save()

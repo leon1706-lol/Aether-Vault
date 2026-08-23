@@ -6,7 +6,7 @@ Usage:
 """
 from pathlib import Path
 
-from ._shared import build_metric_args, resolve_repo_root, run_av
+from ._shared import build_metric_args, commit_scoped, resolve_repo_root, run_av
 
 try:
     from lightning.pytorch.callbacks import Callback
@@ -61,9 +61,10 @@ class AetherVaultCallback(Callback):
         if not self.dataset_paths:
             return
         repo_root = resolve_repo_root(Path(self.dataset_paths[0]).parent)
-        run_av(repo_root, ["add", *self.dataset_paths])
         commit_args = ["commit", "-m", f"datasets for {self.tag or 'run'}", "--tag", "dataset"]
-        run_av(repo_root, commit_args)
+        # Scoped: a dataset commit must not sweep unrelated staged files into the tree
+        # (Probleme.md #38).
+        commit_scoped(repo_root, list(self.dataset_paths), commit_args)
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint) -> None:
         paths = self._resolve_checkpoint_paths(trainer)
@@ -71,7 +72,6 @@ class AetherVaultCallback(Callback):
             return
 
         repo_root = resolve_repo_root(Path(paths[0]).parent)
-        run_av(repo_root, ["add", *paths])
 
         metrics = {
             k: v.item() if hasattr(v, "item") else v
@@ -81,7 +81,7 @@ class AetherVaultCallback(Callback):
         commit_args = ["commit", "-m", message, *build_metric_args(metrics)]
         if self.tag:
             commit_args.extend(["--tag", self.tag])
-        run_av(repo_root, commit_args)
+        commit_scoped(repo_root, paths, commit_args)
 
     def on_train_end(self, trainer, pl_module) -> None:
         paths = self._resolve_checkpoint_paths(trainer)
@@ -116,7 +116,6 @@ def import_checkpoint(
         except Exception:
             metrics = {}
 
-    run_av(resolved_root, ["add", checkpoint_path])
     commit_args = [
         "commit",
         "-m",
@@ -127,4 +126,4 @@ def import_checkpoint(
     ]
     if tag:
         commit_args.extend(["--tag", tag])
-    run_av(resolved_root, commit_args)
+    commit_scoped(resolved_root, [checkpoint_path], commit_args)

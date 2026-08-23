@@ -9,7 +9,7 @@ from pathlib import Path
 
 from av_cli.exceptions import AetherVaultException
 
-from ._shared import build_metric_args, resolve_repo_root, run_av
+from ._shared import build_metric_args, commit_scoped, resolve_repo_root
 
 try:
     from mlflow.tracking import MlflowClient
@@ -55,8 +55,6 @@ def import_run(
     if not artifact_paths:
         raise AetherVaultException(f"MLflow run {run_id} has no artifacts to import.")
 
-    run_av(resolved_root, ["add", *artifact_paths])
-
     metrics = dict(run.data.metrics)
     commit_args = [
         "commit",
@@ -71,4 +69,6 @@ def import_run(
             commit_args.extend(["--tag", f"{key}={value}"])
     if tag:
         commit_args.extend(["--tag", tag])
-    run_av(resolved_root, commit_args)
+    # Scoped so the import commits exactly the run's artifacts — unrelated staged files
+    # keep their pending state (Probleme.md #38).
+    commit_scoped(resolved_root, artifact_paths, commit_args)
