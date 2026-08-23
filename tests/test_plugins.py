@@ -365,3 +365,59 @@ def test_lightning_checkpoint_commit_does_not_sweep_staged_files(tmp_path):
     from av_cli.index import Index
     idx = Index(repo_root)
     assert idx.get_entry("notes.py")["staged"] is True
+
+
+def test_commit_scoped_reimport_is_a_noop(tmp_path):
+    """Regression for Probleme.md #71: scoping must not destroy the change-detection
+    baseline. The first version of commit_scoped emptied the index before running
+    `add`, so a re-import of unchanged content looked brand-new and produced a
+    duplicate commit instead of the documented "Nothing to commit" no-op. Caught by
+    CI's plugin job (extras installed); framework-free here so it always runs.
+    """
+    from python.av_plugins._shared import commit_scoped
+
+    repo_root = _init_repo(tmp_path)
+    ckpt = repo_root / "model.pt"
+    ckpt.write_text("dummy weights")
+
+    args = ["commit", "-m", "imported checkpoint", "--tag", "lightning-import"]
+    commit_scoped(repo_root, [str(ckpt)], args)
+    commit_scoped(repo_root, [str(ckpt)], args)
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1, "re-importing unchanged content created a second commit"
+
+    # A content CHANGE under the same path must still produce exactly one new commit.
+    ckpt.write_text("updated weights v2")
+    commit_scoped(repo_root, [str(ckpt)], ["commit", "-m", "imported checkpoint v2"])
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 2
+    assert any("model.pt" in t["tree"] and "v2" in t["message"] for t in trees)
+
+
+def test_commit_scoped_keeps_directory_targets_together(tmp_path):
+    """Transformers imports stage whole checkpoint DIRECTORIES — every file inside must
+    land in one scoped commit while unrelated staged files stay out."""
+    from python.av_plugins._shared import commit_scoped
+
+    repo_root = _init_repo(tmp_path)
+    unrelated = _stage_unrelated(repo_root)
+    ckpt_dir = repo_root / "checkpoint-5"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "model.safetensors").write_text("weights")
+    (ckpt_dir / "trainer_state.json").write_text("{}")
+
+    commit_scoped(
+        repo_root,
+        [str(ckpt_dir)],
+        ["commit", "-m", "Imported Transformers checkpoint checkpoint-5"],
+    )
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    assert any(p.startswith("checkpoint-5") for p in trees[0]["tree"])
+    assert not any(p == "notes.py" for p in trees[0]["tree"])
+
+    from av_cli.index import Index
+    idx = Index(repo_root)
+    assert idx.get_entry("notes.py")["staged"] is True

@@ -154,7 +154,7 @@ npx playwright test                     # dashboard.spec.ts + weight-diff.spec.t
 The schema is owned by Alembic (`python/av_server/migrations/`); `create_all` is gone. Server startup runs the chain programmatically (`python/av_server/database.py::init_db`) — no alembic.ini, no manual step:
 
 1. Fresh database → migration `0001_baseline` creates every table exactly as `models.py` defines them (including `commits.extra_parents`, `trees.chunks`), then records itself in `alembic_version`.
-2. Legacy database (a pre-Alembic create_all volume: `commits` exists, `alembic_version` doesn't) → startup heals the known post-adoption column drift in place and stamps the chain applied. Zero-touch; only future revisions ever execute on it.
+2. Unrecorded schema (a pre-Alembic create_all volume, or any database whose version rows were lost while the tables stayed) → startup heals known column drift in place and stamps the chain applied. Zero-touch; only future revisions ever execute on it. Replaying into existing tables would crash startup with DuplicateTableError — that's what adoption detection exists to prevent (see [Probleme.md](Probleme.md) #70/#73).
 
 Authoring a new migration:
 

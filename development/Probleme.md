@@ -851,3 +851,39 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **How found:** full offline reproduction — installed embedded PostgreSQL 15 binaries locally, pointed `DATABASE_URL` at it, and instrumented env.py/`_ensure_schema_sync`/`0001_baseline.upgrade()` step by step: the revision fn executed, `command.upgrade` returned cleanly, and `pg_tables` stayed empty — isolating commit semantics as the only remaining variable.
 
 **Fix:** `engine.begin()` (commits at context exit) — which is exactly what the pre-Alembic `create_all` code used; the Phase-46 rewrite changed both the schema mechanism and the transaction wrapper in one motion. Verified locally against real Postgres: fresh DB reaches `{alembic_version, commits, objects, refs, trees}` after startup, second startup idempotent.
+
+---
+
+### 71. `commit_scoped()` emptied the index and destroyed change detection — re-imports duplicated commits
+
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-08-23)
+
+**Problem:** The v1.1.9 `commit_scoped` implementation snapshot-and-EMPTIED the index before invoking the CLI `add`, so the target paths' existing entries (hash baselines) were invisible during re-import. `add_entry`'s `changed = existing is None or hash differs` therefore read True for byte-identical content, staged it, and the "re-import unchanged checkpoint is a no-op" contract broke: a second import produced a second identical commit (`assert 2 == 1` in `test_lightning_import_checkpoint`). Invisible locally (framework extras absent → Lightning tests skip; the framework-free regression tests only exercised single imports) and caught immediately by CI's plugin-tests job — the first failure caught BY the pipeline rather than by manual debugging, which is exactly what the v1.1.8/v1.1.9 CI repairs were for.
+
+**Fix:** Baseline-preserving scoping: run `add` against the UNTOUCHED index, then scope to exactly the keys this add touched (new keys / content-changed keys / newly-staged transitions — distinguishing machine staging from pre-existing user staging via a pre-import `pre_staged` set), commit the scope, merge everything else back in `finally`. Unchanged re-imports now touch nothing → empty scope → documented "Nothing to commit" no-op.
+
+**Verification:** New always-run regression `test_commit_scoped_reimport_is_a_noop` (double import → exactly 1 commit; content change under same path → exactly 2) plus a directory-target test mirroring Transformers imports; full scoped quartet green locally.
+
+---
+
+### 72. Per-user attribution tests read back without credentials — asserted against a 401 body
+
+**Severity:** 2/10 · **Status:** 🟢 `fixed` (2026-08-23)
+
+**Problem:** The three v1.1.8 attribution tests (`stamps_authenticated_username`, `respects_explicit_author`, `owner_shared_secret_stamps_owner`) POSTed with Bearer headers but then did plain `GET /api/commits/{hash}` while `_AUTH_USERS`/`AV_API_TOKEN` fixtures were still active — the middleware correctly 401'd those reads, and `.json()["author"]` raised KeyError on the `{"detail": ...}` body. A test bug (the middleware behaved exactly as designed); invisible locally behind the reachability skip.
+
+**Fix:** Follow-up GETs reuse the same credential as their POST.
+
+**Verification:** All three green against the local live stack (embedded Postgres + TCP probe standing in for Redis) before push — the exact CI environment shape.
+
+---
+
+### 73. Heal test imported a helper from the wrong module — and exposed an unrecorded-chain startup crash
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-08-23)
+
+**Problem:** Two layers. (a) `test_legacy_database_is_healed_and_stamped` imported `init_db_with_engine` from `python.av_server.database` — a helper that only ever existed in the test file itself; ImportError on every CI run since Phase 46 (skipped locally, so never seen). (b) Fixing (a) revealed the real find: the test simulates a legacy volume by deleting alembic_version's ROWS, but `_ensure_schema_sync` only took the heal+stamp path when the version TABLE was absent — an existing-but-empty version table fell through to the upgrade path, which replayed `0001_baseline` into the existing tables and crashed startup with `DuplicateTableError`. A production volume that lost its version rows (truncated, partial restore) would have bricked every restart.
+
+**Fix:** (a) import `_apply_schema` directly. (b) product hardening: adoption now triggers whenever a data table exists without a recorded revision (`_unrecorded_chain()` — no version table OR no current revision), healing and stamping both shapes instead of replaying into them.
+
+**Verification:** Full server suite green twice in a row against embedded Postgres 15 (56 passed each), including the heal test end-to-end: columns dropped + rows deleted → startup heals, stamps `0001`, restores `extra_parents`/`chunks`.

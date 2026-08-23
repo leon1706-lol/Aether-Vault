@@ -59,30 +59,49 @@ def commit_scoped(repo_root: Path, paths: list[str], commit_args: list[str]) -> 
     Fixes Probleme.md #38: `av commit` snapshots the whole index, so an import firing
     while the user had unrelated files staged used to sweep them into the import's
     commit under the import's message/tags. Since the tree IS the full index, isolation
-    means scoping the staging area for exactly one commit: snapshot every entry, empty
-    the index, let the real CLI re-add just the target paths and run the normal
-    single-code-path commit, then merge everything else back with its staged flag
-    untouched — so whatever the user had pending stays pending for their own next
-    commit.
+    means scoping the staging area for exactly one commit — WITHOUT destroying the
+    change-detection baseline (Probleme.md #71): `add` must still see the real entries
+    for the target paths, or a re-import of unchanged content looks "new" and produces
+    a duplicate commit instead of the intended "Nothing to commit" no-op.
 
-    Still drives the actual add/commit through the CLI (same in-process invocation as
-    `run_av`) — zero duplicated commit logic; only the staging scope is managed here.
-    Crash-safety: the pre-import snapshot is written atomically away in step 1 and the
-    restore runs in `finally`, so every ordinary exception path (including `add`
-    rejecting a bad path) leaves the user's staging area byte-identical.
+    Sequence: snapshot everything → run the real CLI `add` against the untouched index
+    → reload and scope the index to exactly the keys `add` touched (new keys or newly
+    staged) → run the normal single-code-path commit → merge every other entry back in
+    `finally` with its staged flag untouched. A plain `av commit` keeps full-snapshot
+    semantics; only machine-driven plugin events are scoped. Still drives add/commit
+    through the CLI (same in-process invocation as `run_av`) — zero duplicated commit
+    logic; only the staging scope is managed here.
     """
+    previous_cwd = Path.cwd()
+    os.chdir(repo_root)
     import copy
 
     from av_cli.index import Index
 
-    previous_cwd = Path.cwd()
-    os.chdir(repo_root)
     idx = Index(repo_root)
     saved = copy.deepcopy(idx.entries)
-    idx.entries = {}
-    idx.save()
+    baseline_keys = set(saved)
+    # Staged-before-import set: lets the scoping step below tell "add staged this" apart
+    # from "the USER had this staged long before the import fired" — both read as
+    # staged=True afterwards.
+    pre_staged = {rel_path for rel_path, entry in saved.items() if entry.get("staged")}
     try:
         cli.main(args=["add", *paths], prog_name="av", standalone_mode=False)
+
+        # Scope to exactly what THIS add touched: brand-new keys, keys whose content
+        # changed under a known path (re-staged by add), and keys that transitioned into
+        # staged by this add. Unchanged re-imports touch nothing → scoped index stays
+        # empty → the commit is the documented no-op rather than a duplicate.
+        post_add = Index(repo_root)
+        post_add.entries = {
+            rel_path: entry
+            for rel_path, entry in post_add.entries.items()
+            if rel_path not in baseline_keys
+            or entry.get("hash") != saved[rel_path].get("hash")
+            or (entry.get("staged") and rel_path not in pre_staged)
+        }
+        post_add.save()
+
         cli.main(args=commit_args, prog_name="av", standalone_mode=False)
     finally:
         os.chdir(previous_cwd)

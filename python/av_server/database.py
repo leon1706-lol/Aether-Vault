@@ -62,7 +62,14 @@ def _ensure_schema_sync(sync_conn, cfg) -> None:
     script = ScriptDirectory.from_config(cfg)
     tables = set(sa.inspect(sync_conn).get_table_names())
 
-    if "commits" in tables and "alembic_version" not in tables:
+    # A data table without a recorded revision means "schema exists, chain unrecorded" —
+    # either a true pre-Alembic create_all volume (no version table at all) or a volume
+    # whose version rows were lost/truncated while the tables stayed (same signature).
+    # Both must be healed + stamped to head, never replayed: replaying 0001 into existing
+    # tables crashes startup with DuplicateTableError (found by the live heal test).
+    needs_adoption = "commits" in tables and _unrecorded_chain(sync_conn, tables)
+
+    if needs_adoption:
         # Legacy create_all-era database: heal post-adoption column drift, then mark the
         # entire existing chain applied so only FUTURE revisions ever execute on it.
         _heal_legacy_columns(sync_conn, tables)
@@ -70,6 +77,15 @@ def _ensure_schema_sync(sync_conn, cfg) -> None:
 
     cfg.attributes["connection"] = sync_conn
     command.upgrade(cfg, "head")
+
+
+def _unrecorded_chain(sync_conn, tables: set) -> bool:
+    """True when the migration chain has no recorded revision for this database."""
+    from alembic.runtime.migration import MigrationContext
+
+    if "alembic_version" not in tables:
+        return True
+    return MigrationContext.configure(sync_conn).get_current_revision() is None
 
 
 async def _apply_schema(target_engine: AsyncEngine) -> None:

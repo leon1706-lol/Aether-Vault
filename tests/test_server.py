@@ -299,14 +299,13 @@ def test_per_user_token_rejects_unknown_token(db, auth_users):
 
 def test_push_commit_stamps_authenticated_username_as_author(db, auth_users):
     commit = _make_commit("user-attributed", author="anonymous")
-    resp = db.post(
-        "/api/commits",
-        json=commit,
-        headers={"Authorization": "Bearer alice-token-12345"},
-    )
+    alice_header = {"Authorization": "Bearer alice-token-12345"}
+    resp = db.post("/api/commits", json=commit, headers=alice_header)
     assert resp.status_code == 201
 
-    body = db.get(f"/api/commits/{commit['hash']}").json()
+    # The follow-up read needs the SAME credential — with per-user tokens active the
+    # middleware 401s headerless requests, whose {"detail": ...} body has no "author".
+    body = db.get(f"/api/commits/{commit['hash']}", headers=alice_header).json()
     assert body["author"] == "alice"
 
 
@@ -314,28 +313,22 @@ def test_push_commit_respects_explicit_author_from_authenticated_user(db, auth_u
     # Scripts own their attribution: an authenticated user pushing with a client-set
     # AV_AUTHOR must NOT get silently re-stamped.
     commit = _make_commit("explicit-author", author="ci-bot")
-    resp = db.post(
-        "/api/commits",
-        json=commit,
-        headers={"Authorization": "Bearer bob-token-67890"},
-    )
+    bob_header = {"Authorization": "Bearer bob-token-67890"}
+    resp = db.post("/api/commits", json=commit, headers=bob_header)
     assert resp.status_code == 201
 
-    body = db.get(f"/api/commits/{commit['hash']}").json()
+    body = db.get(f"/api/commits/{commit['hash']}", headers=bob_header).json()
     assert body["author"] == "ci-bot"
 
 
 def test_owner_shared_secret_stamps_owner_as_author(db):
     server_module.AV_API_TOKEN = "owner-token-xyz"
+    owner_header = {"Authorization": "Bearer owner-token-xyz"}
     try:
         commit = _make_commit("owner-attributed", author="anonymous")
-        resp = db.post(
-            "/api/commits",
-            json=commit,
-            headers={"Authorization": "Bearer owner-token-xyz"},
-        )
+        resp = db.post("/api/commits", json=commit, headers=owner_header)
         assert resp.status_code == 201
-        body = db.get(f"/api/commits/{commit['hash']}").json()
+        body = db.get(f"/api/commits/{commit['hash']}", headers=owner_header).json()
         assert body["author"] == "owner"
     finally:
         server_module.AV_API_TOKEN = ""
@@ -693,12 +686,6 @@ def _pg_columns(table: str) -> set[str]:
     return asyncio.run(_run())
 
 
-async def init_db_with_engine(engine):
-    from python.av_server.database import _apply_schema
-
-    return _apply_schema(engine)
-
-
 def test_alembic_brings_schema_to_head(db):
     """The lifespan's init_db() must have run the migration chain, not create_all."""
     import asyncpg
@@ -731,7 +718,11 @@ def test_legacy_database_is_healed_and_stamped(db):
     and proves startup heals it zero-touch (Phase: DB migrations)."""
     import asyncpg
 
-    from python.av_server.database import init_db_with_engine
+    # _apply_schema IS the engine-taking entry point (init_db() closes over the module's
+    # own engine); the old `from ...database import init_db_with_engine` here pointed at a
+    # helper that only ever existed in THIS file — invisible locally behind the
+    # reachability skip, ImportError on every CI run with a live stack.
+    from python.av_server.database import _apply_schema
 
     url_sync = AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
@@ -753,7 +744,7 @@ def test_legacy_database_is_healed_and_stamped(db):
 
     legacy_engine = create_async_engine(AV_TEST_DATABASE_URL)
     try:
-        asyncio.run(init_db_with_engine(legacy_engine))
+        asyncio.run(_apply_schema(legacy_engine))
     finally:
         asyncio.run(legacy_engine.dispose())
 
