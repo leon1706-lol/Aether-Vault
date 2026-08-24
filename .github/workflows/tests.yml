@@ -285,20 +285,22 @@ jobs:
 
       - name: Install the built wheel into a clean venv
         run: |
-          python -m venv clean
-          ./clean/bin/python -m pip install ./dist/*.whl
+          python -m venv "$GITHUB_WORKSPACE/clean"
+          "$GITHUB_WORKSPACE/clean/bin/python" -m pip install ./dist/*.whl
 
       - name: Offline sanity roundtrip through the installed console script
         run: |
+          AV="$GITHUB_WORKSPACE/clean/bin/av"
+          PYBIN="$GITHUB_WORKSPACE/clean/bin/python"
           SCRATCH=$(mktemp -d)
           cd "$SCRATCH"
-          ../clean/bin/av --version
-          ../clean/bin/python -c "import av_cli, av_server"
-          ../clean/bin/av init --mode local --yes --no-repl
+          "$AV" --version
+          "$PYBIN" -c "import av_cli, av_server"
+          "$AV" init --mode local --yes --no-repl
           echo "packaged" > f.txt
-          ../clean/bin/av add f.txt
-          ../clean/bin/av commit -m "wheel-smoke"
-          ../clean/bin/av log | grep "wheel-smoke"
+          "$AV" add f.txt
+          "$AV" commit -m "wheel-smoke"
+          "$AV" log | grep "wheel-smoke"
 
   smoke-sdist-windows:
     needs: package-build
@@ -318,22 +320,25 @@ jobs:
       - name: Compile-install the sdist into a clean venv (MSVC + CMake path)
         shell: pwsh
         run: |
-          python -m venv clean
-          ./clean/Scripts/python.exe -m pip install (Get-Item ./dist/*.tar.gz).FullName
+          python -m venv "$env:GITHUB_WORKSPACE\clean"
+          $sdist = (Get-Item ./dist/*.tar.gz).FullName
+          & "$env:GITHUB_WORKSPACE\clean\Scripts\python.exe" -m pip install $sdist
 
       - name: Offline sanity roundtrip through the installed console script
         shell: pwsh
         run: |
+          $av = "$env:GITHUB_WORKSPACE\clean\Scripts\av.exe"
+          $py = "$env:GITHUB_WORKSPACE\clean\Scripts\python.exe"
           $scratch = Join-Path $env:RUNNER_TEMP "av-sdist-smoke"
           New-Item -ItemType Directory -Force $scratch | Out-Null
           Set-Location $scratch
-          ./clean/Scripts/av.exe --version
-          ./clean/Scripts/python.exe -c "import av_cli, av_server"
-          ./clean/Scripts/av.exe init --mode local --yes --no-repl
+          & $av --version
+          & $py -c "import av_cli, av_server"
+          & $av init --mode local --yes --no-repl
           Set-Content -Path f.txt -Value packaged
-          ./clean/Scripts/av.exe add f.txt
-          ./clean/Scripts/av.exe commit -m sdist-smoke
-          ./clean/Scripts/av.exe log | Select-String sdist-smoke
+          & $av add f.txt
+          & $av commit -m sdist-smoke
+          (& $av log) | Select-String sdist-smoke
 
   webui-e2e:
     runs-on: ubuntu-latest

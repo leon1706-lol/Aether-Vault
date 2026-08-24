@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .database import get_session, init_db
 from . import rate_limit
@@ -39,24 +40,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Aether-Vault Server", version="1.4.0", lifespan=lifespan)
-
-# CORS is env-driven and locked to the webui's origin by default — the old blanket
-# allow_origins=["*"] let any page a developer visited fire credentialed-less requests at
-# a reachable registry (drive-by GC/uploads). "*" remains available explicitly for
-# genuinely open deployments via AV_CORS_ORIGINS="*"; multiple origins are comma-separated.
-_CORS_ORIGINS = [
-    origin.strip()
-    for origin in os.environ.get("AV_CORS_ORIGINS", "http://localhost:3000").split(",")
-    if origin.strip()
-]
-if not _CORS_ORIGINS:
-    _CORS_ORIGINS = ["http://localhost:3000"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_CORS_ORIGINS,
-    allow_methods=["GET", "POST", "PUT", "HEAD"],
-    allow_headers=["*"],
-)
 
 # --- Authentication ("Protected" mode) ------------------------------------------
 # Two credential sources, both optional, both read once at process start (matching
@@ -120,7 +103,6 @@ def _resolve_identity(supplied_token: str) -> str | None:
     return None
 
 
-@app.middleware("http")
 async def require_token(request: Request, call_next):
     if request.url.path in _AUTH_EXEMPT_PATHS:
         return await call_next(request)
@@ -133,6 +115,35 @@ async def require_token(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
     request.state.username = identity
     return await call_next(request)
+
+
+# MIDDLEWARE PIPELINE — Starlette runs the LAST-added middleware OUTERMOST, so these
+# three registrations ARE the architecture; reorder them and you change what browsers
+# and floods experience (Probleme.md #75):
+#
+#   registration order:  auth  →  CORS  →  rate limit
+#   runtime order:       rate  →  CORS  →  auth  →  routes
+#
+# * CORS must sit OUTSIDE auth: browser preflights are credentialless by spec, and —
+#   the subtle part — auth's own 401 JSONResponses need ACAO headers too, or the
+#   browser can't even READ the 401 and TokenGate's entry prompt never fires (the webui
+#   rendered empty dashboards instead). The original v1.1.x order had auth outside
+#   CORS: Anonymous dashboards worked, Protected ones silently broke.
+app.add_middleware(BaseHTTPMiddleware, dispatch=require_token)
+
+_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("AV_CORS_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+if not _CORS_ORIGINS:
+    _CORS_ORIGINS = ["http://localhost:3000"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "HEAD"],
+    allow_headers=["*"],
+)
 
 
 # --- Rate limiting (outermost middleware: floods are rejected before any other work) ---

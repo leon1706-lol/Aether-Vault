@@ -6,7 +6,7 @@ Usage:
 """
 from pathlib import Path
 
-from ._shared import build_metric_args, commit_scoped, resolve_repo_root, run_av
+from ._shared import build_metric_args, commit_scoped, filter_existing_files, resolve_repo_root, run_av
 
 try:
     from lightning.pytorch.callbacks import Callback
@@ -47,15 +47,15 @@ class AetherVaultCallback(Callback):
 
     def _resolve_checkpoint_paths(self, trainer) -> list[str]:
         if self.checkpoint_paths:
-            return self.checkpoint_paths
-
-        paths = []
-        ckpt_cb = getattr(trainer, "checkpoint_callback", None)
-        for attr in ("best_model_path", "last_model_path"):
-            path = getattr(ckpt_cb, attr, None) if ckpt_cb else None
-            if path:
-                paths.append(path)
-        return paths
+            paths = self.checkpoint_paths
+        else:
+            paths = []
+            ckpt_cb = getattr(trainer, "checkpoint_callback", None)
+            for attr in ("best_model_path", "last_model_path"):
+                path = getattr(ckpt_cb, attr, None) if ckpt_cb else None
+                if path:
+                    paths.append(path)
+        return filter_existing_files(paths)
 
     def on_train_start(self, trainer, pl_module) -> None:
         if not self.dataset_paths:

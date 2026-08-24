@@ -425,16 +425,19 @@ def test_commit_scoped_keeps_directory_targets_together(tmp_path):
 
 @pytest.mark.skipif(not _HAS_LIGHTNING, reason="lightning not installed")
 def test_lightning_real_training_loop_smoke(tmp_path):
-    """A REAL one-epoch Lightning training run (tiny CPU model, real Trainer + real
-    ModelCheckpoint) through AetherVaultCallback — the fake-trainer tests above prove
-    callback logic, this proves the actual framework wiring: on_save_checkpoint firing
-    from Lightning's own checkpoint machinery, real metrics flowing into --metric flags,
-    and the scoped commit landing tagged. Kept tiny (~seconds): 8 samples, batch 4,
-    one epoch, CPU, no logging."""
+    """A REAL one-epoch Lightning training run (tiny CPU model, real Trainer) through
+    AetherVaultCallback — the fake-trainer tests above prove callback logic, this proves
+    the actual framework wiring: on_save_checkpoint firing from Lightning's own
+    checkpoint machinery, real metrics flowing into --metric flags, and the scoped
+    commit landing tagged. Kept tiny (~seconds): 8 samples, batch 4, CPU, no logging.
+
+    Ordering note (Probleme.md #76): Lightning fires on_save_checkpoint BEFORE writing
+    the file, so the callback skips not-yet-existing paths and catches them on a LATER
+    save event. The test therefore drives TWO explicit saves afterwards — by the second
+    hook invocation the first checkpoint exists on disk and is committed."""
     import torch
     import torch.nn as nn
     from lightning.pytorch import LightningModule, Trainer
-    from lightning.pytorch.callbacks import ModelCheckpoint
     from torch.utils.data import DataLoader, TensorDataset
 
     from python.av_plugins.lightning import AetherVaultCallback
@@ -462,17 +465,22 @@ def test_lightning_real_training_loop_smoke(tmp_path):
 
     ds = TensorDataset(torch.randn(8, 4), torch.randn(8))
     callback = AetherVaultCallback(tag="real-loop-smoke")
-    ckpt_cb = ModelCheckpoint(dirpath=str(ckpt_dir), save_last=True)
     trainer = Trainer(
         max_epochs=1,
         accelerator="cpu",
         logger=False,
         enable_progress_bar=False,
         enable_model_summary=False,
-        callbacks=[callback, ckpt_cb],
+        callbacks=[callback],
         limit_train_batches=2,
     )
-    trainer.fit(Tiny(), train_dataloaders=DataLoader(ds, batch_size=4))
+    model = Tiny()
+    trainer.fit(model, train_dataloaders=DataLoader(ds, batch_size=4))
+
+    # Two explicit saves: the first write lands AFTER its hook ran; the second hook
+    # therefore finds a real file on disk and stages it.
+    trainer.save_checkpoint(str(ckpt_dir / "manual-a.ckpt"))
+    trainer.save_checkpoint(str(ckpt_dir / "manual-b.ckpt"))
 
     trees = _commit_trees(repo_root)
     assert len(trees) >= 1, "real training loop produced no commit via the callback"
@@ -484,3 +492,54 @@ def test_lightning_real_training_loop_smoke(tmp_path):
     # Real Lightning metrics (train_loss) must ride the commit as metrics, not just tags.
     assert any("train_loss" in t["metrics"] for t in trees), \
         f"expected train_loss metric, got: {[t['metrics'] for t in trees]}"
+
+
+def test_lightning_save_hook_before_file_write_is_survivable(tmp_path):
+    """Regression for Probleme.md #76, framework-free so it always runs: Lightning fires
+    on_save_checkpoint BEFORE the checkpoint file hits disk (the first v1.1.11 CI run
+    crashed `av add` with FileNotFoundError inside the real training loop). Path
+    resolution must skip not-yet-existing files — the helper lives in _shared so this
+    assertion runs without framework extras."""
+    from python.av_plugins._shared import filter_existing_files
+
+    ckpt = tmp_path / "ckpts" / "epoch=0-step=2.ckpt"
+    ckpt.parent.mkdir()
+    ghost = tmp_path / "nope.pt"
+
+    assert filter_existing_files([str(ckpt), str(ghost)]) == []
+    ckpt.write_text("weights")
+    assert filter_existing_files([str(ckpt), str(ghost)]) == [str(ckpt)]
+
+
+@pytest.mark.skipif(not _HAS_LIGHTNING, reason="lightning not installed")
+def test_lightning_callback_skips_unwritten_checkpoint_then_commits_it(tmp_path):
+    """Callback-level half of #76 — runs in CI's plugin job where Lightning exists."""
+    from python.av_plugins.lightning import AetherVaultCallback
+
+    repo_root = _init_repo(tmp_path)
+    ckpt = repo_root / "ckpts" / "epoch=0-step=2.ckpt"
+    ckpt.parent.mkdir()
+
+    class FakeCkptCb:
+        best_model_path = str(ckpt)
+        last_model_path = ""
+
+    class FakeTrainer:
+        checkpoint_callback = FakeCkptCb()
+        current_epoch = 0
+        global_step = 2
+        callback_metrics = {"train_loss": 0.25}
+
+    cb = AetherVaultCallback(tag="race-smoke")
+
+    # Hook fires while the file does NOT exist yet (Lightning's real ordering):
+    cb.on_save_checkpoint(FakeTrainer(), None, {})
+    assert len(_commit_trees(repo_root)) == 0, "must not stage a not-yet-written checkpoint"
+
+    # File lands; the NEXT save event picks it up:
+    ckpt.write_text("weights")
+    cb.on_save_checkpoint(FakeTrainer(), None, {})
+    trees = _commit_trees(repo_root)
+    assert any(
+        "epoch=0-step=2.ckpt" in rel for t in trees for rel in t["tree"]
+    ), f"existing checkpoint never committed: {[list(t['tree']) for t in trees]}"

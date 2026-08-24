@@ -156,9 +156,19 @@ def probe_client():
     def _health_stub():
         return {"status": "ok", "version": "probe"}
 
-    # Same exemption semantics as production: the middleware checks raw path strings, so
-    # stubbing the same paths exercises the identical branch.
+    # Same registration ORDER as production (v1.1.12 pipeline: auth added first, CORS
+    # second ⇒ CORS outermost, decorating even auth's 401s) so this fixture reproduces
+    # the real middleware sandwich, preflight and error-visibility behavior included
+    # (Probleme.md #75).
+    from fastapi.middleware.cors import CORSMiddleware
+
     probe.add_middleware(BaseHTTPMiddleware, dispatch=server_module.require_token)
+    probe.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000"],
+        allow_methods=["GET", "POST", "PUT", "HEAD"],
+        allow_headers=["*"],
+    )
     return TestClient(probe)
 
 
@@ -228,3 +238,50 @@ def test_combined_mode_accepts_both_credential_shapes(probe_client, auth_state):
     server_module._AUTH_USERS = {"alice": "tok-a"}
     assert _refs(probe_client, headers={"Authorization": "Bearer owner-secret"}).status_code == 200
     assert _refs(probe_client, headers={"Authorization": "Bearer tok-a"}).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Browser preflights in Protected mode (Probleme.md #75)
+# ---------------------------------------------------------------------------
+# A Bearer-authenticated fetch is non-simple: the browser sends an OPTIONS preflight
+# FIRST, without any credentials. With auth middleware outside CORS (the production
+# sandwich), that preflight used to be 401'd with no CORS headers and the browser
+# aborted the real request — Protected mode silently broke the entire webui.
+
+PREFLIGHT_HEADERS = {
+    "Origin": "http://localhost:3000",
+    "Access-Control-Request-Method": "GET",
+    "Access-Control-Request-Headers": "authorization",
+}
+
+
+def test_preflight_passes_in_users_only_mode(probe_client, auth_state):
+    server_module._AUTH_USERS = {"alice": "tok-a"}
+    resp = probe_client.options("/api/refs", headers=PREFLIGHT_HEADERS)
+    assert resp.status_code == 200, "preflight must not be gated"
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+
+def test_unauthorized_response_carries_cors_headers_so_browser_can_read_it(probe_client, auth_state):
+    # The subtle half of #75: with CORS inner to auth, a tokenless browser request's 401
+    # had NO ACAO headers — fetch rejected as a TypeError and the webui showed an empty
+    # dashboard instead of the TokenGate prompt. The 401 must be CORS-decorated so JS
+    # can read res.status and route to onUnauthorized.
+    server_module.AV_API_TOKEN = "owner-secret"
+    resp = probe_client.get("/api/refs", headers={"Origin": "http://localhost:3000"})
+    assert resp.status_code == 401
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+
+def test_authenticated_get_from_browser_origin_gets_cors_headers(probe_client, auth_state):
+    # The full round trip a real browser performs once the preflight succeeds.
+    server_module.AV_API_TOKEN = "owner-secret"
+    resp = probe_client.get(
+        "/api/refs",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Authorization": "Bearer owner-secret",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:3000"

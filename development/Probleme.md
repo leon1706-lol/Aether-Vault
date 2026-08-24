@@ -899,3 +899,29 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** Assertions now parse MESSAGES out of the bracketed log lines (stripping an optional `(HEAD, main)` ref decoration) and compare the exact sequence `== ["c3", "c2"]`. A repo-wide sweep for other `assert "<≤4-char all-hex>" in/not-in output` patterns found no further failure-capable instances (the two raw hits are presence-checks against deterministic content, which cannot false-fail).
 
 **Verification:** 6 consecutive runs of the fixed test green locally; sweep script documented in the audit trail.
+
+---
+
+### 75. Protected mode silently broke the entire browser UI — auth middleware sat outside CORS
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-08-24)
+
+**Problem:** Two stacked consequences of one middleware-ordering mistake. Starlette runs the LAST-added middleware OUTERMOST; `require_token` registered itself after CORSMiddleware and therefore wrapped it. (a) Browser CORS **preflights** are credentialless by spec, so in Protected mode every preflight was 401'd with no ACAO headers and the browser aborted the real request before it existed. (b) The subtle half: auth's own 401 JSONResponses were generated OUTSIDE the CORS layer too — no ACAO headers on those either, so `fetch` rejected them as opaque TypeErrors. Net effect: an Anonymous registry worked everywhere, but the moment a token was involved the webui rendered a healthy-looking shell with **"Total Commits 0"** and no TokenGate prompt — undiagnosable from the page alone. Never caught before v1.1.11 because nothing had ever exercised Protected mode *from a browser*; the CLI is not CORS-bound.
+
+**How found:** local full-fidelity reproduction of the CI failure (real uvicorn + seeded Postgres + built webui + Playwright) with request/response/console capture — `/api/health` 200 while every Bearer-carrying request died with `blocked by CORS policy`.
+
+**Fix:** Explicit middleware pipeline with documented contract (`server.py`): registration order auth → CORS → rate-limit ⇒ runtime order rate → CORS → auth → routes. CORS now decorates ALL responses including auth's 401s, so TokenGate's entry prompt actually fires.
+
+**Verification:** Two new always-run middleware-sandwich tests (preflight passes in Protected mode; unauthorized response carries ACAO headers); full local Playwright run green — token handoff, localStorage persistence, entry prompt, manual unlock — against the real protected server; anonymous dashboard spec unchanged.
+
+---
+
+### 76. Lightning fires on_save_checkpoint BEFORE writing the file — real training loops crashed staging
+
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-08-24)
+
+**Problem:** The hook exists so callbacks can inject extras into the checkpoint dict BEFORE `_atomic_save`, and ModelCheckpoint updates best/last_model_path around that same window — so `AetherVaultCallback.on_save_checkpoint` resolved paths that legitimately didn't exist yet and passed them to `av add`, aborting the training loop with FileNotFoundError. Every fake-trainer test pre-wrote files and never saw it; the first REAL loop (v1.1.11's new smoke test) crashed immediately in CI's plugin job.
+
+**Fix:** `filter_existing_files()` in `_shared.py` (import-safe without extras): resolve paths, keep only existing ones — the next save event picks up what wasn't ready. The smoke test now drives two explicit `trainer.save_checkpoint()` calls, matching the catch-up semantics deterministically instead of racing ModelCheckpoint's internal timing.
+
+**Verification:** Framework-free helper regression + callback-level skipif test (green in CI where extras exist); real-loop test rewritten to the deterministic two-save shape.

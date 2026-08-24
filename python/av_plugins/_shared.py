@@ -53,6 +53,20 @@ def build_metric_args(metrics: dict) -> list[str]:
     return args
 
 
+def filter_existing_files(paths: list[str]) -> list[str]:
+    """Keeps only paths that currently exist on disk.
+
+    Lightning invokes on_save_checkpoint BEFORE the checkpoint file is written (the hook
+    exists so callbacks can inject extras into the checkpoint dict), and
+    ModelCheckpoint updates best/last_model_path around that same window — so a resolved
+    path can legitimately not exist yet. Staging a missing file would abort the whole
+    training loop with FileNotFoundError; skip it here and let the NEXT save event pick
+    it up instead (Probleme.md #76). Lives in _shared so the regression test runs
+    without framework extras installed.
+    """
+    return [p for p in paths if Path(p).is_file()]
+
+
 def commit_scoped(repo_root: Path, paths: list[str], commit_args: list[str]) -> None:
     """Stages `paths` and commits ONLY them, leaving unrelated staged work alone.
 
