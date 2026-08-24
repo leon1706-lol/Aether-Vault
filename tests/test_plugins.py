@@ -473,6 +473,11 @@ def test_lightning_real_training_loop_smoke(tmp_path):
         enable_model_summary=False,
         callbacks=[callback],
         limit_train_batches=2,
+        # Lightning auto-adds its own ModelCheckpoint when none is supplied, writing to
+        # default_root_dir/checkpoints — which defaults to CWD (the checkout root, where
+        # there is no .av repo). Root the trainer INSIDE the av repo so the callback's
+        # resolve_repo_root finds it.
+        default_root_dir=str(repo_root),
     )
     model = Tiny()
     trainer.fit(model, train_dataloaders=DataLoader(ds, batch_size=4))

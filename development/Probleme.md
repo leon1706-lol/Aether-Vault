@@ -925,3 +925,15 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** `filter_existing_files()` in `_shared.py` (import-safe without extras): resolve paths, keep only existing ones — the next save event picks up what wasn't ready. The smoke test now drives two explicit `trainer.save_checkpoint()` calls, matching the catch-up semantics deterministically instead of racing ModelCheckpoint's internal timing.
 
 **Verification:** Framework-free helper regression + callback-level skipif test (green in CI where extras exist); real-loop test rewritten to the deterministic two-save shape.
+
+---
+
+### 77. `av --version` never existed — the packaging smoke layer caught its first UX gap exactly as designed
+
+**Severity:** 2/10 · **Status:** 🟢 `fixed` (2026-08-24)
+
+**Problem:** The wheel-install smoke job's sanity roundtrip began with `av --version` — an option the CLI never had (the version lives in the banner corner and importlib metadata only). Click rejected it with exit 2, killing the job in ~15 s. Not a regression: the flag had simply never been built, and v1.1.11's smoke layer was the first thing ever to invoke it.
+
+**Fix:** Proper `--version` flag on the root group (`main.py`) printing `av <version>` from the same `_get_version()` source the banner uses, exiting cleanly before any repo detection. Regression test asserts output shape + clean exit.
+
+**Verification:** Flag exercised locally against the editable install; smoke job will pass its first line on next run. Meta-note recorded for the audit trail: two of the three V1.1.12-cycle product findings (#75, #76) plus this one were all surfaced BY the new CI depth, which is precisely the bug-detection-per-surface goal it was built for.

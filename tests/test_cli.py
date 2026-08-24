@@ -1880,3 +1880,13 @@ def test_log_detached_head(repo):
     assert result.exit_code == 0, result.output
     assert "HEAD" in result.output.splitlines()[0]
     assert "(main)" not in result.output.splitlines()[0]
+
+
+def test_version_flag_prints_and_exits_clean():
+    """`av --version` (Probleme.md #77): the packaging smoke jobs were the first thing
+    ever to invoke it, and it didn't exist. Must print an `av <version>` line and exit
+    without touching any repo state."""
+    result = invoke("--version")
+    assert result.exit_code == 0, result.output
+    out = result.output.strip()
+    assert out.startswith("av ") and len(out) > 3

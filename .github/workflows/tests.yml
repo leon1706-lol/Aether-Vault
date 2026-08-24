@@ -453,7 +453,8 @@ jobs:
           REDIS_URL=redis://localhost:6379/0 \
           AV_DATA_DIR=${{ runner.temp }}/av-data \
           AV_API_TOKEN=owner-browser-secret AV_AUTH_USERS='{"alice":"alice-browser-token"}' \
-            nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
+            nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 \
+            > /tmp/prot-server.log 2>&1 &
           for i in $(seq 1 30); do
             curl -sf http://localhost:8000/api/health && break
             sleep 1
@@ -464,6 +465,12 @@ jobs:
       - name: Run browser-level token-gate E2E
         working-directory: webui
         run: npx playwright test token-gate.spec.ts
+
+      # Ground truth for any token-gate failure: the protected server's OWN access log
+      # (orphaned-process stdout otherwise vanishes between step log sections).
+      - name: Dump protected-server access log
+        if: always()
+        run: tail -n 60 /tmp/prot-server.log 2>/dev/null || echo "(no log)"
 
       - name: Upload Playwright report on failure
         if: failure()

@@ -78,11 +78,24 @@ from .core import _AuthRetryGroup  # noqa: F401
 @click.group(invoke_without_command=True, cls=_AuthRetryGroup)
 @click.option("--verbose", is_flag=True, default=False, help="Enable debug logging.")
 @click.option("--silent", is_flag=True, default=False, help="Suppress all output.")
+@click.option(
+    "--version",
+    "show_version",
+    is_flag=True,
+    default=False,
+    help="Print the installed version and exit (same source as the banner's corner).",
+)
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool, silent: bool) -> None:
+def cli(ctx: click.Context, verbose: bool, silent: bool, show_version: bool) -> None:
     """Aether-Vault: High-performance version control for ML models & datasets."""
     ctx.ensure_object(dict)
     setup_logging(verbose, silent)
+
+    if show_version:
+        from .ui import _get_version
+
+        click.echo(f"av {_get_version()}")
+        raise click.exceptions.Exit(0)
 
     if ctx.invoked_subcommand is not None:
         return

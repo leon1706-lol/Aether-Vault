@@ -11,6 +11,16 @@ import { expect, test } from "@playwright/test";
 const TOKEN_KEY = "aether-vault:api-token";
 const OWNER_TOKEN = "owner-browser-secret";
 
+// Every API response the page produces, echoed into the Playwright log — turns any
+// failure into a self-diagnosing one (status codes are what the CORS/#75 bug class hid).
+test.beforeEach(async ({ page }, testInfo) => {
+  page.on("response", (r) => {
+    if (r.url().includes(":8000")) {
+      console.log(`[net] ${testInfo.title} :: ${r.status()} ${r.request().method()} ${r.url()}`);
+    }
+  });
+});
+
 test("av_token= handoff: consumed, stripped from URL, persisted, dashboard renders", async ({
   page,
 }) => {
