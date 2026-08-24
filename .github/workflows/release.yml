@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0 # full history so setuptools-scm can see tags
 
-      - uses: pypa/cibuildwheel@v2.16
+      - uses: pypa/cibuildwheel@v4.2
         env:
           CIBW_BUILD_VERBOSITY: 1
 
