@@ -57,13 +57,13 @@ jobs:
     permissions:
       id-token: write # required for PyPI trusted publishing (OIDC)
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: sdist
           path: dist
@@ -80,13 +80,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: sdist
           path: dist
