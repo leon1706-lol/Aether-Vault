@@ -17,7 +17,7 @@
     "lucide-react": "^0.400.0",
     "next": "14.2.5",
     "react": "^18",
-    "react-dom": "^18",
+    "react-dom": "^19",
     "recharts": "^2.12.7"
   },
   "devDependencies": {
@@ -27,7 +27,7 @@
     "@testing-library/user-event": "^14.5.0",
     "@types/node": "^20",
     "@types/react": "^18",
-    "@types/react-dom": "^18",
+    "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^4.3.0",
     "eslint": "8.57.1",
     "eslint-config-next": "14.2.5",
