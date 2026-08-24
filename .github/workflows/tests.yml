@@ -4,16 +4,23 @@ on:
   push:
   pull_request:
 
+# Superseded runs (rapid-fire pushes) are cancelled — saves runner minutes and makes
+# the latest commit's result the authoritative one.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: windows-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         # Floor (3.10: eager annotations, oldest supported) + ceiling (3.14: newest stable,
         # PEP 649 lazy-annotation semantics). The in-between versions add Windows-runner
         # minutes without covering new failure modes — the static eager-annotation checker
-        # covers ≤3.12 semantics.
+        # covers ≤3.12 semantics. Wider range runs nightly (see nightly.yml).
         python-version: ["3.10", "3.14"]
 
     steps:
@@ -31,6 +38,7 @@ jobs:
 
   plugin-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
 
     steps:
       - uses: actions/checkout@v5
@@ -47,6 +55,7 @@ jobs:
 
   webui-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v5
@@ -73,6 +82,7 @@ jobs:
 
   server-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:15-alpine
@@ -135,8 +145,199 @@ jobs:
       - name: Run av_server tests (TestClient + real-wire) against live Postgres + Redis
         run: pytest tests/test_server.py -v
 
+  # The live layer has only ever been exercised on Linux — Windows path/encoding quirks in
+  # the server stayed invisible until a real user hit them. Service containers don't exist
+  # on Windows runners, so this twin installs PostgreSQL and Memurai (Redis-compatible)
+  # natively via Chocolatey instead.
+  server-tests-windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    env:
+      AV_TEST_DATABASE_URL: postgresql+asyncpg://postgres:av_password@localhost:5432/aether_vault_test
+      AV_TEST_REDIS_URL: redis://localhost:6379/0
+      PGPASSWORD: av_password
+      PG_BIN: C:\Program Files\PostgreSQL\15\bin
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install PostgreSQL 15 and Memurai via Chocolatey
+        run: |
+          choco install postgresql15 --params '/Password:av_password /Port:5432' -y --no-progress
+          choco install memurai-developer -y --no-progress
+
+      - name: Create the test database
+        shell: pwsh
+        run: |
+          $env:Path += ";$env:PG_BIN"
+          & "$env:PG_BIN\psql.exe" -U postgres -h localhost -d postgres -c "SELECT version()" || Start-Sleep 10
+          & "$env:PG_BIN\psql.exe" -U postgres -h localhost -d postgres -c "CREATE DATABASE aether_vault_test;"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install Aether-Vault (builds the C++ core via pybind11)
+        run: pip install -e .[dev]
+
+      - name: Run av_server tests against live native Postgres + Memurai
+        shell: pwsh
+        run: pytest tests/test_server.py -v
+
+  # Full product flows driven by the REAL av CLI against a REAL server process — the layers
+  # unit/TestClient tests cannot reach. See scripts/e2e_scenario.sh for the phase map.
+  e2e-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: av_user
+          POSTGRES_PASSWORD: av_password
+          POSTGRES_DB: aether_vault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis/redis-stack-server:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      AV_TEST_DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test
+      AV_TEST_REDIS_URL: redis://localhost:6379/0
+      E2E_PSQL_URL: postgresql://av_user:av_password@localhost:5432/aether_vault_test
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install Aether-Vault (builds the C++ core via pybind11)
+        run: pip install -e .[dev]
+
+      - name: Run end-to-end scenario suite (real CLI ↔ real server)
+        shell: bash
+        run: bash scripts/e2e_scenario.sh
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-server-log
+          path: /tmp/server-e2e.log
+          if-no-files-found: ignore
+
+  # First time release artifacts are ever INSTALLED rather than just built: a wheel goes
+  # into a clean Linux venv, and the sdist is compiled from scratch inside a clean Windows
+  # venv (validating the MSVC/CMake path end users hit when no wheel matches).
+  package-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  smoke-wheel-linux:
+    needs: package-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the built wheel into a clean venv
+        run: |
+          python -m venv clean
+          ./clean/bin/python -m pip install ./dist/*.whl
+
+      - name: Offline sanity roundtrip through the installed console script
+        run: |
+          SCRATCH=$(mktemp -d)
+          cd "$SCRATCH"
+          ../clean/bin/av --version
+          ../clean/bin/python -c "import av_cli, av_server"
+          ../clean/bin/av init --mode local --yes --no-repl
+          echo "packaged" > f.txt
+          ../clean/bin/av add f.txt
+          ../clean/bin/av commit -m "wheel-smoke"
+          ../clean/bin/av log | grep "wheel-smoke"
+
+  smoke-sdist-windows:
+    needs: package-build
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Compile-install the sdist into a clean venv (MSVC + CMake path)
+        shell: pwsh
+        run: |
+          python -m venv clean
+          ./clean/Scripts/python.exe -m pip install (Get-Item ./dist/*.tar.gz).FullName
+
+      - name: Offline sanity roundtrip through the installed console script
+        shell: pwsh
+        run: |
+          $scratch = Join-Path $env:RUNNER_TEMP "av-sdist-smoke"
+          New-Item -ItemType Directory -Force $scratch | Out-Null
+          Set-Location $scratch
+          ./clean/Scripts/av.exe --version
+          ./clean/Scripts/python.exe -c "import av_cli, av_server"
+          ./clean/Scripts/av.exe init --mode local --yes --no-repl
+          Set-Content -Path f.txt -Value packaged
+          ./clean/Scripts/av.exe add f.txt
+          ./clean/Scripts/av.exe commit -m sdist-smoke
+          ./clean/Scripts/av.exe log | Select-String sdist-smoke
+
   webui-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 18
     services:
       postgres:
         image: postgres:15-alpine
@@ -230,9 +431,34 @@ jobs:
             sleep 1
           done
 
-      - name: Run Playwright E2E tests
+      - name: Run Playwright E2E tests (anonymous-mode specs)
         working-directory: webui
-        run: npx playwright test
+        run: npx playwright test dashboard.spec.ts weight-diff.spec.ts
+
+      # Browser-level Protected-mode coverage: restart THE SAME server in Protected mode
+      # (same DB/data, so seeded content stays visible), then drive the ?av_token= handoff
+      # — token consumed, URL stripped, localStorage persisted, dashboard renders behind
+      # the gate. Wrong-token must show the entry prompt instead of data.
+      - name: Restart server in Protected mode
+        run: |
+          pkill -f "uvicorn av_server.server:app" || true
+          sleep 2
+          cd "$GITHUB_WORKSPACE"
+          DATABASE_URL=postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault \
+          REDIS_URL=redis://localhost:6379/0 \
+          AV_DATA_DIR=${{ runner.temp }}/av-data \
+          AV_API_TOKEN=owner-browser-secret AV_AUTH_USERS='{"alice":"alice-browser-token"}' \
+            nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/api/health && break
+            sleep 1
+          done
+          [[ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/api/refs)" == "401" ]] || {
+            echo "::error::server did not come up in Protected mode"; exit 1; }
+
+      - name: Run browser-level token-gate E2E
+        working-directory: webui
+        run: npx playwright test token-gate.spec.ts
 
       - name: Upload Playwright report on failure
         if: failure()

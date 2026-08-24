@@ -1,0 +1,38 @@
+name: Nightly Compatibility
+
+# The push matrix only covers the floor (3.10) + ceiling (3.14) — the in-between versions
+# cost minutes every push without covering distinct failure modes most days. Nightly runs
+# the FULL range so a regression in 3.11–3.13 surfaces within a day instead of at release.
+# Also serves as the manual "run everything stack-free across versions" button
+# (workflow_dispatch) before cutting a release.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # daily 03:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Aether-Vault (builds the C++ core via pybind11)
+        run: pip install -e .[dev]
+
+      - name: Run full suite
+        run: pytest tests/ -q

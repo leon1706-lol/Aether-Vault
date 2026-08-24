@@ -653,7 +653,9 @@ async def get_stats(db: AsyncSession = Depends(get_session)) -> dict:
 # them yet. A client uploads object shards first and pushes the commit afterwards, so a GC
 # running inside that window would otherwise delete a live object whose commit is still
 # in-flight. This grace period closes that race without needing a global GC/upload lock.
-GC_GRACE_SECONDS = 3600
+# Env-overridable (AV_GC_GRACE_SECONDS, integer) so ops — and the e2e suite — can shrink
+# it for drills; defaults to the production hour.
+GC_GRACE_SECONDS = int(os.environ.get("AV_GC_GRACE_SECONDS", "3600"))
 
 # Delete in batches to stay well under driver bind-parameter limits (asyncpg ~32k).
 _GC_DELETE_BATCH = 500

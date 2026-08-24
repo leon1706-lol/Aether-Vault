@@ -887,3 +887,15 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** (a) import `_apply_schema` directly. (b) product hardening: adoption now triggers whenever a data table exists without a recorded revision (`_unrecorded_chain()` — no version table OR no current revision), healing and stamping both shapes instead of replaying into them.
 
 **Verification:** Full server suite green twice in a row against embedded Postgres 15 (56 passed each), including the heal test end-to-end: columns dropped + rows deleted → startup heals, stamps `0001`, restores `extra_parents`/`chunks`.
+
+---
+
+### 74. `av log` assertions substring-matched short messages against output containing random hashes — recurring CI flake
+
+**Severity:** 2/10 · **Status:** 🟢 `fixed` (2026-08-24)
+
+**Problem:** `tests/test_cli.py::test_log_limit_and_empty_repo` asserted `"c1" not in result.output` after a `--limit 2` log. `av log` lines embed random 7-char hex hashes (`[c11f8ca] c2`) and timestamps, so any run whose displayed hashes happened to contain the substrings `c1`/`c2`/`c3` tripped the assertions — observed live as the v1.1.10 `test (3.10)` job failure (`assert 'c1' not in '[d61fa71] (...'; the colliding token was `[c11f8ca] c2`). Purely probabilistic (~a few % per run, matrix-doubled): the 3.14 twin in the SAME run had non-colliding hashes and passed, which made it look version-specific when it wasn't.
+
+**Fix:** Assertions now parse MESSAGES out of the bracketed log lines (stripping an optional `(HEAD, main)` ref decoration) and compare the exact sequence `== ["c3", "c2"]`. A repo-wide sweep for other `assert "<≤4-char all-hex>" in/not-in output` patterns found no further failure-capable instances (the two raw hits are presence-checks against deterministic content, which cannot false-fail).
+
+**Verification:** 6 consecutive runs of the fixed test green locally; sweep script documented in the audit trail.

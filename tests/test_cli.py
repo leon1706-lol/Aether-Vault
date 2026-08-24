@@ -1820,8 +1820,19 @@ def test_log_limit_and_empty_repo(repo):
     assert result.exit_code == 0, result.output
     shown = [ln for ln in result.output.splitlines() if ln.startswith("[")]
     assert len(shown) == 2
-    assert "c3" in result.output and "c2" in result.output
-    assert "c1" not in result.output
+
+    # Parse MESSAGES out of the bracketed lines instead of substring-matching them:
+    # short hex-y messages ("c1") otherwise collide with random short hashes — a run
+    # whose displayed hash contained "c1" (e.g. `[c11f8ca] c2`) failed this test on CI
+    # once every few dozen runs. See Probleme.md #74.
+    def _message_after_hash(line: str) -> str:
+        rest = line.split("] ", 1)[1].strip()
+        if rest.startswith("("):  # ref decoration, e.g. "(HEAD, main) c3"
+            rest = rest.split(") ", 1)[1]
+        return rest.strip()
+
+    messages = [_message_after_hash(ln) for ln in shown]
+    assert messages == ["c3", "c2"]
 
 
 def test_log_branch_flag_and_bad_branch(repo):

@@ -421,3 +421,66 @@ def test_commit_scoped_keeps_directory_targets_together(tmp_path):
     from av_cli.index import Index
     idx = Index(repo_root)
     assert idx.get_entry("notes.py")["staged"] is True
+
+
+@pytest.mark.skipif(not _HAS_LIGHTNING, reason="lightning not installed")
+def test_lightning_real_training_loop_smoke(tmp_path):
+    """A REAL one-epoch Lightning training run (tiny CPU model, real Trainer + real
+    ModelCheckpoint) through AetherVaultCallback — the fake-trainer tests above prove
+    callback logic, this proves the actual framework wiring: on_save_checkpoint firing
+    from Lightning's own checkpoint machinery, real metrics flowing into --metric flags,
+    and the scoped commit landing tagged. Kept tiny (~seconds): 8 samples, batch 4,
+    one epoch, CPU, no logging."""
+    import torch
+    import torch.nn as nn
+    from lightning.pytorch import LightningModule, Trainer
+    from lightning.pytorch.callbacks import ModelCheckpoint
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from python.av_plugins.lightning import AetherVaultCallback
+
+    repo_root = _init_repo(tmp_path)
+    ckpt_dir = tmp_path / "ckpts"
+    ckpt_dir.mkdir()
+
+    class Tiny(LightningModule):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(4, 1)
+
+        def forward(self, x):
+            return self.layer(x).squeeze(-1)
+
+        def training_step(self, batch, _idx):
+            x, y = batch
+            loss = ((self(x) - y) ** 2).mean()
+            self.log("train_loss", loss)
+            return loss
+
+        def configure_optimizers(self):
+            return torch.optim.SGD(self.parameters(), lr=0.01)
+
+    ds = TensorDataset(torch.randn(8, 4), torch.randn(8))
+    callback = AetherVaultCallback(tag="real-loop-smoke")
+    ckpt_cb = ModelCheckpoint(dirpath=str(ckpt_dir), save_last=True)
+    trainer = Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        logger=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        callbacks=[callback, ckpt_cb],
+        limit_train_batches=2,
+    )
+    trainer.fit(Tiny(), train_dataloaders=DataLoader(ds, batch_size=4))
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) >= 1, "real training loop produced no commit via the callback"
+    committed_files = [p for t in trees for p in t["tree"]]
+    assert any(p.endswith(".ckpt") for p in committed_files), \
+        f"no .ckpt among committed files: {committed_files}"
+    smoke = [t for t in trees if "real-loop-smoke" in t["tags"]]
+    assert smoke, "callback tag missing from the real-loop commit(s)"
+    # Real Lightning metrics (train_loss) must ride the commit as metrics, not just tags.
+    assert any("train_loss" in t["metrics"] for t in trees), \
+        f"expected train_loss metric, got: {[t['metrics'] for t in trees]}"

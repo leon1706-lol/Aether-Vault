@@ -79,9 +79,11 @@ AV_AUTH_USERS  (empty/unset = no per-user tokens)
 AV_CORS_ORIGINS http://localhost:3000   (default; comma-separated; "*" reopens all)
                Anything not listed gets no Access-Control-Allow-Origin on responses.
 AV_RATE_LIMIT_GC  10/minute   (default)
-               Hard cap on the destructive GC endpoint, Anonymous mode included.
+                Hard cap on the destructive GC endpoint, Anonymous mode included.
 AV_RATE_LIMIT_DEFAULT  (empty = data plane unlimited)
-               Opt-in cap for every other /api route; bulk uploads burst by design.
+                Opt-in cap for every other /api route; bulk uploads burst by design.
+AV_GC_GRACE_SECONDS  3600   (default)
+                Shrink for drills/E2E; 0 makes freshly uploaded orphans sweepable.
 AV_REMOTE_URL  (CLI-side) default registry for av clone; else http://localhost:8000.
 AV_AUTHOR      (CLI-side) commit author string; defaults to "anonymous".
 ```
@@ -127,7 +129,7 @@ pip install -e .[dev]
 pytest tests/
 ```
 
-Without Docker, live-server tests skip cleanly — `tests/test_server.py` probes TCP reachability of Postgres/Redis (via `AV_TEST_DATABASE_URL` / `AV_TEST_REDIS_URL`) rather than using `importorskip`, so you get a clean skip, not an import error. The CI `server-tests` job provisions both as service containers and runs them for real.
+Without Docker, live-server tests skip cleanly — `tests/test_server.py` probes TCP reachability of Postgres/Redis (via `AV_TEST_DATABASE_URL` / `AV_TEST_REDIS_URL`) rather than using `importorskip`, so you get a clean skip, not an import error. The CI `server-tests` job provisions both as service containers and runs them for real; the `server-tests-windows` twin installs native PostgreSQL 15 + Memurai via Chocolatey (service containers don't exist on Windows runners).
 
 The `av test` wrapper adds convenience variants:
 
@@ -144,10 +146,46 @@ cd webui && npm test                    # Vitest units, no services needed
 docker compose up -d db redis aether-vault-server
 python webui/e2e/seed_data.py           # pushes 2 real commits via the actual av CLI
 cd webui && npm run build && npm run start
-npx playwright test                     # dashboard.spec.ts + weight-diff.spec.ts
+npx playwright test dashboard.spec.ts weight-diff.spec.ts   # anonymous-mode specs
+# then, to exercise Protected mode in the browser, restart the server with
+# AV_API_TOKEN/AV_AUTH_USERS set and run: npx playwright test token-gate.spec.ts
 ```
 
 **Standing rule:** never seed E2E data against a registry holding real work — `seed_data.py` creates its own throwaway repos but still talks to whatever registry is listening on :8000.
+
+### End-to-End Scenario Suite (`scripts/e2e_scenario.sh`)
+
+Product-level flows driven by the real CLI against a real server process — the layer unit and TestClient tests cannot reach. Runs in CI as the `e2e-suite` job; locally it works against any live Postgres:
+
+```bash
+AV_TEST_DATABASE_URL=postgresql+asyncpg://... AV_TEST_REDIS_URL=redis://... \
+E2E_PSQL_URL=postgresql://... bash scripts/e2e_scenario.sh
+```
+
+Phase map: A clone→diverge→conflicting merge→`--theirs`→two-parent push · B offline queue drain across a real restart · C pre-Alembic volume heal + stamp on a real boot · D protected mode with per-user tokens (join/attribution/wrong-token/revocation) · E zero-grace GC sweep. Notes for local runs: on Windows use Git Bash (the script converts its temp paths via cygpath), keep psql on PATH, and pass options before the connection URI if calling psql yourself — MSYS-style getopt ignores `-c` after a positional URI.
+
+## CI Job Map
+
+Every product surface and the workflow that guards it (Tests workflow unless noted):
+
+| Surface | Job(s) |
+|---|---|
+| Full stack-free suite, py3.10 + 3.14 (Windows build) | `test` matrix |
+| In-between Pythons 3.11–3.13 | `nightly.yml` (`compat`) |
+| Server live stack (Postgres+Redis): TestClient + real-wire | `server-tests` |
+| Same, native Windows services | `server-tests-windows` |
+| Product flows via real CLI: merge collaboration, offline drain, legacy upgrade, per-user auth, GC | `e2e-suite` (`scripts/e2e_scenario.sh`) |
+| Plugins incl. real Lightning training loop | `plugin-tests` |
+| WebUI lint/typecheck/Vitest | `webui-tests` |
+| WebUI browser E2E: dashboard, weight-diff, token gate | `webui-e2e` |
+| sdist+wheel build & twine check | `package-build` |
+| Wheel install smoke (Linux venv) | `smoke-wheel-linux` |
+| Sdist compile-install smoke (Windows venv, MSVC path) | `smoke-sdist-windows` |
+| `:edge` images on master pushes | `docker-edge.yml` |
+| Wheels cp310–314 ×3 OS, PyPI, GitHub Release, GHCR | `release.yml` (tags) |
+| Dependency freshness | Dependabot (pip/npm/actions, weekly) |
+
+Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` flow test, no macOS install smoke, Dependabot PRs need human merges.
 
 ## Database Migrations
 
