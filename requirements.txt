@@ -1,6 +1,6 @@
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
-requests>=2.31.0
+requests>=2.34.2
 click>=8.1.0
 pybind11>=3.0.0
 sqlalchemy>=2.0.0
