@@ -8,6 +8,6 @@ alembic>=1.13
 asyncpg>=0.29.0
 redis>=5.0.0
 rich>=13.7.0
-questionary>=2.0.0
+questionary>=2.1.1
 prompt_toolkit>=3.0.0
 packaging>=23.0
