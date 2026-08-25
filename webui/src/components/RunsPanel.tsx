@@ -39,7 +39,7 @@ export function RunsPanel({ projectId, runsPollMs = 15_000, eventsPollMs = 10_00
     load();
     const id = setInterval(load, runsPollMs);
     return () => clearInterval(id);
-  }, [load]);
+  }, [load, runsPollMs]);
 
   useEffect(() => {
     const id = setInterval(async () => {
@@ -52,7 +52,7 @@ export function RunsPanel({ projectId, runsPollMs = 15_000, eventsPollMs = 10_00
       }
     }, eventsPollMs);
     return () => clearInterval(id);
-  }, []);
+  }, [eventsPollMs]);
 
   async function refresh() {
     await load();

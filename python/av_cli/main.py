@@ -184,6 +184,9 @@ cli.add_command(watch)
 from .cmd_registry import registry  # noqa: E402
 
 cli.add_command(registry)
+from .cmd_webhooks import webhooks  # noqa: E402
+
+cli.add_command(webhooks)
 
 cli.add_command(policy_group)
 cli.add_command(promote)

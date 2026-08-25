@@ -29,11 +29,24 @@ def _collect(full: bool) -> dict:
         except Exception:
             return None
 
+    seeds: dict = {}
+    for var in ("SEED", "RANDOM_SEED", "PL_GLOBAL_SEED", "PYTHONHASHSEED"):
+        if os.environ.get(var):
+            seeds[var] = os.environ[var]
+    try:  # best-effort torch seed introspection (never fatal)
+        import torch  # type: ignore
+
+        if hasattr(torch, "initial_seed"):
+            seeds["torch_initial_seed"] = str(torch.initial_seed())
+    except Exception:
+        pass
+
     snap: dict = {
         "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "seeds": seeds,
         "pins": {name: ver for name in _CURATED if (ver := v(name))},
     }
     if full:
@@ -71,8 +84,11 @@ def snapshot(full: bool) -> None:
 @env.command()
 @click.argument("target", required=False, default=None)
 @click.option("--dockerfile", is_flag=True, default=False, help="Emit a Dockerfile draft.")
-def replay(target: str | None, dockerfile: bool) -> None:
-    """Print the reproduction recipe for the latest (or given) snapshot."""
+@click.option("--execute", "execute_mode", is_flag=True, default=False,
+              help="Execute the recipe's pip installs after showing it (asks first unless -y).")
+@click.option("-y", "--yes", is_flag=True, default=False, help="Skip the execute confirmation.")
+def replay(target: str | None, dockerfile: bool, execute_mode: bool, yes: bool) -> None:
+    """Print (or execute) the reproduction recipe for the latest (or given) snapshot."""
     repo_root = ensure_repo()
     path = repo_root / ".av" / "env_snapshot.json"
     if not path.exists():
@@ -99,7 +115,30 @@ def replay(target: str | None, dockerfile: bool) -> None:
             "packages:\n" + install_block
         )
 
-    if current_output_mode() == "json":
-        emit_json(None, "env replay", data={"recipe": recipe, "snapshot": snap})
-        return
     click.echo(recipe)
+
+    if execute_mode:
+        pip_lines = [
+            ln.strip()[len("pip install "):]
+            for ln in recipe.splitlines() if ln.strip().startswith("pip install ")
+        ]
+        if not pip_lines:
+            fail(None, "validation", "Nothing to install — snapshot has no pins.")
+        import subprocess as _sp
+
+        if not yes:
+            click.secho(f"About to run {len(pip_lines)} pip install command(s) "
+                        "in THIS interpreter. Continue? [y/N]", fg="yellow", nl=False)
+            if input().strip().lower() not in ("y", "yes"):
+                click.secho("Aborted — nothing executed.", fg="yellow")
+                return
+        for pin in pip_lines:
+            rc = _sp.call(["pip", "install", pin])
+            if rc != 0:
+                fail(None, "validation", f"pip install failed for: {pin}")
+        click.secho("Environment reproduced (pip level).", fg="green")
+
+    if current_output_mode() == "json":
+        emit_json(None, "env replay", data={"recipe": recipe, "snapshot": snap,
+                                            "executed": bool(execute_mode)})
+        return

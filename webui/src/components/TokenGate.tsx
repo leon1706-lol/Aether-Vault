@@ -23,7 +23,13 @@ export function TokenGate({ children }: Props) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  // Consume the one-time handoff token DURING RENDER (guarded to the browser), not in
+  // an effect: child panels mount and fire their first fetches BEFORE this component's
+  // useEffect ever runs (React runs child effects first), so an effect-based consume
+  // raced the very requests it was meant to authenticate — first wave went out
+  // unauthenticated and data only appeared after the next poll interval (Probleme.md
+  // #79). Writing localStorage here is idempotent and happens-before any child fetch.
+  if (typeof window !== "undefined") {
     const url = new URL(window.location.href);
     const handoffToken = url.searchParams.get("av_token");
     if (handoffToken) {
@@ -31,7 +37,9 @@ export function TokenGate({ children }: Props) {
       url.searchParams.delete("av_token");
       window.history.replaceState({}, "", url.toString());
     }
+  }
 
+  useEffect(() => {
     setUnauthorizedHandler(() => {
       setError(null);
       setShowPrompt(true);

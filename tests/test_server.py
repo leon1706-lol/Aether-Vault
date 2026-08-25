@@ -918,3 +918,40 @@ def test_audit_log_records_mutations(db):
     assert "commit.push" in actions
     assert "ref.update" in actions
     assert rows[0]["ts"] >= rows[-1]["ts"]  # ordered
+
+
+def test_multi_agent_same_run_interleaved_pushes(db):
+    """Two agents push commits referencing the SAME new run id, interleaved. The run is
+    lazily created by whichever push lands first; both commits must end up linked and
+    the metrics summary must reflect the union of both agents' latest values."""
+    import uuid
+
+    run_id = str(uuid.uuid4())
+    c1 = _make_commit("agent-a", project_id="proj-multi", author="anonymous",
+                      metrics={"val_loss": 0.5})
+    c1["run_id"] = run_id
+    c2 = _make_commit("agent-b", project_id="proj-multi", author="anonymous",
+                      metrics={"steps": 500})
+    c2["run_id"] = run_id
+
+    assert db.post("/api/commits", json=c1).status_code == 201
+    assert db.post("/api/commits", json=c2).status_code == 201
+
+    body = db.get(f"/api/runs/{run_id}").json()
+    assert sorted(body["commit_hashes"]) == sorted([c1["hash"], c2["hash"]])
+    assert body["metrics_summary"].get("val_loss") == 0.5
+    assert body["metrics_summary"].get("steps") == 500
+    assert body["status"] == "created"  # lazy-created state, not failed by ordering
+
+
+def test_run_create_is_idempotent_for_concurrent_agents(db):
+    import uuid
+
+    run_id = str(uuid.uuid4())
+    payload = {"id": run_id, "project_id": "proj-idem", "name": "same"}
+    r1 = db.post("/api/runs", json=payload)
+    r2 = db.post("/api/runs", json=payload)
+    assert r1.json()["status"] in ("created", "exists")
+    assert r2.json()["status"] in ("created", "exists")
+    listing = db.get("/api/runs?project_id=proj-idem").json()["runs"]
+    assert len([x for x in listing if x["id"] == run_id]) == 1

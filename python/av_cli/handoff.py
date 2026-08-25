@@ -373,6 +373,7 @@ def generate_handoff(
     agent_instructions: str | None = None,
     diff_weights: bool = False,
     since: str | None = None,
+    with_memory: bool = True,
 ) -> tuple[Path, Path]:
     from .exceptions import ValidationError
 
@@ -387,6 +388,9 @@ def generate_handoff(
             agent_instructions = json.load(f).get("agent_instructions")
 
     handoff_data = build_handoff_dict(repo_root, agent_instructions)
+    if not with_memory:
+        # Privacy/size trim for agents that only want the state snapshot.
+        handoff_data["context_memory"] = {"notes": [], "metrics_history_tail": []}
 
     with open(avh_path, "w") as f:
         json.dump(handoff_data, f, indent=2, sort_keys=True)

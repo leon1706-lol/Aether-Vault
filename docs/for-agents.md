@@ -54,8 +54,8 @@ curl "http://localhost:8000/api/events?since=0&project_id=…&kinds=commit&wait=
 ```
 
 Ordered, resumable by event `id`; long-poll with `wait`. Webhooks: POST signed
-`X-AV-Signature: hex(hmac-sha256(secret, body))`; manage via `/api/webhooks`
-(`av webhooks` CLI planned; API stable now).
+`X-AV-Signature: hex(hmac-sha256(secret, body))`; manage via the
+`av webhooks add/list/remove/test` CLI (v1.2.1).
 
 ## 5. `.avh` v2 — context memory
 

@@ -743,6 +743,25 @@ For the full results, the methodology behind each benchmark, and the rating lege
 
 ---
 
+## For Agents (SDK, JSON, events, .avh)
+
+Aether-Vault is built so autonomous agents are first-class operators. Four stable contracts:
+
+1. **JSON envelopes + exit codes** — `av --output json <cmd>` emits
+   `{"ok": true, "data": {…}, "error": null, "meta": {"command": "…"}}`;
+   failures set `ok:false` with `error.code` in {not_a_repo, nothing_to_commit,
+   auth_failed, unreachable_queued, merge_conflict, validation, policy_denied} and exit
+   codes 10–16.
+2. **Python SDK** — `from av_sdk import Repo`: add/commit/push/log/diff/runs/context with
+   typed `SDKError`; drives the same single-writer path as the CLI.
+3. **Event stream + webhooks** — resumable ordered feed:
+   `GET /api/events?since=<id>&kinds=commit&wait=25`; signed webhook deliveries
+   (`X-AV-Signature: hex(hmac-sha256(secret, body))`), managed via `av webhooks …`.
+4. **.avh v2 context memory** — lineage + semantic summary + replay recipe +
+   append-only agent notes; the next agent inherits intent and trend without any API calls.
+
+Full details, examples, and the guardrails you should arm: [docs/for-agents.md](docs/for-agents.md).
+
 ## Open Source Roadmap
 
 No open items — shipped milestones (v1.0/v1.1.x releases, clone/pull, log, merge, chunk

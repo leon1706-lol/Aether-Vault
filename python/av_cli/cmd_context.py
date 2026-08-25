@@ -86,6 +86,75 @@ def validate() -> None:
 
 
 @context.command()
+@click.option("--against", "against_path", default=None,
+              help="Compare against this .avh file (default: the Aether-Handoff snapshot before latest).")
+def diff(against_path: str | None) -> None:
+    """Diff the current .avh v2 document against a previous one (sections + notes + metrics)."""
+    from .handoff import build_handoff_dict, upgrade_handoff
+
+    repo_root = ensure_repo()
+    current = upgrade_handoff(build_handoff_dict(repo_root, None))
+
+    previous = None
+    if against_path:
+        p = pathlib.Path(against_path)
+        if not p.exists():
+            fail(None, "validation", f"File not found: {against_path}")
+        previous = upgrade_handoff(json.loads(p.read_text(encoding="utf-8")))
+    else:
+        snapshots_dir = repo_root / "Aether-Handoff" / "snapshots"
+        if snapshots_dir.is_dir():
+            snaps = sorted(snapshots_dir.glob("*.avh"))
+            if len(snaps) >= 1:
+                try:
+                    previous = upgrade_handoff(json.loads(
+                        snaps[-1].read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    previous = None
+
+    def _notes(doc):
+        return [n.get("note") for n in (doc.get("context_memory") or {}).get("notes", [])]
+
+    def _metrics(doc):
+        return doc.get("metrics") or {}
+
+    result: dict = {"against": against_path or "(latest snapshot)"}
+
+    prev_notes, cur_notes = _notes(previous) if previous else [], _notes(current)
+    result["notes_added"] = [n for n in cur_notes if n not in prev_notes]
+    pm, cm = _metrics(previous) if previous else {}, _metrics(current)
+    result["metrics_changed"] = {
+        k: {"from": pm.get(k), "to": cm.get(k)}
+        for k in set(pm) | set(cm) if pm.get(k) != cm.get(k)
+    }
+    ss_prev = (previous or {}).get("semantic_summary")
+    ss_cur = current.get("semantic_summary")
+    result["semantic_summary_changed"] = bool(ss_prev != ss_cur)
+    if isinstance(ss_cur, dict):
+        result["files_added"] = len((ss_cur.get("files") or {}).get("added", []))
+        result["files_removed"] = len((ss_cur.get("files") or {}).get("removed", []))
+        result["files_changed"] = len((ss_cur.get("files") or {}).get("changed", []))
+    replay_changed = bool(previous and previous.get("replay") != current.get("replay"))
+    result["replay_changed"] = replay_changed
+
+    if current_output_mode() == "json":
+        emit_json(None, "context diff", data=result)
+        return
+
+    click.secho(f"context diff vs {result['against']}:", bold=True)
+    for n in result["notes_added"]:
+        click.secho(f"  + note: {n}", fg="green")
+    for k, ch in result["metrics_changed"].items():
+        click.secho(f"  ~ metric {k}: {ch['from']} → {ch['to']}", fg="yellow")
+    if isinstance(ss_cur, dict) and (result["files_added"] or result["files_changed"]
+                                     or result["files_removed"]):
+        click.echo(f"  files: +{result['files_added']} ~{result['files_changed']} "
+                   f"-{result['files_removed']}")
+    if replay_changed:
+        click.secho("  ~ replay recipe changed", fg="yellow")
+
+
+@context.command()
 @click.option("--format", "fmt", type=click.Choice(["avh", "md", "json"]), default="json",
               show_default=True)
 @click.option("--out", default=None, help="Write to file instead of stdout.")

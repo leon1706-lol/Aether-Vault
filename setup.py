@@ -23,5 +23,11 @@ setup(
     cmdclass={"build_ext": build_ext},
     packages=["av_cli", "av_server", "av_server.migrations", "av_plugins", "av_sdk"],
     package_dir={"": "python"},
-    package_data={"av_server.migrations": ["script.py.mako"]},
+    package_data={
+        "av_server.migrations": ["script.py.mako"],
+        # .avh v2 contract artifact: shipped so external validators (jsonschema CLI,
+        # editors, other languages) can validate handoff documents against the exact
+        # schema the project enforces structurally via handoff.validate_handoff().
+        "av_cli": ["schemas/*.schema.json"],
+    },
 )

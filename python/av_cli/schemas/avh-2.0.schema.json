@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/avh-2.0.json",
+  "title": "Aether-Vault Handoff (.avh) v2",
+  "type": "object",
+  "required": ["$schema", "avh_version", "generated_at", "current_branch", "lineage", "context_memory"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "avh_version": {"type": "string", "pattern": "^2\\."},
+    "generated_at": {"type": "string"},
+    "current_branch": {"type": ["string", "null"]},
+    "current_commit_hash": {"type": ["string", "null"]},
+    "commit_message": {"type": ["string", "null"]},
+    "tags": {"type": "array", "items": {"type": "string"}},
+    "metrics": {"type": "object"},
+    "model_paths": {"type": "array"},
+    "dataset_lineage": {"type": "array"},
+    "code_files": {"type": "array", "items": {"type": "string"}},
+    "agent_instructions": {"type": ["string", "null"]},
+    "lineage": {
+      "type": "object",
+      "required": ["run_id", "parent_run_ids", "code_pointer"],
+      "properties": {
+        "run_id": {"type": ["string", "null"]},
+        "parent_run_ids": {"type": "array", "items": {"type": "string"}},
+        "code_pointer": {
+          "type": ["object", "null"],
+          "properties": {
+            "git_remote": {"type": ["string", "null"]},
+            "git_sha": {"type": ["string", "null"]},
+            "dirty": {"type": ["boolean", "null"]}
+          }
+        }
+      }
+    },
+    "semantic_summary": {
+      "type": ["object", "null"],
+      "properties": {
+        "summary": {"type": "string"},
+        "files": {"type": "object"},
+        "models": {"type": "array"},
+        "chunks": {"type": "object"},
+        "datasets": {"type": "array"},
+        "totals": {"type": "object"}
+      }
+    },
+    "replay": {
+      "type": ["object", "null"],
+      "properties": {
+        "captured_at": {"type": "string"},
+        "python": {"type": "string"},
+        "platform": {"type": "string"},
+        "cuda_visible_devices": {"type": ["string", "null"]},
+        "pins": {"type": "object"},
+        "freeze": {"type": "array"},
+        "seeds": {"type": "object"}
+      }
+    },
+    "context_memory": {
+      "type": "object",
+      "required": ["notes", "metrics_history_tail"],
+      "properties": {
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "ts": {"type": ["string", "null"]},
+              "agent": {"type": ["string", "null"]},
+              "note": {"type": "string"}
+            },
+            "required": ["note"]
+          }
+        },
+        "metrics_history_tail": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "hash": {"type": "string"},
+              "message": {"type": "string"},
+              "metrics": {"type": "object"},
+              "run_id": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -126,6 +126,83 @@ def export(out_dir: str, project_id: str | None) -> None:
                 + (f", {failed} FAILED" if failed else ""), fg="green")
 
 
+@registry.command()
+@click.argument("archive_dir")
+def restore(archive_dir: str) -> None:
+    """Re-ingest an `av registry export` archive into the configured registry.
+
+    Ordering mirrors the push path (objects → commits → refs) and every object shard is
+    hash-re-verified BEFORE upload, so a corrupted archive fails loudly instead of
+    poisoning the registry. Duplicate hashes ingest as idempotent 409s — restoring into
+    a partially-populated registry is safe; run `av gc` afterwards to sweep anything
+    orphaned by the export.
+    """
+    repo_root = ensure_repo()
+    client = _client(repo_root)
+    src = pathlib.Path(archive_dir)
+    manifest_path = src / "manifest.json"
+    if not manifest_path.exists():
+        fail(None, "validation", f"manifest.json not found in {src}")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    failed = 0
+
+    ok = dup = 0
+    for entry in manifest.get("objects", []):
+        h = entry["hash"]
+        fpath = src / "objects" / h[:2] / h[2:]
+        if not fpath.exists():
+            failed += 1
+            click.secho(f"  missing shard {h[:12]}… skipped", fg="yellow")
+            continue
+        data = fpath.read_bytes()
+        if hashlib.sha256(data).hexdigest() != h:
+            failed += 1
+            click.secho(f"  CORRUPT archive shard {h[:12]}… skipped", fg="red")
+            continue
+        resp = client.session.post(f"{client.server_url}/api/objects/{h}", data=data,
+                                   timeout=120)
+        if resp.status_code in (201, 409):
+            ok += 1
+            if resp.status_code == 409:
+                dup += 1
+        else:
+            failed += 1
+
+    c_ok = c_dup = 0
+    for commit in manifest.get("commits", []):
+        payload = dict(commit)
+        payload.pop("timestamp", None)  # server re-stamps from message payload if absent
+        resp = client.session.post(f"{client.server_url}/api/commits", json=payload,
+                                   timeout=60)
+        if resp.status_code in (201, 409):
+            c_ok += 1
+            if resp.status_code == 409:
+                c_dup += 1
+        else:
+            failed += 1
+
+    r_ok = 0
+    refs = manifest.get("refs") or {}
+    for name, ref_hash in refs.items():
+        resp = client.session.put(f"{client.server_url}/api/refs/{name}",
+                                  json={"commit_hash": ref_hash}, timeout=60)
+        if resp.status_code == 200:
+            r_ok += 1
+        else:
+            failed += 1
+
+    summary = {"objects_uploaded": ok, "objects_duplicate": dup, "commits": c_ok,
+               "commits_duplicate": c_dup, "refs": r_ok, "failed": failed}
+    if current_output_mode() == "json":
+        emit_json(None, "registry restore", data=summary)
+        return
+    if failed:
+        click.secho(f"Restore INCOMPLETE: {summary}", fg="red")
+        ctx_exit(EXIT_VALIDATION)
+    click.secho(f"Restored: {summary}", fg="green")
+
+
 @registry.command("keygen")
 def keygen() -> None:
     """Generate an attestation key (HMAC secret) into this repo's config."""
@@ -141,7 +218,7 @@ def keygen() -> None:
     click.secho("Attestation key generated and stored in .av/config.", fg="green")
 
 
-@click.command()
+@registry.command()
 @click.argument("commit_hash")
 def attest(commit_hash: str) -> None:
     """Attach an HMAC attestation tag to COMMIT_HASH (key required)."""

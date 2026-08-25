@@ -43,8 +43,10 @@ def graph(update: bool) -> None:
 @click.option("--instructions-file", type=click.Path(exists=True), default=None, help="Read agent instructions from a file.")
 @click.option("--diff-weights", is_flag=True, help="Include a per-layer weight-diff against the parent commit.")
 @click.option("--since", default=None, help="Diff weights/metrics against this commit hash instead of the direct parent.")
+@click.option("--with-memory/--no-memory", default=True, show_default=True,
+              help="Include the agent context-memory layer (notes + metric trend).")
 @click.pass_context
-def handoff(ctx: click.Context, update: bool, note: str | None, instructions_file: str | None, diff_weights: bool, since: str | None) -> None:
+def handoff(ctx: click.Context, update: bool, note: str | None, instructions_file: str | None, diff_weights: bool, since: str | None, with_memory: bool) -> None:
     """Generate (or update) a .avh agent handoff snapshot and a Markdown log entry in Aether-Handoff/."""
     if ctx.invoked_subcommand is not None:
         return
@@ -53,7 +55,8 @@ def handoff(ctx: click.Context, update: bool, note: str | None, instructions_fil
     from .handoff import generate_handoff
     note_text = Path(instructions_file).read_text() if instructions_file else note
     avh_path, md_path = generate_handoff(
-        repo_root, update=update, agent_instructions=note_text, diff_weights=diff_weights, since=since
+        repo_root, update=update, agent_instructions=note_text, diff_weights=diff_weights,
+        since=since, with_memory=with_memory,
     )
     click.secho(f"Handoff snapshot written: {avh_path.relative_to(repo_root)}", fg="green")
     click.secho(f"Markdown log entry: {md_path.relative_to(repo_root)}", fg="cyan")

@@ -312,7 +312,7 @@ Weight Diff is the distinctive panel: a client-side per-layer heatmap built from
 
 Auth surfaces through `TokenGate` (one-time `?av_token=` handoff, described in Auth Token Contract). Polling cadence defaults to 15 seconds via `webui/src/hooks/useDashboard.ts::useDashboard()` — live enough to feel current during training runs, cheap enough to leave open.
 
-**Stop:** the graph view draws `parent_hash` edges only, so merges render linear here too — same root cause as the Merge Contract limitation, same tracked status.
+**Note (updated v1.2.1):** the WEBUI commit graph now draws one edge per parent (see the Merge Contract's resolved note). The `av graph` OBSIDIAN export still walks `parent_hash` only, so merge diamonds render linear in generated vaults — tracked limitation, low priority because Obsidian's own graph view is the primary consumption surface there.
 
 ## Plugin Contract
 
