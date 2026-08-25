@@ -1,5 +1,6 @@
 import datetime
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -8,7 +9,98 @@ from .index import Index
 DATASET_EXTS = {'.csv', '.parquet', '.h5', '.arrow', '.json', '.jsonl'}
 MODEL_EXTS = {'.pt', '.pth', '.safetensors', '.onnx', '.ckpt'}
 
-AVH_VERSION = "1.0"
+AVH_VERSION = "2.0"
+AVH_SCHEMA_ID = "https://aether-vault.dev/schemas/avh-2.0.json"
+
+
+def _code_pointer(repo_root: Path) -> dict | None:
+    """Git pointer for the code that produced this state (best-effort, never fatal).
+
+    Aether versions ARTIFACTS; code stays in git. Capturing remote+SHA+dirty gives
+    agents a reproducible link back to the source without reinventing source control.
+    """
+    import subprocess
+
+    def _git(*args: str) -> str | None:
+        try:
+            out = subprocess.run(["git", *args], cwd=repo_root, capture_output=True,
+                                 text=True, timeout=10)
+            return out.stdout.strip() or None if out.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    sha = _git("rev-parse", "HEAD")
+    if not sha:
+        return None
+    remote = _git("remote", "get-url", "origin")
+    dirty = bool(_git("status", "--porcelain"))
+    return {"git_remote": remote, "git_sha": sha, "dirty": dirty}
+
+
+def _load_run_state(repo_root: Path) -> dict:
+    path = repo_root / ".av" / "run.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _context_notes(repo_root: Path) -> list[dict]:
+    """Append-only agent memory: .av/context/memory.jsonl — survives handoff regen."""
+    path = repo_root / ".av" / "context" / "memory.jsonl"
+    if not path.exists():
+        return []
+    notes = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                notes.append(json.loads(line))
+            except json.JSONDecodeError:
+                notes.append({"ts": None, "note": line})  # legacy free-text lines
+    except OSError:
+        pass
+    return notes
+
+
+def _metrics_history_tail(repo_root: Path, limit: int = 10) -> list[dict]:
+    """Last `limit` commits' key metrics, newest first — trend without API calls."""
+    branch, head_hash = resolve_head(repo_root)
+    out: list[dict] = []
+    cur = head_hash
+    seen: set[str] = set()
+    while cur and len(out) < limit and cur not in seen:
+        seen.add(cur)
+        commit = load_commit(repo_root, cur)
+        if not commit:
+            break
+        if isinstance(commit.get("metrics"), dict) and commit["metrics"]:
+            out.append({
+                "hash": cur[:12],
+                "message": (commit.get("message") or "")[:80],
+                "metrics": commit["metrics"],
+                "run_id": next((t.split(":", 1)[1] for t in commit.get("tags", [])
+                                if t.startswith("run:")), None),
+            })
+        cur = commit.get("parent_hash")
+    return out
+
+
+def build_semantic_summary(repo_root: Path, current_commit: dict | None) -> dict | None:
+    """Semantic diff vs the parent commit via semdiff (layers/chunks/datasets)."""
+    from .semdiff import diff_trees, human_summary
+
+    if not current_commit:
+        return None
+    parent_hash = current_commit.get("parent_hash")
+    parent = load_commit(repo_root, parent_hash) if parent_hash else None
+    sd = diff_trees((parent or {}).get("tree"), current_commit.get("tree"))
+    sd["summary"] = human_summary(sd)
+    return sd
 
 
 def classify_lineage(rel_path: str) -> str:
@@ -73,7 +165,18 @@ def build_handoff_dict(repo_root: Path, agent_instructions: str | None) -> dict:
         else:
             code_files.append(rel_path)
 
+    run_state = _load_run_state(repo_root)
+    run_id = run_state.get("run_id") or os.environ.get("AV_RUN_ID")
+    env_path = repo_root / ".av" / "env_snapshot.json"
+    replay = None
+    if env_path.exists():
+        try:
+            replay = json.loads(env_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            replay = None
+
     return {
+        "$schema": AVH_SCHEMA_ID,
         "avh_version": AVH_VERSION,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "current_branch": branch,
@@ -85,7 +188,59 @@ def build_handoff_dict(repo_root: Path, agent_instructions: str | None) -> dict:
         "dataset_lineage": sorted(dataset_lineage, key=lambda e: e["rel_path"]),
         "code_files": sorted(code_files),
         "agent_instructions": agent_instructions,
+        # --- v2: context-memory layer -------------------------------------
+        "lineage": {
+            "run_id": run_id,
+            "parent_run_ids": run_state.get("parent_run_ids", []),
+            "code_pointer": _code_pointer(repo_root),
+        },
+        "semantic_summary": build_semantic_summary(repo_root, commit_data),
+        "replay": replay,
+        "context_memory": {
+            "notes": _context_notes(repo_root),
+            "metrics_history_tail": _metrics_history_tail(repo_root),
+        },
     }
+
+
+def upgrade_handoff(doc: dict) -> dict:
+    """Upgrades a v1 .avh document to the v2 shape in memory (never mutates the file).
+
+    v1 docs lack $schema/lineage/semantic_summary/replay/context_memory; agents reading
+    old snapshots get a consistent shape with nulls instead of KeyErrors.
+    """
+    if str(doc.get("avh_version", "")).startswith("2"):
+        return doc
+    upgraded = dict(doc)
+    upgraded.setdefault("$schema", AVH_SCHEMA_ID)
+    upgraded["avh_version"] = AVH_VERSION
+    upgraded.setdefault("lineage", {"run_id": None, "parent_run_ids": [], "code_pointer": None})
+    upgraded.setdefault("semantic_summary", None)
+    upgraded.setdefault("replay", None)
+    upgraded.setdefault("context_memory", {"notes": [], "metrics_history_tail": []})
+    return upgraded
+
+
+def validate_handoff(doc: dict) -> list[str]:
+    """Structural validation without a jsonschema dependency. Returns problem list."""
+    problems: list[str] = []
+    version = str(doc.get("avh_version", ""))
+    if not version:
+        problems.append("missing avh_version")
+    for required in ("generated_at", "current_branch"):
+        if required not in doc:
+            problems.append(f"missing field: {required}")
+    cm = doc.get("context_memory") or {}
+    if not isinstance(cm.get("notes", []), list):
+        problems.append("context_memory.notes must be a list")
+    ss = doc.get("semantic_summary")
+    if ss is not None and not isinstance(ss, dict):
+        problems.append("semantic_summary must be an object or null")
+    lin = doc.get("lineage") or {}
+    for key in ("run_id", "parent_run_ids", "code_pointer"):
+        if key not in lin:
+            problems.append(f"lineage missing: {key}")
+    return problems
 
 
 def diff_model_weights(repo_root: Path, current_tree: list[dict], parent_commit_hash: str | None) -> list[dict]:

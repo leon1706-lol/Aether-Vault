@@ -17,7 +17,7 @@ when things may break, and how releases are cut.
 |---|---|---|---|
 | **CLI surface** (`av ...`) | Removing/renaming a command or flag; changing a command's output format in a way scripts parse | New commands (`log`, `clone`, `pull`, `merge`), new flags, richer human-readable output | Bug fixes, performance, docs |
 | **`.av/` on-disk format** | Changing existing file layouts/index entry semantics so an older binary misreads them | Adding keys readers must tolerate as absent (`layers`, `chunks`) — old binaries stay functional | Fixes to writers only |
-| **Registry HTTP API** (`/api/*`) | Removing endpoints/fields clients rely on; changing response shapes incompatibly | New endpoints (`/api/projects`, `/sync/batch-objects`), new optional request params, new response fields (`parents`, `chunks`) — old clients ignore unknown fields | Server-side fixes with identical wire behavior |
+| **Registry HTTP API** (`/api/*`) | Removing endpoints/fields clients rely on; changing response shapes incompatibly | New endpoints (`/api/projects`, `/sync/batch-objects`, v1.2.0: `/api/runs*`, `/api/events`, `/api/webhooks*`, `/api/admin/audit`), new optional request params, new response fields (`parents`, `chunks`) — old clients ignore unknown fields | Server-side fixes with identical wire behavior |
 | **Config files** (`.av/config`, `.env`) | Removing/renaming keys | New optional keys (`project_id`, `remote_api_token`, `login_mode`, `AV_AUTH_USERS` — v1.1.8's per-user token map is additive; unset keeps Anonymous/single-token behavior byte-identical) | — |
 | **Python package** (`import av_cli...`) | Moving/removing public modules/functions | New modules/functions | Internal fixes |
 
@@ -35,6 +35,14 @@ or client stop working, it's MAJOR.*
 4. Pre-1.0 exceptions no longer apply: since `v1.1.1` the above is binding on maintainers.
 
 Known standing deprecation candidates (tracked, not yet scheduled): none currently.
+
+## v1.2.0 additive surfaces
+
+Runs/events/webhooks/audit endpoints, the JSON envelope + exit-code registry, .avh v2
+(reads upgrade v1 documents in memory; writers emit v2), and v_sdk are all ADDITIVE
+MINOR features. The one behavioral nuance: commits pushed with an active run now carry a
+
+un:<id> tag — consumers matching exact tag sets must tolerate the extra element.
 
 ## Database schema compatibility
 

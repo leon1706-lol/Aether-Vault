@@ -19,12 +19,15 @@ from .core import _collect_dirty_paths, _finalize_commit, _materialize_tree
     multiple=True,
     help="Metric in key=value format (repeatable). E.g. --metric sharpe=2.45",
 )
+@click.option("--no-upload", is_flag=True, default=False,
+              help="Skip the registry entirely: persist locally and queue for `av push`.")
 @click.option("--metric-sharpe", type=float, default=None, help="Sharpe ratio (legacy shorthand).")
 @click.option("--metric-drawdown", type=float, default=None, help="Max drawdown (legacy shorthand).")
 def commit(
     message: str,
     tags: tuple,
     metrics_raw: tuple,
+    no_upload: bool,
     metric_sharpe: float | None,
     metric_drawdown: float | None,
 ) -> None:
@@ -38,8 +41,26 @@ def commit(
 
     staged = idx.get_staged_entries()
     if not staged:
+        if current_output_mode() == "json":
+            emit_json(None, "commit", data={
+                "committed": False, "reason": "nothing_to_commit",
+                "hash": None, "queued": False,
+            })
+            return
         click.secho("Nothing to commit", fg="yellow")
         return
+
+    # Run linkage (v1.2.0): an active run (av run start / AV_RUN_ID) rides the commit
+    # payload so the server can file it under the run without extra round trips.
+    run_id = os.environ.get("AV_RUN_ID")
+    run_state_path = repo_root / ".av" / "run.json"
+    if not run_id and run_state_path.exists():
+        try:
+            run_id = json.loads(run_state_path.read_text(encoding="utf-8")).get("run_id")
+        except (json.JSONDecodeError, OSError):
+            run_id = None
+    if run_id:
+        tags = tuple(tags) + (f"run:{run_id}",) if f"run:{run_id}" not in tags else tags
 
     # --- Build metrics dict ---
     metrics: dict = {}
@@ -58,53 +79,38 @@ def commit(
     # --- Update local metadata registry ---
     update_registry(repo_root, list(tags), metrics)
 
-    # --- Build tree snapshot (unified flat format, PR #8) ---
-    tree: dict = {}
-    for rel_path, e in idx.entries.items():
-        tree[rel_path] = {
-            "hash": e["hash"],
-            "size": e["size"],
-            "type": e["type"],
-            "layers": e.get("layers", []),
-            "chunks": e.get("chunks", []),
-        }
+    sink_data: dict = {}
+    json_sink = None
+    if current_output_mode() == "json":
+        def json_sink(result):
+            sink_data.update(result)  # humans get echoes; JSON gets the recorded result
 
-    # --- Resolve parent commit ---
-    head_path = repo_root / ".av" / "HEAD"
-    parents: list[str] = []
-    ref_path = None
-    if head_path.exists():
-        head_content = head_path.read_text().strip()
-        if head_content.startswith("ref: "):
-            ref_path = repo_root / ".av" / head_content.split(": ", 1)[1]
-            if ref_path.exists() and ref_path.read_text().strip():
-                parents.append(ref_path.read_text().strip())
-        else:
-            parents.append(head_content)
+    # --no-upload (or AV_COMMIT_UPLOAD=0): high-frequency loops persist locally and let
+    # `av push` drain later. The offline queue IS the mechanism — no separate store.
+    defer_upload = no_upload or os.environ.get("AV_COMMIT_UPLOAD", "").strip().lower() in ("0", "false", "off")
 
-    commit_data: dict = {
-        "parents": parents,
-        "author": os.environ.get("AV_AUTHOR", "anonymous"),
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "message": message,
-        "tree": tree,
-        "tags": list(tags),
-        "metrics": metrics,
-        # Included in the hashed payload (not just attached after) so two different
-        # projects can never collide on the same commit hash even if their tree/message/
-        # timestamp happened to be byte-identical — the shared registry's `commits` table
-        # is keyed by hash alone.
-        "project_id": cfg["project_id"],
-        "project_name": cfg["project_name"],
-    }
+    # THE shared commit path (also used by `av watch` and the av_sdk SDK).
+    from .core import commit_staged
 
-    # Deterministic hash over sorted JSON (preserves DAG integrity), atomic local persist,
-    # ref advance, and remote push/queue — shared with `av merge` via _finalize_commit.
-    return _finalize_commit(
-        repo_root, cfg, client,
-        commit_data=commit_data, tree=tree, ref_path=ref_path, head_path=head_path,
-        idx=idx, tags=tags, metrics=metrics,
+    head_hash = commit_staged(
+        repo_root, message, tags=tags, metrics=metrics,
+        run_id=run_id, defer_upload=defer_upload,
+        result_sink=json_sink,
     )
+
+    if current_output_mode() == "json":
+        queued_reason = sink_data.get("queued_reason") or ("upload_deferred" if defer_upload else None)
+        emit_json(None, "commit", data={
+            "committed": True,
+            "hash": head_hash,
+            "short": (head_hash or "")[:7],
+            "message": message,
+            "tags": list(tags),
+            "metrics": metrics,
+            "run_id": run_id,
+            "queued": sink_data.get("queued", False) or bool(defer_upload),
+            "queued_reason": queued_reason,
+        })
 
 
 @click.command()
@@ -551,15 +557,30 @@ def push() -> None:
 
     pending_before = load_pending_push(repo_root)
     if not pending_before:
+        if current_output_mode() == "json":
+            emit_json(None, "push", data={"drained": 0, "still_queued": 0, "reachable": None})
+            return
         click.secho("Nothing pending — all commits are synced.", fg="green")
         return
 
     if not client.server_available():
+        if current_output_mode() == "json":
+            emit_json(None, "push", data={"drained": 0,
+                                          "still_queued": len(pending_before),
+                                          "reachable": False})
+            return
         click.secho("Error: Remote server is not reachable.", fg="red")
         return
 
     still_pending = flush_pending_push(repo_root, client)
     pushed = len(pending_before) - len(still_pending)
+    if current_output_mode() == "json":
+        emit_json(None, "push", data={
+            "drained": pushed,
+            "still_queued": len(still_pending),
+            "reachable": True,
+        })
+        return
     if pushed:
         click.secho(f"[OK] Pushed {pushed} commit(s) to the remote server", fg="green")
     if still_pending:

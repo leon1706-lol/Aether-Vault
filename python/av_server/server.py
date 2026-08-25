@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -19,9 +19,21 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .database import get_session, init_db
+from .database import async_session_factory, get_session, init_db
 from . import rate_limit
-from .models import DBCommit, DBObject, DBRef, DBTree, utcnow_naive
+from .models import (
+    DBAuditLog,
+    DBCommit,
+    DBEvent,
+    DBObject,
+    DBRef,
+    DBRun,
+    DBRunCommit,
+    DBTree,
+    DBWebhook,
+    _new_uuid,
+    utcnow_naive,
+)
 from .redis_cache import cache
 from .storage import CASStorage
 
@@ -454,6 +466,40 @@ async def push_commit(
         if commit_ts is not None:
             new_commit.timestamp = commit_ts
         db.add(new_commit)
+        await db.flush()
+
+        # --- v1.2.0: run linkage + event + audit -------------------------------
+        run_id = commit_data.get("run_id")
+        if run_id:
+            run_row = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+            if not run_row:
+                # Lazy-create: multi-agent pushes must never fail on ordering — a run the
+                # server hasn't seen yet (client registered offline) is created in
+                # 'created' state and linked, exactly as if it had been registered first.
+                run_row = DBRun(
+                    id=run_id, project_id=project_id,
+                    created_by=username or author,
+                    metrics_summary=dict(metrics) if isinstance(metrics, dict) else {},
+                    created_at=utcnow_naive(),
+                )
+                db.add(run_row)
+            else:
+                if isinstance(metrics, dict) and metrics:
+                    merged = dict(run_row.metrics_summary or {})
+                    merged.update(metrics)
+                    run_row.metrics_summary = merged
+                run_row.updated_at = utcnow_naive()
+            db.add(DBRunCommit(run_id=run_id, commit_hash=commit_hash))
+
+        await _emit_event(db, project_id, "commit", {
+            "hash": commit_hash,
+            "message": new_commit.message,
+            "author": author,
+            "run_id": run_id,
+        })
+        _audit(db, username, "commit.push", project_id,
+               {"hash": commit_hash, "message": new_commit.message})
+
         await db.commit()
         return Response(status_code=201)
     except IntegrityError as exc:
@@ -584,7 +630,8 @@ async def get_commit(
 
 @app.put("/api/refs/{ref_name:path}")
 async def update_ref(
-    ref_name: str, payload: RefUpdate, db: AsyncSession = Depends(get_session)
+    ref_name: str, payload: RefUpdate, request: Request,
+    db: AsyncSession = Depends(get_session),
 ) -> dict:
     ref_name = validate_ref_name(ref_name)
     stmt = select(DBRef).where(DBRef.name == ref_name).with_for_update()
@@ -594,6 +641,10 @@ async def update_ref(
         ref.commit_hash = payload.commit_hash
     else:
         db.add(DBRef(name=ref_name, commit_hash=payload.commit_hash))
+    project_id = ref_name.split("/", 1)[0] if "/" in ref_name else None
+    await _emit_event(db, project_id, "ref", {"ref": ref_name, "commit_hash": payload.commit_hash})
+    _audit(db, _identity(request), "ref.update", project_id,
+           {"ref": ref_name, "commit_hash": payload.commit_hash})
     await db.commit()
     return {"status": "updated"}
 
@@ -785,6 +836,18 @@ async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dic
         for h in alive_hashes:
             await cache.add_hash(h)
 
+        # Retention sweep for the event stream (default 30 days, AV_EVENT_RETENTION_DAYS).
+        from datetime import timedelta as _td
+
+        event_cutoff = utcnow_naive() - _td(days=EVENT_RETENTION_DAYS)
+        await db.execute(delete(DBEvent).where(DBEvent.ts < event_cutoff))
+
+        await db.commit()
+        await _emit_event(db, None, "gc", {
+            "deleted_objects": deleted_count,
+            "alive_objects": len(alive_hashes),
+            "reused_trees": len(visited_trees),
+        })
         await db.commit()
         return {
             "status": "success",
@@ -976,3 +1039,336 @@ async def dashboard_summary(db: AsyncSession = Depends(get_session)) -> dict:
             for c in commits[:20]
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Autonomous-loop surface (v1.2.0): runs, event stream, webhooks, audit
+# ---------------------------------------------------------------------------
+# Design notes:
+# * Events are an append-only feed whose autoincrement id IS the resumable cursor
+#   (?since=<id> returns strictly newer rows, ascending). Orchestrators long-poll with
+#   wait=<secs> instead of hot-looping.
+# * Webhooks are signed HMAC-SHA256 over the raw JSON body; the signing secret lives in
+#   this database by necessity (deliveries must be signed) and is never returned.
+# * Runs are first-class (see models.DBRun); commits link to runs at push time via the
+#   payload's optional run_id, lazily creating unknown runs so multi-agent pushes never
+#   fail on ordering.
+
+from fastapi import Body  # noqa: E402
+
+import hashlib  # noqa: E402
+import hmac as hmac_mod  # noqa: E402
+
+EVENT_RETENTION_DAYS = int(os.environ.get("AV_EVENT_RETENTION_DAYS", "30"))
+_WEBHOOK_TIMEOUT_SECS = 10
+
+
+async def _emit_event(db: AsyncSession, project_id: str | None, kind: str, payload: dict | None):
+    """Appends one event row (flushed so the cursor id exists) and schedules signed
+    webhook deliveries as a background task — never blocking or failing the mutation.
+    With zero active webhooks no task is created at all: fire-and-forget tasks that
+    open their own sessions must never become routine overhead (they leak connections
+    across TestClient requests otherwise)."""
+    row = DBEvent(project_id=project_id, kind=kind, payload=payload)
+    db.add(row)
+    await db.flush()
+    hook_count = (
+        await db.execute(
+            select(func.count()).select_from(DBWebhook).where(DBWebhook.active.is_(True))
+        )
+    ).scalar_one()
+    if not hook_count:
+        return row.id
+
+    async def _deliver_later():
+        try:
+            async with async_session_factory() as session:
+                hooks = (
+                    await session.execute(select(DBWebhook).where(DBWebhook.active.is_(True)))
+                ).scalars().all()
+            await _deliver_webhooks(hooks,
+                {"id": row.id, "kind": kind, "project_id": project_id, "payload": payload}
+            )
+        except Exception:  # pragma: no cover — delivery must never break the mutation
+            logger.exception("webhook delivery scheduling failed")
+
+    asyncio.create_task(_deliver_later())
+    return row.id
+
+
+def _sign(secret: str, body: bytes) -> str:
+    return hmac_mod.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+async def _deliver_webhooks(hooks: list, event: dict) -> None:
+    """POSTs the event to every matching active webhook, signed, in a worker thread.
+
+    Fire-and-forget with per-URL try/except: a dead subscriber must never fail the
+    original mutation. Retries are left to subscribers (at-least-once via their own
+    reconciliation against /api/events) — v1 keeps the server side simple and honest.
+    """
+    matching = [
+        h for h in hooks
+        if (h.project_id is None or h.project_id == event.get("project_id"))
+        and (h.kinds is None or event["kind"] in h.kinds)
+    ]
+    if not matching:
+        return
+    import json as _json
+
+    body = _json.dumps(
+        {"id": event["id"], "kind": event["kind"], "project_id": event.get("project_id"), "payload": event.get("payload")},
+        sort_keys=True,
+    ).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-AV-Event-Id": str(event["id"]),
+        "X-AV-Event-Kind": event["kind"],
+    }
+    loop = asyncio.get_running_loop()
+    for hook in matching:
+        hook_headers = dict(headers)
+        hook_headers["X-AV-Signature"] = _sign(hook.secret, body)
+
+        def _post(url=hook.url, hdrs=hook_headers, b=body):
+            import requests as _requests
+
+            try:
+                _requests.post(url, data=b, headers=hdrs, timeout=_WEBHOOK_TIMEOUT_SECS)
+            except Exception:
+                logger.warning("webhook delivery failed: %s", url)
+
+        await loop.run_in_executor(None, _post)
+
+
+def _audit(db: AsyncSession, username: str | None, action: str,
+           project_id: str | None, details: dict | None = None):
+    if AUDIT_ENABLED:
+        db.add(DBAuditLog(username=username, action=action,
+                          project_id=project_id, details=details))
+
+
+AUDIT_ENABLED = os.environ.get("AV_AUDIT_LOG", "1") not in ("", "0", "false")
+
+
+def _identity(request: Request) -> str | None:
+    return getattr(request.state, "username", None)
+
+
+@app.get("/api/events")
+async def list_events(
+    since: int = 0,
+    project_id: Optional[str] = None,
+    kinds: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    wait: int = 0,
+    db: AsyncSession = Depends(get_session),
+):
+    """Resumable ordered event feed. wait=<secs> long-polls for at least one new row."""
+    kind_list = [k.strip() for k in kinds.split(",")] if kinds else None
+    waited = 0.0
+
+    async def _fetch():
+        stmt = select(DBEvent).where(DBEvent.id > since)
+        if project_id:
+            stmt = stmt.where((DBEvent.project_id == project_id) | (DBEvent.project_id.is_(None)))
+        if kind_list:
+            stmt = stmt.where(DBEvent.kind.in_(kind_list))
+        rows = (await db.execute(stmt.order_by(DBEvent.id.asc()).limit(limit))).scalars().all()
+        return [
+            {"id": e.id, "ts": e.ts.isoformat() if e.ts else None,
+             "kind": e.kind, "project_id": e.project_id, "payload": e.payload}
+            for e in rows
+        ]
+
+    events = await _fetch()
+    while not events and wait > waited:
+        await asyncio.sleep(0.5)
+        waited += 0.5
+        events = await _fetch()
+
+    next_cursor = events[-1]["id"] if events else since
+    return {"events": events, "next_cursor": next_cursor}
+
+
+QUERY_BEFORE_DAYS_DEFAULT = EVENT_RETENTION_DAYS
+
+
+@app.delete("/api/events")
+async def prune_events(request: Request, before_days: int = QUERY_BEFORE_DAYS_DEFAULT,
+                       db: AsyncSession = Depends(get_session)):
+    """Manual retention pruning (default also applied automatically during GC)."""
+    from datetime import timedelta
+
+    cutoff = utcnow_naive() - timedelta(days=max(before_days, 0))
+    result = await db.execute(delete(DBEvent).where(DBEvent.ts < cutoff))
+    await db.commit()
+    _audit(db, _identity(request), "events.prune", None, {"deleted": result.rowcount, "before_days": before_days})
+    await db.commit()
+    return {"deleted": result.rowcount}
+
+
+@app.post("/api/runs")
+async def create_run(request: Request, run: Dict[str, Any] = Body(...),
+                     db: AsyncSession = Depends(get_session)):
+    run_id = run.get("id") or _new_uuid()
+    project_id = run.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    exists = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}  # idempotent create (multi-agent safe)
+    now = utcnow_naive()
+    db_run = DBRun(
+        id=run_id, project_id=project_id, name=run.get("name"),
+        status="running", parent_run_id=run.get("parent_run_id"),
+        created_by=_identity(request), config_hash=run.get("config_hash"),
+        code_pointer=run.get("code_pointer"), env_snapshot_id=run.get("env_snapshot_id"),
+        created_at=now, updated_at=now,
+    )
+    db.add(db_run)
+    await _emit_event(db, project_id, "run", {"action": "started", "run_id": run_id, "name": run.get("name")})
+    _audit(db, _identity(request), "run.create", project_id, {"run_id": run_id})
+    await db.commit()
+    return {"status": "created", "id": run_id}
+
+
+@app.get("/api/runs")
+async def list_runs(project_id: Optional[str] = None, status: Optional[str] = None,
+                    parent_run_id: Optional[str] = None, limit: int = 50, offset: int = 0,
+                    db: AsyncSession = Depends(get_session)):
+    stmt = select(DBRun).order_by(DBRun.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBRun.project_id == project_id)
+    if status:
+        stmt = stmt.where(DBRun.status == status)
+    if parent_run_id:
+        stmt = stmt.where(DBRun.parent_run_id == parent_run_id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    return {"runs": [_run_to_dict(r) for r in rows], "total": total,
+            "limit": limit, "offset": offset}
+
+
+def _run_to_dict(r: DBRun) -> dict:
+    return {
+        "id": r.id, "project_id": r.project_id, "name": r.name, "status": r.status,
+        "parent_run_id": r.parent_run_id, "created_by": r.created_by,
+        "code_pointer": r.code_pointer, "env_snapshot_id": r.env_snapshot_id,
+        "metrics_summary": r.metrics_summary or {},
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+    }
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str, db: AsyncSession = Depends(get_session)):
+    r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    commit_rows = (await db.execute(
+        select(DBRunCommit.commit_hash).where(DBRunCommit.run_id == run_id)
+    )).scalars().all()
+    d = _run_to_dict(r)
+    d["commit_hashes"] = commit_rows
+    return d
+
+
+@app.post("/api/runs/{run_id}/complete")
+async def complete_run(run_id: str, request: Request,
+                       body: Dict[str, Any] = Body(default={}),
+                       db: AsyncSession = Depends(get_session)):
+    return await _finish_run(run_id, request, "completed", body, db)
+
+
+@app.post("/api/runs/{run_id}/fail")
+async def fail_run(run_id: str, request: Request,
+                   body: Dict[str, Any] = Body(default={}),
+                   db: AsyncSession = Depends(get_session)):
+    return await _finish_run(run_id, request, "failed", body, db)
+
+
+async def _finish_run(run_id: str, request: Request, status: str, body: dict, db: AsyncSession):
+    r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    r.status = status
+    r.completed_at = utcnow_naive()
+    r.updated_at = r.completed_at
+    if isinstance(body, dict) and body.get("metrics_summary"):
+        r.metrics_summary = {**(r.metrics_summary or {}), **body["metrics_summary"]}
+    await _emit_event(db, r.project_id, "run", {"action": status, "run_id": run_id})
+    _audit(db, _identity(request), f"run.{status}", r.project_id, {"run_id": run_id})
+    await db.commit()
+    return {"status": status, "id": run_id}
+
+
+@app.get("/api/admin/audit")
+async def get_audit_log(request: Request, limit: int = Query(50, ge=1, le=500),
+                        project_id: Optional[str] = None,
+                        db: AsyncSession = Depends(get_session)):
+    """Trust surface: recent mutating-call trail. Auth-gated like every other route;
+    in Anonymous mode usernames are simply None entries."""
+    stmt = select(DBAuditLog).order_by(DBAuditLog.id.desc()).limit(limit)
+    if project_id:
+        stmt = stmt.where(DBAuditLog.project_id == project_id)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"entries": [
+        {"id": a.id, "ts": a.ts.isoformat() if a.ts else None, "username": a.username,
+         "action": a.action, "project_id": a.project_id, "details": a.details}
+        for a in rows
+    ]}
+
+
+# --- webhook management ------------------------------------------------------
+
+class WebhookCreate(BaseModel):
+    url: str
+    secret: str
+    project_id: Optional[str] = None
+    kinds: Optional[List[str]] = None
+
+
+@app.post("/api/webhooks")
+async def create_webhook(request: Request, wh: WebhookCreate,
+                         db: AsyncSession = Depends(get_session)):
+    if not wh.url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail="url must be http(s)")
+    row = DBWebhook(url=wh.url, secret=wh.secret, project_id=wh.project_id, kinds=wh.kinds)
+    db.add(row)
+    _audit(db, _identity(request), "webhook.create", wh.project_id, {"webhook_id": row.id, "url": wh.url})
+    await db.commit()
+    return {"id": row.id, "url": wh.url, "active": True}
+
+
+@app.get("/api/webhooks")
+async def list_webhooks(db: AsyncSession = Depends(get_session)):
+    rows = (await db.execute(select(DBWebhook))).scalars().all()
+    return {"webhooks": [
+        {"id": w.id, "url": w.url, "project_id": w.project_id,
+         "kinds": w.kinds, "active": w.active,
+         "secret": (w.secret[:3] + "…") if w.secret else None}
+        for w in rows
+    ]}
+
+
+@app.delete("/api/webhooks/{webhook_id}")
+async def delete_webhook(webhook_id: str, request: Request,
+                         db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBWebhook).where(DBWebhook.id == webhook_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    await db.execute(delete(DBWebhook).where(DBWebhook.id == webhook_id))
+    _audit(db, _identity(request), "webhook.delete", row.project_id, {"webhook_id": webhook_id})
+    await db.commit()
+    return {"status": "deleted"}
+
+
+@app.post("/api/webhooks/{webhook_id}/test")
+async def test_webhook(webhook_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBWebhook).where(DBWebhook.id == webhook_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    await _deliver_webhooks([row], {"id": -1, "kind": "webhook_test",
+                                    "project_id": row.project_id, "payload": {"ping": True}})
+    return {"status": "delivered"}

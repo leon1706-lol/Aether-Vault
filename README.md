@@ -3,23 +3,29 @@
 <h1 align="center">Aether-Vault</h1>
 
 <p align="center">
-  <strong>High-performance, Git-like version control and registry for Machine Learning models, datasets, and code — in a single atomic commit.</strong>
+  <strong>The version-control layer built for continuous & autonomous AI training.</strong>
+</p>
+
+<p align="center">
+  <sub>Layer-level safetensors dedup · fastest content hashing at scale · native agent context memory (.avh) · Python SDK + event stream for training loops that never stop.</sub>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
+  <img src="https://img.shields.io/badge/C%2B%2B-17-808080?style=flat-square&labelColor=1A1A1A" alt="C++17">
   <img src="https://img.shields.io/badge/bindings-pybind11-FF8C00?style=flat-square&labelColor=1A1A1A" alt="pybind11">
-  <img src="https://img.shields.io/badge/tests-309%2F309%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="309 of 309 tests passing">
+  <img src="https://img.shields.io/badge/tests-green-brightgreen?style=flat-square&labelColor=1A1A1A" alt="tests passing">
 </p>
 
-Aether-Vault solves the core challenge of ML reproducibility by versioning the **"Holy Trinity"** together:
+Aether-Vault versions the **"Holy Trinity"** together — and is engineered so that *agents* can drive the whole loop without a human in the seat:
 
 | | Type | Examples |
 |---|---|---|
-| 1 | **Code** | Python training scripts, pipelines, validators |
-| 2 | **Model Weights** | `.pt`, `.safetensors`, `.onnx` |
-| 3 | **Datasets** | `.csv`, `.parquet`, `.h5`, `.arrow` |
+| 1 | **Code** | Python training scripts, pipelines, validators (pointer-integrated with git) |
+| 2 | **Model Weights** | `.pt`, `.safetensors` (per-layer dedup + partial fetch), `.onnx` |
+| 3 | **Datasets** | `.csv`, `.parquet`, `.h5`, `.arrow`, CDC-chunked binaries |
+
+**Why agents & autonomous loops choose it:** stable JSON envelopes + exit-code contract (`av --output json`) · `av_sdk.Repo` (single-writer Python SDK) · resumable event stream + signed webhooks · first-class Runs with lineage & metrics summaries · `.avh` v2 context memory so the next agent inherits intent, trend, and a replay recipe. Start at [docs/for-agents.md](docs/for-agents.md).
 
 ## Table of Contents
 
@@ -32,6 +38,7 @@ Aether-Vault solves the core challenge of ML reproducibility by versioning the *
 - [Development Progress](#development-progress)
 - [Benchmark Comparison](#benchmark-comparison)
 - [Open Source Roadmap](#open-source-roadmap)
+- [For Agents (SDK, JSON, events, .avh)](#for-agents-sdk-json-events-avh)
 - [Enterprise Roadmap](#enterprise-roadmap-commercial-variant)
 - [Contributing](#contributing)
 
@@ -436,6 +443,83 @@ av merge <target> --no-ff               # force a merge commit even when a fast-
 Successful merges create a real two-parent commit that syncs to the registry (servers ≥ v1.1.1
 store both parents) and shows up in `av log`. Content-level line merging is intentionally out of
 scope — versioned payloads are binary artifacts; an honest abort beats a corrupt merge.
+`--force` bypasses an armed branch policy for this one merge (see `av policy` below).
+
+### `av diff`
+Semantic change summary between two refs/commits (default: HEAD vs its parent) — built on the
+layer/chunk hashes the core already produces, so it answers *what moved and by how much*, not
+just which files:
+```bash
+av diff                       # HEAD vs parent: layers moved, chunks reused, datasets touched
+av diff feature-x             # HEAD vs another branch/commit
+av diff v2 --from v1          # explicit base→target pair
+av --output json diff v2      # machine-readable full breakdown (models[].moved, chunks, totals)
+```
+
+### `av run`
+First-class experiment runs: group every commit of a training effort, link lineage
+(parent runs), and keep the latest value per metric queryable server-side.
+```bash
+av run start fine-tune-v2        # commits now auto-tag run:<id> until finish
+av run start --parent <run-id>   # lineage: 'descended from that run'
+av run finish --metric final=0.31
+av run finish --fail
+av run list [--status completed]
+av run show <run-id>             # linked commits + metrics summary + code pointer
+```
+`AV_RUN_ID=<id>` makes ANY process' commits join the run — zero integration required.
+The webui has a matching **Runs** tab with a live activity badge fed by the event stream.
+
+### `av context`
+Agent context memory. Notes are append-only and durable; `export` renders the full `.avh`
+v2 document — lineage, semantic summary, replay recipe, metric trend, and the notes — so
+the next agent (or human) inherits intent without any API calls.
+```bash
+av context note "baseline established; next agent should tune LR"
+av context note "dataset v3 fixed the NaN rows" --agent alice
+av context show
+av context validate              # structural check against the .avh v2 contract
+av context export --format md --out CONTEXT.md   # also: avh | json
+```
+
+### `av policy` / `av promote`
+Promotion guardrails for autonomous loops: arm a per-branch metric policy, evaluated
+client-side before merges land (server-side authz is enterprise-tier).
+```bash
+av policy set main val_loss "<" --baseline-ref "main~1"
+av policy set release val_loss "<" --threshold 0.35
+av policy list / av policy remove main
+av promote <candidate> --into main      # evaluate → checkout main → merge (two-parent)
+av promote <candidate> --force          # conscious bypass, recorded in the merge message
+av merge <target> --force               # same bypass at merge level (exit code 16 on deny)
+```
+
+### `av env`
+Recipe-exact environment snapshots and reproduction recipes.
+```bash
+av env snapshot              # python + curated package pins (+ seeds/CUDA info) → .av/env_snapshot.json
+av env snapshot --full       # include complete pip freeze
+av env replay                # print the reproduction recipe
+av env replay --dockerfile   # emit a Dockerfile draft
+```
+
+### `av watch`
+Filesystem watcher for continuous training loops without framework plugins: stages +
+commits new/changed artifacts matching a pattern as soon as they stabilize (upload
+deferred; offline queue applies). Pure stdlib polling — no extra dependency.
+```bash
+av watch --glob "runs/*.ckpt" --interval 10 --debounce 5
+av watch --max-commits 20    # exit after N auto-commits (CI-friendly)
+```
+
+### `av registry`
+Registry-level backup and attestation:
+```bash
+av registry export ./backup            # commits+refs+runs+objects archive, hashes re-verified
+av registry keygen                     # generate an attestation key (.av/config)
+av attest  <commit-hash>               # HMAC attestation tag via metadata commit
+av verify  <commit-hash>               # check an attestation
+```
 
 ### `av stash`
 Git-stash-style temporary shelving of uncommitted changes (staged + modified tracked files —

@@ -6,6 +6,7 @@ main.py (`_find_source_root`, `_update_readme_test_badge`) are accessed late-bou
 """
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
+from .core import current_output_mode, emit_json  # noqa: E402
 
 
 
@@ -62,6 +63,7 @@ def add(paths: tuple) -> None:
 
     attr_rules = attributes.load_attributes(repo_root)
     any_changed = False
+    json_staged: list[dict] = []
     for fpath in files_to_process:
         rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
         if is_pointer_file(fpath):
@@ -69,9 +71,19 @@ def add(paths: tuple) -> None:
         if stage_one_file(repo_root, idx, threshold_bytes, fpath, rel_path,
                           attributes.flags_for(attr_rules, rel_path)):
             any_changed = True
+            entry = idx.get_entry(rel_path) or {}
+            json_staged.append({
+                "path": rel_path,
+                "type": entry.get("type", "file"),
+                "hash": entry.get("hash"),
+                "size": entry.get("size"),
+            })
 
     if any_changed:
         idx.save()
+
+    if current_output_mode() == "json":
+        emit_json(None, "add", data={"staged": json_staged, "count": len(json_staged)})
 
 
 _AVIGNORE_TEMPLATE = """\
@@ -204,6 +216,22 @@ def status() -> None:
         head_content = head_path.read_text().strip()
         if head_content.startswith("ref: refs/heads/"):
             branch = head_content.split("/")[-1]
+
+    staged, modified, deleted, untracked = compute_status(repo_root, idx)
+
+    if current_output_mode() == "json":
+        emit_json(
+            None,
+            "status",
+            data={
+                "branch": branch,
+                "staged": sorted(staged),
+                "modified": sorted(modified),
+                "deleted": sorted(deleted),
+                "untracked": sorted(untracked),
+            },
+        )
+        return
 
     click.secho(f"On branch {branch}\n", bold=True)
 

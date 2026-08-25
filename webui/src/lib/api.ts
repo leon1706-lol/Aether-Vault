@@ -132,6 +132,40 @@ export async function fetchProjects(): Promise<Project[]> {
   return data.projects ?? [];
 }
 
+// ---------------------------------------------------------------------------
+// Runs (v1.2.0) — first-class experiment grouping on the server
+// ---------------------------------------------------------------------------
+
+export interface Run {
+  id: string;
+  project_id: string;
+  name: string | null;
+  status: "created" | "running" | "completed" | "failed";
+  parent_run_id: string | null;
+  created_by: string | null;
+  metrics_summary: Record<string, number | string>;
+  created_at: string | null;
+  completed_at: string | null;
+  commit_hashes?: string[];
+}
+
+export async function fetchRuns(
+  opts: { projectId?: string | null; status?: string; limit?: number } = {}
+): Promise<Run[]> {
+  const params = new URLSearchParams();
+  if (opts.projectId) params.set("project_id", opts.projectId);
+  if (opts.status) params.set("status", opts.status);
+  params.set("limit", String(opts.limit ?? 50));
+  const data = await fetchJSON<{ runs: Run[] }>(`/api/runs?${params.toString()}`);
+  return data.runs ?? [];
+}
+
+// Lightweight poll target for the live badge: newest event id (0 when none yet).
+export async function fetchLatestEventId(): Promise<number> {
+  const data = await fetchJSON<{ events: { id: number }[] }>("/api/events?limit=1");
+  return data.events?.[0]?.id ?? 0;
+}
+
 // ref_name may itself contain a "/" (project_id/branch namespacing) — the server's
 // {ref_name:path} route expects that slash literal in the URL path, not percent-encoded,
 // so this intentionally does not encodeURIComponent the whole name (matches how

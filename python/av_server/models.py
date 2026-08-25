@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
+import uuid
 
-from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, JSON, String
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Index, Integer, JSON, String
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import declarative_base
 
@@ -97,3 +98,102 @@ class DBRef(Base):
     name = Column(String, primary_key=True)
     commit_hash = Column(String, ForeignKey("commits.hash"), nullable=False)
     updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+
+# ---------------------------------------------------------------------------
+# v1.2.0 — autonomous-loop layer (runs, events, webhooks, audit). All additive;
+# migration 0002 creates them (see python/av_server/migrations/versions/).
+# ---------------------------------------------------------------------------
+
+def _new_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+class DBRun(Base):
+    """A first-class Experiment/Run: groups commits produced by one training effort.
+
+    Agents and humans alike start runs (`av run start` / SDK / POST /api/runs); every
+    commit pushed while a run is active is filed into run_commits, and metrics_summary
+    keeps the LATEST value per metric so lineage queries never need to walk trees.
+    parent_run_id enables 'this fine-tune descended from that run' chains.
+    """
+    __tablename__ = "runs"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=True)
+    # created | running | completed | failed — plain strings keep SQLite heal-tests portable.
+    status = Column(String, nullable=False, default="created")
+    parent_run_id = Column("parent_run_id", String, ForeignKey("runs.id"), nullable=True)
+    created_by = Column(String, nullable=True)  # resolved auth identity ('owner'/username)
+    config_hash = Column(String, nullable=True)
+    code_pointer = Column(JSON, nullable=True)  # {git_remote, git_sha, dirty}
+    env_snapshot_id = Column(String, nullable=True)
+    # Latest value per metric name: {"val_loss": 0.31, "steps": 12000} — refreshed on
+    # every linked commit push. Query-friendly without walking commit trees.
+    metrics_summary = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_runs_project_status", "project_id", "status"),
+        Index("ix_runs_parent", "parent_run_id"),
+    )
+
+
+class DBRunCommit(Base):
+    """Join table: which commits belong to which run (a run usually spans many)."""
+    __tablename__ = "run_commits"
+
+    run_id = Column(String, ForeignKey("runs.id"), primary_key=True)
+    commit_hash = Column(String, ForeignKey("commits.hash"), primary_key=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBEvent(Base):
+    """Append-only event stream: the resumable cursor feed agents/orchestrators poll.
+
+    id is an autoincrementing integer — its monotonicity IS the cursor contract
+    (?since=<last seen id> returns strictly newer events in id order).
+    """
+    __tablename__ = "events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=utcnow_naive, nullable=False)
+    project_id = Column(String, nullable=True, index=True)
+    kind = Column(String, nullable=False)  # commit | ref | run | promote | gc | webhook_test
+    payload = Column(JSON, nullable=True)
+
+    __table_args__ = (Index("ix_events_project_kind_id", "project_id", "kind", "id"),)
+
+
+class DBWebhook(Base):
+    """A subscriber URL that receives signed POSTs for matching events."""
+    __tablename__ = "webhooks"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    url = Column(String, nullable=False)
+    # The signing secret is stored verbatim because deliveries must be SIGNED with it
+    # (HMAC-SHA256 over the body). It is never returned by any API response (masked
+    # listing only). A registry compromise exposes these secrets — the same trust domain
+    # as the .env auth tokens themselves, documented in SECURITY.md.
+    secret = Column(String, nullable=False)
+    project_id = Column(String, nullable=True, index=True)  # null = all projects
+    kinds = Column(JSON, nullable=True)  # null = all kinds; else list of kind strings
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBAuditLog(Base):
+    """Immutable who-did-what trail for mutating API calls (trust/enterprise surface)."""
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=utcnow_naive, nullable=False)
+    username = Column(String, nullable=True)  # resolved identity; None in Anonymous mode
+    action = Column(String, nullable=False)   # e.g. 'commit.push', 'ref.update', 'run.create'
+    project_id = Column(String, nullable=True, index=True)
+    details = Column(JSON, nullable=True)
+
+    __table_args__ = (Index("ix_audit_ts", "ts"),)

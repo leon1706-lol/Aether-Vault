@@ -216,8 +216,10 @@ def pull(force: bool) -> None:
               help="Resolve conflicting files by taking TARGET's version.")
 @click.option("--no-ff", is_flag=True, default=False,
               help="Create a merge commit even when a fast-forward would do.")
+@click.option("--force", "-f", is_flag=True, default=False,
+              help="Bypass an armed branch policy for this merge (recorded in output).")
 def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bool,
-          no_ff: bool) -> None:
+          no_ff: bool, force: bool) -> None:
     """Merge another branch or commit into the current branch.
 
     Tree-level three-way merge against the nearest common ancestor: per file, whichever
@@ -247,6 +249,17 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
     if policy_ours and policy_theirs:
         click.secho("Error: --ours and --theirs are mutually exclusive.", fg="red")
         return
+
+    # Promotion guardrail (v1.2.0): a policy armed for the CURRENT branch is evaluated
+    # against OUR latest metrics before any merge lands on it. --force bypasses.
+    if not force:
+        from .cmd_policy import _latest_metrics_for_ref, enforce_policy
+
+        enforce_policy(
+            repo_root, branch,
+            candidate_metrics=_latest_metrics_for_ref(repo_root, "HEAD"),
+            baseline_metrics_fn=lambda ref: _latest_metrics_for_ref(repo_root, ref),
+        )
 
     heads_dir = repo_root / ".av" / "refs" / "heads"
 

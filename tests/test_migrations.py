@@ -28,11 +28,12 @@ def test_migration_chain_resolves_to_single_head():
 
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
-    assert heads == ["0001"], f"unexpected heads: {heads}"
+    assert heads == ["0002"], f"unexpected heads: {heads}"
     # walk_revisions() yields every revision reachable from head exactly once —
-    # no dangling down_revisions, no surprise second branch.
-    walked = [rev.revision for rev in script.walk_revisions()]
-    assert sorted(walked) == ["0001"]
+    # no dangling down_revisions, no surprise second branch. The chain is strictly
+    # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline).
+    walked = sorted(rev.revision for rev in script.walk_revisions())
+    assert walked == ["0001", "0002"]
 
 
 def test_env_py_is_valid_python():
@@ -157,6 +158,10 @@ def test_chain_renders_complete_postgres_ddl_offline():
     # The chain actually executed end-to-end and stamped itself as its final act:
     assert "CREATE TABLE alembic_version" in ddl
     assert "INSERT INTO alembic_version" in ddl
+
+    # v1.2.0 autonomous-loop tables ride the same chain (0002):
+    for table in ("runs", "run_commits", "events", "webhooks", "audit_log"):
+        assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
 
     # Every table from 0001_baseline exists in the rendered schema.
     for table in ("objects", "trees", "commits", "refs"):

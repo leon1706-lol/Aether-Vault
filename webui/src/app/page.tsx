@@ -11,6 +11,7 @@ import { BranchList } from "@/components/BranchList";
 import { MetricsChart } from "@/components/MetricsChart";
 import { WeightDiffPanel } from "@/components/WeightDiffPanel";
 import { ProjectsPanel } from "@/components/ProjectsPanel";
+import { RunsPanel } from "@/components/RunsPanel";
 import { CommitsPanel } from "@/components/CommitsPanel";
 import { BranchesPanel } from "@/components/BranchesPanel";
 import { MetricsPanel } from "@/components/MetricsPanel";
@@ -27,6 +28,7 @@ const TAB_TITLES: Record<string, string> = {
   storage: "Storage",
   "weight-diff": "Weight Diff",
   projects: "Projects",
+  runs: "Runs",
 };
 
 export default function DashboardPage() {
@@ -76,6 +78,8 @@ export default function DashboardPage() {
             <WeightDiffPanel projectId={selectedProject?.project_id ?? null} />
           ) : active === "projects" ? (
             <ProjectsPanel selectedProjectId={selectedProject?.project_id ?? null} onOpen={openProject} />
+          ) : active === "runs" ? (
+            <RunsPanel projectId={selectedProject?.project_id ?? null} />
           ) : active === "commits" ? (
             <CommitsPanel refs={data?.refs ?? {}} projectId={selectedProject?.project_id ?? null} />
           ) : active === "branches" ? (

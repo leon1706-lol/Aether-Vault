@@ -79,6 +79,14 @@ from .core import _AuthRetryGroup  # noqa: F401
 @click.option("--verbose", is_flag=True, default=False, help="Enable debug logging.")
 @click.option("--silent", is_flag=True, default=False, help="Suppress all output.")
 @click.option(
+    "--output",
+    "output_mode",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Agent-facing commands emit a stable JSON envelope instead of human text.",
+)
+@click.option(
     "--version",
     "show_version",
     is_flag=True,
@@ -86,9 +94,13 @@ from .core import _AuthRetryGroup  # noqa: F401
     help="Print the installed version and exit (same source as the banner's corner).",
 )
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool, silent: bool, show_version: bool) -> None:
+def cli(ctx: click.Context, verbose: bool, silent: bool, output_mode: str, show_version: bool) -> None:
     """Aether-Vault: High-performance version control for ML models & datasets."""
     ctx.ensure_object(dict)
+    ctx.obj["output"] = output_mode
+    from .core import set_output_mode
+
+    set_output_mode(output_mode)
     setup_logging(verbose, silent)
 
     if show_version:
@@ -153,6 +165,28 @@ cli.add_command(commit)
 cli.add_command(branch)
 cli.add_command(checkout)
 cli.add_command(log)
+from .cmd_diff import diff  # noqa: E402
+
+cli.add_command(diff)
+from .cmd_context import context  # noqa: E402
+
+cli.add_command(context)
+from .cmd_run import run  # noqa: E402
+
+cli.add_command(run)
+from .cmd_env import env  # noqa: E402
+
+cli.add_command(env)
+from .cmd_policy import policy as policy_group, promote  # noqa: E402
+from .cmd_watch import watch  # noqa: E402
+
+cli.add_command(watch)
+from .cmd_registry import registry  # noqa: E402
+
+cli.add_command(registry)
+
+cli.add_command(policy_group)
+cli.add_command(promote)
 cli.add_command(clone)
 cli.add_command(pull)
 cli.add_command(merge)

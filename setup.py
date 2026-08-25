@@ -21,7 +21,7 @@ ext_modules = [
 setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
-    packages=["av_cli", "av_server", "av_server.migrations", "av_plugins"],
+    packages=["av_cli", "av_server", "av_server.migrations", "av_plugins", "av_sdk"],
     package_dir={"": "python"},
     package_data={"av_server.migrations": ["script.py.mako"]},
 )

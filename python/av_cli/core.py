@@ -586,7 +586,9 @@ def resolve_head_tree(repo_root: Path) -> dict:
     return tree
 
 
-CHUNKABLE_EXTS = {".pt", ".pth", ".ckpt"}
+# v1.2.0: generalized dataset chunking - serialization formats that benefit from
+# CDC dedup on re-exports. Per-file override stays with .avattributes.
+CHUNKABLE_EXTS = {".pt", ".pth", ".ckpt", ".npz", ".h5", ".hdf5", ".pb", ".msgpack"}
 
 
 def stage_one_file(
@@ -792,6 +794,8 @@ def _finalize_commit(
     idx: Index,
     tags: tuple = (),
     metrics: dict | None = None,
+    result_sink=None,
+    defer_upload: bool = False,
 ) -> str:
     """Everything `av commit` does after its tree snapshot and parents are resolved: hash
     the payload deterministically over sorted JSON (preserves DAG integrity — two projects
@@ -820,11 +824,29 @@ def _finalize_commit(
         atomic_write_text(head_path, commit_hash)
 
     idx.clear_staged()
-    click.secho(f"[{commit_hash[:7]}] {message}", fg="green")
-    if tags:
-        click.secho(f"  Tags: {', '.join(tags)}", fg="cyan")
-    if metrics:
-        click.secho(f"  Metrics: {metrics}", fg="cyan")
+    result = {
+        "hash": commit_hash,
+        "short": commit_hash[:7],
+        "message": message,
+        "tags": list(tags),
+        "metrics": dict(metrics),
+        "queued": False,
+        "queued_reason": None,
+    }
+
+    def _queued(reason: str) -> None:
+        result["queued"] = True
+        result["queued_reason"] = reason
+
+    if result_sink is not None:
+        result_sink(result)
+        result["committed"] = True  # marker for the sink path; humans see the echo below
+    else:
+        click.secho(f"[{commit_hash[:7]}] {message}", fg="green")
+        if tags:
+            click.secho(f"  Tags: {', '.join(tags)}", fg="cyan")
+        if metrics:
+            click.secho(f"  Metrics: {metrics}", fg="cyan")
 
     # --- Push to remote if available ---
     # Refs are namespaced as "<project_id>/<branch>" on the shared registry so two projects
@@ -838,7 +860,14 @@ def _finalize_commit(
     except AuthenticationError:
         pass  # already re-queued by flush_pending_push itself; this commit's own push attempt below still needs to happen
 
-    if client.server_available():
+    if defer_upload:
+        # High-frequency mode: skip every network attempt, queue directly. The commit is
+        # fully durable locally; `av push` (or the next online commit) drains the queue.
+        queue_pending_push(repo_root, commit_hash, remote_ref_name)
+        _queued("upload_deferred")
+        if result_sink is None:
+            click.secho("  Upload deferred — queued for `av push`", fg="yellow")
+    elif client.server_available():
         try:
             # Objects must reach the server before the commit: the server's tree rows store
             # each entry's object hash as a foreign key, so pushing the commit first makes
@@ -851,10 +880,14 @@ def _finalize_commit(
                     ref_ok = client.update_ref(remote_ref_name, commit_hash)
                 if not ref_ok:
                     queue_pending_push(repo_root, commit_hash, remote_ref_name)
-                    click.secho("  Ref update failed — commit queued for retry (run `av push` later)", fg="yellow")
+                    _queued("ref_update_failed")
+                    if result_sink is None:
+                        click.secho("  Ref update failed — commit queued for retry (run `av push` later)", fg="yellow")
             else:
                 queue_pending_push(repo_root, commit_hash, remote_ref_name)
-                click.secho("  Push failed — commit queued for retry (run `av push` later)", fg="yellow")
+                _queued("push_failed")
+                if result_sink is None:
+                    click.secho("  Push failed — commit queued for retry (run `av push` later)", fg="yellow")
         except AuthenticationError:
             # client.server_available() only proves the server is up (it's exempt from the
             # auth gate) — it does NOT prove this token is valid, so a bad/stale token surfaces
@@ -863,16 +896,100 @@ def _finalize_commit(
             # specifically, vs. a network problem, would be an arbitrary distinction the user
             # shouldn't have to think about.
             queue_pending_push(repo_root, commit_hash, remote_ref_name)
-            click.secho(
-                "  Server rejected the access token — commit queued for retry "
-                "(run `av auth set-token <token>` then `av push`)",
-                fg="yellow",
-            )
+            _queued("auth_rejected")
+            if result_sink is None:
+                click.secho(
+                    "  Server rejected the access token — commit queued for retry "
+                    "(run `av auth set-token <token>` then `av push`)",
+                    fg="yellow",
+                )
     else:
         queue_pending_push(repo_root, commit_hash, remote_ref_name)
-        click.secho("  Server unreachable — commit queued for push (run `av push` later)", fg="yellow")
+        _queued("server_unreachable")
+        if result_sink is None:
+            click.secho("  Server unreachable — commit queued for push (run `av push` later)", fg="yellow")
 
     return commit_hash
+
+
+def commit_staged(
+    repo_root: Path,
+    message: str,
+    tags: tuple = (),
+    metrics: dict | None = None,
+    run_id: str | None = None,
+    defer_upload: bool = False,
+    result_sink=None,
+) -> str | None:
+    """Commit whatever is currently staged — THE shared entry point.
+
+    Callers: `av commit` (after flag parsing), `av watch` (auto-commits), and the
+    av_sdk.Repo SDK. All of them get identical semantics because this is the only place
+    that builds the payload and calls _finalize_commit (the historical single writer):
+    deterministic hash over sorted JSON, atomic local persist, ref advance, and
+    push-or-queue with offline resilience.
+
+    Returns the new commit hash, or None when nothing was staged.
+    """
+    from .client import VaultClient
+
+    idx = Index(repo_root)
+    if not idx.get_staged_entries():
+        return None
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"),
+                         cfg.get("remote_api_token"))
+
+    tree: dict = {}
+    for rel_path, e in idx.entries.items():
+        tree[rel_path] = {
+            "hash": e["hash"],
+            "size": e["size"],
+            "type": e["type"],
+            "layers": e.get("layers", []),
+            "chunks": e.get("chunks", []),
+        }
+
+    head_path = repo_root / ".av" / "HEAD"
+    parents: list[str] = []
+    ref_path = None
+    if head_path.exists():
+        head_content = head_path.read_text().strip()
+        if head_content.startswith("ref: "):
+            ref_path = repo_root / ".av" / head_content.split(": ", 1)[1]
+            if ref_path.exists() and ref_path.read_text().strip():
+                parents.append(ref_path.read_text().strip())
+        else:
+            parents.append(head_content)
+
+    import datetime as _dt
+
+    commit_data: dict = {
+        "parents": parents,
+        "author": os.environ.get("AV_AUTHOR", "anonymous"),
+        "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "message": message,
+        "tree": tree,
+        "tags": list(tags),
+        "metrics": metrics or {},
+        # In the hashed payload so two projects can never collide on byte-identical
+        # trees/messages/timestamps (registry keys commits by hash alone).
+        "project_id": cfg["project_id"],
+        "project_name": cfg["project_name"],
+    }
+    if run_id:
+        commit_data["run_id"] = run_id
+        tagged = f"run:{run_id}"
+        if tagged not in commit_data["tags"]:
+            commit_data["tags"] = commit_data["tags"] + [tagged]
+            tags = tuple(commit_data["tags"])
+
+    return _finalize_commit(
+        repo_root, cfg, client,
+        commit_data=commit_data, tree=tree, ref_path=ref_path, head_path=head_path,
+        idx=idx, tags=tags, metrics=metrics or {},
+        result_sink=result_sink, defer_upload=defer_upload,
+    )
 
 
 def _collect_dirty_paths(repo_root: Path, idx: Index) -> list[str]:
@@ -964,3 +1081,90 @@ def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: I
         entry["staged"] = False
 
     idx.save()
+
+
+# ---------------------------------------------------------------------------
+# Agent surface: structured output envelope + stable exit-code contract (v1.2.0)
+# ---------------------------------------------------------------------------
+# Commands reachable by agents emit either human text or a single JSON envelope,
+# selected by the root group's --output flag. The envelope shape is a compatibility
+# surface: {"ok": bool, "data": ..., "error": {"code","message"}|null, "meta": {...}}.
+# See docs/for-agents.md; the exit-code table below is part of that contract.
+
+EXIT_OK = 0
+EXIT_USAGE = 2                    # click's own usage-error code
+EXIT_NOT_A_REPO = 10
+EXIT_NOTHING_TO_COMMIT = 11
+EXIT_AUTH_FAILED = 12
+EXIT_UNREACHABLE_QUEUED = 13      # work is SAFE (queued), registry unreachable
+EXIT_CONFLICT = 14                # merge conflicts present, nothing touched
+EXIT_VALIDATION = 15              # bad input values
+EXIT_POLICY_DENIED = 16           # promotion/branch policy rejected the action
+
+_EXIT_CODES = {
+    "not_a_repo": EXIT_NOT_A_REPO,
+    "nothing_to_commit": EXIT_NOTHING_TO_COMMIT,
+    "auth_failed": EXIT_AUTH_FAILED,
+    "unreachable_queued": EXIT_UNREACHABLE_QUEUED,
+    "merge_conflict": EXIT_CONFLICT,
+    "validation": EXIT_VALIDATION,
+    "policy_denied": EXIT_POLICY_DENIED,
+}
+
+
+_OUTPUT_MODE = "text"
+
+
+def set_output_mode(mode: str) -> None:
+    """Called once by the root group; process-lifetime output selection."""
+    global _OUTPUT_MODE
+    _OUTPUT_MODE = mode if mode in ("text", "json") else "text"
+
+
+def current_output_mode() -> str:
+    return _OUTPUT_MODE
+
+
+def output_is_json(ctx) -> bool:
+    """True when the root group was invoked with --output json."""
+    return bool(ctx and isinstance(ctx.obj, dict) and ctx.obj.get("output") == "json")
+
+
+def json_envelope(command: str, data=None, error_code: str | None = None,
+                  error_message: str | None = None) -> dict:
+    """Builds the one-and-only agent-facing response shape."""
+    from . import _version
+
+    try:
+        version = _version.__version__
+    except Exception:
+        version = "dev"
+    env: dict = {
+        "ok": error_code is None,
+        "data": data if data is not None else {},
+        "error": None,
+        "meta": {"command": command, "version": version},
+    }
+    if error_code is not None:
+        env["error"] = {"code": error_code, "message": error_message or ""}
+    return env
+
+
+def emit_json(ctx, command: str, data=None) -> None:
+    """Prints an ok-envelope for `command` (call instead of human output in JSON mode)."""
+    click.echo(json.dumps(json_envelope(command, data=data)))
+
+
+def fail(ctx, code: str, message: str, command: str | None = None):
+    """Uniform failure path: JSON envelope + documented exit code in one raise.
+
+    In text mode the message prints plainly (no traceback); in JSON mode the envelope
+    carries the machine-readable code. Always raises — call sites stop here.
+    """
+    exit_code = _EXIT_CODES.get(code, EXIT_VALIDATION)
+    cmd = command or (ctx.command.name if ctx and getattr(ctx, "command", None) else "av")
+    if output_is_json(ctx):
+        click.echo(json.dumps(json_envelope(cmd, error_code=code, error_message=message)))
+    else:
+        click.secho(f"Error: {message}", fg="red", err=True)
+    ctx.exit(exit_code)

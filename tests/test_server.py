@@ -15,6 +15,7 @@ import json
 import os
 import socket
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 import pytest
@@ -707,7 +708,7 @@ def test_alembic_brings_schema_to_head(db):
             await conn.close()
 
     version, tables = asyncio.run(_probe())
-    assert version == "0001"
+    assert version == "0002"
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
@@ -758,7 +759,7 @@ def test_legacy_database_is_healed_and_stamped(db):
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "0001"
+    assert asyncio.run(_version()) == "0002"  # stamps to CURRENT head, not a hardcoded rev
 
 
 
@@ -799,3 +800,121 @@ def test_cors_defaults_lock_to_webui_origin(db):
 
     foreign = db.get("/api/health", headers={"Origin": "https://drive-by.example"})
     assert "access-control-allow-origin" not in foreign.headers
+
+
+# ---------------------------------------------------------------------------
+# v1.2.0 autonomous-loop surface: events, webhooks, runs, audit
+# ---------------------------------------------------------------------------
+
+def test_events_cursor_orders_and_resumes(db):
+    commit = _make_commit("evt-a")
+    db.post("/api/commits", json=commit)
+    db.put("/api/refs/proj/main", json={"commit_hash": commit["hash"]})
+    first = db.get("/api/events?limit=10").json()
+    assert first["events"], "commit/ref mutations must emit events"
+    ids = [e["id"] for e in first["events"]]
+    assert ids == sorted(ids)
+    kinds = {e["kind"] for e in first["events"]}
+    assert {"commit", "ref"} <= kinds
+
+    # resume strictly after the last seen cursor:
+    since = first["next_cursor"]
+    second = db.get(f"/api/events?since={since}").json()
+    assert all(e["id"] > since for e in second["events"])
+
+    # project filter only narrows, never leaks other projects' rows:
+    scoped = db.get("/api/events?project_id=proj-nope").json()
+    assert all(e["project_id"] in (None, "proj-nope") for e in scoped["events"])
+
+
+def test_runs_crud_and_commit_linkage_with_lazy_create(db):
+    import uuid
+
+    run_id = str(uuid.uuid4())
+    r = db.post("/api/runs", json={"id": run_id, "project_id": "proj-runs",
+                                   "name": "smoke-run"})
+    assert r.status_code == 200 and r.json()["status"] == "created"
+    # Idempotent create (multi-agent safe):
+    again = db.post("/api/runs", json={"id": run_id, "project_id": "proj-runs"})
+    assert again.json()["status"] == "exists"
+
+    commit = _make_commit("run-linked", metrics={"val_loss": 0.42})
+    commit["run_id"] = run_id
+    assert db.post("/api/commits", json=commit).status_code == 201
+
+    body = db.get(f"/api/runs/{run_id}").json()
+    assert commit["hash"] in body["commit_hashes"]
+    assert body["metrics_summary"].get("val_loss") == 0.42
+
+    done = db.post(f"/api/runs/{run_id}/complete", json={"metrics_summary": {"status_score": 1}})
+    assert done.status_code == 200
+    assert db.get(f"/api/runs/{run_id}").json()["status"] == "completed"
+
+    # Lazy-create: a push referencing an UNKNOWN run must succeed AND create it.
+    ghost = str(uuid.uuid4())
+    c2 = _make_commit("ghost-run", project_id="proj-lazy")
+    c2["run_id"] = ghost
+    assert db.post("/api/commits", json=c2).status_code == 201
+    lazy = db.get(f"/api/runs/{ghost}").json()
+    assert lazy["status"] == "created"  # never failed the push
+
+
+def test_webhook_delivery_is_signed_and_filtered(db, monkeypatch):
+    delivered = []
+
+    class FakeResp:
+        status_code = 200
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        delivered.append({"url": url, "body": data, "headers": headers})
+        return FakeResp()
+
+    import requests as requests_mod
+    monkeypatch.setattr(requests_mod, "post", fake_post)
+
+    created = db.post("/api/webhooks", json={
+        "url": "http://orchestrator.test/hook",
+        "secret": "whsec-123",
+        "project_id": "proj-hooked",
+        "kinds": ["commit"],
+    })
+    wid = created.json()["id"]
+
+    commit = _make_commit("hooked", project_id="proj-hooked")
+    db.post("/api/commits", json=commit)
+    # give the fire-and-forget task a beat:
+    for _ in range(40):
+        if delivered:
+            break
+        time.sleep(0.05)
+    assert delivered, "webhook did not fire for matching commit event"
+    import hashlib
+    import hmac as hmac_mod
+    expected_sig = hmac_mod.new(b"whsec-123", delivered[0]["body"], hashlib.sha256).hexdigest()
+    assert delivered[0]["headers"]["X-AV-Signature"] == expected_sig
+
+    # Non-matching project/kind must NOT deliver:
+    before = len(delivered)
+    other = _make_commit("unhooked", project_id="proj-other")
+    db.post("/api/commits", json=other)
+    for _ in range(20):
+        if len(delivered) > before:
+            break
+        time.sleep(0.05)
+    assert len(delivered) == before, "webhook fired for a non-matching project"
+
+    listing = db.get("/api/webhooks").json()
+    row = next(w for w in listing["webhooks"] if w["id"] == wid)
+    assert not row["secret"].startswith("whsec-123"), "full secret must never be returned"
+    assert row["secret"].endswith("\u2026")
+
+
+def test_audit_log_records_mutations(db):
+    commit = _make_commit("audited")
+    db.post("/api/commits", json=commit)
+    db.put("/api/refs/proj/main", json={"commit_hash": commit["hash"]})
+    rows = db.get("/api/admin/audit?limit=20").json()["entries"]
+    actions = {r["action"] for r in rows}
+    assert "commit.push" in actions
+    assert "ref.update" in actions
+    assert rows[0]["ts"] >= rows[-1]["ts"]  # ordered

@@ -78,6 +78,10 @@ def bucket_class_for(path: str) -> str | None:
         return None
     if path == _GC_PREFIX or path.startswith(_GC_PREFIX + "/"):
         return "gc"
+    if path.startswith("/api/events") or path.startswith("/api/webhooks"):
+        # Agent polling/delivery surface — opt-in cap like the data plane (bulk
+        # orchestrators legitimately long-poll), never accidentally limited.
+        return "events"
     return "default"
 
 
@@ -127,6 +131,9 @@ def build_limiter_from_env(env: dict[str, str] | None = None) -> WindowRateLimit
     return WindowRateLimiter(
         limits={
             "gc": parse_limit(env.get("AV_RATE_LIMIT_GC", "10/minute")),
+            # Agent event/webhook surface: unlimited by default (long-poll loops are
+            # legitimate), opt-in cap via AV_RATE_LIMIT_EVENTS.
+            "events": parse_limit(env.get("AV_RATE_LIMIT_EVENTS", "")),
             "default": parse_limit(env.get("AV_RATE_LIMIT_DEFAULT", "")),
         }
     )

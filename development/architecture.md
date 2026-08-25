@@ -350,6 +350,51 @@ Semver and deprecation policy live in [`../VERSIONING.md`](../VERSIONING.md): MA
 
 **Resolved:** wheels shipped cp310–cp314 since Phase 46 (cibuildwheel matrix), matching the dev environment's Python 3.14.
 
+## Runs Contract (v1.2.0)
+
+A Run is the first-class grouping for one training effort. Storage: `runs` +
+`run_commits` (migration `0002`). Creation is idempotent by client-generated UUID;
+pushes referencing an UNKNOWN run lazily create it in `created` state — ordering between
+agents never fails a push. `metrics_summary` keeps the latest value per metric, refreshed
+on every linked commit. Client surface: `av run start/finish/list/show`, `AV_RUN_ID`,
+SDK `repo.runs`. Commits auto-tag `run:<id>` (tags remain part of the hashed payload).
+
+## Events & Webhooks Contract (v1.2.0)
+
+`events` is append-only; the autoincrement id IS the resumable cursor
+(`GET /api/events?since=<id>&project_id=&kinds=&wait=<secs>`, ascending, bounded limit).
+Kinds today: commit · ref · run · gc · webhook_test. Webhooks POST the raw JSON body with
+`X-AV-Event-Id/-Kind/X-AV-Signature: hex(hmac-sha256(secret, body))`; secrets live in the
+registry (signing requirement) and are never returned (masked listings only). Delivery is
+at-most-one-attempt per event — subscribers reconcile via the cursor. Zero active hooks ⇒
+zero background work. Retention: `AV_EVENT_RETENTION_DAYS` (default 30) swept during GC,
+plus manual `DELETE /api/events?before_days=N`.
+
+## Semantic Diff Contract (v1.2.0)
+
+`python/av_cli/semdiff.py::diff_trees(old_tree, new_tree)` is pure: added/removed/changed,
+per-model layer movement (count/pct/largest movers), chunk reuse ratio across CDC-chunked
+files, dataset classification (extension+name heuristics), byte totals, and a one-sentence
+human summary. Consumers: `av diff`, `.avh.semantic_summary`, WebUI expanded commits.
+The dict shape is additive-only by policy.
+
+## .avh v2 — Agent Context Memory Contract (v1.2.0)
+
+`handoff.avh` carries `$schema` + `avh_version:"2.0"`, legacy v1 keys (never removed),
+and: `lineage{run_id,parent_run_ids,code_pointer{git_remote,git_sha,dirty}}`,
+`semantic_summary`, `replay{pins,seeds,cuda,commands}`, and
+`context_memory{notes[],metrics_history_tail[]}` — notes are APPEND-ONLY in
+`.av/context/memory.jsonl` (`av context note`) and survive every regeneration.
+Readers must tolerate unknown sections; writers must run `validate_handoff()` in CI paths.
+
+## Promotion Policy Contract (v1.2.0)
+
+Policies live in `.av/policies.json`: `{branch: {metric, op∈{<,<=,>,>=},
+baseline_ref|threshold}}`. Enforcement points: `av merge` (current branch armed → deny,
+exit 16, unless --force) and `av promote CANDIDATE --into BRANCH` (authoritative eval —
+merge-side check intentionally bypassed there to avoid comparing the baseline against
+itself). Enforcement is CLIENT-SIDE v1; server-side authz is enterprise-tier.
+
 ## Testing And Verification Map
 
 | Surface | Test file(s) | Notes |

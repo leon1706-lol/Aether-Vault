@@ -33,6 +33,8 @@ npx playwright test      # E2E against a seeded live stack (docker compose up)
   one-time `?av_token=` URL; any other entry point shows the `TokenGate` prompt once.
   Per-user tokens work identically — any valid credential issued by `av auth add-user`
   passes the same gate.
+- Runs tab (v1.2.0): lists registry runs with status colors, metric summaries, and a
+  live activity badge fed by /api/events polling; see RunsPanel.tsx + api.ts fetchRuns.
 - Merge visualization: the commit graph draws one edge per parent from the server's
   reconstructed `parents` array (first-parent lane inheritance), so merge commits fork
   on screen; payloads without `parents` fall back to `parent_hash`. Covered by

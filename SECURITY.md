@@ -55,3 +55,9 @@ individually; keep Postgres/Redis off the host network (the release compose file
 omits their port mappings), keep the default CORS lock and GC rate limit in place (widen
 `AV_CORS_ORIGINS` only for deployments that actually need it), and put TLS termination
 in front of uvicorn for any non-localhost use.
+
+v1.2.0 trust surfaces: the audit trail (udit_log, on by default, disable with
+AV_AUDIT_LOG=0) records who performed each mutation; webhook signing secrets are stored
+registry-side because deliveries must be signed — treat registry compromise as secret
+compromise for subscribers; commit attestations are HMAC-based integrity-v0 (tamper
+evidence vs. key-holders only), asymmetric signing is enterprise-tier.

@@ -83,9 +83,18 @@ AV_RATE_LIMIT_GC  10/minute   (default)
 AV_RATE_LIMIT_DEFAULT  (empty = data plane unlimited)
                 Opt-in cap for every other /api route; bulk uploads burst by design.
 AV_GC_GRACE_SECONDS  3600   (default)
-                Shrink for drills/E2E; 0 makes freshly uploaded orphans sweepable.
+               Shrink for drills/E2E; 0 makes freshly uploaded orphans sweepable.
+AV_EVENT_RETENTION_DAYS  30   (default)
+               Event-stream retention; swept during GC and via DELETE /api/events.
+AV_RATE_LIMIT_EVENTS  (empty = unlimited)
+               Opt-in cap for the agent event/webhook surface (long-poll loops).
+AV_COMMIT_UPLOAD  1   (default)
+               =0 → every commit defers upload (queue drains via av push).
+AV_AUDIT_LOG  1   (default)
+               =0 disables the audit trail inserts.
 AV_REMOTE_URL  (CLI-side) default registry for av clone; else http://localhost:8000.
 AV_AUTHOR      (CLI-side) commit author string; defaults to "anonymous".
+AV_RUN_ID      (CLI-side) file subsequent commits under this run.
 ```
 
 **Caution:** `AV_DATA_DIR`'s `/data` default is container-oriented. Bare-metal uvicorn MUST point it at a writable directory, or every object upload fails with PermissionError while `/api/health` stays green — the most misleading failure mode in the project. This exact failure broke CI `webui-e2e` once: uploads 500ed, seed pushes queued offline, the dashboard rendered empty, Playwright failed on element-not-found. Documented in [CHANGELOG.md](CHANGELOG.md); the fix lives as explicit env vars on both uvicorn-starting CI jobs.
@@ -191,7 +200,7 @@ Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` fl
 
 The schema is owned by Alembic (`python/av_server/migrations/`); `create_all` is gone. Server startup runs the chain programmatically (`python/av_server/database.py::init_db`) — no alembic.ini, no manual step:
 
-1. Fresh database → migration `0001_baseline` creates every table exactly as `models.py` defines them (including `commits.extra_parents`, `trees.chunks`), then records itself in `alembic_version`.
+1. Fresh database → migrations `0001_baseline` + `0002_runs_events_webhooks_audit` create every table exactly as `models.py` defines them (including `commits.extra_parents`, `trees.chunks`, and the v1.2.0 runs/events/webhooks/audit tables), then record the head in `alembic_version`.
 2. Unrecorded schema (a pre-Alembic create_all volume, or any database whose version rows were lost while the tables stayed) → startup heals known column drift in place and stamps the chain applied. Zero-touch; only future revisions ever execute on it. Replaying into existing tables would crash startup with DuplicateTableError — that's what adoption detection exists to prevent (see [Probleme.md](Probleme.md) #70/#73).
 
 Authoring a new migration:

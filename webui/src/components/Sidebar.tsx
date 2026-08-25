@@ -77,6 +77,18 @@ const navItems: NavItem[] = [
     ),
   },
   {
+    id: "runs",
+    label: "Runs",
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="6" cy="6" r="3" />
+        <circle cx="18" cy="18" r="3" />
+        <path d="M9 6h6a3 3 0 013 3v5" />
+        <path d="M15 18H9a3 3 0 01-3-3v-5" />
+      </svg>
+    ),
+  },
+  {
     id: "projects",
     label: "Projects",
     icon: (
