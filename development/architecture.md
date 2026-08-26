@@ -1,10 +1,6 @@
 # Aether-Vault Architecture
 
-Status: current as of v1.2.2 on `master`
-
-Focus: contributor-facing subsystem contracts — what each piece guarantees, the exact files and functions involved, and what remains open
-
-**How to read this document**: later sections build on earlier ones. The Objective frames what Aether-Vault is, System Flow and Tech Stack give the end-to-end picture, and every subsystem after the Module Map gets its own contract section stating what it does, the exact files and functions involved, and what is open — stated plainly rather than implied. When this document and the code disagree, the code wins and this file owes a patch. Operational tasks — starting the stack, running tests, inspecting the database, cutting releases — live in the sibling [infrastructure.md](infrastructure.md); build history lives in [CHANGELOG.md](CHANGELOG.md).
+Describes the system as it exists today — what each subsystem guarantees, the exact files and functions involved, and what remains open. When this document and the code disagree, the code wins and this file owes a patch. Operational tasks live in [infrastructure.md](infrastructure.md); build history lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## Objective
 
@@ -141,7 +137,7 @@ Directory staging via `av add .` skips anything matching `.avignore` (gitignore-
 | Split/chunk raises | Logged warning, whole-file fallback |
 | Native core unavailable | Whole-file fallback for thresholded artifacts too — staging never hard-fails on a missing extension |
 
-**Follow-up:** benchmark #4 shows no-op `av status`/`av add` around 15x slower than Git LFS — interpreter startup and import cost dominate. Open finding, documented in `development/BENCHMARKS.md`, not hidden.
+**Stop:** benchmark #4 shows no-op `av status`/`av add` around 15x slower than Git LFS — interpreter startup and import cost dominate. Open finding, documented in `development/BENCHMARKS.md`, not hidden.
 
 ## Commit Contract
 
@@ -199,7 +195,7 @@ Divergence is not an error state — it is a handoff. The fetched commits stay o
 
 Both commands refuse to run over a dirty working tree, guarded by `python/av_cli/core.py::_collect_dirty_paths()`, unless `--force` is passed; `av stash` is the non-destructive alternative.
 
-**Caution:** pull walks `parents[0]` for chain-following after normalization reconstructs the full parents array — first-parent traversal. This is sufficient for fast-forward detection today but is worth revisiting if criss-cross merge topologies become common.
+**Stop:** pull walks `parents[0]` for chain-following after normalization reconstructs the full parents array — first-parent traversal. Sufficient for fast-forward detection today but worth revisiting if criss-cross merge topologies become common.
 
 ## Merge Contract
 

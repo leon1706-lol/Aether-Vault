@@ -1,22 +1,18 @@
-# `python/` — All Aether-Vault Python Packages
+# python
 
-Three installable packages built from this directory (see `../setup.py`): the **CLI**
-(`av_cli`), the **registry server** (`av_server`), and the optional **framework plugins**
-(`av_plugins`). See the [main README](../README.md) for the project overview.
+Owns every installable Aether-Vault Python package built from this directory by
+`setup.py`: the **CLI** (`av_cli`), the FastAPI registry server (`av_server`), and the
+optional framework plugins (`av_plugins`). All three import flat (`import av_cli`) via
+`package_dir`, while tests import them as `python.av_cli.*` from a checkout - that
+split is why `[tool.pytest.ini_options] pythonpath = ["."]` exists in `pyproject.toml`.
 
-## Contents
+- `av_cli/` - the `av` command line interface plus ALL client-side logic: local DAG,
+  CAS, staging, sync/clone/pull, merge, chunking, signing, doctor. See `av_cli/README.md`.
+- `av_server/` - the Dockerized content-addressable registry backed by PostgreSQL
+  (Merkle DAG) + RedisBloom. See `av_server/README.md`.
+- `av_plugins/` - optional Lightning / Transformers / MLflow auto-commit callbacks.
+  See `av_plugins/README.md`.
 
-| Package | Purpose | Details |
-|---|---|---|
-| [`av_cli/`](av_cli/README.md) | The `av` command line interface + all client-side logic (DAG, CAS, sync, merge, chunking) | ~20 modules |
-| [`av_server/`](av_server/README.md) | FastAPI Content-Addressable Storage registry backed by PostgreSQL + RedisBloom | 6 modules |
-| [`av_plugins/`](av_plugins/README.md) | Optional PyTorch Lightning / HuggingFace Transformers / MLflow auto-commit callbacks | 5 modules |
-
-## Layout notes
-
-- Packages live under `python/` but import flat (`import av_cli`), wired via `setup.py`'s
-  `package_dir`. Tests, however, import them as `python.av_cli.*` from a repo checkout —
-  that's why `[tool.pytest.ini_options] pythonpath = ["."]` exists in `pyproject.toml`.
-- New CLI features should put their logic in a dedicated module here (`history.py`,
-  `sync.py`, `merge.py`, `attributes.py` are the v1.1.1 additions) and keep the Click
-  wrapper in `main.py` thin.
+New CLI features put their logic in a dedicated module (`history.py`, `sync.py`,
+`merge.py`, `attributes.py`, `signing.py` are prior art) and keep the Click wrapper in
+`main.py` thin - see `av_cli/README.md` for the invariants that enforce it.

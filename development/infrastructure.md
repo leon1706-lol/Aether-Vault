@@ -20,7 +20,7 @@ One lap through the running stack, so every later command has context:
 4. Postgres persists Merkle trees, project-scoped refs, and metrics; RedisBloom caches object existence; shards land on the `vault_data` volume.
 5. Dashboards, `av clone`, and `av pull` read all of it back through `/api/*`.
 
-## Start
+## Starting the stack
 
 Start Postgres + Redis first; the engine brings registry AND dashboard up together:
 
