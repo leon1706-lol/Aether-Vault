@@ -39,6 +39,20 @@ export function TokenGate({ children }: Props) {
     }
   }
 
+  // Strip safety-net AFTER hydration: Next.js patches window.history.replaceState to
+  // integrate with the App Router, and a replaceState issued BEFORE hydration finished
+  // can be overridden when hydration completes — restoring the entry URL with the
+  // ?av_token= param still in the address bar (token itself already persisted, so only
+  // the cosmetic strip was lost; caught by webui-e2e's token-gate spec). Re-running the
+  // strip post-mount is idempotent and costs nothing when the render-phase pass won.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.has("av_token")) {
+      url.searchParams.delete("av_token");
+      window.history.replaceState({}, "", url.toString());
+    }
+  }, []);
+
   useEffect(() => {
     setUnauthorizedHandler(() => {
       setError(null);

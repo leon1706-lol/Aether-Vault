@@ -1021,3 +1021,18 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** Both writers (`cmd_env.snapshot`, `core.upload_commit_objects`) now materialize the CAS object from the canonical bytes; the pretty file stays local-only for humans.
 
 **Verification:** Manual wire pass: snapshot id visible in server access log as 201, `av replay <commit>` inside a fresh clone renders the recipe; v122/v120 suites green.
+
+
+---
+
+---
+
+### 85. TokenGate URL-strip could be overridden by Next.js patched history - Protected-mode handoff left ?av_token= in the address bar
+
+**Severity:** 3/10 - **Status:** fixed (2026-08-26)
+
+**Problem:** webui-e2e's token-gate spec failed: the handoff token was correctly consumed and persisted (first fetch wave authenticated), but the render-phase `window.history.replaceState` strip did not stick - Next.js patches history methods for App Router integration and can restore the ENTRY URL when hydration completes after a pre-hydration replaceState. Result: `?av_token=...` lingered in the address bar/history (cosmetic, but exactly what the spec exists to prevent).
+
+**Fix:** post-mount effect in TokenGate re-strips the param (idempotent no-op when the render-phase pass won). The CONSUME stays render-phase - that part is load-bearing for first-fetch authentication (Probleme #79).
+
+**Verification:** new Vitest test simulates the override (first replaceState restores the entry URL) and asserts the URL is clean after effects run; existing TokenGate suite unchanged-green. Browser-level confirmation lands with CI's own token-gate spec on the next push.

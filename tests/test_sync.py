@@ -215,6 +215,8 @@ def test_normalize_commit_row_carries_signature_and_env_id():
 def test_clone_preserves_signature_for_offline_verify(fake_registry, tmp_path, monkeypatch):
     """The whole point of persisting signatures server-side: a clone on a FRESH machine
     (no .av/keys of its own) can still verify the author's commit — offline."""
+    pytest.importorskip("cryptography")  # keygen below needs the [sign] extra
+
     import base64
 
     from python.av_cli.signing import generate_keypair, verify_signature
