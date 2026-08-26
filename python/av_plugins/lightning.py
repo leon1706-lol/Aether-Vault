@@ -6,7 +6,7 @@ Usage:
 """
 from pathlib import Path
 
-from ._shared import build_metric_args, commit_scoped, filter_existing_files, resolve_repo_root, run_av
+from ._shared import commit_scoped, filter_existing_files, resolve_repo_root, run_av
 
 try:
     from lightning.pytorch.callbacks import Callback
@@ -61,10 +61,10 @@ class AetherVaultCallback(Callback):
         if not self.dataset_paths:
             return
         repo_root = resolve_repo_root(Path(self.dataset_paths[0]).parent)
-        commit_args = ["commit", "-m", f"datasets for {self.tag or 'run'}", "--tag", "dataset"]
         # Scoped: a dataset commit must not sweep unrelated staged files into the tree
-        # (Probleme.md #38).
-        commit_scoped(repo_root, list(self.dataset_paths), commit_args)
+        # (Probleme.md #38). Drives the internal seam directly (v1.2.2) — no CLI hop.
+        commit_scoped(repo_root, list(self.dataset_paths),
+                      f"datasets for {self.tag or 'run'}", tags=("dataset",))
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint) -> None:
         paths = self._resolve_checkpoint_paths(trainer)
@@ -77,11 +77,10 @@ class AetherVaultCallback(Callback):
             k: v.item() if hasattr(v, "item") else v
             for k, v in trainer.callback_metrics.items()
         }
-        message = f"epoch={trainer.current_epoch} step={trainer.global_step}"
-        commit_args = ["commit", "-m", message, *build_metric_args(metrics)]
-        if self.tag:
-            commit_args.extend(["--tag", self.tag])
-        commit_scoped(repo_root, paths, commit_args)
+        tags = (self.tag,) if self.tag else ()
+        commit_scoped(repo_root, paths,
+                      f"epoch={trainer.current_epoch} step={trainer.global_step}",
+                      tags=tags, metrics=metrics)
 
     def on_train_end(self, trainer, pl_module) -> None:
         paths = self._resolve_checkpoint_paths(trainer)
@@ -116,14 +115,9 @@ def import_checkpoint(
         except Exception:
             metrics = {}
 
-    commit_args = [
-        "commit",
-        "-m",
-        f"Imported Lightning checkpoint {Path(checkpoint_path).name}",
-        "--tag",
-        "lightning-import",
-        *build_metric_args(metrics),
-    ]
+    tags = ("lightning-import",)
     if tag:
-        commit_args.extend(["--tag", tag])
-    commit_scoped(resolved_root, [checkpoint_path], commit_args)
+        tags += (tag,)
+    commit_scoped(resolved_root, [checkpoint_path],
+                  f"Imported Lightning checkpoint {Path(checkpoint_path).name}",
+                  tags=tags, metrics=metrics)

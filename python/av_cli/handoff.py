@@ -67,6 +67,24 @@ def _context_notes(repo_root: Path) -> list[dict]:
     return notes
 
 
+def _commit_parent(commit: dict | None) -> str | None:
+    """First parent of a commit dict, tolerating BOTH storage shapes.
+
+    Locally-authored commits store a `parents` LIST (see core._finalize_commit); commits
+    fetched from the registry (sync.normalize_commit_row) carry `parent_hash` instead.
+    handoff used to read ONLY `parent_hash`, so for local commits — i.e. every repo's
+    normal case — the semantic summary compared against an EMPTY baseline and
+    metrics_history_tail stopped after one hop (found by the v1.2.2 flow-through test).
+    """
+    if not commit:
+        return None
+    direct = commit.get("parent_hash")
+    if direct:
+        return direct
+    parents = commit.get("parents")
+    return parents[0] if isinstance(parents, list) and parents else None
+
+
 def _metrics_history_tail(repo_root: Path, limit: int = 10) -> list[dict]:
     """Last `limit` commits' key metrics, newest first — trend without API calls."""
     branch, head_hash = resolve_head(repo_root)
@@ -86,7 +104,7 @@ def _metrics_history_tail(repo_root: Path, limit: int = 10) -> list[dict]:
                 "run_id": next((t.split(":", 1)[1] for t in commit.get("tags", [])
                                 if t.startswith("run:")), None),
             })
-        cur = commit.get("parent_hash")
+        cur = _commit_parent(commit)
     return out
 
 
@@ -96,7 +114,7 @@ def build_semantic_summary(repo_root: Path, current_commit: dict | None) -> dict
 
     if not current_commit:
         return None
-    parent_hash = current_commit.get("parent_hash")
+    parent_hash = _commit_parent(current_commit)
     parent = load_commit(repo_root, parent_hash) if parent_hash else None
     sd = diff_trees((parent or {}).get("tree"), current_commit.get("tree"))
     sd["summary"] = human_summary(sd)
@@ -174,6 +192,16 @@ def build_handoff_dict(repo_root: Path, agent_instructions: str | None) -> dict:
             replay = json.loads(env_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             replay = None
+        if isinstance(replay, dict):
+            # v1.2.2 env snapshot/replay: the canonical content id rides .avh.replay so
+            # an agent can fetch the exact snapshot object from any registry clone
+            # (`av replay <snapshot-id>` / GET /api/objects/<id>).
+            from .core import env_snapshot_id
+
+            try:
+                replay["snapshot_id"] = env_snapshot_id(replay)
+            except TypeError:
+                pass
 
     return {
         "$schema": AVH_SCHEMA_ID,

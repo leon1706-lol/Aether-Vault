@@ -1,22 +1,35 @@
+# ============================================================================
+# Dev compose (v1.2.2 engine topology): ONE image, ONE container running ALL
+# subservices — FastAPI registry on :8000 AND the Next.js webui on :3000,
+# supervised by docker/engine-entrypoint.sh inside aether-vault-engine.
+#
+# The release twin at python/av_cli/docker/docker-compose.release.yml mirrors
+# this shape but pulls published GHCR images instead of building, and does NOT
+# map 5432/6379 to the host (this dev file does, purely so
+# tests/test_server.py can reach Postgres/Redis directly from localhost).
+# ============================================================================
 services:
-  aether-vault-server:
+  aether-vault-engine:
     build: .
-    container_name: aether-vault-server
+    container_name: aether-vault-engine
     ports:
       - '8000:8000'
+      - '3000:3000'
     volumes:
       - vault_data:/data
     environment:
       - AV_DATA_DIR=/data
+      # Explicit role: with DATABASE_URL also set here, the legacy auto-detect
+      # would otherwise pick "server"-only — pin "all" for the one-container mode.
+      - AV_ENGINE_ROLE=all
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=production
+      - WEBUI_PORT=3000
       - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db:5432/aether_vault
       - REDIS_URL=redis://redis:6379/0
       # Optional shared-secret gate ("Protected" mode) — empty/unset means every route behaves
       # exactly as before ("Anonymous"). Set via `av auth set-token`, which writes this to a
-      # .env file next to this compose file and restarts this service to pick it up. Postgres/
-      # Redis ports stay mapped to the host in *this* dev compose file specifically so
-      # tests/test_server.py's direct localhost:5432/6379 connections keep working — see
-      # docker-compose.release.yml (the one real end users run) for the hardened version of
-      # this same stack, which removes those mappings.
+      # .env file next to this compose file and restarts this service to pick it up.
       - AV_API_TOKEN=${AV_API_TOKEN:-}
       # Optional per-user token map ({"username": "token", ...} JSON) managed by
       # `av auth add-user/list-users/remove-user` via the same .env + restart plumbing.
@@ -27,34 +40,14 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    # Both runtimes exist in-engine (python + node), so both health legs are
+    # checked without adding any package: python-urllib for :8000, node fetch :3000.
     healthcheck:
-      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8000/api/health").read()']
+      test: ['CMD-SHELL', 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/health\").read()" && node -e "fetch(\"http://localhost:3000/\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
       interval: 10s
       timeout: 15s
       retries: 5
       start_period: 40s
-
-  # ── Web UI Dashboard ──────────────────────────────────────────────────────
-  aether-vault-webui:
-    build:
-      context: ./webui
-      args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
-    container_name: aether-vault-webui
-    ports:
-      - '3000:3000'
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
-      - NODE_ENV=production
-    depends_on:
-      aether-vault-server:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ['CMD-SHELL', 'wget -qO- http://localhost:3000/ || exit 1']
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
   db:
     image: postgres:15-alpine

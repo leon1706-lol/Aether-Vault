@@ -1,6 +1,6 @@
 """Unit tests for the skip-summary aggregation (tests/skipsummary.py).
 
-The classification/formatting pair is what every `pytest` run's tail now prints — these
+The classification/formatting pair is what every `pytest` run's tail now prints â€” these
 tests pin the bucketing against the exact reason strings the suite actually produces
 (see the skip census in tests/test_server.py's header and the importorskip sites).
 """
@@ -17,8 +17,8 @@ def _report(reason: str):
 
 def test_classify_docker_stack_variants():
     assert classify_skip(
-        "Live aether-vault-server not reachable on :8000; run "
-        "`docker compose up -d db redis aether-vault-server`"
+        "live aether-vault-engine not reachable on :8000; run "
+        "`docker compose up -d db redis aether-vault-engine`"
     ) == "docker-stack"
     assert classify_skip(
         "Postgres/Redis test services not reachable "
@@ -65,7 +65,7 @@ def test_format_note_full_block_matches_approved_shape():
     assert "- Skipped by design" in note
     assert "36 skipped:" in note
     assert "33 tests need the Docker registry stack (db/redis/server unreachable)" in note
-    assert "start it with: docker compose up -d db redis aether-vault-server" in note
+    assert "start it with: docker compose up -d db redis aether-vault-engine" in note
     assert "1 optional-dependency guard (native C++ core not built here)" in note
     assert "2 optional-dependency guards (plugin extras)" in note
     # docker hint sits directly under its own line, before the other buckets

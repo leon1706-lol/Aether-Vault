@@ -1258,3 +1258,75 @@ findings (resolved and still-open).
 - **Deferred A-items closed:** README For-Agents body section (broken TOC anchor fixed) · `av context diff` · `av registry restore` (hash-verified re-ingest, idempotent 409s) · `av webhooks add/list/remove/test` CLI · `.avh` v2 JSON-Schema artifact shipped as package data (+ `--with-memory/--no-memory`) · plugins' scoped commits already ride the internal seam; run path documented as deliberate · WebUI runs detail deferred to design pass (list view shipped) · `replay --execute` + seeds capture.
 - **Hardening:** av_sdk.Repo REWRITTEN onto the internal seam — calls Index/compute_status/stage_one_file/commit_staged/flush_pending_push/semdiff directly; no chdir, no stdout capture; relative paths resolve against the repo (caught by e2e Phase F); envelope shapes unchanged so parity tests pass as-is · speedcheck hot-path gate (3× budget) wired into the battery · live test: interleaved same-run pushes from two agents link both commits and union the metrics summary.
 - **Verification:** stack-free battery 427 passed / 0 failed · live suite 110 passed / 0 failed vs embedded PG · e2e scenario 8/8 phases PASS locally after SDK seam change · eslint/tsc/vitest clean · checker clean (31 files).
+
+
+## Phase 56 — V1.2.2: Engine image consolidation + architectural gap closure
+
+- **Files:** root `Dockerfile`, `docker/engine-entrypoint.sh` (new), `docker-compose.yml`,
+  `python/av_cli/docker/docker-compose.release.yml`, `.github/workflows/{tests,release,docker-edge}.yml`,
+  `python/av_cli/{core,signing,cmd_env,cmd_run,cmd_audit,cmd_registry,cmd_auth,docker_runtime,sync,semdiff,speedcheck,handoff,main}.py` (several new),
+  `python/av_server/{models,server,database}.py` + migration `0003_webhook_deliveries_audit_signature.py`,
+  `python/av_plugins/{_shared,lightning,transformers,mlflow}.py`, `pyproject.toml`,
+  `webui/src/lib/{api,runDetail}.ts` + `RunsPanel.tsx`, tests (`test_signing`, `test_dataset_cdc`,
+  `test_v122` new; plugin/sync/server/migrations/semdiff/speedcheck/perf-gate/docker-runtime/skip-summary suites updated),
+  `scripts/e2e_scenario.sh` (+Phases J/K), docs (README, architecture, infrastructure,
+  VERSIONING, SECURITY, sub-READMEs, Probleme #78–84, this file).
+- **Part 1 — ONE image, ONE container (owner decision):** the split server/webui images
+  collapse into a single multi-stage build producing `ghcr.io/leon1706-lol/aether-vault-engine`
+  (py-builder wheel stage unchanged → Node 20 web-builder producing Next standalone output →
+  python:3.12-slim runtime with BOTH runtimes). `docker/engine-entrypoint.sh` supervises all
+  subservices in one container: uvicorn :8000 + node server.js :3000 under `AV_ENGINE_ROLE=all`
+  (default); either child dying restarts the whole engine. LEGACY ALIASES kept for one
+  transition cycle (owner decision): release/edge workflows also push the same image under
+  the historical aether-vault-server/-webui tags, and the entrypoint AUTO-DETECTS legacy
+  role from container env (DATABASE_URL set → server-only; NEXT_PUBLIC_API_URL without it →
+  webui-only) so pinned pre-1.2.2 composes keep working unchanged. Compose files become
+  single-service (`aether-vault-engine`, ports 8000+3000) with a dual healthcheck
+  (python-urllib :8000 && node fetch :3000 — both runtimes ship in-engine).
+  `docker_runtime.RELEASE_IMAGES` and the auth-restart plumbing point at the engine.
+- **Gap 1 — env snapshot/replay:** snapshots are content-addressed (sha256 of canonical
+  compact JSON minus captured_at ⇒ deterministic ids); the object rides the NORMAL push flow
+  (`upload_commit_objects`), commits carry `env_snapshot_id` in the hashed payload, the id is
+  persisted server-side AND back-fills `runs.env_snapshot_id` on first linked commit;
+  `.avh.replay.snapshot_id` added. `av env replay <run-id|commit-hash|snapshot-id>` (top-level
+  `av replay` alias) loads from local CAS or registry — cross-machine replay proven over real wire.
+- **Gap 2 — dataset CDC visibility:** boundary-stability + determinism + staging-path +
+  `.avattributes` no-chunk matrix parametrized across ALL of CHUNKABLE_EXTS
+  (.pt/.pth/.ckpt/.npz/.h5/.hdf5/.pb/.msgpack); semdiff gained `chunks.dedup_efficiency`
+  (= reused/(reused+new), None when no chunks) flowing into `.avh.semantic_summary`.
+- **Gap 3 — audit depth:** every mutation records its HTTP outcome (`audit_log.status_code`);
+  `GET /api/admin/audit` gained action/project/since/until filters + offset pagination + total;
+  `DELETE /api/admin/audit?before_days=N` prune; `AV_AUDIT_RETENTION_DAYS` (default 90) swept
+  during GC; CLI `av audit list [--action --project --since --until --limit --offset]`.
+- **Gap 4 — signed commits:** `[sign]` extra (cryptography); `av registry keygen` → ed25519
+  keypair under .av/keys/ (private 0600); canonical form = sorted-keys payload JSON minus
+  signature with timezone-normalized timestamp; auto-sign inside `_finalize_commit` when a key
+  exists (best-effort, never blocks); signatures persist server-side so CLONES verify;
+  `av verify <hash>` = signature-first, legacy HMAC attest fallback, honest UNSIGNED verdict.
+  Trust model documented in SECURITY.md ("tamper evidence, not a trust network").
+- **Gap 5 — WebUI run detail:** expandable run rows → detail panel with parent-lineage chain,
+  linked commits w/ messages + metrics table, client-side semantic summary from the last two
+  linked commits' trees (`lib/runDetail.ts` pure functions, NO new server endpoint), env-snapshot
+  pointer; live activity badge stays wired into the panel header via the event cursor.
+- **Gap 6 — plugin seam migration:** scoped-commit logic moved into
+  `core.commit_scoped_paths()` (baseline-preserving per #38/#71, missing-path tolerant per #76,
+  AV_RUN_ID-aware); Lightning/Transformers/MLflow add+commit now call the internal seam directly —
+  zero chdir, zero CLI hop for staging/commit; push remains the deliberate CLI flush.
+  Parity tests pin identical commit payloads across seam/SDK/CLI incl. metrics + run tagging.
+- **Gap 7 — smaller items:** perf gate strictened 3×→2× and semdiff probe added to speedcheck;
+  migration 0003 adds `webhook_deliveries` (per-attempt ledger w/ retry/dead-letter columns),
+  startup+interval retry worker (`AV_WEBHOOK_MAX_ATTEMPTS`=5, `AV_WEBHOOK_RETRY_INTERVAL_SECS`=30),
+  `GET /api/admin/webhook-deliveries` observability, terminal deliveries swept during GC;
+  pull's divergence message now attributes both tips to their runs while keeping the remote-tip
+  hash first (e2e Phase A parsing intact).
+- **Real bugs found by this cycle's own verification (details in Probleme):** #78 fail(None)
+  traceback, #79 undefined ctx_exit, #80 adoption skipping post-create_all tables, #81 .avh
+  summary diffing against an empty baseline, #82 clones dropping signature/env_snapshot_id,
+  #83 timestamp tz-spelling breaking cloned signatures, #84 snapshot uploaded with non-canonical bytes.
+- **CI:** plugin job installs `[sign]` and runs the signing gate; NEW `e2e-engine-smoke` job =
+  e2e Phase I (builds the engine image, proves role=all / role=server / legacy auto-detect /
+  role=webui dispatch + dual healthchecks); packaging smoke jobs gain `av diff --help` +
+  `av registry --help` presence lines; e2e-suite installs `[sign]` and runs Phases J (signed
+  roundtrip + tamper + unsigned-ok) and K (live audit filters + outcome capture + CLI path).
+- **Deferred:** benchmark #5 measured row + full cross-tool re-run (needs a Docker session —
+  owner-acknowledged deferral, see infrastructure.md ops note).

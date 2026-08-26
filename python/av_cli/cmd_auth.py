@@ -38,10 +38,12 @@ def _restart_server_for_token_change(repo_root: Path) -> bool:
         )
         return False
     compose_file, _ = docker_runtime.resolve_compose_file(_root._find_source_root())
-    if not docker_runtime.restart_service(compose_file, "aether-vault-server"):
+    # v1.2.2 engine topology: one container (aether-vault-engine) runs the registry
+    # AND the webui; restarting it restarts both subservices together.
+    if not docker_runtime.restart_service(compose_file, "aether-vault-engine"):
         click.secho(
             "Saved, but restarting the server automatically failed — restart it manually "
-            "(`docker compose up -d aether-vault-server`) for the change to take effect.",
+            "(`docker compose up -d aether-vault-engine`) for the change to take effect.",
             fg="yellow",
         )
         return False

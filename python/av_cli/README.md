@@ -16,7 +16,9 @@ tooling. See [`../README.md`](../README.md) and the [main project README](../../
 | `index.py` | The staging index (`.av/index`): entries with hash/size/mtime/type/layers/chunks |
 | `client.py` | `VaultClient` — every registry HTTP call (objects, commits, refs, projects, batch existence checks) |
 | `pointer.py`, `fsutil.py`, `exceptions.py` | LFS pointer files, atomic-write helpers, error types |
-| `docker_runtime.py` | Local backend lifecycle: compose detection, start/rebuild/update of server+webui containers |
+| `docker_runtime.py` | Local backend lifecycle: compose detection, start/rebuild/update of the engine container (v1.2.2: one `aether-vault-engine` runs registry + webui) |
+| `signing.py` | v1.2.2 signed commits: ed25519 keypair under `.av/keys/`, canonical payload bytes, best-effort auto-sign, verify (requires `[sign]` extra only when used) |
+| `cmd_audit.py` | v1.2.2 `av audit list`: filterable read access to the registry's audit trail |
 | `update_check.py` | PyPI version check, opt-in silent auto-update |
 | `speedcheck.py` | Hot-path probes behind `av doctor --speed` / `av test --speed` |
 | `handoff.py`, `graph.py` | Agent handoff snapshots (`.avh`) and the Obsidian code-graph generator |

@@ -289,6 +289,46 @@ def update_registry(repo_root: Path, tags: list[str], metrics: dict) -> None:
 # Pending-push queue: commits made while the remote server was unreachable
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Env snapshot identity (v1.2.2 env snapshot/replay)
+# ---------------------------------------------------------------------------
+
+ENV_SNAPSHOT_RELPATH = ".av/env_snapshot.json"
+
+
+def env_snapshot_file(repo_root: Path) -> Path:
+    return repo_root / ".av" / "env_snapshot.json"
+
+
+def canonical_env_bytes(snap: dict) -> bytes:
+    """Canonical bytes of an env snapshot: sorted-keys JSON minus volatile fields.
+
+    `captured_at` is deliberately excluded — two captures of the same environment
+    MUST produce the same id (that's the determinism contract the replay tests pin),
+    so a timestamp can never leak into the hash."""
+    canon = {k: v for k, v in snap.items() if k not in ("captured_at",)}
+    return json.dumps(canon, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def env_snapshot_id(snap: dict) -> str:
+    """Content-addressed id of an env snapshot (sha256 over its canonical bytes)."""
+    return hashlib.sha256(canonical_env_bytes(snap)).hexdigest()
+
+
+def load_env_snapshot(repo_root: Path) -> tuple[str, dict] | None:
+    """(id, snapshot) from .av/env_snapshot.json, or None when absent/corrupt."""
+    path = env_snapshot_file(repo_root)
+    if not path.exists():
+        return None
+    try:
+        snap = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(snap, dict):
+            return None
+        return env_snapshot_id(snap), snap
+    except (OSError, ValueError):
+        return None
+
+
 def load_pending_push(repo_root: Path) -> list[dict]:
     """Load the queue of commits not yet pushed to the remote server."""
     path = repo_root / ".av" / "pending_push"
@@ -333,6 +373,10 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
     Uploads are batch-checked then sent in parallel (small thread pool — these are
     network-bound HTTP calls, not CPU work) rather than one HEAD+POST round trip per
     object in sequence: a 60-object commit was previously ~120 serial round trips.
+
+    v1.2.2 env snapshot/replay: when `.av/env_snapshot.json` exists it is ALSO uploaded
+    through this exact object flow under its canonical content hash, so `av replay
+    <run|commit>` can fetch the snapshot from any clone of the registry — no side channel.
     """
     candidates: dict[str, Path] = {}  # hash -> object file on disk, dedup'd
     for info in tree.values():
@@ -348,6 +392,26 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
             obj_file = repo_root / ".av" / "objects" / info["hash"][:2] / info["hash"][2:]
             if obj_file.exists():
                 candidates.setdefault(info["hash"], obj_file)
+
+    env_file = env_snapshot_file(repo_root)
+    if env_file.exists():
+        try:
+            snap = json.loads(env_file.read_text(encoding="utf-8"))
+            sid = env_snapshot_id(snap)
+            # The CAS object must contain EXACTLY the canonical bytes the id hashes —
+            # uploading the pretty-printed .av/env_snapshot.json instead makes the
+            # server reject it (sha256 mismatch → 400) and clones can never replay
+            # (found by the v1.2.2 manual wire pass).
+            obj_path = repo_root / ".av" / "objects" / sid[:2] / sid[2:]
+            if not obj_path.exists():
+                obj_path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(obj_path,
+                                  canonical_env_bytes(snap).decode("utf-8"))
+                # atomic_write_text adds nothing; but keep bytes exact:
+                obj_path.write_bytes(canonical_env_bytes(snap))
+            candidates.setdefault(sid, obj_path)
+        except (OSError, ValueError):
+            pass  # a corrupt snapshot never blocks a push
 
     if not candidates:
         return
@@ -815,6 +879,20 @@ def _finalize_commit(
     commit_hash = hashlib.sha256(commit_str.encode()).hexdigest()
     commit_data["hash"] = commit_hash
 
+    # --- v1.2.2 signed commits: auto-sign when an ed25519 key is configured ---
+    # The signature covers the canonical sorted-keys JSON of the payload INCLUDING the
+    # hash just computed, EXCLUDING the signature itself (see signing.py). Best-effort:
+    # no key configured → unsigned commit (always valid); [sign] extra missing → logged
+    # and skipped. Signing never blocks or fails a commit — tamper evidence, not a gate.
+    try:
+        from .signing import sign_payload
+
+        signature = sign_payload(commit_data, repo_root)
+        if signature:
+            commit_data["signature"] = signature
+    except Exception as exc:  # pragma: no cover - defensive; sign_payload swallows its own
+        logger.warning("commit signing skipped: %s", exc)
+
     # --- Persist locally ---
     atomic_write_json(repo_root / ".av" / "commits" / f"{commit_hash}.json", commit_data)
 
@@ -984,12 +1062,115 @@ def commit_staged(
             commit_data["tags"] = commit_data["tags"] + [tagged]
             tags = tuple(commit_data["tags"])
 
+    # v1.2.2 env snapshot/replay: when a snapshot exists, its content id rides the
+    # hashed payload (so `av replay <commit>` can find it) and the linked run back-fills
+    # env_snapshot_id server-side on first link. The snapshot OBJECT itself uploads via
+    # the normal object flow inside upload_commit_objects().
+    loaded_snapshot = load_env_snapshot(repo_root)
+    if loaded_snapshot:
+        commit_data["env_snapshot_id"] = loaded_snapshot[0]
+
     return _finalize_commit(
         repo_root, cfg, client,
         commit_data=commit_data, tree=tree, ref_path=ref_path, head_path=head_path,
         idx=idx, tags=tags, metrics=metrics or {},
         result_sink=result_sink, defer_upload=defer_upload,
     )
+
+
+def commit_scoped_paths(
+    repo_root: Path,
+    paths: list[str],
+    message: str,
+    tags: tuple = (),
+    metrics: dict | None = None,
+    run_id: str | None = None,
+) -> str | None:
+    """Stages exactly `paths` and commits ONLY them, leaving unrelated staged work alone.
+
+    THE shared machine-driven-commit seam (v1.2.2): framework plugins
+    (`av_plugins._shared.commit_scoped`) call this instead of chdir-ing and invoking
+    the CLI, and agent tooling can too — while plain `av commit` keeps full-snapshot
+    semantics through `commit_staged`. Both funnel into `_finalize_commit`, so there is
+    still exactly one commit writer.
+
+    Fixes Probleme.md #38: a naive commit sweeps unrelated staged files under a message
+    they never agreed to. Isolation WITHOUT destroying the change-detection baseline
+    (Probleme.md #71): staging runs against the untouched index so re-importing unchanged
+    content stays a "Nothing to commit" no-op, then the index is scoped to exactly what
+    THIS staging touched (new keys / changed content / staged transitions) before the
+    single-code-path commit, and everything else merges back in `finally` with its staged
+    flag untouched.
+
+    Missing paths are skipped silently (Lightning legitimately announces checkpoints
+    before writing them — Probleme.md #76); directory paths stage recursively via the
+    same iter_working_files rules `av add .` uses (`.avignore` honored).
+
+    Returns the new commit hash, or None when nothing changed (documented no-op).
+    """
+    import copy
+
+    from .attributes import flags_for, load_attributes
+
+    idx = Index(repo_root)
+    saved = copy.deepcopy(idx.entries)
+    baseline_keys = set(saved)
+    # Staged-before-this-call set: lets the scoping step tell "this staging staged it"
+    # apart from "the user had this staged long before" — both read staged=True after.
+    pre_staged = {rel for rel, entry in saved.items() if entry.get("staged")}
+
+    cfg = load_config(repo_root)
+    threshold_bytes = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
+    rules = load_attributes(repo_root)
+
+    if run_id is None:
+        # AV_RUN_ID / active-run state flow for free: machine commits join the ambient
+        # run exactly like CLI commits do.
+        from .cmd_run import current_run_id
+
+        run_id = current_run_id(repo_root)
+
+    try:
+        for raw_path in paths:
+            p = Path(raw_path)
+            if not p.is_absolute():
+                p = repo_root / p
+            p = p.resolve()
+            targets = list(iter_working_files(p)) if p.is_dir() else [p]
+            for fpath in targets:
+                if not fpath.exists():
+                    continue
+                rel = str(fpath.relative_to(repo_root)).replace(os.sep, "/")
+                if rel.endswith(".av-pointer"):
+                    continue
+                stage_one_file(repo_root, idx, threshold_bytes, fpath, rel,
+                               flags_for(rules, rel))
+
+        # Scope to exactly what THIS staging touched: brand-new keys, keys whose content
+        # changed under a known path (re-staged), and keys that transitioned into staged
+        # because of it. Unchanged re-imports touch nothing → scoped index stays empty →
+        # commit_staged returns None (the documented no-op).
+        idx.entries = {
+            rel_path: entry
+            for rel_path, entry in idx.entries.items()
+            if rel_path not in baseline_keys
+            or entry.get("hash") != saved[rel_path].get("hash")
+            or (entry.get("staged") and rel_path not in pre_staged)
+        }
+        idx.save()
+
+        return commit_staged(
+            repo_root, message, tags=tuple(tags), metrics=dict(metrics or {}),
+            run_id=run_id,
+        )
+    finally:
+        # Post-commit index: the scoped targets present with staged flags cleared by
+        # _finalize_commit; everything the user had before comes back unchanged.
+        fresh = Index(repo_root)
+        for rel_path, entry in saved.items():
+            if rel_path not in fresh.entries:
+                fresh.entries[rel_path] = entry
+        fresh.save()
 
 
 def _collect_dirty_paths(repo_root: Path, idx: Index) -> list[str]:
@@ -1167,4 +1348,9 @@ def fail(ctx, code: str, message: str, command: str | None = None):
         click.echo(json.dumps(json_envelope(cmd, error_code=code, error_message=message)))
     else:
         click.secho(f"Error: {message}", fg="red", err=True)
-    ctx.exit(exit_code)
+    # Many call sites pass ctx=None (they run outside a click context or before one is
+    # handy). Context.exit on None used to raise AttributeError AFTER the message printed,
+    # so users saw a Python traceback under every clean validation failure (Probleme.md).
+    if ctx is not None:
+        ctx.exit(exit_code)
+    raise SystemExit(exit_code)

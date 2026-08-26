@@ -47,11 +47,14 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Aether-Vault with the Lightning/Transformers/MLflow extras
-        run: pip install -e .[dev,lightning,transformers,mlflow]
+      - name: Install Aether-Vault with the Lightning/Transformers/MLflow/sign extras
+        # [sign] added in v1.2.2 so the signed-commit gate (tests/test_signing.py) runs
+        # here rather than skipping everywhere — this is the only job with the
+        # cryptography extra installed by default.
+        run: pip install -e .[dev,lightning,transformers,mlflow,sign]
 
-      - name: Run framework-plugin tests
-        run: pytest tests/test_plugins.py -v
+      - name: Run framework-plugin tests (+ signed-commit gate)
+        run: pytest tests/test_plugins.py tests/test_signing.py -v
 
   webui-tests:
     runs-on: ubuntu-latest
@@ -227,7 +230,8 @@ jobs:
           python-version: "3.10"
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
-        run: pip install -e .[dev]
+        # [sign] so e2e Phase J (signed roundtrip) runs; cryptography is a small wheel.
+        run: pip install -e .[dev,sign]
 
       - name: Run end-to-end scenario suite (real CLI ↔ real server)
         shell: bash
@@ -240,6 +244,93 @@ jobs:
           name: e2e-server-log
           path: /tmp/server-e2e.log
           if-no-files-found: ignore
+
+  # Phase I of the e2e layer (v1.2.2): the ENGINE IMAGE itself is a product surface now.
+  # Builds the consolidated image and proves all three dispatch modes from it:
+  # role=all (both subservices healthy in ONE container), role=server, role=webui —
+  # including the legacy auto-detect that keeps pre-1.2.2 pinned composes working
+  # against the aliased aether-vault-server/-webui tags.
+  e2e-engine-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the engine image
+        run: docker build -t aether-vault-engine:smoke .
+
+      - name: Role=all — one container, both subservices healthy
+        run: |
+          docker network create avnet >/dev/null
+          docker run -d --name pg --network avnet -e POSTGRES_USER=av_user \
+            -e POSTGRES_PASSWORD=av_password -e POSTGRES_DB=aether_vault \
+            --health-cmd "pg_isready -U av_user" postgres:15-alpine >/dev/null
+          for i in $(seq 1 30); do
+            docker exec pg pg_isready -U av_user >/dev/null 2>&1 && break; sleep 1; done
+          docker run -d --name engine-all --network avnet -p 8000:8000 -p 3000:3000 \
+            -e AV_ENGINE_ROLE=all \
+            -e DATABASE_URL=postgresql+asyncpg://av_user:av_password@pg:5432/aether_vault \
+            -e REDIS_URL=redis://this-host-is-intentionally-absent:6379/0 \
+            aether-vault-engine:smoke >/dev/null
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/api/health >/dev/null 2>&1 \
+               && curl -sf http://localhost:3000/ >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          [[ "$ok" == 1 ]] || { docker logs engine-all >&2 || true; exit 1; }
+          echo "::notice::role=all: registry :8000 AND webui :3000 healthy in one container"
+
+      - name: Role=server + legacy auto-detect dispatch
+        run: |
+          docker stop engine-all >/dev/null
+          # Explicit role:
+          docker run -d --name engine-srv --network avnet -p 8010:8000 \
+            -e AV_ENGINE_ROLE=server \
+            -e DATABASE_URL=postgresql+asyncpg://av_user:av_password@pg:5432/aether_vault \
+            aether-vault-engine:smoke >/dev/null
+          # Legacy alias behavior: NO AV_ENGINE_ROLE, but DATABASE_URL set → server-only
+          # (this is exactly what pre-1.2.2 pinned compose files produce).
+          docker run -d --name engine-legacy --network avnet \
+            -e DATABASE_URL=postgresql+asyncpg://av_user:av_password@pg:5432/aether_vault \
+            aether-vault-engine:smoke >/dev/null
+          ok=0
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8010/api/health >/dev/null 2>&1 && { ok=1; break; }
+            sleep 2
+          done
+          [[ "$ok" == 1 ]] || { docker logs engine-srv >&2 || true; exit 1; }
+          sleep 8
+          # The webui must NOT be running under either server-role container:
+          if docker top engine-srv | grep -q "[n]ode server.js"; then
+            echo "::error::AV_ENGINE_ROLE=server started the webui too"; exit 1; fi
+          if docker top engine-legacy | grep -q "[n]ode server.js"; then
+            echo "::error::legacy auto-detect started the webui too"; exit 1; fi
+          # Legacy container's own registry must be healthy on its unmapped :8000:
+          docker exec engine-legacy python -c \
+            "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health').read()" || {
+            echo "::error::legacy auto-detect did not start the registry"; exit 1; }
+
+      - name: Role=webui — standalone Next server only
+        run: |
+          docker run -d --name engine-webui -p 3001:3000 \
+            -e AV_ENGINE_ROLE=webui -e NEXT_PUBLIC_API_URL=http://localhost:8000 \
+            aether-vault-engine:smoke >/dev/null
+          ok=0
+          for i in $(seq 1 45); do
+            curl -sf http://localhost:3001/ >/dev/null 2>&1 && { ok=1; break; }
+            sleep 2
+          done
+          [[ "$ok" == 1 ]] || { docker logs engine-webui >&2 || true; exit 1; }
+          if docker top engine-webui | grep -q "[u]vicorn"; then
+            echo "::error::AV_ENGINE_ROLE=webui started the registry too"; exit 1; fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f engine-all engine-srv engine-legacy engine-webui pg >/dev/null 2>&1 || true
+          docker network rm avnet >/dev/null 2>&1 || true
 
   # First time release artifacts are ever INSTALLED rather than just built: a wheel goes
   # into a clean Linux venv, and the sdist is compiled from scratch inside a clean Windows
@@ -296,6 +387,10 @@ jobs:
           cd "$SCRATCH"
           "$AV" --version
           "$PYBIN" -c "import av_cli, av_server"
+          # v1.2.2 packaging gates: the context-diff and registry surfaces must ship in
+          # the wheel (they were both missing-at-runtime classes of bug historically).
+          "$AV" diff --help > /dev/null
+          "$AV" registry --help > /dev/null
           "$AV" init --mode local --yes --no-repl
           echo "packaged" > f.txt
           "$AV" add f.txt
@@ -334,6 +429,9 @@ jobs:
           Set-Location $scratch
           & $av --version
           & $py -c "import av_cli, av_server"
+          # v1.2.2 packaging gates: context-diff + registry surfaces present in the sdist.
+          & $av diff --help *> $null
+          & $av registry --help *> $null
           & $av init --mode local --yes --no-repl
           Set-Content -Path f.txt -Value packaged
           & $av add f.txt

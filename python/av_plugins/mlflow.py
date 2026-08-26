@@ -9,7 +9,7 @@ from pathlib import Path
 
 from av_cli.exceptions import AetherVaultException
 
-from ._shared import build_metric_args, commit_scoped, resolve_repo_root
+from ._shared import commit_scoped, resolve_repo_root
 
 try:
     from mlflow.tracking import MlflowClient
@@ -56,19 +56,12 @@ def import_run(
         raise AetherVaultException(f"MLflow run {run_id} has no artifacts to import.")
 
     metrics = dict(run.data.metrics)
-    commit_args = [
-        "commit",
-        "-m",
-        f"Imported MLflow run {run_id}",
-        "--tag",
-        "mlflow-import",
-        *build_metric_args(metrics),
-    ]
-    for key, value in run.data.params.items():
-        if isinstance(value, str):
-            commit_args.extend(["--tag", f"{key}={value}"])
+    tags = ["mlflow-import"] + [f"{key}={value}" for key, value in run.data.params.items()
+                                if isinstance(value, str)]
     if tag:
-        commit_args.extend(["--tag", tag])
+        tags.append(tag)
     # Scoped so the import commits exactly the run's artifacts — unrelated staged files
-    # keep their pending state (Probleme.md #38).
-    commit_scoped(resolved_root, artifact_paths, commit_args)
+    # keep their pending state (Probleme.md #38). Internal seam (v1.2.2) — no CLI hop.
+    commit_scoped(resolved_root, artifact_paths,
+                  f"Imported MLflow run {run_id}",
+                  tags=tuple(tags), metrics=metrics)

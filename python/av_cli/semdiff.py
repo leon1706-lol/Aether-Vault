@@ -4,7 +4,8 @@ Pure functions, no I/O: input are two flat trees in the standard commit format
 ({rel_path: {hash,size,type,layers,chunks}}). The output feeds three consumers:
 
 * `av diff <ref>` (human + --json)
-* `.avh` v2's `semantic_summary` section (agent context memory)
+* `.avh` v2's `semantic_summary` section (agent context memory) — including
+  `chunks.dedup_efficiency` (v1.2.2): reused / (reused+new), None when no chunks
 * the WebUI's expanded-commit view (later milestone)
 
 The whole point is answering an agent's / reviewer's real question — *what actually
@@ -76,6 +77,11 @@ def diff_trees(old_tree: Tree | None, new_tree: Tree | None) -> dict:
         chunks_new += len(chs - parent_chs)
         chunks_reused += len(chs & parent_chs)
 
+    # v1.2.2 dataset-CDC visibility: how much of the new chunk population was reused
+    # rather than re-stored. None when no chunked files exist (no signal ≠ zero).
+    chunk_total = chunks_reused + chunks_new
+    dedup_efficiency = round(chunks_reused / chunk_total, 4) if chunk_total else None
+
     DATASET_EXTS = {".parquet", ".csv", ".h5", ".hdf5", ".npz", ".npy", ".arrow",
                     ".jsonl", ".tfrecord", ".wav", ".flac"}
 
@@ -101,7 +107,8 @@ def diff_trees(old_tree: Tree | None, new_tree: Tree | None) -> dict:
                         (old_tree.get(p) or {}).get("type"))} for p in changed],
         },
         "models": models,
-        "chunks": {"reused": chunks_reused, "new": chunks_new},
+        "chunks": {"reused": chunks_reused, "new": chunks_new,
+                   "dedup_efficiency": dedup_efficiency},
         "datasets": datasets,
         "totals": {
             "bytes_before": _bytes(old_tree),

@@ -69,11 +69,15 @@ def normalize_commit_row(row: dict) -> dict:
 
     The server persists `parent_hash` (plus `extra_parents` for merge commits); local commits
     store a full `parents` list — this is where the two shapes meet.
+
+    v1.2.2: `signature` and `env_snapshot_id` ride through verbatim — dropping either
+    would make cloned repos unable to verify commit signatures or resolve replay
+    snapshots (both were silently lost in the first manual-debug pass of this feature).
     """
     parents = list(row.get("parents") or [])
     if not parents and row.get("parent_hash"):
         parents = [row["parent_hash"]]
-    return {
+    normalized = {
         "hash": row["hash"],
         "parents": parents,
         "author": row.get("author") or "anonymous",
@@ -85,6 +89,11 @@ def normalize_commit_row(row: dict) -> dict:
         "project_id": row.get("project_id"),
         "project_name": row.get("project_name"),
     }
+    if row.get("signature"):
+        normalized["signature"] = row["signature"]
+    if row.get("env_snapshot_id"):
+        normalized["env_snapshot_id"] = row["env_snapshot_id"]
+    return normalized
 
 
 def fetch_project_commits(client, project_id: str) -> list[dict]:

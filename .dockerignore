@@ -24,3 +24,19 @@ dist/
 *.pt
 *.csv
 *.parquet
+
+# The engine image builds webui/ in its own node stage (npm ci from package
+# files) — the host's node_modules/.next/Playwright output must never enter the
+# build context, or the context upload alone takes minutes.
+webui/node_modules/
+webui/.next/
+webui/playwright-report/
+webui/test-results/
+webui/e2e/
+docker-compose.release.yml
+aether-vault-server.tar
+Aether-vault-Obsidian-Vault/
+commits/
+objects/
+refs/
+development/

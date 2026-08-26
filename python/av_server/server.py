@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -6,7 +7,7 @@ import os
 import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +32,7 @@ from .models import (
     DBRunCommit,
     DBTree,
     DBWebhook,
+    DBWebhookDelivery,
     _new_uuid,
     utcnow_naive,
 )
@@ -43,12 +45,39 @@ logger = logging.getLogger("av_server")
 # App setup
 # ---------------------------------------------------------------------------
 
+# Webhook delivery retry worker (v1.2.2): failed deliveries persist with a next_retry_at
+# and are re-driven on an interval until AV_WEBHOOK_MAX_ATTEMPTS is exhausted → dead-letter.
+WEBHOOK_MAX_ATTEMPTS = int(os.environ.get("AV_WEBHOOK_MAX_ATTEMPTS", "5"))
+WEBHOOK_RETRY_INTERVAL_SECS = int(os.environ.get("AV_WEBHOOK_RETRY_INTERVAL_SECS", "30"))
+# Terminal-status (delivered/dead) delivery rows are swept with the event retention window.
+AUDIT_RETENTION_DAYS = int(os.environ.get("AV_AUDIT_RETENTION_DAYS", "90"))
+
+
+async def _webhook_retry_worker(interval_secs: float = 30.0):
+    """Background loop re-driving due webhook deliveries. Never raises outward — a tick
+    that fails logs and retries on the next interval."""
+    while True:
+        await asyncio.sleep(interval_secs)
+        try:
+            await process_due_webhook_deliveries()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("webhook retry worker tick failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Replaces the deprecated @app.on_event("startup") hook.
     await init_db()
     await cache.init_filter()
-    yield
+    worker = asyncio.create_task(_webhook_retry_worker(WEBHOOK_RETRY_INTERVAL_SECS))
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
 
 
 app = FastAPI(title="Aether-Vault Server", version="1.4.0", lifespan=lifespan)
@@ -463,6 +492,16 @@ async def push_commit(
             project_id=project_id,
             project_name=project_name,
         )
+        # v1.2.2 signed commits: the client's signature blob rides along verbatim so
+        # `av verify` keeps working on cloned/pulled copies, not just in the authoring repo.
+        raw_signature = commit_data.get("signature")
+        if isinstance(raw_signature, dict):
+            new_commit.signature = json.dumps(raw_signature, sort_keys=True)
+        # env_snapshot_id is part of the hashed/signed payload — persist it so cloned
+        # payloads stay byte-equal to the authoring ones (signature validity + replay).
+        env_id = commit_data.get("env_snapshot_id")
+        if isinstance(env_id, str) and re.match(r"^[a-f0-9]{64}$", env_id):
+            new_commit.env_snapshot_id = env_id
         if commit_ts is not None:
             new_commit.timestamp = commit_ts
         db.add(new_commit)
@@ -489,6 +528,11 @@ async def push_commit(
                     merged.update(metrics)
                     run_row.metrics_summary = merged
                 run_row.updated_at = utcnow_naive()
+            # v1.2.2 env snapshot/replay: a commit carrying env_snapshot_id back-fills the
+            # linked run's pointer when the run doesn't have one yet (first-link wins).
+            env_snapshot_id = commit_data.get("env_snapshot_id")
+            if env_snapshot_id and not run_row.env_snapshot_id:
+                run_row.env_snapshot_id = str(env_snapshot_id)
             db.add(DBRunCommit(run_id=run_id, commit_hash=commit_hash))
 
         await _emit_event(db, project_id, "commit", {
@@ -498,7 +542,7 @@ async def push_commit(
             "run_id": run_id,
         })
         _audit(db, username, "commit.push", project_id,
-               {"hash": commit_hash, "message": new_commit.message})
+               {"hash": commit_hash, "message": new_commit.message}, status_code=201)
 
         await db.commit()
         return Response(status_code=201)
@@ -591,6 +635,18 @@ def _full_parents(parent_hash: Optional[str], extra_parents_json: Optional[str])
     return parents
 
 
+def _signature_out(raw: Optional[str]) -> Optional[dict]:
+    """Decodes a stored signature blob for API responses; corrupt JSON degrades to None
+    so one bad row can't 500 commit reads."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
 @app.get("/api/commits/{hash}")
 async def get_commit(
     hash: str, db: AsyncSession = Depends(get_session)
@@ -621,6 +677,8 @@ async def get_commit(
         "tree": tree_data,
         "project_id": commit.project_id,
         "project_name": commit.project_name,
+        "signature": _signature_out(commit.signature),
+        "env_snapshot_id": commit.env_snapshot_id,
     }
 
 
@@ -644,7 +702,7 @@ async def update_ref(
     project_id = ref_name.split("/", 1)[0] if "/" in ref_name else None
     await _emit_event(db, project_id, "ref", {"ref": ref_name, "commit_hash": payload.commit_hash})
     _audit(db, _identity(request), "ref.update", project_id,
-           {"ref": ref_name, "commit_hash": payload.commit_hash})
+           {"ref": ref_name, "commit_hash": payload.commit_hash}, status_code=200)
     await db.commit()
     return {"status": "updated"}
 
@@ -836,11 +894,25 @@ async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dic
         for h in alive_hashes:
             await cache.add_hash(h)
 
-        # Retention sweep for the event stream (default 30 days, AV_EVENT_RETENTION_DAYS).
+        # Retention sweeps for the autonomous-loop surfaces:
+        # - events (default 30 days, AV_EVENT_RETENTION_DAYS)
+        # - audit_log (default 90 days, AV_AUDIT_RETENTION_DAYS)
+        # - terminal-status webhook deliveries (delivered/dead) ride the event window;
+        #   stuck pending/failed rows are never swept here — the retry worker owns them.
         from datetime import timedelta as _td
 
         event_cutoff = utcnow_naive() - _td(days=EVENT_RETENTION_DAYS)
         await db.execute(delete(DBEvent).where(DBEvent.ts < event_cutoff))
+
+        audit_cutoff = utcnow_naive() - _td(days=AUDIT_RETENTION_DAYS)
+        await db.execute(delete(DBAuditLog).where(DBAuditLog.ts < audit_cutoff))
+
+        await db.execute(
+            delete(DBWebhookDelivery).where(
+                DBWebhookDelivery.status.in_(["delivered", "dead"]),
+                DBWebhookDelivery.updated_at < event_cutoff,
+            )
+        )
 
         await db.commit()
         await _emit_event(db, None, "gc", {
@@ -955,6 +1027,8 @@ async def list_commits(
             "metrics": c.metrics or {},
             "project_id": c.project_id,
             "project_name": c.project_name,
+            "signature": _signature_out(c.signature),
+            "env_snapshot_id": c.env_snapshot_id,
         }
         if include_layers:
             d["tree"] = await resolve_tree(db, c.root_tree_hash) if c.root_tree_hash else {}
@@ -1086,9 +1160,9 @@ async def _emit_event(db: AsyncSession, project_id: str | None, kind: str, paylo
                 hooks = (
                     await session.execute(select(DBWebhook).where(DBWebhook.active.is_(True)))
                 ).scalars().all()
-            await _deliver_webhooks(hooks,
-                {"id": row.id, "kind": kind, "project_id": project_id, "payload": payload}
-            )
+                await _deliver_webhooks(session, hooks,
+                    {"id": row.id, "kind": kind, "project_id": project_id, "payload": payload})
+                await session.commit()
         except Exception:  # pragma: no cover — delivery must never break the mutation
             logger.exception("webhook delivery scheduling failed")
 
@@ -1100,13 +1174,108 @@ def _sign(secret: str, body: bytes) -> str:
     return hmac_mod.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
-async def _deliver_webhooks(hooks: list, event: dict) -> None:
-    """POSTs the event to every matching active webhook, signed, in a worker thread.
+def _event_body(event: dict) -> bytes:
+    """The canonical signed body for an event dict {id, kind, project_id, payload}.
 
-    Fire-and-forget with per-URL try/except: a dead subscriber must never fail the
-    original mutation. Retries are left to subscribers (at-least-once via their own
-    reconciliation against /api/events) — v1 keeps the server side simple and honest.
-    """
+    Shared by first-attempt delivery AND retries so a retry reconstructs the
+    byte-identical (and therefore signature-identical) payload."""
+    import json as _json
+
+    return _json.dumps(
+        {"id": event["id"], "kind": event["kind"], "project_id": event.get("project_id"), "payload": event.get("payload")},
+        sort_keys=True,
+    ).encode()
+
+
+async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict) -> None:
+    """One POST attempt for one hook, persisting the outcome onto its delivery row.
+
+    Failure handling: attempt++ with next_retry_at scheduled at the retry interval;
+    exhausting AV_WEBHOOK_MAX_ATTEMPTS dead-letters the row (status='dead'). The row is
+    created 'pending' BEFORE the POST so a crash mid-delivery still leaves a retryable
+    record rather than a silently dropped fan-out."""
+    body = _event_body(event)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AV-Event-Id": str(event["id"]),
+        "X-AV-Event-Kind": event["kind"],
+        "X-AV-Signature": _sign(hook.secret, body),
+    }
+    loop = asyncio.get_running_loop()
+
+    def _post():
+        import requests as _requests
+
+        try:
+            resp = _requests.post(hook.url, data=body, headers=headers,
+                                  timeout=_WEBHOOK_TIMEOUT_SECS)
+            return resp.status_code, None
+        except Exception as exc:
+            return None, str(exc)
+
+    status_code, error = await loop.run_in_executor(None, _post)
+    if status_code is not None and 200 <= status_code < 300:
+        delivery.status = "delivered"
+        delivery.response_code = status_code
+        delivery.last_error = None
+        delivery.next_retry_at = None
+    else:
+        delivery.attempt += 1
+        delivery.response_code = status_code
+        delivery.last_error = error or f"http_{status_code}"
+        if delivery.attempt >= WEBHOOK_MAX_ATTEMPTS:
+            delivery.status = "dead"
+            logger.warning("webhook %s dead-lettered after %s attempts", hook.url,
+                           delivery.attempt)
+        else:
+            delivery.status = "failed"
+            delivery.next_retry_at = utcnow_naive() + timedelta(
+                seconds=WEBHOOK_RETRY_INTERVAL_SECS)
+
+
+async def process_due_webhook_deliveries() -> int:
+    """Re-drives every due pending/failed delivery (called by the interval worker and
+    exposed to tests). Returns how many rows were re-attempted."""
+    now = utcnow_naive()
+    delivered = 0
+    async with async_session_factory() as db:
+        rows = (await db.execute(
+            select(DBWebhookDelivery)
+            .where(DBWebhookDelivery.status.in_(["pending", "failed"]))
+            .where((DBWebhookDelivery.next_retry_at.is_(None))
+                   | (DBWebhookDelivery.next_retry_at <= now))
+            .limit(100)
+        )).scalars().all()
+        for delivery in rows:
+            hook = (await db.execute(
+                select(DBWebhook).where(DBWebhook.id == delivery.webhook_id)
+            )).scalar_one_or_none()
+            # Hook deleted since scheduling → dead-letter the orphan instead of looping.
+            if hook is None:
+                delivery.status = "dead"
+                delivery.last_error = "webhook deleted"
+                continue
+            if not hook.active:
+                delivery.status = "dead"
+                delivery.last_error = "webhook deactivated"
+                continue
+            event = {"id": delivery.event_id or -1, "kind": delivery.event_kind,
+                     "project_id": delivery.project_id, "payload": delivery.payload}
+            await _deliver_one(hook, delivery, event)
+            delivered += 1
+        await db.commit()
+    return delivered
+
+
+async def _deliver_webhooks(db: AsyncSession, hooks: list, event: dict) -> None:
+    """POSTs the event to every matching active webhook, signed, in worker threads.
+
+    v1.2.2: every attempt is persisted in webhook_deliveries BEFORE the request goes
+    out and updated after — failed deliveries are retried by the background worker
+    (startup + interval) until AV_WEBHOOK_MAX_ATTEMPTS exhausts into a dead-letter.
+    Delivery rows ride the MUTATION's own session/transaction, so a rolled-back
+    mutation never leaves phantom delivery records. Per-URL try/except stays inside
+    _deliver_one: a dead subscriber must never fail the original mutation."""
     matching = [
         h for h in hooks
         if (h.project_id is None or h.project_id == event.get("project_id"))
@@ -1114,38 +1283,28 @@ async def _deliver_webhooks(hooks: list, event: dict) -> None:
     ]
     if not matching:
         return
-    import json as _json
 
-    body = _json.dumps(
-        {"id": event["id"], "kind": event["kind"], "project_id": event.get("project_id"), "payload": event.get("payload")},
-        sort_keys=True,
-    ).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "X-AV-Event-Id": str(event["id"]),
-        "X-AV-Event-Kind": event["kind"],
-    }
-    loop = asyncio.get_running_loop()
     for hook in matching:
-        hook_headers = dict(headers)
-        hook_headers["X-AV-Signature"] = _sign(hook.secret, body)
-
-        def _post(url=hook.url, hdrs=hook_headers, b=body):
-            import requests as _requests
-
-            try:
-                _requests.post(url, data=b, headers=hdrs, timeout=_WEBHOOK_TIMEOUT_SECS)
-            except Exception:
-                logger.warning("webhook delivery failed: %s", url)
-
-        await loop.run_in_executor(None, _post)
+        delivery = DBWebhookDelivery(
+            webhook_id=hook.id, event_id=event["id"] if event["id"] >= 0 else None,
+            event_kind=event["kind"], project_id=event.get("project_id"),
+            payload=event.get("payload"), attempt=1, status="pending",
+            next_retry_at=None,
+        )
+        db.add(delivery)
+        await db.flush()
+        await _deliver_one(hook, delivery, event)
 
 
 def _audit(db: AsyncSession, username: str | None, action: str,
-           project_id: str | None, details: dict | None = None):
+           project_id: str | None, details: dict | None = None,
+           status_code: int | None = None):
+    """Records one mutation. v1.2.2: `status_code` captures the HTTP outcome the caller
+    is about to return, so the trail answers "did it land?" — not just "was it tried"."""
     if AUDIT_ENABLED:
         db.add(DBAuditLog(username=username, action=action,
-                          project_id=project_id, details=details))
+                          project_id=project_id, details=details,
+                          status_code=status_code))
 
 
 AUDIT_ENABLED = os.environ.get("AV_AUDIT_LOG", "1") not in ("", "0", "false")
@@ -1203,7 +1362,7 @@ async def prune_events(request: Request, before_days: int = QUERY_BEFORE_DAYS_DE
     cutoff = utcnow_naive() - timedelta(days=max(before_days, 0))
     result = await db.execute(delete(DBEvent).where(DBEvent.ts < cutoff))
     await db.commit()
-    _audit(db, _identity(request), "events.prune", None, {"deleted": result.rowcount, "before_days": before_days})
+    _audit(db, _identity(request), "events.prune", None, {"deleted": result.rowcount, "before_days": before_days}, status_code=200)
     await db.commit()
     return {"deleted": result.rowcount}
 
@@ -1228,7 +1387,7 @@ async def create_run(request: Request, run: Dict[str, Any] = Body(...),
     )
     db.add(db_run)
     await _emit_event(db, project_id, "run", {"action": "started", "run_id": run_id, "name": run.get("name")})
-    _audit(db, _identity(request), "run.create", project_id, {"run_id": run_id})
+    _audit(db, _identity(request), "run.create", project_id, {"run_id": run_id}, status_code=201)
     await db.commit()
     return {"status": "created", "id": run_id}
 
@@ -1298,26 +1457,78 @@ async def _finish_run(run_id: str, request: Request, status: str, body: dict, db
     if isinstance(body, dict) and body.get("metrics_summary"):
         r.metrics_summary = {**(r.metrics_summary or {}), **body["metrics_summary"]}
     await _emit_event(db, r.project_id, "run", {"action": status, "run_id": run_id})
-    _audit(db, _identity(request), f"run.{status}", r.project_id, {"run_id": run_id})
+    _audit(db, _identity(request), f"run.{status}", r.project_id, {"run_id": run_id}, status_code=200)
     await db.commit()
     return {"status": status, "id": run_id}
 
 
+def _parse_iso_dt(value: str, field: str) -> datetime:
+    """ISO-8601 audit filter parsing; invalid input is a 422, never a silent match-all."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail=f"Invalid {field} timestamp: {value!r}")
+    # Naive UTC storage throughout the schema (see utcnow_naive) — normalize aware inputs.
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 @app.get("/api/admin/audit")
-async def get_audit_log(request: Request, limit: int = Query(50, ge=1, le=500),
-                        project_id: Optional[str] = None,
-                        db: AsyncSession = Depends(get_session)):
-    """Trust surface: recent mutating-call trail. Auth-gated like every other route;
-    in Anonymous mode usernames are simply None entries."""
-    stmt = select(DBAuditLog).order_by(DBAuditLog.id.desc()).limit(limit)
+async def get_audit_log(
+    request: Request,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    project_id: Optional[str] = None,
+    action: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    db: AsyncSession = Depends(get_session),
+):
+    """Trust surface: recent mutating-call trail with outcome capture. Auth-gated like
+    every other route; in Anonymous mode usernames are simply None entries.
+
+    Filters (v1.2.2): action (exact match), project_id, since/until (ISO-8601 ts bounds),
+    limit+offset pagination — all composable."""
+    stmt = select(DBAuditLog)
+    count_stmt = select(func.count()).select_from(DBAuditLog)
     if project_id:
         stmt = stmt.where(DBAuditLog.project_id == project_id)
-    rows = (await db.execute(stmt)).scalars().all()
+        count_stmt = count_stmt.where(DBAuditLog.project_id == project_id)
+    if action:
+        stmt = stmt.where(DBAuditLog.action == action)
+        count_stmt = count_stmt.where(DBAuditLog.action == action)
+    if since:
+        cutoff = _parse_iso_dt(since, "since")
+        stmt = stmt.where(DBAuditLog.ts >= cutoff)
+        count_stmt = count_stmt.where(DBAuditLog.ts >= cutoff)
+    if until:
+        cutoff = _parse_iso_dt(until, "until")
+        stmt = stmt.where(DBAuditLog.ts <= cutoff)
+        count_stmt = count_stmt.where(DBAuditLog.ts <= cutoff)
+    total = (await db.execute(count_stmt)).scalar_one()
+    rows = (await db.execute(
+        stmt.order_by(DBAuditLog.id.desc()).limit(limit).offset(offset)
+    )).scalars().all()
     return {"entries": [
         {"id": a.id, "ts": a.ts.isoformat() if a.ts else None, "username": a.username,
-         "action": a.action, "project_id": a.project_id, "details": a.details}
+         "action": a.action, "project_id": a.project_id, "details": a.details,
+         "status_code": a.status_code}
         for a in rows
-    ]}
+    ], "total": total, "limit": limit, "offset": offset}
+
+
+@app.delete("/api/admin/audit")
+async def prune_audit_log(request: Request, before_days: int = Query(AUDIT_RETENTION_DAYS, ge=0),
+                          db: AsyncSession = Depends(get_session)):
+    """Manual audit-trail pruning; the same window is swept automatically during GC."""
+    cutoff = utcnow_naive() - timedelta(days=max(before_days, 0))
+    result = await db.execute(delete(DBAuditLog).where(DBAuditLog.ts < cutoff))
+    await db.commit()
+    _audit(db, _identity(request), "audit.prune", None,
+           {"deleted": result.rowcount, "before_days": before_days}, status_code=200)
+    await db.commit()
+    return {"deleted": result.rowcount}
 
 
 # --- webhook management ------------------------------------------------------
@@ -1336,7 +1547,7 @@ async def create_webhook(request: Request, wh: WebhookCreate,
         raise HTTPException(status_code=422, detail="url must be http(s)")
     row = DBWebhook(url=wh.url, secret=wh.secret, project_id=wh.project_id, kinds=wh.kinds)
     db.add(row)
-    _audit(db, _identity(request), "webhook.create", wh.project_id, {"webhook_id": row.id, "url": wh.url})
+    _audit(db, _identity(request), "webhook.create", wh.project_id, {"webhook_id": row.id, "url": wh.url}, status_code=201)
     await db.commit()
     return {"id": row.id, "url": wh.url, "active": True}
 
@@ -1359,7 +1570,7 @@ async def delete_webhook(webhook_id: str, request: Request,
     if not row:
         raise HTTPException(status_code=404, detail="Webhook not found")
     await db.execute(delete(DBWebhook).where(DBWebhook.id == webhook_id))
-    _audit(db, _identity(request), "webhook.delete", row.project_id, {"webhook_id": webhook_id})
+    _audit(db, _identity(request), "webhook.delete", row.project_id, {"webhook_id": webhook_id}, status_code=200)
     await db.commit()
     return {"status": "deleted"}
 
@@ -1369,6 +1580,42 @@ async def test_webhook(webhook_id: str, db: AsyncSession = Depends(get_session))
     row = (await db.execute(select(DBWebhook).where(DBWebhook.id == webhook_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Webhook not found")
-    await _deliver_webhooks([row], {"id": -1, "kind": "webhook_test",
+    await _deliver_webhooks(db, [row], {"id": -1, "kind": "webhook_test",
                                     "project_id": row.project_id, "payload": {"ping": True}})
+    await db.commit()
     return {"status": "delivered"}
+
+
+# --- webhook delivery observability (v1.2.2) ----------------------------------
+
+@app.get("/api/admin/webhook-deliveries")
+async def list_webhook_deliveries(
+    status: Optional[str] = None,
+    webhook_id: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_session),
+):
+    """Delivery-ledger observability: attempts, outcomes, retry schedule, dead-letters."""
+    stmt = select(DBWebhookDelivery)
+    count_stmt = select(func.count()).select_from(DBWebhookDelivery)
+    if status:
+        stmt = stmt.where(DBWebhookDelivery.status == status)
+        count_stmt = count_stmt.where(DBWebhookDelivery.status == status)
+    if webhook_id:
+        stmt = stmt.where(DBWebhookDelivery.webhook_id == webhook_id)
+        count_stmt = count_stmt.where(DBWebhookDelivery.webhook_id == webhook_id)
+    total = (await db.execute(count_stmt)).scalar_one()
+    rows = (await db.execute(
+        stmt.order_by(DBWebhookDelivery.id.desc()).limit(limit).offset(offset)
+    )).scalars().all()
+    return {"deliveries": [
+        {"id": d.id, "webhook_id": d.webhook_id, "event_id": d.event_id,
+         "event_kind": d.event_kind, "project_id": d.project_id,
+         "attempt": d.attempt, "status": d.status,
+         "response_code": d.response_code, "last_error": d.last_error,
+         "next_retry_at": d.next_retry_at.isoformat() if d.next_retry_at else None,
+         "created_at": d.created_at.isoformat() if d.created_at else None,
+         "updated_at": d.updated_at.isoformat() if d.updated_at else None}
+        for d in rows
+    ], "total": total, "limit": limit, "offset": offset}

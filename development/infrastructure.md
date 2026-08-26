@@ -2,10 +2,9 @@
 
 How to run Aether-Vault's Docker stack: what runs, how to start it, what to configure, and how to verify each piece. Architecture contracts live in [architecture.md](architecture.md); this file stays operational.
 
-Stack components:
+Stack components (v1.2.2 engine topology — ONE image, ONE container for the product):
 
-- `server` — FastAPI CAS registry on :8000 (compose service `aether-vault-server`)
-- `webui` — Next.js dashboard on :3000 (compose service `aether-vault-webui`)
+- `aether-vault-engine` — ONE container running ALL subservices: FastAPI CAS registry on :8000 AND the Next.js dashboard on :3000, dispatched/supervised by `docker/engine-entrypoint.sh` (`AV_ENGINE_ROLE=all|server|webui`; default `all`). Image: built from the root Dockerfile (dev compose) or `ghcr.io/leon1706-lol/aether-vault-engine:latest` (release compose). The historical `aether-vault-server`/`-webui` images remain published as ALIASES of this same engine image for one transition cycle (removed next release); legacy per-service containers keep working via entrypoint role auto-detect.
 - `db` — PostgreSQL 15 persistence (image `postgres:15-alpine`, container `aether-vault-db`)
 - `redis` — RedisBloom existence cache (image `redis/redis-stack-server:latest`, container `aether-vault-redis`)
 
@@ -23,21 +22,20 @@ One lap through the running stack, so every later command has context:
 
 ## Start
 
-Start the core three services first; add the webui separately when you want the dashboard:
+Start Postgres + Redis first; the engine brings registry AND dashboard up together:
 
 ```bash
-docker compose up -d db redis aether-vault-server
+docker compose up -d db redis aether-vault-engine
 ```
 
 This dev compose deliberately maps `5432` and `6379` to the host so `tests/test_server.py` can connect directly from localhost. The RELEASE compose at `python/av_cli/docker/docker-compose.release.yml` removes those mappings on purpose — do not port them back.
 
 ```bash
-curl http://localhost:8000/api/health
+curl http://localhost:8000/api/health   # registry leg
+curl -sf http://localhost:3000/ >/dev/null && echo webui-ok   # dashboard leg
 ```
 
-A JSON response here means the registry is up: schema created, bloom filter initialized, storage mounted.
-
-**Verified directly:** `docker-compose.yml` healthchecks poll exactly this endpoint with a Python one-liner inside the container, `start_period: 40s`.
+**Verified directly:** the engine healthcheck checks BOTH legs in one container — python-urllib against :8000 and node fetch against :3000 (both runtimes ship in-engine), `start_period: 40s`.
 
 End users on Local mode never run any of this by hand — `av init` detects whether the backend is missing, unbuilt, or stopped and starts it automatically.
 
@@ -89,9 +87,19 @@ AV_EVENT_RETENTION_DAYS  30   (default)
 AV_RATE_LIMIT_EVENTS  (empty = unlimited)
                Opt-in cap for the agent event/webhook surface (long-poll loops).
 AV_COMMIT_UPLOAD  1   (default)
-               =0 → every commit defers upload (queue drains via av push).
+                =0 → every commit defers upload (queue drains via av push).
 AV_AUDIT_LOG  1   (default)
-               =0 disables the audit trail inserts.
+                =0 disables the audit trail inserts.
+AV_AUDIT_RETENTION_DAYS  90   (default)
+                Audit-trail retention; swept during GC + DELETE /api/admin/audit?before_days=N.
+AV_WEBHOOK_MAX_ATTEMPTS  5   (default)
+                Webhook delivery attempts before a row dead-letters (status='dead').
+AV_WEBHOOK_RETRY_INTERVAL_SECS  30   (default)
+                Worker interval AND retry backoff step for failed webhook deliveries.
+AV_ENGINE_ROLE  all   (container-side default)
+                Engine dispatch: all | server | webui. Legacy alias containers WITHOUT
+                this var auto-detect: DATABASE_URL set → server; NEXT_PUBLIC_API_URL
+                without it → webui.
 AV_REMOTE_URL  (CLI-side) default registry for av clone; else http://localhost:8000.
 AV_AUTHOR      (CLI-side) commit author string; defaults to "anonymous".
 AV_RUN_ID      (CLI-side) file subsequent commits under this run.
@@ -184,7 +192,8 @@ Every product surface and the workflow that guards it (Tests workflow unless not
 | Server live stack (Postgres+Redis): TestClient + real-wire | `server-tests` |
 | Same, native Windows services | `server-tests-windows` |
 | Product flows via real CLI: merge collaboration, offline drain, legacy upgrade, per-user auth, GC | `e2e-suite` (`scripts/e2e_scenario.sh`) |
-| Plugins incl. real Lightning training loop | `plugin-tests` |
+| Engine image smoke (Phase I): role dispatch + dual healthchecks from ONE container | `e2e-engine-smoke` |
+| Plugins incl. real Lightning training loop + signed-commit gate (`[sign]` extra) | `plugin-tests` |
 | WebUI lint/typecheck/Vitest | `webui-tests` |
 | WebUI browser E2E: dashboard, weight-diff, token gate | `webui-e2e` |
 | sdist+wheel build & twine check | `package-build` |
@@ -200,8 +209,8 @@ Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` fl
 
 The schema is owned by Alembic (`python/av_server/migrations/`); `create_all` is gone. Server startup runs the chain programmatically (`python/av_server/database.py::init_db`) — no alembic.ini, no manual step:
 
-1. Fresh database → migrations `0001_baseline` + `0002_runs_events_webhooks_audit` create every table exactly as `models.py` defines them (including `commits.extra_parents`, `trees.chunks`, and the v1.2.0 runs/events/webhooks/audit tables), then record the head in `alembic_version`.
-2. Unrecorded schema (a pre-Alembic create_all volume, or any database whose version rows were lost while the tables stayed) → startup heals known column drift in place and stamps the chain applied. Zero-touch; only future revisions ever execute on it. Replaying into existing tables would crash startup with DuplicateTableError — that's what adoption detection exists to prevent (see [Probleme.md](Probleme.md) #70/#73).
+1. Fresh database → migrations `0001_baseline` + `0002_runs_events_webhooks_audit` + `0003_webhook_deliveries_audit_signature` create every table exactly as `models.py` defines them (including `commits.extra_parents`, `trees.chunks`, the v1.2.0 runs/events/webhooks/audit tables, and 0003's `webhook_deliveries` + `commits.signature`/`env_snapshot_id` + `audit_log.status_code`), then record the head in `alembic_version`.
+2. Unrecorded schema (a pre-Alembic create_all volume, or any database whose version rows were lost while the tables stayed) → startup creates any MISSING models.py tables, heals known column drift in place (`_LEGACY_COLUMNS`) and stamps the chain applied. Zero-touch; only future revisions ever execute on it. Replaying into existing tables would crash startup with DuplicateTableError — that's what adoption detection exists to prevent (see [Probleme.md](Probleme.md) #70/#73).
 
 Authoring a new migration:
 
@@ -241,14 +250,14 @@ Inside the compose network, services reach each other by service name:
 
 - `db:5432` — Postgres (this exact hostname appears in `DATABASE_URL`)
 - `redis://redis:6379/0` — RedisBloom cache
-- `http://aether-vault-server:8000` — registry API (the webui builds against `http://localhost:8000` for browser-side calls instead)
+- `http://aether-vault-engine:8000` — registry API inside the compose network (v1.2.2; the webui builds against `http://localhost:8000` for browser-side calls instead, and both subservices share the engine container anyway)
 
 From the host machine, everything rides localhost — but two of these exist only because the dev compose maps them:
 
 - `localhost:5432` — Postgres, DEV-ONLY mapping for the host-side test suite
 - `localhost:6379` — Redis, DEV-ONLY for the same reason
-- `localhost:8000` — registry API
-- `localhost:3000` — webui
+- `localhost:8000` — registry API (engine container)
+- `localhost:3000` — webui (same engine container)
 
 **Standing rule:** the release compose intentionally drops the 5432/6379 mappings. Anything that depends on them must declare itself dev-only, like `tests/test_server.py` does via its reachability skip.
 
@@ -277,7 +286,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 4. `release.yml` then builds wheels (cp310–cp314 × Windows/Linux/macOS via cibuildwheel) plus sdist.
 5. PyPI publishes via trusted publishing (OIDC, environment `pypi`) — no stored tokens.
 6. A GitHub Release appears with auto-generated notes and all artifacts attached.
-7. GHCR receives `:latest` + version-tagged images for both server and webui.
+7. GHCR receives `:latest` + version-tagged **engine images** (`aether-vault-engine`), plus the legacy `aether-vault-server`/`-webui` names as aliases of the SAME image for the one transition cycle (deprecated — removed next release).
 
 Users pick releases up themselves:
 

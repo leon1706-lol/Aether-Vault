@@ -177,6 +177,11 @@ cli.add_command(run)
 from .cmd_env import env  # noqa: E402
 
 cli.add_command(env)
+from .cmd_env import replay as replay_cmd  # noqa: E402
+
+# Top-level alias so agents can `av replay <run|commit|snapshot-id>` directly
+# (v1.2.2); `av env replay` remains the canonical home.
+cli.add_command(replay_cmd)
 from .cmd_policy import policy as policy_group, promote  # noqa: E402
 from .cmd_watch import watch  # noqa: E402
 
@@ -187,6 +192,9 @@ cli.add_command(registry)
 from .cmd_webhooks import webhooks  # noqa: E402
 
 cli.add_command(webhooks)
+from .cmd_audit import audit as audit_group  # noqa: E402
+
+cli.add_command(audit_group)
 
 cli.add_command(policy_group)
 cli.add_command(promote)

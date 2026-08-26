@@ -7,7 +7,7 @@ Usage:
 import json
 from pathlib import Path
 
-from ._shared import build_metric_args, commit_scoped, resolve_repo_root, run_av
+from ._shared import commit_scoped, resolve_repo_root, run_av
 
 try:
     from transformers import TrainerCallback
@@ -51,12 +51,9 @@ class AetherVaultTrainerCallback(TrainerCallback):
             return
         repo_root = resolve_repo_root(Path(self.dataset_paths[0]).parent)
         # Scoped: a dataset commit must not sweep unrelated staged files into the tree
-        # (Probleme.md #38).
-        commit_scoped(
-            repo_root,
-            list(self.dataset_paths),
-            ["commit", "-m", f"datasets for {self.tag or 'run'}", "--tag", "dataset"],
-        )
+        # (Probleme.md #38). Internal seam (v1.2.2) — no CLI hop, no chdir.
+        commit_scoped(repo_root, list(self.dataset_paths),
+                      f"datasets for {self.tag or 'run'}", tags=("dataset",))
 
     def on_save(self, args, state, control, **kwargs) -> None:
         ckpt_dir = self._checkpoint_dir(args, state)
@@ -66,10 +63,9 @@ class AetherVaultTrainerCallback(TrainerCallback):
         repo_root = resolve_repo_root(Path(ckpt_dir))
 
         metrics = self._latest_numeric_metrics(state)
-        commit_args = ["commit", "-m", f"step={state.global_step}", *build_metric_args(metrics)]
-        if self.tag:
-            commit_args.extend(["--tag", self.tag])
-        commit_scoped(repo_root, [ckpt_dir], commit_args)
+        tags = (self.tag,) if self.tag else ()
+        commit_scoped(repo_root, [ckpt_dir], f"step={state.global_step}",
+                      tags=tags, metrics=metrics)
 
     def on_train_end(self, args, state, control, **kwargs) -> None:
         repo_root = resolve_repo_root(Path(args.output_dir))
@@ -97,14 +93,9 @@ def import_checkpoint(checkpoint_dir: str, repo_root: Path | None = None, tag: s
         except Exception:
             metrics = {}
 
-    commit_args = [
-        "commit",
-        "-m",
-        f"Imported Transformers checkpoint {Path(checkpoint_dir).name}",
-        "--tag",
-        "transformers-import",
-        *build_metric_args(metrics),
-    ]
+    tags = ("transformers-import",)
     if tag:
-        commit_args.extend(["--tag", tag])
-    commit_scoped(resolved_root, [checkpoint_dir], commit_args)
+        tags += (tag,)
+    commit_scoped(resolved_root, [checkpoint_dir],
+                  f"Imported Transformers checkpoint {Path(checkpoint_dir).name}",
+                  tags=tags, metrics=metrics)

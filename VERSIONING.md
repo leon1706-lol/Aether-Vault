@@ -34,15 +34,41 @@ or client stop working, it's MAJOR.*
 3. **Removal** happens only at the next MAJOR boundary, with a migration note.
 4. Pre-1.0 exceptions no longer apply: since `v1.1.1` the above is binding on maintainers.
 
-Known standing deprecation candidates (tracked, not yet scheduled): none currently.
+Known standing deprecation candidates (tracked, not yet scheduled):
+- **Legacy GHCR alias tags** `ghcr.io/leon1706-lol/aether-vault-server` and
+  `.../aether-vault-webui` — since v1.2.2 they are ALIASES of the consolidated
+  `aether-vault-engine` image (same digest, role auto-detected per container).
+  Announced in the v1.2.2 release notes + CHANGELOG Phase 56; removal lands in the NEXT
+  release (one full MINOR grace cycle honored). Pinned installs should switch compose
+  files / pulls to `aether-vault-engine`.
 
 ## v1.2.0 additive surfaces
 
 Runs/events/webhooks/audit endpoints, the JSON envelope + exit-code registry, .avh v2
-(reads upgrade v1 documents in memory; writers emit v2), and v_sdk are all ADDITIVE
+(reads upgrade v1 documents in memory; writers emit v2), and av_sdk are all ADDITIVE
 MINOR features. The one behavioral nuance: commits pushed with an active run now carry a
+`run:<id>` tag — consumers matching exact tag sets must tolerate the extra element.
 
-un:<id> tag — consumers matching exact tag sets must tolerate the extra element.
+## v1.2.2 additive surfaces
+
+All additive MINOR changes, per surface:
+- **HTTP API**: `commits.signature` + `commits.env_snapshot_id` are NEW OPTIONAL response
+  fields (older clients ignore them); `/api/admin/audit` gained optional
+  `action/since/until/offset` params + `total`; NEW endpoints
+  `DELETE /api/admin/audit`, `GET /api/admin/webhook-deliveries`. Commit pushes may now
+  carry optional `signature` / `env_snapshot_id` payload keys (unknown-key tolerant).
+- **Commit payloads**: optional `signature` and `env_snapshot_id` keys join the hashed
+  payload when applicable — commit HASHES change for newly made commits only (they always
+  did on any payload evolution); existing history is untouched.
+- **CLI**: NEW commands `av audit list` and top-level `av replay`; `av registry keygen`
+  upgraded from writing an HMAC secret to generating an ed25519 keypair under `.av/keys/`
+  (the old HMAC attest flow still works with a manually configured key);
+  `av verify` prefers signatures, falls back to attestation tags, reports UNSIGNED honestly.
+- **DB schema**: migration `0003` adds `webhook_deliveries`, `commits.signature`,
+  `commits.env_snapshot_id`, `audit_log.status_code` — applied automatically at startup,
+  legacy volumes healed zero-touch.
+- **Docker**: ONE engine image/container replaces the two-image split; legacy image names
+  remain published as aliases of the same image for this cycle ONLY (see deprecation list).
 
 ## Database schema compatibility
 

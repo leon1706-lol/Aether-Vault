@@ -39,7 +39,7 @@ def test_layer_movement_counts_and_largest_movers():
     assert same["models"][0]["layers_changed"] == 0
 
 
-def test_chunk_reuse_ratio():
+def test_chunk_reuse_ratio_and_dedup_efficiency():
     ch_old = [{"hash": f"{i}" * 64, "size": 1, "offset": i} for i in range(8)]
     ch_new = [{"hash": f"{i}" * 64, "size": 1, "offset": i} for i in range(6)] + [
         {"hash": "f" * 64, "size": 1, "offset": 99},
@@ -48,7 +48,20 @@ def test_chunk_reuse_ratio():
     old = {"ckpt.pt": _entry(chunks=ch_old)}
     new = {"ckpt.pt": _entry("9" * 64, chunks=ch_new)}
     sd = diff_trees(old, new)
-    assert sd["chunks"] == {"reused": 6, "new": 2}
+    # v1.2.2: dedup_efficiency = reused / (reused + new); None when no chunks exist.
+    assert sd["chunks"] == {"reused": 6, "new": 2, "dedup_efficiency": 0.75}
+    empty = diff_trees(None, None)
+    assert empty["chunks"]["dedup_efficiency"] is None
+
+
+def test_dedup_efficiency_math_edges():
+    # all-new population → 0.0; single reused-only file → 1.0
+    ch_a = [{"hash": "a" * 64, "size": 1, "offset": 0}]
+    ch_b = [{"hash": "b" * 64, "size": 1, "offset": 0}]
+    all_new = diff_trees({"m.pt": _entry(chunks=ch_b)}, {"m.pt": _entry("x" * 64, chunks=ch_a)})
+    assert all_new["chunks"]["dedup_efficiency"] == 0.0
+    unchanged = diff_trees({"m.pt": _entry(chunks=ch_a)}, {"m.pt": _entry("y" * 64, chunks=list(ch_a))})
+    assert unchanged["chunks"]["dedup_efficiency"] == 1.0
 
 
 def test_dataset_detection_by_extension_and_name():

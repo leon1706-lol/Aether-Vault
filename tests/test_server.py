@@ -2,14 +2,15 @@
 
 Pure validation tests (no DB/Redis needed) always run. Everything else requires a live
 Postgres + Redis (see AV_TEST_DATABASE_URL / AV_TEST_REDIS_URL below) and is skipped cleanly,
-with a clear message, if they're not reachable — same philosophy as test_core.py's
+with a clear message, if they're not reachable â€” same philosophy as test_core.py's
 `pytest.importorskip`, just for service reachability instead of an import.
 
     docker compose up -d db redis            # enough for everything except the real-wire test
-    docker compose up -d db redis aether-vault-server   # also enables the real-wire test
+    docker compose up -d db redis aether-vault-engine   # also enables the real-wire test
     pytest tests/test_server.py -v
 """
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -28,7 +29,7 @@ AV_TEST_DATABASE_URL = os.environ.get(
 )
 AV_TEST_REDIS_URL = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/0")
 
-# Point the server's own module-level config at the test instance *before* importing it —
+# Point the server's own module-level config at the test instance *before* importing it â€”
 # database.py/redis_cache.py read DATABASE_URL/REDIS_URL at import time, and storage.py's
 # CASStorage is constructed at import time too (AV_DATA_DIR). Explicit assignment (not
 # setdefault) so a real dev DATABASE_URL already exported in the shell never leaks in here.
@@ -61,7 +62,7 @@ def _real_server_reachable() -> bool:
 
 
 async def _truncate_all() -> None:
-    # A raw asyncpg connection, not the SQLAlchemy async engine's pooled connection — the pool's
+    # A raw asyncpg connection, not the SQLAlchemy async engine's pooled connection â€” the pool's
     # connections are bound to whichever event loop first used them (TestClient's internal
     # lifespan loop), so reusing the pool from a *separate* asyncio.run() call here raises
     # "got Future ... attached to a different loop". Opening (and closing) a brand-new
@@ -69,7 +70,12 @@ async def _truncate_all() -> None:
     import asyncpg
     conn = await asyncpg.connect(AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"))
     try:
-        await conn.execute("TRUNCATE objects, trees, commits, refs CASCADE")
+        # v1.2.2: include the autonomous-loop + delivery/audit tables — otherwise audit
+        # rows from earlier tests leak into later filters/pagination assertions.
+        await conn.execute(
+            "TRUNCATE objects, trees, commits, refs, runs, run_commits, events,"
+            " webhooks, webhook_deliveries, audit_log CASCADE"
+        )
     finally:
         await conn.close()
 
@@ -105,7 +111,7 @@ def client():
 
 
 def _clear_storage_dirs() -> None:
-    # _truncate_all() only clears the DB tables — any object a test uploaded via
+    # _truncate_all() only clears the DB tables â€” any object a test uploaded via
     # POST /api/objects/{hash} still has its physical shard file on disk afterward (CASStorage
     # has no DB-driven TTL of its own). Without also clearing these, later tests in the same
     # session (e.g. the GC grace-period test) see genuine orphan files left over from earlier
@@ -130,7 +136,7 @@ def db(client):
 def protected_token(db):
     """Turns on the require_token middleware for the duration of one test ("Protected" mode).
 
-    AV_API_TOKEN is read once at module import (see server.py) — empty in this whole test
+    AV_API_TOKEN is read once at module import (see server.py) â€” empty in this whole test
     file's process, since nothing sets the env var before `app` is imported above. Reassigning
     the module attribute directly is the correct way to flip it for a single test: the
     middleware looks up the bare name `AV_API_TOKEN` in its enclosing module's globals at call
@@ -146,7 +152,7 @@ def protected_token(db):
 
 
 # ---------------------------------------------------------------------------
-# Pure validation tests — no DB/Redis needed, always run
+# Pure validation tests â€” no DB/Redis needed, always run
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name", ["main", "feature/x", "proj-id_123/main", "release.1.0"])
@@ -176,7 +182,7 @@ def test_safe_ref_path_accepts_normal_name(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# HTTP-layer tests — require a reachable Postgres + Redis
+# HTTP-layer tests â€” require a reachable Postgres + Redis
 # ---------------------------------------------------------------------------
 
 def test_health_check_ok(db):
@@ -190,7 +196,7 @@ def test_health_check_ok(db):
 # ---------------------------------------------------------------------------
 
 def test_no_token_configured_behaves_exactly_as_before(db):
-    # AV_API_TOKEN is unset for every other test in this file — this just makes the "Anonymous
+    # AV_API_TOKEN is unset for every other test in this file â€” this just makes the "Anonymous
     # is truly unchanged" guarantee explicit rather than implicit.
     resp = db.get("/api/health")
     assert resp.status_code == 200
@@ -220,7 +226,7 @@ def test_protected_mode_rejects_the_wrong_token(db, protected_token):
         "Bearer",  # scheme with no token at all
         "Bearer ",  # scheme with trailing space, no token
         "Basic test-secret-token-12345",  # wrong scheme entirely
-        "bearer test-secret-token-12345",  # lowercase scheme — still must work (see next test)
+        "bearer test-secret-token-12345",  # lowercase scheme â€” still must work (see next test)
     ],
 )
 def test_protected_mode_header_parsing_edge_cases(db, protected_token, header_value):
@@ -284,7 +290,7 @@ def auth_users(db):
 
 
 # ---------------------------------------------------------------------------
-# Per-user access tokens (AV_AUTH_USERS) — live attribution round-trips
+# Per-user access tokens (AV_AUTH_USERS) â€” live attribution round-trips
 # ---------------------------------------------------------------------------
 
 def test_per_user_token_grants_access_with_no_shared_secret(db, auth_users):
@@ -304,7 +310,7 @@ def test_push_commit_stamps_authenticated_username_as_author(db, auth_users):
     resp = db.post("/api/commits", json=commit, headers=alice_header)
     assert resp.status_code == 201
 
-    # The follow-up read needs the SAME credential — with per-user tokens active the
+    # The follow-up read needs the SAME credential â€” with per-user tokens active the
     # middleware 401s headerless requests, whose {"detail": ...} body has no "author".
     body = db.get(f"/api/commits/{commit['hash']}", headers=alice_header).json()
     assert body["author"] == "alice"
@@ -336,7 +342,7 @@ def test_owner_shared_secret_stamps_owner_as_author(db):
 
 
 def test_anonymous_mode_keeps_author_untouched(db):
-    # No credentials configured ⇒ no identity exists ⇒ author passes through verbatim
+    # No credentials configured â‡’ no identity exists â‡’ author passes through verbatim
     # (the pre-v1.1.8 behavior, byte-compatible).
     commit = _make_commit("anon-mode-author", author="anonymous")
     assert db.post("/api/commits", json=commit).status_code == 201
@@ -413,7 +419,7 @@ def test_list_commits_include_layers_matches_get_commit(db):
     for commit, file_hash in ((commit_a, file_hash_a), (commit_b, file_hash_b)):
         assert "tree" in by_hash[commit["hash"]]
         assert by_hash[commit["hash"]]["tree"]["model.bin"]["hash"] == file_hash
-        # Must match GET /api/commits/{hash}'s own tree exactly — same resolve_tree() call.
+        # Must match GET /api/commits/{hash}'s own tree exactly â€” same resolve_tree() call.
         direct = db.get(f"/api/commits/{commit['hash']}").json()
         assert by_hash[commit["hash"]]["tree"] == direct["tree"]
 
@@ -529,19 +535,19 @@ def test_gc_respects_grace_period_then_sweeps_when_aged(db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Real-wire test — needs the actual aether-vault-server process, not just TestClient
+# Real-wire test â€” needs the actual aether-vault-server process, not just TestClient
 # ---------------------------------------------------------------------------
 
 def test_cli_commit_pushes_to_a_live_server(tmp_path, monkeypatch):
     # Checked here (lazily, when this test actually runs) rather than via a `skipif` decorator
-    # (evaluated once at collection time, before any other test has run) — a `skipif` condition
+    # (evaluated once at collection time, before any other test has run) â€” a `skipif` condition
     # check competes with whatever the rest of collection/the test run is doing for CPU/network
     # scheduling right at that single moment, and a slow tick there reads as "unreachable" even
     # though the server is fine moments later (observed once in a heavy combined venv+Docker run).
     if not _real_server_reachable():
         pytest.skip(
-            "Live aether-vault-server not reachable on :8000; run "
-            "`docker compose up -d db redis aether-vault-server`"
+            "live aether-vault-engine not reachable on :8000; run "
+            "`docker compose up -d db redis aether-vault-engine`"
         )
 
     from click.testing import CliRunner
@@ -606,8 +612,8 @@ def test_live_two_repo_clone_pull_flow(tmp_path, monkeypatch):
 
     if not _real_server_reachable():
         pytest.skip(
-            "Live aether-vault-server not reachable on :8000; run "
-            "`docker compose up -d db redis aether-vault-server`"
+            "live aether-vault-engine not reachable on :8000; run "
+            "`docker compose up -d db redis aether-vault-engine`"
         )
 
     from click.testing import CliRunner
@@ -664,7 +670,7 @@ def test_live_two_repo_clone_pull_flow(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Alembic adoption — live schema assertions against Postgres
+# Alembic adoption â€” live schema assertions against Postgres
 # ---------------------------------------------------------------------------
 
 def _pg_columns(table: str) -> set[str]:
@@ -708,10 +714,14 @@ def test_alembic_brings_schema_to_head(db):
             await conn.close()
 
     version, tables = asyncio.run(_probe())
-    assert version == "0002"
+    assert version == "0003"
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
+    # v1.2.2 additive surfaces:
+    assert {"signature"} <= _pg_columns("commits")
+    assert {"status_code"} <= _pg_columns("audit_log")
+    assert "webhook_deliveries" in tables
 
 
 def test_legacy_database_is_healed_and_stamped(db):
@@ -721,7 +731,7 @@ def test_legacy_database_is_healed_and_stamped(db):
 
     # _apply_schema IS the engine-taking entry point (init_db() closes over the module's
     # own engine); the old `from ...database import init_db_with_engine` here pointed at a
-    # helper that only ever existed in THIS file — invisible locally behind the
+    # helper that only ever existed in THIS file â€” invisible locally behind the
     # reachability skip, ImportError on every CI run with a live stack.
     from python.av_server.database import _apply_schema
 
@@ -740,7 +750,7 @@ def test_legacy_database_is_healed_and_stamped(db):
     assert "extra_parents" not in _pg_columns("commits")
     assert "chunks" not in _pg_columns("trees")
 
-    # A fresh engine (own event loop) — never reuse the TestClient's pooled one across loops.
+    # A fresh engine (own event loop) â€” never reuse the TestClient's pooled one across loops.
     from sqlalchemy.ext.asyncio import create_async_engine
 
     legacy_engine = create_async_engine(AV_TEST_DATABASE_URL)
@@ -759,12 +769,12 @@ def test_legacy_database_is_healed_and_stamped(db):
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "0002"  # stamps to CURRENT head, not a hardcoded rev
+    assert asyncio.run(_version()) == "0003"  # stamps to CURRENT head, not a hardcoded rev
 
 
 
 # ---------------------------------------------------------------------------
-# API hardening — rate limiting + CORS defaults (live-server assertions)
+# API hardening â€” rate limiting + CORS defaults (live-server assertions)
 # ---------------------------------------------------------------------------
 
 def test_rate_limit_blocks_gc_burst_but_data_plane_stays_open(db, monkeypatch):
@@ -955,3 +965,197 @@ def test_run_create_is_idempotent_for_concurrent_agents(db):
     assert r2.json()["status"] in ("created", "exists")
     listing = db.get("/api/runs?project_id=proj-idem").json()["runs"]
     assert len([x for x in listing if x["id"] == run_id]) == 1
+
+
+# ---------------------------------------------------------------------------
+# v1.2.2 audit depth, webhook delivery ledger, signatures, env snapshot linkage
+# ---------------------------------------------------------------------------
+
+def test_audit_records_outcome_status_codes(db):
+    """Every mutation's trail entry carries the HTTP outcome ("did it land?", not just
+    "was it tried")."""
+    commit = _make_commit("audited-outcome")
+    resp = db.post("/api/commits", json=commit)
+    rows = db.get(f"/api/admin/audit?action=commit.push&limit=5").json()["entries"]
+    mine = next(r for r in rows if r["details"]["hash"] == commit["hash"])
+    assert mine["status_code"] == resp.status_code == 201
+
+
+def test_audit_filters_action_project_time_and_pagination(db):
+    proj_a, proj_b = "proj-audit-a", "proj-audit-b"
+    ca = _make_commit("audit-fa", project_id=proj_a)
+    cb = _make_commit("audit-fb", project_id=proj_b)
+    db.post("/api/commits", json=ca)
+    db.post("/api/commits", json=cb)
+    db.put(f"/api/refs/{proj_a}/main", json={"commit_hash": ca["hash"]})
+
+    # action filter:
+    rows = db.get("/api/admin/audit?action=ref.update&limit=50").json()
+    assert rows["total"] >= 1
+    assert all(r["action"] == "ref.update" for r in rows["entries"])
+    assert all(r["project_id"] == proj_a for r in rows["entries"])
+
+    # project filter:
+    rows = db.get(f"/api/admin/audit?project_id={proj_b}&limit=50").json()
+    assert rows["total"] >= 1
+    assert all(r["project_id"] == proj_b for r in rows["entries"])
+
+    # since/until windows: an empty window matches nothing, a wide one matches all.
+    empty_past = db.get(
+        "/api/admin/audit?since=2030-01-01T00:00:00&limit=500").json()
+    assert empty_past["total"] == 0
+    empty_until = db.get(
+        "/api/admin/audit?until=2020-01-01T00:00:00&limit=500").json()
+    assert empty_until["total"] == 0
+    wide = db.get("/api/admin/audit?since=2020-01-01T00:00:00&limit=500").json()
+    assert wide["total"] >= 2
+
+    # invalid timestamps are 422, never silent match-alls:
+    assert db.get("/api/admin/audit?since=not-a-date").status_code == 422
+
+    # pagination math:
+    page1 = db.get("/api/admin/audit?limit=1&offset=0").json()
+    page2 = db.get("/api/admin/audit?limit=1&offset=1").json()
+    assert page1["entries"][0]["id"] != page2["entries"][0]["id"]
+    assert page1["total"] == page2["total"]
+
+
+def test_audit_retention_sweep_runs_during_gc(db, monkeypatch):
+    from datetime import datetime, timedelta
+
+    commit = _make_commit("audit-retention")
+    db.post("/api/commits", json=commit)
+    before = db.get("/api/admin/audit?limit=500").json()["total"]
+    assert before > 0
+
+    # Retention 0 days ⇒ every existing row is past its cutoff at GC time.
+    monkeypatch.setattr(server_module, "AUDIT_RETENTION_DAYS", 0)
+    gc = db.post("/api/admin/gc")
+    assert gc.status_code == 200
+    after = db.get("/api/admin/audit?limit=500").json()["total"]
+    assert after < before
+
+
+def test_webhook_delivery_rows_record_outcome_and_dead_letter(db, monkeypatch):
+    """v1.2.2 webhook depth: attempts persist BEFORE the POST; failures retry on the
+    worker interval and dead-letter after AV_WEBHOOK_MAX_ATTEMPTS; observability
+    endpoint exposes the ledger."""
+    calls = []
+
+    class FakeResp:
+        def __init__(self, code):
+            self.status_code = code
+
+    def always_fail(url, data=None, headers=None, timeout=None):
+        calls.append(url)
+        return FakeResp(500)
+
+    import requests as requests_mod
+    monkeypatch.setattr(requests_mod, "post", always_fail)
+    # Retry interval 0 ⇒ failed rows are immediately due again (test-speed backoff).
+    monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", 0)
+
+    created = db.post("/api/webhooks", json={
+        "url": "http://dead.test/hook", "secret": "s3",
+        "project_id": "proj-dead", "kinds": ["commit"],
+    })
+    wid = created.json()["id"]
+
+    commit = _make_commit("dead-letter", project_id="proj-dead")
+    db.post("/api/commits", json=commit)
+    for _ in range(40):
+        rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={wid}").json()["deliveries"]
+        if rows:
+            break
+        time.sleep(0.05)
+    assert rows, "no delivery row was persisted"
+    row = rows[0]
+    assert row["attempt"] >= 2 and row["response_code"] == 500
+    assert row["event_kind"] == "commit" and row["project_id"] == "proj-dead"
+
+    def _drive():
+        fut = db.portal.start_task_soon(server_module.process_due_webhook_deliveries)
+        return fut.result(timeout=30)
+
+    # Drive retries until dead-letter (first attempt done; max 5 ⇒ ≤4 more rounds).
+    for _ in range(10):
+        _drive()
+        row = db.get(
+            f"/api/admin/webhook-deliveries?webhook_id={wid}&status=dead"
+        ).json()["deliveries"]
+        if row:
+            break
+    assert row, f"delivery never dead-lettered: last={row!r}"
+    assert calls, "retry worker did not re-POST"
+
+    # status filter works both ways:
+    pendingish = db.get(
+        f"/api/admin/webhook-deliveries?webhook_id={wid}&status=pending"
+    ).json()["deliveries"]
+    assert pendingish == []
+
+
+def test_webhook_delivery_success_path_records_delivered(db, monkeypatch):
+    class FakeResp:
+        status_code = 200
+
+    delivered_ok = []
+    import requests as requests_mod
+
+    monkeypatch.setattr(requests_mod, "post",
+                        lambda url, data=None, headers=None, timeout=None:
+                        delivered_ok.append(url) or FakeResp())
+
+    created = db.post("/api/webhooks", json={
+        "url": "http://ok.test/hook", "secret": "s4",
+        "project_id": "proj-ok", "kinds": ["commit"],
+    })
+    wid = created.json()["id"]
+    db.post("/api/commits", json=_make_commit("delivered-ok", project_id="proj-ok"))
+
+    for _ in range(40):
+        rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={wid}").json()["deliveries"]
+        if rows and rows[0]["status"] == "delivered":
+            break
+        time.sleep(0.05)
+    assert rows and rows[0]["status"] == "delivered"
+    assert rows[0]["response_code"] == 200
+    assert rows[0]["next_retry_at"] is None
+
+
+def test_commit_signature_round_trips_over_the_wire(db):
+    sig_blob = {"algo": "ed25519", "public_key": "ab" * 32,
+                "sig": base64.b64encode(b"\x01" * 64).decode(), "signed_at": "now"}
+    commit = _make_commit("signed-wire", signature=sig_blob)
+    assert db.post("/api/commits", json=commit).status_code == 201
+
+    got = db.get(f"/api/commits/{commit['hash']}").json()
+    assert got["signature"]["algo"] == "ed25519"
+    assert got["signature"]["sig"] == sig_blob["sig"], \
+        "signature must survive push→fetch byte-exactly so clones can verify"
+
+    listed = db.get("/api/commits?limit=50").json()["commits"]
+    match = next(c for c in listed if c["hash"] == commit["hash"])
+    assert match["signature"]["public_key"] == "ab" * 32
+
+    unsigned = _make_commit("unsigned-wire")
+    db.post("/api/commits", json=unsigned)
+    got = db.get(f"/api/commits/{unsigned['hash']}").json()
+    assert got["signature"] is None  # unsigned stays valid, honestly represented
+
+
+def test_push_back_fills_run_env_snapshot_id_once(db):
+    import uuid
+
+    run_id = str(uuid.uuid4())
+    sid = "e" * 64  # snapshot ids are sha256 hex like any CAS object
+    c1 = _make_commit("env-first", project_id="proj-env")
+    c1.update(run_id=run_id, env_snapshot_id=sid)
+    assert db.post("/api/commits", json=c1).status_code == 201
+    assert db.get(f"/api/runs/{run_id}").json()["env_snapshot_id"] == sid
+
+    # A different later snapshot must NOT steal the pointer (first link wins):
+    c2 = _make_commit("env-second", project_id="proj-env")
+    c2.update(run_id=run_id, env_snapshot_id="f" * 64)
+    assert db.post("/api/commits", json=c2).status_code == 201
+    assert db.get(f"/api/runs/{run_id}").json()["env_snapshot_id"] == sid

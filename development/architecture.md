@@ -1,6 +1,6 @@
 # Aether-Vault Architecture
 
-Status: current as of v1.1.x on `master`
+Status: current as of v1.2.2 on `master`
 
 Focus: contributor-facing subsystem contracts — what each piece guarantees, the exact files and functions involved, and what remains open
 
@@ -92,7 +92,8 @@ CI mirrors the runtime split as five jobs in `.github/workflows/tests.yml`: the 
   - `main.py` — thin compat shell: cli group construction + registration order (= `av --help` order), the PEP 562 lazy `VaultClient`, and the two monkeypatch-target owners (`_find_source_root`, `_update_readme_test_badge`) plus re-exports of the historical namespace surface.
   - `core.py` — shared multi-consumer helpers: config/root/logging, staging (`stage_one_file`, avignore), CAS restore machinery (`materialize_file`, `_materialize_tree`, `_collect_dirty_paths`), pending-push trio, `upload_commit_objects`, `_finalize_commit`, meta/hash helpers.
   - command modules — `cmd_repo.py` (init/update), `cmd_staging.py` (config/add/file/unstage/status), `cmd_history.py` (commit/branch/checkout/log/stash/list-meta/push), `cmd_sync.py` (clone/pull/merge), `cmd_auth.py` (Protected-mode tokens + per-user add-user/list-users/remove-user), `cmd_maintenance.py` (doctor/gc), `cmd_devtools.py` (test/benchmark/badge), `cmd_integrations.py` (graph/handoff/webui/plugin imports).
-  - feature modules — `index.py` (`Index`), `merge.py` (pure algorithms), `sync.py` (clone/pull primitives), `history.py` (log walking/rendering), `attributes.py` (`.avattributes` directives), `client.py` (`VaultClient`), `pointer.py`, `fsutil.py`, `handoff.py`, `repl.py`, `docker_runtime.py`, `update_check.py`, `speedcheck.py`.
+  - feature modules — `index.py` (`Index`), `merge.py` (pure algorithms), `sync.py` (clone/pull primitives), `history.py` (log walking/rendering), `attributes.py` (`.avattributes` directives), `client.py` (`VaultClient`), `pointer.py`, `fsutil.py`, `handoff.py`, `repl.py`, `docker_runtime.py`, `update_check.py`, `speedcheck.py`, `signing.py` (ed25519 commit signatures, v1.2.2).
+  - agent-facing command groups — `cmd_diff.py`, `cmd_context.py`, `cmd_run.py` (+ SDK), `cmd_env.py` (snapshot/replay incl. top-level `av replay` alias), `cmd_policy.py`, `cmd_watch.py`, `cmd_registry.py` (export/restore/keygen/attest/verify), `cmd_webhooks.py`, `cmd_audit.py` (v1.2.2 audit-trail query).
 - `python/av_server/`: the FastAPI CAS registry — `server.py` (routes, GC, auth middleware, CORS, rate limiting), `models.py` (SQLAlchemy schema incl. `extra_parents`/`chunks`), `database.py` (Alembic runner), `migrations/` (versioned schema chain), `rate_limit.py` (fixed-window limiter), `redis_cache.py`, `storage.py` (`CASStorage`).
 - `python/av_plugins/`: optional Lightning/Transformers/MLflow callbacks that drive the CLI in-process via `_shared.py`.
 - `src/`: the C++17 performance core — `core.cpp` (safetensors split + CDC chunker + parallel hashing), `sha256.cpp`, `thread_pool.h`; bound as the `aether_core` pybind11 extension.
@@ -312,7 +313,7 @@ Weight Diff is the distinctive panel: a client-side per-layer heatmap built from
 
 Auth surfaces through `TokenGate` (one-time `?av_token=` handoff, described in Auth Token Contract). Polling cadence defaults to 15 seconds via `webui/src/hooks/useDashboard.ts::useDashboard()` — live enough to feel current during training runs, cheap enough to leave open.
 
-**Note (updated v1.2.1):** the WEBUI commit graph now draws one edge per parent (see the Merge Contract's resolved note). The `av graph` OBSIDIAN export still walks `parent_hash` only, so merge diamonds render linear in generated vaults — tracked limitation, low priority because Obsidian's own graph view is the primary consumption surface there.
+**Note (updated v1.2.2):** the WEBUI commit graph now draws one edge per parent (see the Merge Contract's resolved note). The Runs tab gained an expandable detail view: parent-lineage chain, linked commits with messages and a metrics table, and a semantic summary composed client-side from the last two linked commits' trees (`webui/src/lib/runDetail.ts` — deliberately no new server endpoint). The `av graph` OBSIDIAN export still walks `parent_hash` only, so merge diamonds render linear in generated vaults — tracked limitation, low priority because Obsidian's own graph view is the primary consumption surface there.
 
 ## Plugin Contract
 
@@ -325,11 +326,18 @@ Optional framework callbacks — Lightning, Transformers, MLflow — auto-stage 
 | `python/av_plugins/mlflow.py` | MLflow | `import_run` backfill (requires the `[mlflow]` extra) |
 | `python/av_plugins/_shared.py` | all | The in-process CLI bridge every plugin routes through |
 
-Plugins drive the CLI IN-PROCESS through `python/av_plugins/_shared.py::run_av()`: temporarily chdir into the repo root, call `cli.main(args, standalone_mode=False)` so exceptions propagate to the training loop, chdir back. The chdir dance exists because `add`/`commit` resolve their repository via `Path.cwd()` rather than an argument. The obvious refactor — threading a repo-root parameter through every command — was examined and explicitly declined: the duplication it eliminates is smaller than the risk of splitting one code path into two subtly different ones. Zero duplicated logic beats slightly awkward mechanics. `resolve_repo_root()` mirrors the CLI's upward walk but accepts an explicit start path so callbacks fire correctly regardless of where the training script sits.
+Plugins drive add/commit through the INTERNAL SEAM since v1.2.2: `_shared.py::commit_scoped()`
+delegates to `core.commit_scoped_paths()` — the same function agent tooling uses — which
+stages via `stage_one_file` directly (no chdir, no CLI invocation) and funnels into
+`commit_staged` → `_finalize_commit`. Scoped-commit semantics are unchanged: isolation
+without destroying the change-detection baseline (#38/#71), missing-path tolerance (#76),
+AV_RUN_ID flow. `run_av()` remains ONLY for `push` (the deliberate CLI flush at training
+end). The historical rationale for the old in-process CLI bridge is preserved here because
+`run_av` itself survives for that one path.
 
-Callbacks commit with the current step or epoch as the message, attach numeric training metrics as `--metric` flags, and flush a final `av push` when training ends — so an interrupted run still leaves every intermediate checkpoint committed and queued. `dataset_paths` stages once at training start, tagged `dataset`, because there is no reliable way to auto-detect a dataset's on-disk path from a generic `Dataset`/`DataLoader` object; opt-in beats wrong-guess.
+**Scoped commits (v1.1.9, seam v1.2.2):** every plugin add+commit pair (callbacks AND import backfills) runs through the scoping seam, which isolates one commit without destroying the change-detection baseline: staging runs against the untouched index, the scope is computed as exactly what that staging touched (new keys, changed content, staged transitions), committed through the real single code path, and everything else merges back with its staged flag untouched — an import or checkpoint commit therefore never sweeps unrelated human-staged files into its tree (Probleme.md #38), and unchanged re-imports stay "Nothing to commit" no-ops (Probleme.md #71). Plain `av commit` keeps full-snapshot semantics; only machine-driven plugin events are scoped.
 
-**Scoped commits (v1.1.9):** every plugin add+commit pair (callbacks AND import backfills) runs through `_shared.py::commit_scoped()`, which isolates one commit without destroying the change-detection baseline: `add` runs against the untouched index, the scope is computed as exactly what that add touched (new keys, changed content, staged transitions), committed through the real single code path, and everything else merges back with its staged flag untouched — an import or checkpoint commit therefore never sweeps unrelated human-staged files into its tree (Probleme.md #38), and unchanged re-imports stay "Nothing to commit" no-ops (Probleme.md #71). Plain `av commit` keeps full-snapshot semantics; only machine-driven plugin events are scoped.
+Callbacks commit with the current step or epoch as the message, attach numeric training metrics as first-class metrics, and flush a final `av push` when training ends — so an interrupted run still leaves every intermediate checkpoint committed and queued. `dataset_paths` stages once at training start, tagged `dataset`, because there is no reliable way to auto-detect a dataset's on-disk path from a generic `Dataset`/`DataLoader` object; opt-in beats wrong-guess.
 
 Backfill runs through matching import paths, each available as both a Python function and a CLI command: `av import-lightning`, `av import-transformers`, `av import-mlflow`. Imports read metrics found alongside the checkpoint (Lightning's `callback_metrics`, Transformers' `trainer_state.json` log history, MLflow's own run metrics), tag commits `lightning-import` / `transformers-import` / `mlflow-import`, and re-importing unchanged content is a no-op.
 
@@ -340,15 +348,17 @@ Versions come from setuptools-scm reading git tags — no version string is hand
 1. `cibuildwheel` builds wheels for cp310–cp314 across Windows/Linux/macOS, plus an sdist job.
 2. PyPI publishes via trusted publishing — OIDC, `environment: pypi`, no long-lived token.
 3. A GitHub Release appears with auto-generated notes and every wheel/sdist attached; curated long-form notes link back to [CHANGELOG.md](CHANGELOG.md).
-4. GHCR receives `:latest` plus version-tagged images for both `aether-vault-server` and `aether-vault-webui`.
+4. GHCR receives ONE consolidated **engine image** (`ghcr.io/leon1706-lol/aether-vault-engine`) tagged `:latest` + the version tag. Since v1.2.2 the image is multi-stage (py-builder → Node 20 web-builder → runtime with BOTH Python and Node) and runs ALL subservices in ONE container dispatched by `AV_ENGINE_ROLE` (`all` | `server` | `webui`, supervised by `docker/engine-entrypoint.sh`). For one transition cycle the SAME image is also pushed under the historical `aether-vault-server`/`aether-vault-webui` names; the entrypoint auto-detects the legacy per-service role from container env (`DATABASE_URL` set → server-only; `NEXT_PUBLIC_API_URL` without it → webui-only), so pre-1.2.2 pinned compose files keep working unchanged. **The aliases are deprecated now and are removed in the next release** — pinned installs should move to the engine name.
 
-Installed users pick releases up through `av update`; opted-in silent auto-update re-checks at process exit. `av update --docker` is the separate, opt-in path for the local backend images — restarting a running container is disruptive, so it never rides along with a plain version check. `docker-edge.yml` pushes `:edge` images on pushes to `master` touching code paths, between tagged releases.
+Installed users pick releases up through `av update`; opted-in silent auto-update re-checks at process exit. `av update --docker` is the separate, opt-in path for the local backend images — restarting a running container is disruptive, so it never rides along with a plain version check; it pulls only the canonical engine image. `docker-edge.yml` pushes `:edge` engine images (+ aliases) on pushes to `master` touching code paths, between tagged releases.
 
 Semver and deprecation policy live in [`../VERSIONING.md`](../VERSIONING.md): MAJOR breaks the CLI, `.av/` format, or API surface; MINOR is additive including new optional response fields; PATCH is safe. Deprecations get at least one full MINOR grace window and never vanish inside a PATCH; database schema changes are owned by Alembic migrations applied automatically at server startup.
 
 **Resolved:** `docker-edge.yml` used to trigger on `main`, but this repo's default branch has always been `master` — so edge images never fired. Reconciled to `[master]` in the v1.1.8 cycle; `:edge` now tracks every code-path push.
 
 **Resolved:** wheels shipped cp310–cp314 since Phase 46 (cibuildwheel matrix), matching the dev environment's Python 3.14.
+
+**Resolved:** the two-image split topology (separate `aether-vault-server` and `aether-vault-webui` containers) was consolidated into the single engine image/container in v1.2.2 — see above for the alias transition contract.
 
 ## Runs Contract (v1.2.0)
 
@@ -359,30 +369,70 @@ agents never fails a push. `metrics_summary` keeps the latest value per metric, 
 on every linked commit. Client surface: `av run start/finish/list/show`, `AV_RUN_ID`,
 SDK `repo.runs`. Commits auto-tag `run:<id>` (tags remain part of the hashed payload).
 
-## Events & Webhooks Contract (v1.2.0)
+## Events & Webhooks Contract (v1.2.0, delivery ledger v1.2.2)
 
 `events` is append-only; the autoincrement id IS the resumable cursor
 (`GET /api/events?since=<id>&project_id=&kinds=&wait=<secs>`, ascending, bounded limit).
 Kinds today: commit · ref · run · gc · webhook_test. Webhooks POST the raw JSON body with
 `X-AV-Event-Id/-Kind/X-AV-Signature: hex(hmac-sha256(secret, body))`; secrets live in the
-registry (signing requirement) and are never returned (masked listings only). Delivery is
-at-most-one-attempt per event — subscribers reconcile via the cursor. Zero active hooks ⇒
+registry (signing requirement) and are never returned (masked listings only). Zero active hooks ⇒
 zero background work. Retention: `AV_EVENT_RETENTION_DAYS` (default 30) swept during GC,
 plus manual `DELETE /api/events?before_days=N`.
 
-## Semantic Diff Contract (v1.2.0)
+**Webhook delivery ledger (v1.2.2, migration `0003`):** every fan-out attempt persists a
+`webhook_deliveries` row BEFORE its POST (`pending`) and updates it after
+(`delivered`/`failed`); failed rows carry `next_retry_at` and are re-driven by the server's
+startup+interval retry worker until `AV_WEBHOOK_MAX_ATTEMPTS` (default 5) exhausts into
+`dead`. Rows snapshot the event's kind/payload/project so retries reconstruct the
+byte-identical signed body even after the source event is retention-swept; rows ride the
+mutation's own transaction so rolled-back mutations leave no phantom records.
+Observability: `GET /api/admin/webhook-deliveries?status&webhook_id&limit&offset`.
+
+## Signed Commits Contract (v1.2.2)
+
+Optional per-repo ed25519 signing ("tamper evidence, not a trust network" — see SECURITY.md).
+`av registry keygen` generates `.av/keys/signing.pem` (0600) + `.pub` via the `[sign]`
+extra; when a key exists, `_finalize_commit` auto-signs AFTER hash computation: canonical
+bytes = sorted-keys JSON of the payload minus `signature`, with the timestamp normalized to
+one UTC rendering (naive/aware/Z spellings of the same instant MUST verify identically —
+the registry echoes naive UTC). The signature blob `{algo, public_key, sig}` rides commits
+verbatim, persists in `commits.signature` (0003), and survives clone/pull so `av verify
+<hash>` works on any copy: signature-first, legacy HMAC attest-tag fallback, honest UNSIGNED
+verdict (exit 0 — unsigned commits are valid). Signing never blocks or fails a commit.
+
+## Env Snapshot Contract (v1.2.2)
+
+A snapshot's id IS `sha256(canonical bytes)` where canonical = compact sorted-keys JSON of
+the snapshot minus `captured_at` — equal environments produce equal ids (determinism is a
+tested contract). Snapshots upload through the NORMAL object flow at push; commits carry
+`env_snapshot_id` in the hashed payload; the server persists it on commits AND back-fills
+linked runs on first link (first-link wins). Readers: `av env replay [target]` /
+top-level `av replay <run-id|commit-hash|snapshot-id>` resolve from local CAS or registry;
+`.avh.replay.snapshot_id` carries the pointer into agent context memory.
+
+## Audit Trail Contract (v1.2.2)
+
+Every mutating API call writes `audit_log(username, action, project_id, details,
+status_code)` — the status code captures the HTTP outcome ("did it land?"), not just the
+attempt. Read surface: `GET /api/admin/audit?action&project_id&since&until&limit&offset`
+(invalid timestamps → 422), CLI `av audit list`. Retention: `AV_AUDIT_RETENTION_DAYS`
+(default 90) swept during GC plus manual prune endpoint.
+
+## Semantic Diff Contract (v1.2.0, dedup_efficiency v1.2.2)
 
 `python/av_cli/semdiff.py::diff_trees(old_tree, new_tree)` is pure: added/removed/changed,
 per-model layer movement (count/pct/largest movers), chunk reuse ratio across CDC-chunked
-files, dataset classification (extension+name heuristics), byte totals, and a one-sentence
-human summary. Consumers: `av diff`, `.avh.semantic_summary`, WebUI expanded commits.
-The dict shape is additive-only by policy.
+files (+ `chunks.dedup_efficiency` = reused/(reused+new), None when no chunks — flows into
+`.avh.semantic_summary`), dataset classification (extension+name heuristics), byte totals,
+and a one-sentence human summary. Consumers: `av diff`, `.avh.semantic_summary`, WebUI
+expanded commits and the v1.2.2 run-detail panel (client-side re-composition in
+`webui/src/lib/runDetail.ts`). The dict shape is additive-only by policy.
 
 ## .avh v2 — Agent Context Memory Contract (v1.2.0)
 
 `handoff.avh` carries `$schema` + `avh_version:"2.0"`, legacy v1 keys (never removed),
 and: `lineage{run_id,parent_run_ids,code_pointer{git_remote,git_sha,dirty}}`,
-`semantic_summary`, `replay{pins,seeds,cuda,commands}`, and
+`semantic_summary`, `replay{pins,seeds,cuda,commands,snapshot_id}`, and
 `context_memory{notes[],metrics_history_tail[]}` — notes are APPEND-ONLY in
 `.av/context/memory.jsonl` (`av context note`) and survive every regeneration.
 Readers must tolerate unknown sections; writers must run `validate_handoff()` in CI paths.
@@ -408,10 +458,16 @@ itself). Enforcement is CLIENT-SIDE v1; server-side authz is enterprise-tier.
 | Registry primitives | `tests/test_registry.py` | Ref namespacing and project-scoped lookups |
 | Stash / fs utilities / repl / graph / ui | `tests/test_stash.py`, `tests/test_fsutil.py`, `tests/test_repl.py`, `tests/test_graph.py`, `tests/test_ui.py` | Supporting-surface coverage |
 | Runtime plumbing | `tests/test_docker_runtime.py`, `tests/test_update_check.py`, `tests/test_speedcheck.py`, `tests/test_tool_runner.py`, `tests/test_dependency_guards.py` | Container control, update checks, speed budgets, benchmark tool runner, optional-dependency guards |
-| Plugins | `tests/test_plugins.py` | Callback + import paths with framework extras installed |
-| Web UI units | `webui/` Vitest suite (`npm test`) | Components plus pure logic incl. `diffWeights` |
+| Plugins | `tests/test_plugins.py` | Callback + import paths with framework extras installed; v1.2.2 seam-parity tests (seam vs SDK vs CLI, AV_RUN_ID + metrics flow) |
+| Signed commits | `tests/test_signing.py` | Keygen/roundtrip/tamper/unsigned-ok + canonical-bytes golden fixtures + verify CLI; skips without the `[sign]` extra (CI plugin job installs it) |
+| Dataset CDC matrix | `tests/test_dataset_cdc.py` | Boundary stability/determinism across every CHUNKABLE_EXT + `.avattributes` enforcement matrix |
+| V1.2.2 units | `tests/test_v122.py` | dedup_efficiency→.avh flow, avh schema-file validation path, audit-list param contract |
+| Agent surface (v1.2.0) | `tests/test_v120.py`, `tests/test_av_sdk.py`, `tests/test_semdiff.py`, `tests/test_webhooks_cli.py` | Envelope/exit codes, SDK seam, semdiff math, webhooks CLI |
+| Perf gate | `tests/test_perf_gate.py` | speedcheck synthetic probes within 2× budget (strictened from 3× in v1.2.2; incl. semdiff probe) |
+| Web UI units | `webui/` Vitest suite (`npm test`) | Components plus pure logic incl. `diffWeights` and `runDetail` (lineage chain + client-side tree-diff summary) |
 | Web UI browser E2E | `webui/e2e/*.spec.ts` (Playwright, CI `webui-e2e`) | Seeded live stack: dashboard, weight-diff, and Protected-mode token gate |
-| Product E2E scenarios | `scripts/e2e_scenario.sh` (CI `e2e-suite`) | Real CLI ↔ real server: merge collaboration, offline drain, legacy-volume upgrade, per-user auth attribution/revocation, zero-grace GC |
+| Product E2E scenarios | `scripts/e2e_scenario.sh` (CI `e2e-suite`) | Real CLI ↔ real server: merge collaboration, offline drain, legacy-volume upgrade, per-user auth attribution/revocation, zero-grace GC, SDK loop, event reactiveness, promotion policy, signed roundtrip (J), audit query (K) |
+| Engine image | CI `e2e-engine-smoke` (Phase I) | Builds the consolidated image; proves role=all / role=server / legacy auto-detect / role=webui dispatch + dual healthchecks |
 | Packaging install smoke | CI `smoke-wheel-linux` / `smoke-sdist-windows` | Built artifacts installed into clean venvs; offline CLI roundtrip per OS |
 | Cross-version compat | `.github/workflows/nightly.yml` | Full suite on py3.11–3.13 nightly + pre-release dispatch |
 | Web UI lint + typecheck | `npm run lint` (`next lint --max-warnings 0`), `npm run typecheck` (`tsc --noEmit`) | CI steps in the webui-tests job; `.eslintrc.json` extends `next/core-web-vitals` |

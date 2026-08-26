@@ -1,20 +1,21 @@
-"""Shared helpers for framework plugins (Lightning, Transformers, ...).
+"""Shared helpers for framework plugins (Lightning, Transformers, MLflow).
 
-Plugins drive the existing `av` CLI in-process instead of duplicating its
-add/commit/push logic (LFS pointers, safetensors layer splitting, pending-push
-queueing, project-id namespacing). See ARCHITECTURE.md for the rationale.
+v1.2.2 migration: add/commit no longer shells through the CLI — plugins call
+`core.commit_scoped_paths()` directly (the same internal seam av_sdk.Repo uses), so
+there is no chdir dance and exactly one commit writer for CLI, SDK, watch, AND
+plugins. `run_av` remains ONLY for `push` (the deliberate CLI-flush at training end)
+and is kept for backward compatibility with external callers.
 """
 import os
 from pathlib import Path
 
 from av_cli.exceptions import AetherVaultException
-from av_cli.main import cli
 
 
 def resolve_repo_root(start: Path) -> Path:
     """Walks upward from `start` looking for a `.av` directory.
 
-    Mirrors `find_repo_root()` in av_cli/main.py, but takes an explicit start
+    Mirrors `find_repo_root()` in av_cli/core.py, but takes an explicit start
     path so plugins work regardless of the training script's cwd.
     """
     start = start.resolve()
@@ -29,21 +30,25 @@ def resolve_repo_root(start: Path) -> Path:
 def run_av(repo_root: Path, args: list[str]) -> None:
     """Invokes the `av` CLI in-process with `args`, as if run from `repo_root`.
 
-    `add`/`commit`/etc. resolve their repo via `Path.cwd()`, not an argument,
-    so this temporarily chdirs into `repo_root` for the duration of the call.
-    Exceptions propagate to the caller (standalone_mode=False disables click's
-    own error printing + sys.exit) so training loops can decide how to react.
+    Kept for the plugin `push` flush (a CLI-flush by design — it drains the
+    pending_push queue through the exact code an interactive user runs). `add`/`commit`
+    no longer route here (see commit_scoped below).
     """
     previous_cwd = Path.cwd()
     os.chdir(repo_root)
     try:
+        from av_cli.main import cli
+
         cli.main(args=args, prog_name="av", standalone_mode=False)
     finally:
         os.chdir(previous_cwd)
 
 
 def build_metric_args(metrics: dict) -> list[str]:
-    """Converts a dict of numeric metrics into repeatable `--metric k=v` flags."""
+    """Converts a dict of numeric metrics into repeatable `--metric k=v` flags.
+
+    Retained for backward compatibility with external callers; since the v1.2.2 seam
+    migration, plugins pass metric dicts straight to commit_scoped() instead."""
     args = []
     for key, value in metrics.items():
         if isinstance(value, bool):
@@ -67,62 +72,26 @@ def filter_existing_files(paths: list[str]) -> list[str]:
     return [p for p in paths if Path(p).is_file()]
 
 
-def commit_scoped(repo_root: Path, paths: list[str], commit_args: list[str]) -> None:
+def commit_scoped(
+    repo_root: Path,
+    paths: list[str],
+    message: str,
+    tags: tuple = (),
+    metrics: dict | None = None,
+) -> str | None:
     """Stages `paths` and commits ONLY them, leaving unrelated staged work alone.
 
-    Fixes Probleme.md #38: `av commit` snapshots the whole index, so an import firing
-    while the user had unrelated files staged used to sweep them into the import's
-    commit under the import's message/tags. Since the tree IS the full index, isolation
-    means scoping the staging area for exactly one commit — WITHOUT destroying the
-    change-detection baseline (Probleme.md #71): `add` must still see the real entries
-    for the target paths, or a re-import of unchanged content looks "new" and produces
-    a duplicate commit instead of the intended "Nothing to commit" no-op.
+    Thin delegation to `av_cli.core.commit_scoped_paths()` — THE shared machine-commit
+    seam (also used by agent tooling). See that function's docstring for the scoping
+    contract (Probleme.md #38 isolation, #71 baseline preservation, #76 missing-path
+    tolerance) and AV_RUN_ID flow.
 
-    Sequence: snapshot everything → run the real CLI `add` against the untouched index
-    → reload and scope the index to exactly the keys `add` touched (new keys or newly
-    staged) → run the normal single-code-path commit → merge every other entry back in
-    `finally` with its staged flag untouched. A plain `av commit` keeps full-snapshot
-    semantics; only machine-driven plugin events are scoped. Still drives add/commit
-    through the CLI (same in-process invocation as `run_av`) — zero duplicated commit
-    logic; only the staging scope is managed here.
+    Returns the commit hash, or None when nothing changed ("Nothing to commit" no-op).
+
+    Backward-compat note: this used to take a ready-made `commit_args` CLI list; the
+    signature now takes message/tags/metrics directly since v1.2.2 dropped the CLI hop.
     """
-    previous_cwd = Path.cwd()
-    os.chdir(repo_root)
-    import copy
+    from av_cli.core import commit_scoped_paths
 
-    from av_cli.index import Index
-
-    idx = Index(repo_root)
-    saved = copy.deepcopy(idx.entries)
-    baseline_keys = set(saved)
-    # Staged-before-import set: lets the scoping step below tell "add staged this" apart
-    # from "the USER had this staged long before the import fired" — both read as
-    # staged=True afterwards.
-    pre_staged = {rel_path for rel_path, entry in saved.items() if entry.get("staged")}
-    try:
-        cli.main(args=["add", *paths], prog_name="av", standalone_mode=False)
-
-        # Scope to exactly what THIS add touched: brand-new keys, keys whose content
-        # changed under a known path (re-staged by add), and keys that transitioned into
-        # staged by this add. Unchanged re-imports touch nothing → scoped index stays
-        # empty → the commit is the documented no-op rather than a duplicate.
-        post_add = Index(repo_root)
-        post_add.entries = {
-            rel_path: entry
-            for rel_path, entry in post_add.entries.items()
-            if rel_path not in baseline_keys
-            or entry.get("hash") != saved[rel_path].get("hash")
-            or (entry.get("staged") and rel_path not in pre_staged)
-        }
-        post_add.save()
-
-        cli.main(args=commit_args, prog_name="av", standalone_mode=False)
-    finally:
-        os.chdir(previous_cwd)
-        # Post-commit index: the import's targets present with staged flags cleared by
-        # _finalize_commit. Everything the user had staged before comes back unchanged.
-        fresh = Index(repo_root)
-        for rel_path, entry in saved.items():
-            if rel_path not in fresh.entries:
-                fresh.entries[rel_path] = entry
-        fresh.save()
+    return commit_scoped_paths(repo_root, paths, message, tags=tuple(tags),
+                               metrics=dict(metrics or {}))

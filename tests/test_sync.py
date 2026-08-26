@@ -77,6 +77,10 @@ class FakeRemoteClient(client_module.VaultClient):
             "metrics": commit_data.get("metrics", {}),
             "project_id": commit_data.get("project_id"),
             "project_name": commit_data.get("project_name"),
+            # v1.2.2: mirror the real server, which echoes signature blobs (and would
+            # env_snapshot ids) so clones can verify/replay — dropping these here hid
+            # exactly the bug the live manual pass caught.
+            "signature": commit_data.get("signature"),
         }
         if include_tree:
             row["tree"] = commit_data.get("tree", {})
@@ -183,6 +187,60 @@ def fake_registry(tmp_path, monkeypatch):
 
     monkeypatch.setattr(client_module, "VaultClient", lambda *a, **k: fake)
     return {"source": source, "fake": fake, "pid": pid}
+
+
+# ---------------------------------------------------------------------------
+# v1.2.2: signatures and env snapshot ids must SURVIVE clone/pull round trips.
+# ---------------------------------------------------------------------------
+
+def test_normalize_commit_row_carries_signature_and_env_id():
+    from python.av_cli.sync import normalize_commit_row
+
+    sig = {"algo": "ed25519", "public_key": "ab", "sig": "cd"}
+    row = {
+        "hash": "1" * 64, "message": "m", "author": "a", "timestamp": None,
+        "parent_hash": None, "parents": [], "tags": [], "metrics": {},
+        "project_id": "p", "project_name": "n",
+        "signature": sig, "env_snapshot_id": "e" * 64,
+    }
+    normalized = normalize_commit_row(row)
+    assert normalized["signature"] == sig
+    assert normalized["env_snapshot_id"] == "e" * 64
+    # And rows WITHOUT them stay clean (no phantom keys):
+    bare = normalize_commit_row({k: v for k, v in row.items()
+                                 if k not in ("signature", "env_snapshot_id")})
+    assert "signature" not in bare and "env_snapshot_id" not in bare
+
+
+def test_clone_preserves_signature_for_offline_verify(fake_registry, tmp_path, monkeypatch):
+    """The whole point of persisting signatures server-side: a clone on a FRESH machine
+    (no .av/keys of its own) can still verify the author's commit — offline."""
+    import base64
+
+    from python.av_cli.signing import generate_keypair, verify_signature
+
+    source = fake_registry["source"]
+    monkeypatch.chdir(source)
+    generate_keypair(source)  # auto-sign kicks in for commits made AFTER this
+    (source / "signed_thing.txt").write_text("v")
+    invoke("add", "signed_thing.txt")
+    r = invoke("commit", "-m", "signed commit")
+    assert r.exit_code == 0, r.output
+    signed_hash = (source / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    clone = tmp_path / "clone"
+    monkeypatch.chdir(tmp_path)
+    result = invoke("clone", fake_registry["pid"], str(clone))
+    assert result.exit_code == 0, result.output
+
+    cloned_commit_file = clone / ".av" / "commits" / f"{signed_hash}.json"
+    assert cloned_commit_file.exists(), "signed commit missing from the clone"
+    data = json.loads(cloned_commit_file.read_text(encoding="utf-8"))
+    assert isinstance(data.get("signature"), dict), \
+        "clone dropped the signature — verify would falsely report UNSIGNED"
+    ok, reason = verify_signature(data)
+    assert ok, f"cloned signature failed verification: {reason}"
+    del base64
 
 
 def test_clone_materializes_tip_full_history_and_identity(fake_registry, tmp_path, monkeypatch):

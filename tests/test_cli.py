@@ -1346,7 +1346,7 @@ def test_auth_set_token_restarts_the_server(repo, monkeypatch):
     )
 
     invoke("auth", "set-token", "a-token")
-    assert restart_calls == ["aether-vault-server"]
+    assert restart_calls == ["aether-vault-engine"]
 
 
 def test_auth_set_token_when_docker_not_running_warns_but_still_saves(repo, monkeypatch):
@@ -1464,7 +1464,7 @@ def test_auth_add_user_merges_into_existing_map_and_restarts(repo, monkeypatch):
     invoke("auth", "add-user", "bob", "tok-b")
 
     assert _stored_auth_users(repo) == {"alice": "tok-a", "bob": "tok-b"}
-    assert restart_calls == ["aether-vault-server", "aether-vault-server"]
+    assert restart_calls == ["aether-vault-engine", "aether-vault-engine"]
 
 
 def test_auth_add_user_duplicate_warns_without_clobbering(repo, monkeypatch):

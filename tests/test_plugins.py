@@ -305,7 +305,9 @@ def test_commit_scoped_commits_only_target_paths(tmp_path):
     ckpt = repo_root / "model.pt"
     ckpt.write_text("dummy weights")
 
-    commit_scoped(repo_root, [str(ckpt)], ["commit", "-m", "imported checkpoint"])
+    # v1.2.2: commit_scoped takes message/tags/metrics directly — it drives the internal
+    # seam (core.commit_scoped_paths), not the CLI.
+    commit_scoped(repo_root, [str(ckpt)], "imported checkpoint")
 
     trees = _commit_trees(repo_root)
     assert len(trees) == 1
@@ -325,10 +327,11 @@ def test_commit_scoped_restore_survives_add_failure(tmp_path):
     repo_root = _init_repo(tmp_path)
     unrelated = _stage_unrelated(repo_root)
 
-    with pytest.raises(Exception):
-        commit_scoped(repo_root, [str(repo_root / "does-not-exist.pt")], ["commit", "-m", "x"])
+    # v1.2.2 seam semantics: a missing path is SKIPPED (Lightning's before-write hook
+    # ordering, Probleme.md #76) — so this neither raises nor commits anything, and the
+    # user's staging area is byte-identical to before.
+    commit_scoped(repo_root, [str(repo_root / "does-not-exist.pt")], "x")
 
-    # Nothing committed, and the user's staging area is byte-identical to before.
     assert len(_commit_trees(repo_root)) == 0
     from av_cli.index import Index
     idx = Index(repo_root)
@@ -380,16 +383,15 @@ def test_commit_scoped_reimport_is_a_noop(tmp_path):
     ckpt = repo_root / "model.pt"
     ckpt.write_text("dummy weights")
 
-    args = ["commit", "-m", "imported checkpoint", "--tag", "lightning-import"]
-    commit_scoped(repo_root, [str(ckpt)], args)
-    commit_scoped(repo_root, [str(ckpt)], args)
+    commit_scoped(repo_root, [str(ckpt)], "imported checkpoint", tags=("lightning-import",))
+    commit_scoped(repo_root, [str(ckpt)], "imported checkpoint", tags=("lightning-import",))
 
     trees = _commit_trees(repo_root)
     assert len(trees) == 1, "re-importing unchanged content created a second commit"
 
     # A content CHANGE under the same path must still produce exactly one new commit.
     ckpt.write_text("updated weights v2")
-    commit_scoped(repo_root, [str(ckpt)], ["commit", "-m", "imported checkpoint v2"])
+    commit_scoped(repo_root, [str(ckpt)], "imported checkpoint v2")
     trees = _commit_trees(repo_root)
     assert len(trees) == 2
     assert any("model.pt" in t["tree"] and "v2" in t["message"] for t in trees)
@@ -410,7 +412,7 @@ def test_commit_scoped_keeps_directory_targets_together(tmp_path):
     commit_scoped(
         repo_root,
         [str(ckpt_dir)],
-        ["commit", "-m", "Imported Transformers checkpoint checkpoint-5"],
+        "Imported Transformers checkpoint checkpoint-5",
     )
 
     trees = _commit_trees(repo_root)
@@ -548,3 +550,111 @@ def test_lightning_callback_skips_unwritten_checkpoint_then_commits_it(tmp_path)
     assert any(
         "epoch=0-step=2.ckpt" in rel for t in trees for rel in t["tree"]
     ), f"existing checkpoint never committed: {[list(t['tree']) for t in trees]}"
+
+
+# ---------------------------------------------------------------------------
+# v1.2.2 seam migration: parity between the plugin seam, the SDK, and the CLI,
+# plus AV_RUN_ID / metrics flow through core.commit_scoped_paths.
+# ---------------------------------------------------------------------------
+
+def test_commit_scoped_paths_resolves_ambient_run_id(tmp_path, monkeypatch):
+    """AV_RUN_ID must flow into machine commits exactly like CLI commits (zero
+    integration required for training loops orchestrated by agents)."""
+    from python.av_cli.core import commit_scoped_paths
+
+    repo_root = _init_repo(tmp_path)
+    ckpt = repo_root / "model.pt"
+    ckpt.write_text("weights")
+
+    monkeypatch.setenv("AV_RUN_ID", "run-abc-123")
+    commit_scoped_paths(repo_root, [str(ckpt)], "scoped under ambient run")
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    assert "run:run-abc-123" in trees[0]["tags"], \
+        f"ambient AV_RUN_ID not applied by the seam: {trees[0]['tags']}"
+
+
+def test_explicit_run_id_beats_env_in_the_seam(tmp_path, monkeypatch):
+    from python.av_cli.core import commit_scoped_paths
+
+    repo_root = _init_repo(tmp_path)
+    ckpt = repo_root / "model.pt"
+    ckpt.write_text("w")
+    monkeypatch.setenv("AV_RUN_ID", "from-env")
+
+    commit_scoped_paths(repo_root, [str(ckpt)], "explicit", run_id="explicit-run")
+    trees = _commit_trees(repo_root)
+    assert any(t.startswith("run:explicit-run") for t in trees[0]["tags"])
+    assert not any(t == "run:from-env" for t in trees[0]["tags"])
+
+
+def test_metrics_flow_through_plugin_seam(tmp_path):
+    """Numeric metrics ride machine commits as first-class metrics (not tags), matching
+    what the real Lightning/Transformers callbacks attach."""
+    from python.av_plugins._shared import commit_scoped
+
+    repo_root = _init_repo(tmp_path)
+    ckpt = repo_root / "model.pt"
+    ckpt.write_text("w")
+
+    commit_scoped(repo_root, [str(ckpt)], "epoch=3",
+                  tags=("unit-test",), metrics={"train_loss": 0.25, "epoch": 3})
+
+    trees = _commit_trees(repo_root)
+    assert trees[0]["metrics"] == {"train_loss": 0.25, "epoch": 3}
+    assert "unit-test" in trees[0]["tags"]
+
+
+def test_seam_parity_plugin_vs_sdk_vs_cli(tmp_path, monkeypatch):
+    """All three surfaces drive ONE writer: the resulting commit payloads carry the same
+    structural fields regardless of which entry point produced them."""
+    import json as json_mod
+
+    from av_sdk import Repo
+    from python.av_cli.core import commit_scoped_paths
+
+    def _tree_of(commit_file):
+        data = json_mod.loads(commit_file.read_text())
+        return {
+            "parents": data["parents"],
+            "has_hash": bool(data.get("hash")),
+            "tree_keys": sorted(data["tree"]),
+            "metrics": data.get("metrics") or {},
+            "tags": sorted(t for t in data.get("tags", []) if not t.startswith("run:")),
+            "author": data.get("author"),
+        }
+
+    # Plugin seam:
+    seam_repo = _init_repo(_mkdir(tmp_path / "seam"))
+    (seam_repo / "artifact.bin").write_bytes(b"x")
+    commit_scoped_paths(seam_repo, ["artifact.bin"], "via seam",
+                        tags=("parity",), metrics={"loss": 0.1})
+    seam_tree = _tree_of(next(iter((seam_repo / ".av" / "commits").glob("*.json"))))
+
+    # SDK:
+    sdk_repo = _init_repo(_mkdir(tmp_path / "sdk"))
+    with Repo(sdk_repo) as r:
+        (r.path / "artifact.bin").write_bytes(b"x")
+        r.add("artifact.bin")
+        r.commit("via sdk", tags=["parity"], metrics={"loss": 0.1})
+    sdk_tree = _tree_of(next(iter((sdk_repo / ".av" / "commits").glob("*.json"))))
+
+    # CLI:
+    cli_repo = _mkdir(tmp_path / "cli")
+    _init_repo(cli_repo)
+    (cli_repo / "artifact.bin").write_bytes(b"x")
+    run_av(cli_repo, ["add", "artifact.bin"])
+    run_av(cli_repo, ["commit", "-m", "via cli", "--tag", "parity",
+                      "--metric", "loss=0.1"])
+    cli_tree = _tree_of(next(iter((cli_repo / ".av" / "commits").glob("*.json"))))
+
+    for field in ("has_hash", "tree_keys", "metrics", "tags"):
+        assert seam_tree[field] == sdk_tree[field] == cli_tree[field], \
+            f"parity broken on {field}: seam={seam_tree[field]} " \
+            f"sdk={sdk_tree[field]} cli={cli_tree[field]}"
+
+
+def _mkdir(p):
+    p.mkdir(parents=True, exist_ok=True)
+    return p

@@ -1,0 +1,220 @@
+"""V1.2.2 unit-level tests: .avh flow-through, schema-file validation, audit CLI params.
+
+Covers the plan's Part-3 "Unit" row:
+- dedup_efficiency flows from semdiff into .avh.semantic_summary (gap 2)
+- the shipped avh-2.0 JSON-Schema artifact validates a golden document and rejects a
+  broken one — with jsonschema if available; the schema FILE is parsed either way so a
+  malformed artifact fails here regardless of extras
+- `av audit list` builds its query params correctly (client-side contract)
+"""
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+from click.testing import CliRunner
+
+from python.av_cli import cmd_audit
+from python.av_cli.attributes import load_attributes  # noqa: F401 (parity with core use)
+from python.av_cli.handoff import build_handoff_dict, validate_handoff
+from python.av_cli.semdiff import diff_trees
+from python.av_cli.main import cli
+
+_SCHEMA_PATH = Path(__file__).resolve().parents[1] / "python" / "av_cli" / "schemas" / "avh-2.0.schema.json"
+
+
+def _init_repo(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    res = CliRunner().invoke(cli, ["init", "--mode", "local", "--yes", "--no-repl"],
+                             standalone_mode=False)
+    assert res.exit_code == 0, res.output
+
+
+def _commit_tree(repo_root, tree: dict, message: str):
+    """Commits a synthetic flat tree via the real single writer. tree entries are full
+    index-entry dicts."""
+    from python.av_cli.core import commit_staged
+    from python.av_cli.index import Index
+
+    idx = Index(repo_root)
+    idx.entries.update(tree)
+    idx.save()
+    return commit_staged(repo_root, message)
+
+
+def _entry(file_hash, chunks):
+    return {
+        "hash": file_hash, "size": sum(c["size"] for c in chunks), "mtime_ns": 0,
+        "type": "artifact", "staged": True, "pointer": None,
+        "chunks": list(chunks),
+    }
+
+
+# ---------------------------------------------------------------------------
+# dedup_efficiency → .avh.semantic_summary
+# ---------------------------------------------------------------------------
+
+def test_dedup_efficiency_flows_into_avh_semantic_summary(tmp_path, monkeypatch):
+    """Parent chunks {A,B} → child chunks {A,fresh}: efficiency must be 1/2 in BOTH the
+    raw engine output and whatever lands in .avh.semantic_summary."""
+    _init_repo(tmp_path, monkeypatch)
+
+    chunk_a = {"hash": "a" * 64, "size": 10, "offset": 0}
+    chunk_b = {"hash": "b" * 64, "size": 10, "offset": 10}
+    chunk_new = {"hash": "f" * 64, "size": 10, "offset": 20}
+
+    parent_hash = _commit_tree(
+        tmp_path, {"m.pt": _entry("p" * 64, [chunk_a, chunk_b])}, "parent")
+
+    # Child reuses A, replaces B with fresh:
+    child_hash = _commit_tree(
+        tmp_path,
+        {"m.pt": dict(_entry("c" * 64, [chunk_a, chunk_new]), staged=True)},
+        "child",
+    )
+
+    parent_tree = json.loads(
+        (tmp_path / ".av" / "commits" / f"{parent_hash}.json").read_text())["tree"]
+    child_commit = json.loads(
+        (tmp_path / ".av" / "commits" / f"{child_hash}.json").read_text())
+
+    engine = diff_trees(parent_tree, child_commit["tree"])
+    assert engine["chunks"]["reused"] == 1
+    assert engine["chunks"]["new"] == 1
+    assert engine["chunks"]["dedup_efficiency"] == 0.5
+
+    avh = build_handoff_dict(tmp_path, None)
+    assert avh["semantic_summary"] is not None
+    assert avh["semantic_summary"]["chunks"] == engine["chunks"], \
+        ".avh.semantic_summary lost the dedup_efficiency flow-through"
+
+
+# ---------------------------------------------------------------------------
+# Schema-file validation path
+# ---------------------------------------------------------------------------
+
+def test_schema_artifact_parses_and_matches_contract():
+    assert _SCHEMA_PATH.exists(), "avh-2.0.schema.json missing from package data"
+    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    assert schema["$id"].endswith("avh-2.0.json")
+    for key in ("$schema", "avh_version", "generated_at", "current_branch",
+                "lineage", "context_memory"):
+        assert key in schema["required"], f"schema lost required key {key}"
+
+
+@pytest.mark.skipif(importlib.util.find_spec("jsonschema") is None,
+                    reason="jsonschema not installed")
+def test_golden_document_validates_against_schema_file(tmp_path, monkeypatch):
+    import jsonschema
+
+    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    doc = build_handoff_dict(_golden_repo(tmp_path, monkeypatch), "hand me the loop")
+    jsonschema.validate(doc, schema)  # raises on any violation
+
+    broken = dict(doc)
+    broken["avh_version"] = "1.0"  # schema pattern ^2\.
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(broken, schema)
+
+
+def test_structural_validator_agrees_on_golden_and_broken(tmp_path, monkeypatch):
+    repo = _golden_repo(tmp_path, monkeypatch)
+    doc = build_handoff_dict(repo, None)
+    assert validate_handoff(doc) == []
+
+    broken = dict(doc)
+    broken.pop("lineage")
+    problems = validate_handoff(broken)
+    assert any("lineage" in p for p in problems)
+
+
+def _golden_repo(tmp_path, monkeypatch):
+    _init_repo(tmp_path, monkeypatch)
+    return tmp_path
+
+
+# ---------------------------------------------------------------------------
+# av audit list client-side param building
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, payload, status=200):
+        self._payload, self.status_code = payload, status
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    def __init__(self, responder):
+        self._responder = responder
+
+    def get(self, url, params=None, timeout=None):
+        return self._responder(url, params)
+
+
+class _FakeClient:
+    def __init__(self, responder=None):
+        self.server_url = "http://fake"
+        self.calls = []
+        self.session = _FakeSession(self._record(responder))
+
+    def _record(self, responder):
+        def _get(url, params=None, timeout=None):
+            self.calls.append((url, params))
+            if responder is None:
+                return _FakeResponse({"entries": [], "total": 0})
+            return responder(url, params)
+        return _get
+
+
+def test_audit_list_builds_filters_and_defaults(monkeypatch, tmp_path):
+    fake = _FakeClient()
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, ["audit", "list"], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    url, params = fake.calls[-1]
+    assert url.endswith("/api/admin/audit")
+    assert params["limit"] == 50 and params["offset"] == 0
+    assert "action" not in params and "project_id" not in params
+
+
+def test_audit_list_passes_every_filter_through(monkeypatch, tmp_path):
+    fake = _FakeClient()
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, [
+        "audit", "list", "--action", "commit.push", "--project", "proj-1",
+        "--since", "2026-08-01T00:00:00", "--until", "2026-08-26T23:59:59",
+        "--limit", "10", "--offset", "20",
+    ], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    _, params = fake.calls[-1]
+    assert params == {
+        "limit": 10, "offset": 20, "action": "commit.push",
+        "project_id": "proj-1",
+        "since": "2026-08-01T00:00:00", "until": "2026-08-26T23:59:59",
+    }
+
+
+def test_audit_list_json_envelope_shape(monkeypatch, tmp_path):
+    entries = [{
+        "id": 7, "ts": "2026-08-26T12:00:00", "username": "alice",
+        "action": "commit.push", "project_id": "p1", "details": {"hash": "ab"},
+        "status_code": 201,
+    }]
+    fake = _FakeClient(responder=lambda url, params: _FakeResponse(
+        {"entries": entries, "total": 1}))
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, ["--output", "json", "audit", "list"],
+                             standalone_mode=False)
+    envelope = json.loads(res.output)
+    assert envelope["ok"] is True
+    assert envelope["data"]["entries"][0]["status_code"] == 201
+    assert envelope["meta"]["command"] == "audit list"

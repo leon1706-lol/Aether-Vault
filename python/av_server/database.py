@@ -23,10 +23,14 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 # Columns introduced after the create_all era began. Legacy databases (created by the
 # pre-Alembic startup) may lack them; they are healed zero-touch at first boot with the
-# Alembic adoption and then stamped onto the migration chain.
+# Alembic adoption and then stamped onto the migration chain. Kept in sync with the
+# additive migrations: 0002-era drift is healed for volumes adopted before 0003 existed;
+# 0003 adds audit_log.status_code and commits.signature.
 _LEGACY_COLUMNS = {
-    "commits": {"extra_parents": "TEXT"},
+    "commits": {"extra_parents": "TEXT", "signature": "TEXT",
+                "env_snapshot_id": "TEXT"},
     "trees": {"chunks": "JSON"},
+    "audit_log": {"status_code": "INTEGER"},
 }
 
 
@@ -52,6 +56,24 @@ def _heal_legacy_columns(sync_conn, tables: set[str]) -> None:
                 sync_conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
 
+def _create_missing_tables(sync_conn, tables: set[str]) -> None:
+    """Creates any models.py tables a legacy volume doesn't have yet (idempotent).
+
+    Adoption stamps the ENTIRE chain as applied, which means later revisions never run
+    on that volume — so a true v1.1.x-era create_all database (no runs/events/webhooks/
+    audit_log/webhook_deliveries) would otherwise be stamped to head and silently stay
+    without the autonomous-loop tables. Creating missing tables from the metadata before
+    stamping closes that gap additively; existing tables are never touched.
+    """
+    import sqlalchemy as sa
+
+    from .models import Base
+
+    missing = [t for t in Base.metadata.sorted_tables if t.name not in tables]
+    if missing:
+        Base.metadata.create_all(sync_conn, tables=missing)
+
+
 def _ensure_schema_sync(sync_conn, cfg) -> None:
     """Runs on a worker thread inside conn.run_sync — no ambient event loop here."""
     import sqlalchemy as sa
@@ -70,8 +92,10 @@ def _ensure_schema_sync(sync_conn, cfg) -> None:
     needs_adoption = "commits" in tables and _unrecorded_chain(sync_conn, tables)
 
     if needs_adoption:
-        # Legacy create_all-era database: heal post-adoption column drift, then mark the
-        # entire existing chain applied so only FUTURE revisions ever execute on it.
+        # Legacy create_all-era database: create any post-create_all tables, heal column
+        # drift, then mark the entire existing chain applied so only FUTURE revisions ever
+        # execute on it.
+        _create_missing_tables(sync_conn, tables)
         _heal_legacy_columns(sync_conn, tables)
         MigrationContext.configure(sync_conn).stamp(script, script.get_current_head())
 

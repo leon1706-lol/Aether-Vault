@@ -1,25 +1,25 @@
 """Skip-summary aggregation for `pytest_terminal_summary` (wired in tests/conftest.py).
 
 Skips-by-design are GOOD (the Docker registry stack and optional plugin extras are
-legitimately unavailable in most local runs) — but a bare "36 skipped" in pytest's tail
+legitimately unavailable in most local runs) â€” but a bare "36 skipped" in pytest's tail
 reads as something being hidden. This module turns the raw skip reasons into an explicit,
 self-explanatory end-of-run block, e.g.:
 
     - Skipped by design --------------------------------------------
       36 skipped:
       - 33 tests need the Docker registry stack (db/redis/server unreachable)
-        -> start it with: docker compose up -d db redis aether-vault-server
+        -> start it with: docker compose up -d db redis aether-vault-engine
       - 3 optional-dependency guards (native core / plugin extras)
 
-Pure functions only — no pytest imports — so classification and rendering are unit-testable
+Pure functions only â€” no pytest imports â€” so classification and rendering are unit-testable
 in isolation (tests/test_skipsummary.py).
 """
 
 from __future__ import annotations
 
-DOCKER_HINT = "docker compose up -d db redis aether-vault-server"
+DOCKER_HINT = "docker compose up -d db redis aether-vault-engine"
 
-_DOCKER_MARKERS = ("docker compose", "postgres/redis", "live aether-vault-server")
+_DOCKER_MARKERS = ("docker compose", "postgres/redis", "live aether-vault-engine")
 _CORE_MARKERS = ("aether_core",)
 _PLUGIN_MARKERS = ("lightning", "transformers", "mlflow")
 

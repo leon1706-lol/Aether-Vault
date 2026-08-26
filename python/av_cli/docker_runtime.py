@@ -22,11 +22,17 @@ from pathlib import Path
 from . import ui
 
 # Images published by .github/workflows/release.yml (tagged releases) and docker-edge.yml
-# (rolling :edge builds from main) — keep these names in sync with both workflows and with
-# docker/docker-compose.release.yml, which references the same images by name.
+# (rolling :edge builds from master) — keep these names in sync with both workflows and with
+# docker/docker-compose.release.yml, which references the same image by name.
+#
+# v1.2.2 engine consolidation: ONE image runs ALL subservices (registry + webui) inside one
+# container dispatched by AV_ENGINE_ROLE (see docker/engine-entrypoint.sh). The historical
+# aether-vault-server/-webui images stay published as aliases of this same engine image for
+# ONE transition cycle — this map deliberately lists only the canonical name, so `av update
+# --docker` pulls the engine and stops pulling the aliases.
+RELEASE_IMAGE = "ghcr.io/leon1706-lol/aether-vault-engine:latest"
 RELEASE_IMAGES = {
-    "aether-vault-server": "ghcr.io/leon1706-lol/aether-vault-server:latest",
-    "aether-vault-webui": "ghcr.io/leon1706-lol/aether-vault-webui:latest",
+    "aether-vault-engine": RELEASE_IMAGE,
 }
 
 
@@ -307,12 +313,16 @@ def ensure_local_backend_running(
     source_root: Path,
     open_browser: bool,
     rebuild: bool = False,
-    container_name: str = "aether-vault-webui",
-    service_name: str = "aether-vault-webui",
+    container_name: str = "aether-vault-engine",
+    service_name: str = "aether-vault-engine",
     url: str = "http://localhost:3000",
     api_token: str | None = None,
 ) -> DockerOnboardingResult:
     """Top-level orchestrator: not running -> image missing -> start -> wait -> connect.
+
+    v1.2.2: the engine is ONE container (aether-vault-engine) running both the
+    registry (:8000) and the webui (:3000), so waiting for the webui URL proves
+    the whole engine came up.
 
     `api_token`, when the caller already has one configured (`.av/config`'s
     `remote_api_token`), is passed through to `_open_browser` so the webui never shows its

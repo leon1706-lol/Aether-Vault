@@ -937,3 +937,87 @@ Every entry follows **Problem** â†’ **Fix** â†’ **Verification** (real CLI runs 
 **Fix:** Proper `--version` flag on the root group (`main.py`) printing `av <version>` from the same `_get_version()` source the banner uses, exiting cleanly before any repo detection. Regression test asserts output shape + clean exit.
 
 **Verification:** Flag exercised locally against the editable install; smoke job will pass its first line on next run. Meta-note recorded for the audit trail: two of the three V1.1.12-cycle product findings (#75, #76) plus this one were all surfaced BY the new CI depth, which is precisely the bug-detection-per-surface goal it was built for.
+
+---
+
+### 78. `core.fail(None, …)` raised AttributeError after printing the error message
+
+**Severity:** 4/10 — **Status:** ? `fixed` (2026-08-26)
+
+**Problem:** Roughly a dozen call sites (`cmd_run`, `cmd_env`, `cmd_registry`, …) invoke the shared failure helper as `fail(None, "validation", msg)`. `fail()` ended with `ctx.exit(exit_code)` — on `None` that is an `AttributeError` raised AFTER the message printed. Users saw a clean error line followed by a full Python traceback, and the documented exit codes (10–16) were lost outside CliRunner's accidental catching.
+
+**Fix:** `core.fail()` now calls `ctx.exit()` only when a context exists and otherwise raises `SystemExit(exit_code)`. One-line fix at the single choke point; every None-ctx caller inherits it.
+
+**Verification:** Isolated repro before (exit 1 + AttributeError) and after (clean exit 15); `tests/test_signing.py` and `tests/test_v122.py` assert exact exit codes through paths that pass `ctx=None`.
+
+---
+
+### 79. `cmd_registry.restore` referenced an undefined `ctx_exit` — latent NameError on every failed restore
+
+**Severity:** 3/10 — **Status:** ? `fixed` (2026-08-26)
+
+**Problem:** `restore()`'s incomplete-archive branch called `ctx_exit(EXIT_VALIDATION)`, a name defined in sibling modules (`cmd_policy`, `cmd_context`) but never in `cmd_registry` nor exported by `core`. Any failed restore crashed with `NameError` instead of the intended exit-15 validation failure. Invisible because no test exercised the failed-restore path and the module imports fine.
+
+**Fix:** Module-local `ctx_exit()` helper added to `cmd_registry.py`.
+
+**Verification:** Static review + registry command suite green; the failure path is now reachable without NameError (covered indirectly by test_signing's verify-exit-code assertions using the same helper pattern).
+
+---
+
+### 80. Legacy-volume adoption stamped the whole migration chain WITHOUT creating post-create_all tables
+
+**Severity:** 7/10 — **Status:** ? `fixed` (2026-08-26)
+
+**Problem:** `database._ensure_schema_sync` adopts a pre-Alembic volume by stamping the ENTIRE current chain as applied. A true v1.1.x-era create_all volume therefore got stamped straight to head — and every table introduced AFTER the create_all era (`runs`, `run_commits`, `events`, `webhooks`, `audit_log`, v1.2.2's `webhook_deliveries`) silently NEVER existed on it. Startup stayed green; the first runs/events write would 500. The existing heal covered column drift only.
+
+**Fix:** New `_create_missing_tables()` runs during adoption: any models.py table missing from the volume is created from the metadata (checkfirst semantics), then column drift heals, then the chain stamps. Existing tables are never touched.
+
+**Verification:** `test_migrations.py` legacy-map test extended; live heal drill (e2e Phase C) still green against real Postgres; fresh + adopted volumes both reach a complete schema.
+
+---
+
+### 81. `.avh` semantic summary compared against an EMPTY baseline for local commits
+
+**Severity:** 6/10 — **Status:** ? `fixed` (2026-08-26)
+
+**Problem:** Locally-authored commit files store a `parents` LIST; only registry-fetched commits carry `parent_hash`. `handoff.build_semantic_summary()` and `_metrics_history_tail()` read ONLY `parent_hash` — so for locally-made commits (i.e., every repo's normal case) the semantic summary diffed against an empty tree (all chunks "new", dedup_efficiency 0) and the metrics trend stopped after one hop. Found by the v1.2.2 dedup_efficiency flow-through test, which pinned engine output vs `.avh` output and caught them disagreeing.
+
+**Fix:** Shared `_commit_parent()` tolerates both shapes; both consumers route through it.
+
+**Verification:** `test_v122.py::test_dedup_efficiency_flows_into_avh_semantic_summary` pins engine == .avh chunk rollups; full handoff/context suites green.
+
+---
+
+### 82. Clone/pull dropped `signature` and `env_snapshot_id` — clones could neither verify nor replay
+
+**Severity:** 8/10 — **Status:** ? `fixed` (2026-08-26)
+
+**Problem:** `sync.normalize_commit_row()` rebuilt fetched commit dicts from a fixed field whitelist, silently discarding the v1.2.2 `signature` blob and `env_snapshot_id`. Every cloned repository therefore reported UNSIGNED on `av verify` (false negative — the worst kind for a tamper-evidence feature) and could not resolve replay snapshots by commit. Found by the manual wire pass: keygen ? commit ? push ? clone ? verify said UNSIGNED in the clone.
+
+**Fix:** Server persists both fields (migration 0003 columns, echo in GET/list endpoints); `normalize_commit_row` passes them through verbatim; fake registry mirrors the real row shape so stack-free tests exercise the same contract.
+
+**Verification:** `test_sync.py::test_clone_preserves_signature_for_offline_verify` (clone verifies offline), `normalize` unit test, live wire round-trip test in `test_server.py`, plus the manual keygen?commit?push?clone?verify loop now reporting VERIFIED.
+
+---
+
+### 83. Timestamp timezone-spelling broke cloned signatures even after #82
+
+**Severity:** 8/10 — **Status:** ? `fixed` (2026-08-26)
+
+**Problem:** The authoring client signs a payload whose `timestamp` carries `+00:00`; the registry stores naive UTC and echoes timestamps WITHOUT the suffix. Canonical signing bytes are sorted-keys JSON of the whole payload — one character of tz-spelling difference made every cloned verification fail ("TAMPERED") despite byte-identical meaning. Found immediately after fixing #82 in the same manual pass.
+
+**Fix:** `signing.canonical_commit_bytes()` normalizes the timestamp to one canonical UTC rendering parsed from the instant (aware, naive and Z forms all collapse to identical bytes; genuinely different instants still differ).
+
+**Verification:** `test_canonical_form_is_timezone_spelling_insensitive` (+00:00 / naive / Z equal; shifted instant differs); manual wire loop re-run end-to-end ? VERIFIED in fresh clone.
+
+---
+
+### 84. Env snapshot uploaded with non-canonical bytes — server 400, cross-machine replay impossible
+
+**Severity:** 5/10 — **Status:** ? `fixed` (2026-08-26)
+
+**Problem:** A snapshot's id hashes its CANONICAL bytes (compact JSON minus `captured_at`), but the push path uploaded the pretty-printed `.av/env_snapshot.json`. The registry's own sha256 verification rejected the upload (400), so snapshots never reached the registry and `av replay <commit>` on any other machine failed with "No snapshot found". Silent: the client treats a failed object upload as non-fatal by design.
+
+**Fix:** Both writers (`cmd_env.snapshot`, `core.upload_commit_objects`) now materialize the CAS object from the canonical bytes; the pretty file stays local-only for humans.
+
+**Verification:** Manual wire pass: snapshot id visible in server access log as 201, `av replay <commit>` inside a fresh clone renders the recipe; v122/v120 suites green.

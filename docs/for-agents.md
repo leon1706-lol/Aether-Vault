@@ -55,7 +55,16 @@ curl "http://localhost:8000/api/events?since=0&project_id=…&kinds=commit&wait=
 
 Ordered, resumable by event `id`; long-poll with `wait`. Webhooks: POST signed
 `X-AV-Signature: hex(hmac-sha256(secret, body))`; manage via the
-`av webhooks add/list/remove/test` CLI (v1.2.1).
+`av webhooks add/list/remove/test` CLI (v1.2.1). Since v1.2.2 failed deliveries persist
+in a server-side ledger with automatic retry + dead-lettering — observe via
+`GET /api/admin/webhook-deliveries`.
+
+## 4b. Signed commits + audit (v1.2.2)
+
+`av registry keygen` (needs `[sign]`) → commits auto-signed (ed25519 over the canonical
+payload; the signature rides clone/pull) and `av verify <hash>` checks them anywhere —
+tamper evidence, not a trust network. Query who-did-what-with-what-outcome via
+`GET /api/admin/audit?action=…&since=…` or `av audit list --action commit.push`.
 
 ## 5. `.avh` v2 — context memory
 

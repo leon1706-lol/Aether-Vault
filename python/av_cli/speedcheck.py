@@ -34,6 +34,9 @@ _BUDGETS_MS = {
     "load_config()": 50.0,
     "iter_working_files()": 200.0,
     "Storage stats": 1000.0,
+    # v1.2.2: semdiff joined the hot-path family (it runs per handoff/diff and now also
+    # inside the perf gate) — budget sized for the synthetic 500-entry tree below.
+    "semdiff.diff_trees()": 100.0,
 }
 
 
@@ -147,6 +150,39 @@ def run_synthetic_probes(
         (shard / h[2:]).write_bytes(b"x" * 64)
     label = f"Storage stats ({SYNTHETIC_OBJECT_COUNT} objs)"
     results.append((label, _time_ms(lambda: storage_stats(av_dir)), _budget_for(label)))
+
+    # v1.2.2 probe: semantic-diff cost over a synthetic 500-entry tree pair (a third of
+    # the entries carry chunk manifests, mirroring a checkpoint-heavy repo). Pure CPU —
+    # this is the path `av diff`, .avh generation, and the webui summary all ride.
+    from .semdiff import diff_trees
+
+    def _synth_tree(chunked_every: int) -> dict:
+        tree: dict = {}
+        for i in range(SYNTHETIC_ENTRY_COUNT):
+            entry = {
+                "hash": uuid.uuid4().hex,
+                "size": 1024,
+                "type": "artifact" if i % 3 == 0 else "code",
+                "layers": [],
+                "chunks": [],
+            }
+            if i % 3 == 0:
+                entry["chunks"] = [
+                    {"hash": uuid.uuid4().hex, "size": 512, "offset": 0}
+                    for _ in range(4)
+                ]
+            tree[f"file_{i}.bin"] = entry
+        del chunked_every
+        return tree
+
+    old_tree = _synth_tree(3)
+    new_tree = _synth_tree(3)
+    # Keep half the population identical so the reuse branch is exercised, not just churn.
+    for i in range(0, SYNTHETIC_ENTRY_COUNT, 2):
+        new_tree[f"file_{i}.bin"] = dict(old_tree[f"file_{i}.bin"])
+    label = f"semdiff.diff_trees() ({SYNTHETIC_ENTRY_COUNT} entries)"
+    results.append((label, _time_ms(lambda: diff_trees(old_tree, new_tree)),
+                    _budget_for(label)))
 
     return results
 

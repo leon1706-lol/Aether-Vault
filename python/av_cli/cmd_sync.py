@@ -99,6 +99,20 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
     click.echo(detail)
 
 
+def _tip_run_id(repo_root: Path, commit_hash: str | None) -> str | None:
+    """The run:<id> tag of a (local) commit, or None — used by pull's divergence message
+    to attribute the divergent tips to their runs (v1.2.2)."""
+    if not commit_hash:
+        return None
+    from . import sync as _sync
+
+    commit = _sync.load_local_commit(repo_root, commit_hash)
+    for tag in (commit or {}).get("tags", []):
+        if isinstance(tag, str) and tag.startswith("run:"):
+            return tag.split(":", 1)[1]
+    return None
+
+
 @click.command()
 @click.option("--force", "-f", is_flag=True, default=False,
               help="Discard uncommitted local changes instead of aborting.")
@@ -179,6 +193,15 @@ def pull(force: bool) -> None:
             f"  av merge {remote_tip[:7]}",
             fg="yellow",
         )
+        # v1.2.2: surface the runs the two tips belong to, so an agent orchestrating
+        # multiple training efforts can tell WHICH experiments diverged without walking
+        # commits by hand. Best-effort: untagged tips simply contribute no line.
+        local_run = _tip_run_id(repo_root, local_tip)
+        remote_run = _tip_run_id(repo_root, remote_tip)
+        if local_run or remote_run:
+            fmt = lambda rid: f"run:{rid[:8]}…" if rid else "(no run)"
+            click.echo(f"  local  tip [{local_tip[:7]}] belongs to {fmt(local_run)}")
+            click.echo(f"  remote tip [{remote_tip[:7]}] belongs to {fmt(remote_run)}")
         return
 
     idx = Index(repo_root)

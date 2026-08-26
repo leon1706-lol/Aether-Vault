@@ -71,14 +71,22 @@ def start(name: str | None, parent_run_id: str | None) -> None:
     except (OSError, subprocess.TimeoutExpired):
         pass
 
+    # v1.2.2 env snapshot/replay: an already-captured snapshot links to the run at
+    # registration AND in local state, so the registry can answer
+    # "what environment did this run use?" from day one.
+    loaded_snapshot = load_env_snapshot(repo_root)
+    env_snapshot_id = loaded_snapshot[0] if loaded_snapshot else None
+
     registered, _ = _register_remote(repo_root, {
         "id": run_id, "name": name, "parent_run_id": parent_run_id,
         "code_pointer": code_pointer,
+        **({"env_snapshot_id": env_snapshot_id} if env_snapshot_id else {}),
     })
 
     state = {"run_id": run_id, "name": name, "status": "running",
              "parent_run_ids": [parent_run_id] if parent_run_id else [],
-             "code_pointer": code_pointer, "started_at": True}
+             "code_pointer": code_pointer, "started_at": True,
+             **({"env_snapshot_id": env_snapshot_id} if env_snapshot_id else {})}
     _state_path(repo_root).write_text(json.dumps(state), encoding="utf-8")
 
     if current_output_mode() == "json":

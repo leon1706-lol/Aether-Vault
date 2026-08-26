@@ -56,8 +56,32 @@ omits their port mappings), keep the default CORS lock and GC rate limit in plac
 `AV_CORS_ORIGINS` only for deployments that actually need it), and put TLS termination
 in front of uvicorn for any non-localhost use.
 
-v1.2.0 trust surfaces: the audit trail (udit_log, on by default, disable with
+v1.2.0 trust surfaces: the audit trail (audit_log, on by default, disable with
 AV_AUDIT_LOG=0) records who performed each mutation; webhook signing secrets are stored
 registry-side because deliveries must be signed — treat registry compromise as secret
 compromise for subscribers; commit attestations are HMAC-based integrity-v0 (tamper
 evidence vs. key-holders only), asymmetric signing is enterprise-tier.
+
+## Signed commits (v1.2.2) - the trust model, stated plainly
+
+`av registry keygen` generates an ed25519 keypair under `.av/keys/` (private key 0600);
+commits made afterward are signed automatically, and `av verify <hash>` validates the
+signature over the canonical commit payload (sorted-keys JSON minus the signature, with
+the timestamp normalized so registry round-trips verify identically). What this DOES and
+DOES NOT mean:
+
+- **It IS tamper evidence**: any modification of a signed commit's payload after signing -
+  message, tree, metrics, tags, even the recorded hash - is detected by `av verify`, on the
+  authoring machine AND on any clone (signatures persist server-side and ride clone/pull).
+- **It is NOT a trust network**: there is no PKI, no web-of-trust, no identity binding.
+  The public key travels WITH the signature, so it attests integrity of the payload, not
+  WHO the signer is. Establishing authorship requires authenticating the public key out
+  of band (e.g., comparing it against a copy fetched from the author directly).
+- **Key loss/rotation**: signatures verify against each commit's EMBEDDED public key, so
+  rotating keys never invalidates history; `av verify` additionally reports whether a
+  signature was made with THIS repo's current key.
+- **Unsigned commits are valid**: signing is opt-in per repository and best-effort by
+  design; `av verify` reports UNSIGNED honestly rather than failing.
+- **Threat-model boundary**: anyone who can write to `.av/keys/` can sign as you - protect
+  it like an SSH private key. Registry compromise lets an attacker DELETE signatures but
+  not forge new ones without the private key.

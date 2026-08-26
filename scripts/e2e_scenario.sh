@@ -192,7 +192,7 @@ start_server legacy-C     # boot must detect the pre-Alembic shape, heal, stamp
 
 [[ "$(psqlq "SELECT count(*) FROM information_schema.columns WHERE table_name='commits' AND column_name='extra_parents'")" == "1" ]] \
   || die "legacy boot did not restore commits.extra_parents"
-[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0002" ]] || die "legacy boot did not stamp chain head (0002)"
+[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0003" ]] || die "legacy boot did not stamp chain head (0003)"
 [[ "$(psqlq "SELECT count(*) FROM commits")" == "$COMMITS_BEFORE" ]] || die "heal lost commit rows!"
 pass "Phase C: pre-Alembic volume healed + stamped zero-touch, data intact"
 
@@ -328,3 +328,75 @@ pass "Phase H: promotion policy surface exercised (deny path unit-tested in CI; 
 
 
 log "ALL E2E PHASES PASSED"
+
+# ============================================================================
+log "Phase I-note — engine smoke runs as the dedicated CI job"
+log "(building/starting the engine image needs Docker; see e2e-engine-smoke)"
+
+# ============================================================================
+log "Phase J — signed commits end-to-end: keygen → auto-sign → verify → tamper"
+
+command -v docker >/dev/null 2>&1 || true  # no-op; phase J itself is stack-free
+"$PY" -c "import cryptography" 2>/dev/null || {
+  log "Phase J SKIPPED — cryptography not installed ([sign] extra missing)"
+  SKIP_J=1
+}
+if [[ "${SKIP_J:-0}" != "1" ]]; then
+  mkdir -p "$WORK/repoSign" && cd "$WORK/repoSign"
+  av . init --mode local --yes --no-repl >/dev/null
+  av . registry keygen >/dev/null
+  [[ -f ".av/keys/signing.pem" && -f ".av/keys/signing.pub" ]] \
+    || die "keygen did not create the ed25519 keypair under .av/keys/"
+
+  echo "signed payload" > signed.txt
+  av . add signed.txt >/dev/null
+  av . commit -m "signed commit" >/dev/null
+  SIGNED_HASH="$(cat .av/refs/heads/main)"
+  STORED="$("$PY" -c "import json;d=json.load(open('.av/commits/$SIGNED_HASH.json'));print(d.get('signature',{}).get('algo',''))")"
+  [[ "$STORED" == "ed25519" ]] || die "commit was not auto-signed (algo=$STORED)"
+
+  VERIFY_OUT="$(av . registry verify "$SIGNED_HASH" 2>&1)" || true
+  grep -q "VERIFIED" <<<"$VERIFY_OUT" || die "verify should pass pre-tamper: $VERIFY_OUT"
+
+  # Tamper AFTER signing — exactly what signing exists to catch:
+  "$PY" - <<PYJ
+import json
+p = ".av/commits/$SIGNED_HASH.json"
+d = json.load(open(p))
+d["message"] = "tampered after signing"
+json.dump(d, open(p, "w"))
+PYJ
+  set +e
+  TAMPER_RC="$(av . registry verify "$SIGNED_HASH" >/dev/null 2>&1; echo $?)"
+  set -e
+  [[ "$TAMPER_RC" == "15" ]] || die "tampered commit must exit 15, got $TAMPER_RC"
+
+  # Unsigned commits remain VALID (unsigned-ok):
+  mkdir -p "$WORK/repoPlain" && cd "$WORK/repoPlain"
+  av . init --mode local --yes --no-repl >/dev/null
+  echo plain > plain.txt; av . add plain.txt >/dev/null; av . commit -m "plain" >/dev/null
+  PLAIN_HASH="$(cat .av/refs/heads/main)"
+  PLAIN_OUT="$(av . registry verify "$PLAIN_HASH" 2>&1)" || true
+  grep -qi "UNSIGNED" <<<"$PLAIN_OUT" || die "unsigned verdict missing: $PLAIN_OUT"
+  pass "Phase J: ed25519 roundtrip verified, tamper detected (exit 15), unsigned-ok"
+fi
+
+# ============================================================================
+log "Phase K — audit trail query with filters over the LIVE protected server"
+
+AUTH="Authorization: Bearer owner-secret-xyz"
+AUDIT_JSON="$(curl -sf -H "$AUTH" "$API/api/admin/audit?action=commit.push&limit=20")"
+COUNT_PUSH="$(<<<"$AUDIT_JSON" jsonget "d['total']")"
+[[ "$COUNT_PUSH" -ge 1 ]] || die "action filter returned no commit.push rows"
+FIRST_STATUS="$(<<<"$AUDIT_JSON" jsonget "[e['status_code'] for e in d['entries'] if e['details'].get('hash')][0]")"
+[[ "$FIRST_STATUS" == "201" ]] || die "outcome capture missing (got $FIRST_STATUS)"
+
+# Wrong-shape timestamp must be a 422, never a silent match-all:
+BAD_TS_CODE="$(api_status -H "$AUTH" "$API/api/admin/audit?since=yesterday-ish")"
+[[ "$BAD_TS_CODE" == "422" ]] || die "invalid since must 422, got $BAD_TS_CODE"
+
+# CLI read path (repoC carries alice's still-valid token):
+AV_AUDIT_OUT="$(cd "$WORK/repoC" && command av audit list --action commit.push --limit 5 2>&1)" \
+  || true
+grep -q "commit.push" <<<"$AV_AUDIT_OUT" || die "av audit list failed: $AV_AUDIT_OUT"
+pass "Phase K: audit outcome capture + filters live (server + CLI)"

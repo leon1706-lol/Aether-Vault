@@ -51,7 +51,7 @@ Aether-Vault bridges Python and C++ for maximum throughput:
 - **C++ Performance Core (`aether_core`)** — Reads multi-gigabyte files in 8MB chunks, hashing them in parallel with a C++11 ThreadPool. Layer-aware `.safetensors` parsing enables per-layer deduplication; content-defined chunking gives opaque checkpoints (`.pt`/`.pth`/`.ckpt`) chunk-level dedup without any framework dependency.
 - **Python CLI (`av_cli`)** — Familiar Git-like interface (`av add`, `av commit`, `av checkout`, plus `clone`/`pull`/`merge`/`log` for team workflows). Files above the LFS threshold are automatically replaced by lightweight pointer files.
 - **Framework Plugins (`av_plugins`)** — Optional native callbacks for PyTorch Lightning and HuggingFace Transformers that drive the CLI in-process to auto-commit checkpoints during training.
-- **FastAPI CAS Server (`av_server`)** — Dockerized Content-Addressable Storage backend, backed by PostgreSQL (Merkle Tree DAG) and RedisBloom (O(1) existence checks).
+- **FastAPI CAS Server (`av_server`)** — Dockerized Content-Addressable Storage backend, backed by PostgreSQL (Merkle Tree DAG) and RedisBloom (O(1) existence checks). Since v1.2.2 it ships inside ONE engine image together with the Web UI: a single `aether-vault-engine` container runs the registry (:8000) and the Next.js dashboard (:3000), dispatched by `AV_ENGINE_ROLE`.
 - **Next.js Web UI (`webui`)** — Browser-based dashboard for visualizing the commit graph, branches, and ML metrics, plus a "Weight Diff" tab for visually comparing per-layer checkpoint changes. Launched with `av webui`.
 
 ### System Diagram
@@ -63,7 +63,7 @@ Split into two focused diagrams rather than one large one — what happens on yo
 ```mermaid
 graph TD
     Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-transformers)")
+    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit)")
     CPP("aether_core (C++)<br>(Splits Safetensors & CDC-Chunks Checkpoints,<br>Hashes in Parallel)")
     LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
     PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
@@ -109,7 +109,7 @@ graph TD
     WebUI -- "Fetches Commits, Refs, Metrics & Per-Layer Hashes<br>(TokenGate Prompts if 401)" --> FastAPI
 
     PyPI("PyPI<br>(pip install aether-vault · release.yml on git tag push)")
-    GHCR("GHCR<br>(aether-vault-server/-webui images ·<br>:latest on tag push · :edge on every push to main)")
+    GHCR("GHCR<br>(aether-vault-engine image ·<br>:latest on tag push · :edge on every push to main<br>+ legacy server/webui alias tags, one transition cycle)")
     CLI -- "update: Checks Latest Version (av init / av update)" --> PyPI
     CLI -- "update --docker: Pulls Latest Image & Restarts Local Backend" --> GHCR
 ```
@@ -495,12 +495,19 @@ av merge <target> --force               # same bypass at merge level (exit code 
 ```
 
 ### `av env`
-Recipe-exact environment snapshots and reproduction recipes.
+Recipe-exact environment snapshots and reproduction recipes. Snapshots are
+content-addressed (the canonical snapshot's hash IS its id) and upload through the
+normal object flow at push, so any clone can reproduce an experiment's environment:
 ```bash
-av env snapshot              # python + curated package pins (+ seeds/CUDA info) → .av/env_snapshot.json
+av env snapshot              # python + curated package pins (+ seeds/CUDA info) → .av/env_snapshot.json + CAS
 av env snapshot --full       # include complete pip freeze
-av env replay                # print the reproduction recipe
+av env replay                # print the reproduction recipe for the latest local snapshot
 av env replay --dockerfile   # emit a Dockerfile draft
+av env replay <target>       # TARGET = run id, commit hash, or snapshot id — loads the
+                             # snapshot from the local CAS or the registry (`av replay`
+                             # works as a top-level alias; on another machine resolve by
+                             # run id or the id in .avh.replay)
+av env replay --execute      # execute the pip installs after showing them (-y skips ask)
 ```
 
 ### `av watch`
@@ -516,9 +523,22 @@ av watch --max-commits 20    # exit after N auto-commits (CI-friendly)
 Registry-level backup and attestation:
 ```bash
 av registry export ./backup            # commits+refs+runs+objects archive, hashes re-verified
-av registry keygen                     # generate an attestation key (.av/config)
-av attest  <commit-hash>               # HMAC attestation tag via metadata commit
-av verify  <commit-hash>               # check an attestation
+av registry keygen                     # generate an ed25519 signing keypair (.av/keys/, private 0600;
+                                       # requires the [sign] extra) — commits are then AUTO-SIGNED
+av attest  <commit-hash>               # HMAC attestation tag via metadata commit (legacy, integrity-v0)
+av verify  <commit-hash>               # verify the ed25519 commit signature (or a legacy attestation
+                                       # tag); tampering after signing exits non-zero. Unsigned commits
+                                       # are valid — this is tamper evidence, not a trust network
+```
+
+### `av audit`
+Read-side query surface for the registry's audit trail (every mutating API call is
+recorded with identity, action, project and the HTTP outcome):
+```bash
+av audit list                          # newest entries
+av audit list --action commit.push     # exact action filter
+av audit list --project <project-id>   # scope to one project
+av audit list --since 2026-08-01 --limit 100
 ```
 
 ### `av stash`

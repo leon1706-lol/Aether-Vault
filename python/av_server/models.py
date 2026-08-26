@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Index, Integer, JSON, String
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import declarative_base
 
@@ -78,6 +78,17 @@ class DBCommit(Base):
     # create_all need a one-time `ALTER TABLE commits ADD COLUMN extra_parents TEXT;`
     # (create_all only adds missing tables, never missing columns).
     extra_parents = Column(String, nullable=True)
+    # v1.2.2 signed commits: JSON blob {"algo","public_key","sig"} — an ed25519 signature
+    # over the canonical (sorted-keys, signature-stripped) commit JSON. Nullable: unsigned
+    # commits are and stay valid ("tamper evidence, not a trust network" — SECURITY.md).
+    # Stored so signatures survive clone/pull round trips instead of living only in the
+    # authoring repo's local commit file.
+    signature = Column(Text, nullable=True)
+    # v1.2.2 env snapshot/replay: content id of the environment snapshot object this
+    # commit was made under. Persisted so cloned repos keep BOTH the replay pointer AND
+    # signature validity — the id is part of the hashed/signed payload, and a clone
+    # missing it would fail every `av verify` (found by the manual wire pass).
+    env_snapshot_id = Column(Text, nullable=True)
     root_tree_hash = Column(String, nullable=False)
     tags = Column(ARRAY(String), default=list)
     metrics = Column(JSON, default=dict)
@@ -195,5 +206,36 @@ class DBAuditLog(Base):
     action = Column(String, nullable=False)   # e.g. 'commit.push', 'ref.update', 'run.create'
     project_id = Column(String, nullable=True, index=True)
     details = Column(JSON, nullable=True)
+    # v1.2.2 audit depth: the HTTP outcome of the mutation (201 created, 409 idempotent
+    # duplicate, ...) so the trail answers "did it actually land?", not just "was it tried".
+    status_code = Column(Integer, nullable=True)
 
     __table_args__ = (Index("ix_audit_ts", "ts"),)
+
+
+class DBWebhookDelivery(Base):
+    """Per-attempt webhook delivery ledger (v1.2.2, migration 0003).
+
+    Every fan-out attempt is persisted BEFORE the POST goes out ('pending') and updated
+    after ('delivered' / 'failed'). Failed rows carry next_retry_at and are re-driven by
+    the server's retry worker until AV_WEBHOOK_MAX_ATTEMPTS is exhausted → 'dead'
+    (dead-letter). The event's kind/payload/project_id are snapshotted onto the row so a
+    retry reconstructs the byte-identical signed body even if the original event has since
+    been retention-swept from `events`.
+    """
+    __tablename__ = "webhook_deliveries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    webhook_id = Column(String, ForeignKey("webhooks.id"), nullable=False, index=True)
+    event_id = Column(Integer, nullable=True, index=True)
+    event_kind = Column(String, nullable=True)
+    project_id = Column(String, nullable=True)
+    payload = Column(JSON, nullable=True)
+    attempt = Column(Integer, nullable=False, default=1)
+    # pending | delivered | failed | dead
+    status = Column(String, nullable=False, default="pending", index=True)
+    response_code = Column(Integer, nullable=True)
+    last_error = Column(String, nullable=True)
+    next_retry_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)

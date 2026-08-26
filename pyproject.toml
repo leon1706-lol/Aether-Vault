@@ -49,6 +49,8 @@ dependencies = [
 lightning = ["lightning>=2.0.0"]
 transformers = ["transformers>=4.30.0"]
 mlflow = ["mlflow>=2.0.0"]
+# v1.2.2 signed commits: ed25519 keygen/auto-sign/verify (av registry keygen, av verify).
+sign = ["cryptography>=42.0.0"]
 dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0", "httpx>=0.24.0"]
 benchmarks = ["dvc>=3.55,<4", "mlflow>=2.16"]
 

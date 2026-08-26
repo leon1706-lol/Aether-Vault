@@ -10,11 +10,11 @@ via the compose files in [`../../python/av_cli/docker/`](../av_cli/docker/) and
 
 | File | Purpose |
 |---|---|
-| `server.py` | All routes (`/api/objects`, `/api/commits`, `/api/refs`, `/api/projects`, `/api/sync/*`, `/api/admin/gc`, dashboard summaries), Merkle-tree construction, GC, optional shared-secret token middleware |
-| `models.py` | SQLAlchemy schema: `DBObject`, `DBTree` (Merkle nodes incl. per-layer + per-chunk manifests), `DBCommit` (incl. merge-commit `extra_parents`), `DBRef` |
+| `server.py` | All routes (`/api/objects`, `/api/commits`, `/api/refs`, `/api/projects`, `/api/runs*`, `/api/events`, `/api/webhooks*`, `/api/sync/*`, `/api/admin/gc`, `/api/admin/audit` + prune, `/api/admin/webhook-deliveries`, dashboard summaries), Merkle-tree construction, GC with retention sweeps, webhook delivery ledger + retry worker, optional shared-secret token middleware |
+| `models.py` | SQLAlchemy schema: `DBObject`, `DBTree` (Merkle nodes incl. per-layer + per-chunk manifests), `DBCommit` (incl. merge-commit `extra_parents`, v1.2.2 `signature`/`env_snapshot_id`), `DBRef`, and the v1.2.0+ tables `DBRun`/`DBRunCommit`/`DBEvent`/`DBWebhook`/`DBAuditLog` (with `status_code`)/`DBWebhookDelivery` |
 | `storage.py` | CASStorage filesystem shards (hash-verified streaming writes); legacy fallback when the DB is empty |
 | `redis_cache.py` | RedisBloom filter for O(1) object-existence checks |
-| `database.py` | Async engine/session setup; schema created via `create_all` at startup (see migration caveat below) |
+| `database.py` | Async engine/session setup; schema owned by Alembic (chain 0001→0003) applied at startup; legacy create_all volumes detected, missing tables created, column drift healed, chain stamped zero-touch |
 
 ## API notes
 

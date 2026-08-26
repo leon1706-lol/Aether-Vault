@@ -147,6 +147,9 @@ export interface Run {
   created_at: string | null;
   completed_at: string | null;
   commit_hashes?: string[];
+  // v1.2.2 env snapshot/replay: content id of the run's environment snapshot object
+  // (fetchable via GET /api/objects/{id}; `av replay <run-id>` renders it).
+  env_snapshot_id?: string | null;
 }
 
 export async function fetchRuns(
@@ -158,6 +161,12 @@ export async function fetchRuns(
   params.set("limit", String(opts.limit ?? 50));
   const data = await fetchJSON<{ runs: Run[] }>(`/api/runs?${params.toString()}`);
   return data.runs ?? [];
+}
+
+// v1.2.2 Run detail: single run incl. linked commit hashes (the panel composes
+// lineage/metrics/semantic summary client-side from this + fetchCommit — no new endpoint).
+export async function fetchRun(runId: string): Promise<Run> {
+  return fetchJSON<Run>(`/api/runs/${encodeURIComponent(runId)}`);
 }
 
 // Lightweight poll target for the live badge: newest event id (0 when none yet).

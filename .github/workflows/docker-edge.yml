@@ -4,12 +4,19 @@ name: Docker Edge Build
 # Never touches `:latest`, which stays exclusively tied to tagged releases (see release.yml).
 # (Was `main` — this repo's default branch has always been `master`, so the trigger never
 # fired; caught in the v1.1.8 doc/config sweep.)
+#
+# v1.2.2 engine consolidation: ONE image (aether-vault-engine) is built and pushed;
+# the historical aether-vault-server/-webui names ride along as ALIASES of the same
+# image for one transition cycle so existing installs' pulls keep working
+# (auto-detected role per legacy container — see docker/engine-entrypoint.sh).
+# Aliases are removed in the next release.
 
 on:
   push:
     branches: [master]
     paths:
       - 'Dockerfile'
+      - 'docker/**'
       - 'webui/**'
       - 'python/**'
       - 'src/**'
@@ -20,8 +27,9 @@ on:
 
 jobs:
   build-and-push-edge:
-    name: Build and push :edge images (GHCR)
+    name: Build and push :edge engine image (GHCR)
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
@@ -34,16 +42,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push server image
+      # One build, one push step — every tag below receives THE SAME image.
+      - name: Build and push engine image (+ legacy aliases)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/leon1706-lol/aether-vault-server:edge
-
-      - name: Build and push webui image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./webui
-          push: true
-          tags: ghcr.io/leon1706-lol/aether-vault-webui:edge
+          tags: |
+            ghcr.io/leon1706-lol/aether-vault-engine:edge
+            ghcr.io/leon1706-lol/aether-vault-server:edge
+            ghcr.io/leon1706-lol/aether-vault-webui:edge

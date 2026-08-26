@@ -28,12 +28,13 @@ def test_migration_chain_resolves_to_single_head():
 
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
-    assert heads == ["0002"], f"unexpected heads: {heads}"
+    assert heads == ["0003"], f"unexpected heads: {heads}"
     # walk_revisions() yields every revision reachable from head exactly once —
     # no dangling down_revisions, no surprise second branch. The chain is strictly
-    # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline).
+    # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline), and
+    # 0003 (webhook_deliveries/audit outcome/signature) descends from 0002.
     walked = sorted(rev.revision for rev in script.walk_revisions())
-    assert walked == ["0001", "0002"]
+    assert walked == ["0001", "0002", "0003"]
 
 
 def test_env_py_is_valid_python():
@@ -67,7 +68,7 @@ def test_legacy_columns_map_matches_models():
         Path(__file__).resolve().parents[1] / "python" / "av_server" / "models.py",
         encoding="utf-8",
     ).read()
-    model_class = {"commits": "DBCommit", "trees": "DBTree"}
+    model_class = {"commits": "DBCommit", "trees": "DBTree", "audit_log": "DBAuditLog"}
     for table, cols in _LEGACY_COLUMNS.items():
         block = re.search(
             rf"class {model_class[table]}\(Base\):(.*?)(?=\nclass |\Z)",
@@ -162,6 +163,11 @@ def test_chain_renders_complete_postgres_ddl_offline():
     # v1.2.0 autonomous-loop tables ride the same chain (0002):
     for table in ("runs", "run_commits", "events", "webhooks", "audit_log"):
         assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
+
+    # v1.2.2 delivery ledger rides the chain too (0003):
+    assert "CREATE TABLE webhook_deliveries" in ddl
+    for col in ("status_code", "signature", "env_snapshot_id", "next_retry_at"):
+        assert col in ddl, f"offline DDL missing 0003 column {col}"
 
     # Every table from 0001_baseline exists in the rendered schema.
     for table in ("objects", "trees", "commits", "refs"):

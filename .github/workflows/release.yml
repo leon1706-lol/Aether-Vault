@@ -105,8 +105,9 @@ jobs:
             dist/*
 
   build-and-push-docker:
-    name: Build and push Docker images (GHCR)
+    name: Build and push Docker engine image (GHCR)
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
@@ -119,20 +120,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push server image
+      # v1.2.2 consolidation: ONE multi-stage build produces the engine image
+      # (registry + webui in one container). The historical server/webui names are
+      # pushed as ALIASES of the same image for one transition cycle — existing
+      # installs' pinned pulls keep working; removed in the next release.
+      - name: Build and push engine image (+ legacy aliases)
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
+            ghcr.io/leon1706-lol/aether-vault-engine:latest
+            ghcr.io/leon1706-lol/aether-vault-engine:${{ github.ref_name }}
             ghcr.io/leon1706-lol/aether-vault-server:latest
             ghcr.io/leon1706-lol/aether-vault-server:${{ github.ref_name }}
-
-      - name: Build and push webui image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./webui
-          push: true
-          tags: |
             ghcr.io/leon1706-lol/aether-vault-webui:latest
             ghcr.io/leon1706-lol/aether-vault-webui:${{ github.ref_name }}

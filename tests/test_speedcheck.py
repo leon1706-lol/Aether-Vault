@@ -8,6 +8,7 @@ def test_budget_for_matches_known_label_prefixes():
     assert speedcheck._budget_for("load_config()") == 50.0
     assert speedcheck._budget_for("iter_working_files() (2000 files)") == 200.0
     assert speedcheck._budget_for("Storage stats (1000 objs)") == 1000.0
+    assert speedcheck._budget_for("semdiff.diff_trees() (500 entries)") == 100.0
 
 
 def test_budget_for_returns_none_for_an_unknown_label():
@@ -17,13 +18,14 @@ def test_budget_for_returns_none_for_an_unknown_label():
 def test_run_synthetic_probes_returns_one_entry_per_probe_with_sane_shape(tmp_path):
     results = speedcheck.run_synthetic_probes(load_config, iter_working_files, tmp_path)
 
-    assert len(results) == 5
+    assert len(results) == 6  # v1.2.2: + semdiff.diff_trees()
     labels = [label for label, _, _ in results]
     assert any("Index.save()" in label for label in labels)
     assert any("Index.load()" in label for label in labels)
     assert any("load_config()" in label for label in labels)
     assert any("iter_working_files()" in label for label in labels)
     assert any("Storage stats" in label for label in labels)
+    assert any(label.startswith("semdiff.diff_trees()") for label in labels)
 
     for label, elapsed_ms, budget_ms in results:
         assert isinstance(elapsed_ms, float)

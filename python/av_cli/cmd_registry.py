@@ -27,6 +27,12 @@ def _client(repo_root):
                        cfg.get("remote_api_token"))
 
 
+def ctx_exit(code):
+    """Module-local exit helper (restore's failure path used to reference this name
+    without defining it anywhere — a latent NameError on every failed restore)."""
+    raise SystemExit(code)
+
+
 @click.group()
 def registry() -> None:
     """Registry-level operations: backup export/restore and commit attestation keys."""
@@ -205,17 +211,34 @@ def restore(archive_dir: str) -> None:
 
 @registry.command("keygen")
 def keygen() -> None:
-    """Generate an attestation key (HMAC secret) into this repo's config."""
-    import secrets
+    """Generate an ed25519 signing keypair under .av/keys/.
+
+    v1.2.2: commits are then AUTO-SIGNED at commit time (signature over the canonical
+    sorted-keys JSON of the payload minus the signature itself) and validated by
+    `av verify <hash>`. Trust model — tamper evidence, not a trust network (SECURITY.md):
+    the embedded public key proves payload integrity, not owner identity. Requires the
+    [sign] extra (`pip install aether-vault[sign]`)."""
+    from .signing import SigningUnavailable, generate_keypair
 
     repo_root = ensure_repo()
-    cfg = load_config(repo_root)
-    cfg["attest_key"] = secrets.token_urlsafe(32)
-    save_config(repo_root, cfg)
+    try:
+        priv, pub = generate_keypair(repo_root)
+    except SigningUnavailable as exc:
+        fail(None, "validation", str(exc))
+    except FileExistsError:
+        fail(None, "validation",
+             "Signing keys already exist in .av/keys/ — delete them first to rotate.")
     if current_output_mode() == "json":
-        emit_json(None, "registry keygen", data={"configured": True})
+        emit_json(None, "registry keygen", data={"configured": True,
+                                                 "algo": "ed25519",
+                                                 "private_key": str(priv),
+                                                 "public_key": str(pub)})
         return
-    click.secho("Attestation key generated and stored in .av/config.", fg="green")
+    click.secho("ed25519 signing keypair generated.", fg="green")
+    click.secho(f"  private: {priv} (0600)", fg="cyan")
+    click.secho(f"  public:  {pub}", fg="cyan")
+    click.secho("Commits are now signed automatically; verify with `av verify <hash>`.",
+                fg="cyan")
 
 
 @registry.command()
@@ -261,23 +284,64 @@ def invoke_mergeless_attest_tag(repo_root, tags):
 @registry.command()
 @click.argument("commit_hash")
 def verify(commit_hash: str) -> None:
-    """Verify an attestation tag on COMMIT_HASH against this repo's key."""
-    repo_root = ensure_repo()
-    cfg = load_config(repo_root)
-    key = cfg.get("attest_key")
-    if not key:
-        fail(None, "validation", "No attestation key in this repo.")
+    """Verify COMMIT_HASH: an ed25519 commit signature when present, else a legacy
+    HMAC attestation tag.
+
+    v1.2.2 verification order:
+    1. `signature` blob on the commit → validate the ed25519 signature over the
+       canonical (sorted-keys, signature-stripped) payload. Works on any clone — the
+       signature and public key ride the commit itself (server persists them).
+    2. Legacy `attest:<prefix>` tag → HMAC check against this repo's attest_key.
+    3. Neither → UNSIGNED (exit 0 in text mode; unsigned commits are valid — this is
+       tamper EVIDENCE, not a trust gate)."""
     from .handoff import load_commit
+    from .signing import SigningUnavailable, load_public_key_hex, verify_signature
+
+    repo_root = ensure_repo()
 
     commit = load_commit(repo_root, commit_hash)
     if not commit:
         fail(None, "validation", f"Unknown commit: {commit_hash}")
+
+    if isinstance(commit.get("signature"), dict):
+        try:
+            ok, reason = verify_signature(commit)
+        except SigningUnavailable as exc:
+            fail(None, "validation", str(exc))
+        local_key = load_public_key_hex(repo_root)
+        matches_local_key = bool(local_key) and \
+            commit["signature"].get("public_key") == local_key
+        data = {"verified": ok, "reason": reason, "scheme": "ed25519",
+                "signed_with_this_repos_key": matches_local_key,
+                "signature_prefix": str(commit["signature"].get("sig", ""))[:16]}
+        if current_output_mode() == "json":
+            emit_json(None, "registry verify", data=data)
+            return
+        if ok:
+            click.secho(f"VERIFIED ({'this repo key' if matches_local_key else 'embedded key'})", fg="green")
+        else:
+            click.secho(f"TAMPERED OR INVALID: {reason}", fg="red")
+            ctx_exit(EXIT_VALIDATION)
+        return
+
+    # Legacy attestation path (integrity-v0, kept for existing repos).
+    cfg = load_config(repo_root)
+    key = cfg.get("attest_key")
+    if not key:
+        if current_output_mode() == "json":
+            emit_json(None, "registry verify", data={"verified": False,
+                                                     "reason": "unsigned",
+                                                     "scheme": None})
+            return
+        click.secho("UNSIGNED — no commit signature and no attestation key here.", fg="yellow")
+        return
     expected = hmac_mod.new(key.encode(), commit["hash"].encode(),
                             hashlib.sha256).hexdigest()
     tags = commit.get("tags") or []
     match = any(t == f"attest:{expected[:16]}" for t in tags)
     if current_output_mode() == "json":
         emit_json(None, "registry verify", data={"verified": match,
+                                                 "scheme": "hmac-attest",
                                                  "signature_prefix": expected[:16]})
         return
     click.secho("VERIFIED" if match else "NO MATCHING ATTESTATION",
