@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/docker-aether--vault--engine-2496ED?style=flat-square&labelColor=1A1A1A&logo=docker&logoColor=white" alt="Docker">
 </p>
 
-Aether-Vault is not git for big files. It is version control purpose-built for machine-learning work: **code + weights + datasets** in one atomic commit that checks out identically on any machine. Throughput comes from a **C++17 core** that hashes multi-gigabyte files in parallel and splits safetensors into per-layer shards. Storage is **deduplicated by construction** — identical layers across fine-tune epochs and identical chunks across saves store once, locally and on the registry alike. The **FastAPI registry** serves any number of independent projects from a single Dockerized engine, backed by **PostgreSQL** Merkle trees and **RedisBloom** O(1) existence checks. Agents are first-class operators: stable **JSON envelopes**, a single-writer **Python SDK**, resumable **event streams**, and **.avh v2 context memory** so the next agent inherits intent without API calls. Start at [docs/for-agents.md](docs/for-agents.md).
+Aether-Vault is not git for big files. It is version control purpose-built for machine-learning work: **code + weights + datasets** in one atomic commit that checks out identically on any machine. Throughput comes from a **C++17 core** that hashes multi-gigabyte files in parallel and splits safetensors into per-layer shards. Storage is **deduplicated by construction** — identical layers across fine-tune epochs and identical chunks across saves store once, locally and on the registry alike. The **FastAPI registry** serves any number of independent projects from a single Dockerized engine, backed by **PostgreSQL** Merkle trees and **RedisBloom** O(1) existence checks. Agents are first-class operators: stable **JSON envelopes**, a single-writer **Python SDK**, resumable **event streams**, and **.avh v2 context memory** so the next agent inherits intent without API calls. Start at [AGENTS.md](AGENTS.md).
 
 ## Known Limitations
 
@@ -184,17 +184,21 @@ For the full subsystem contracts (staging, commit, sync, merge, restore, GC, aut
 
 ## Module Documentation
 
-Every folder documents itself with its own `README.md` — contents, conventions, and pointers deeper into the project:
+Every package below has its own README with the full detail on what it owns
+and how it's wired in, this table is the index.
 
 | Module | What it owns | Docs |
 |---|---|---|
-| [`python/av_cli/`](python/av_cli/README.md) | The `av` CLI: commands, local DAG/CAS, sync, merge, log, chunking, signing, doctor | [package overview](python/README.md) |
-| [`python/av_server/`](python/av_server/README.md) | FastAPI CAS registry (PostgreSQL + RedisBloom) | [package overview](python/README.md) |
-| [`python/av_plugins/`](python/av_plugins/README.md) | Lightning / Transformers / MLflow auto-commit callbacks | [package overview](python/README.md) |
-| [`src/`](src/README.md) | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | — |
-| [`tests/`](tests/README.md) | ~590-test suite across 25+ files (CLI, core, server, plugins) | — |
-| [`benchmarks/`](benchmarks/README.md) | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | — |
-| [`webui/`](webui/README.md) | Next.js dashboard incl. Weight Diff + Playwright E2E | — |
+| `python/` | All Aether-Vault Python packages: CLI, registry server, plugins | [README](python/README.md) |
+| `python/av_cli/` | The `av` CLI: commands, local DAG/CAS, sync, merge, log, chunking, signing, doctor | [README](python/av_cli/README.md) |
+| `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
+| `python/av_plugins/` | Lightning / Transformers / MLflow auto-commit callbacks | [README](python/av_plugins/README.md) |
+| `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
+| `tests/` | ~590-test suite across 25+ files (CLI, core, server, plugins) | [README](tests/README.md) |
+| `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
+| `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
+| `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
+| `docker/` | Runtime assets of the consolidated engine image (v1.2.2) | [README](docker/README.md) |
 
 ---
 
@@ -220,7 +224,6 @@ Every folder documents itself with its own `README.md` — contents, conventions
 | [`LICENSE`](LICENSE) | PolyForm Noncommercial License 1.0.0 |
 | [`SECURITY.md`](SECURITY.md) | Threat model, signing trust chain, reporting process |
 | [`VERSIONING.md`](VERSIONING.md) | SemVer per compatibility surface, deprecation policy, release runbook |
-| [`docs/for-agents.md`](docs/for-agents.md) | Agent-facing contracts: JSON envelopes, SDK, events, .avh context memory |
 
 ---
 
@@ -307,7 +310,7 @@ Aether-Vault is built so autonomous agents are first-class operators. Four stabl
 4. **.avh v2 context memory** — lineage + semantic summary + replay recipe +
    append-only agent notes; the next agent inherits intent and trend without any API calls.
 
-Full details, examples, and the guardrails you should arm: [docs/for-agents.md](docs/for-agents.md).
+Full details, examples, and the guardrails you should arm: [AGENTS.md](AGENTS.md).
 
 ---
 
