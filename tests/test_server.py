@@ -231,6 +231,25 @@ def test_readiness_503_when_data_dir_is_unwritable(db, monkeypatch, tmp_path):
     assert body["checks"]["database"] is True  # the other checks are unaffected
 
 
+def test_readiness_503_when_redis_is_unreachable(db, monkeypatch):
+    """Regression test for a real shipped bug (Probleme.md): /api/ready originally probed
+    Redis via cache.check_hash_exists(), which deliberately fails OPEN (returns True) on
+    any error -- correct for its actual caller (an optimistic skip-the-DB check) but means
+    a downed Redis silently read as healthy here. e2e-engine-smoke's live CI job caught it
+    (REDIS_URL pointed at a nonexistent host still returned `redis: true`); this test
+    exercises the same failure stack-free so it can never regress silently again."""
+    async def _broken_ping():
+        raise ConnectionError("simulated redis outage")
+
+    monkeypatch.setattr(server_module.cache, "ping", _broken_ping)
+    resp = db.get("/api/ready")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["checks"]["redis"] is False
+    assert body["checks"]["database"] is True  # the other checks are unaffected
+
+
 # ---------------------------------------------------------------------------
 # require_token middleware ("Anonymous" vs "Protected" mode)
 # ---------------------------------------------------------------------------

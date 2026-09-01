@@ -377,7 +377,11 @@ async def readiness_check(db: AsyncSession = Depends(get_session)) -> Response:
         checks["database"] = False
 
     try:
-        await cache.check_hash_exists("0" * 64)  # cheap, real round-trip to Redis
+        # v1.2.5 fix: check_hash_exists() deliberately fails OPEN (returns True) on a
+        # Redis error -- correct for its actual caller (an optimistic skip-the-DB check)
+        # but means a downed Redis silently read as healthy here. cache.ping() is a raw
+        # connectivity probe that does not swallow the error (see RedisCache.ping()).
+        await cache.ping()
         checks["redis"] = True
     except Exception:
         checks["redis"] = False

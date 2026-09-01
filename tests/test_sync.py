@@ -198,6 +198,81 @@ def fake_registry(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# v1.2.5: a merge resolving a genuine ref-race divergence must actually land its own
+# push, not re-race against a local commit the server never held. Real bug caught live
+# by scripts/e2e_scenario.sh's Phase A (see Probleme.md) — this reproduces it stack-free.
+# ---------------------------------------------------------------------------
+
+def test_merge_push_lands_when_ours_lost_its_own_ref_race(tmp_path, monkeypatch):
+    """core.py::_finalize_commit() picks expected_hash=parents[0] ("ours") by default for
+    a two-parent merge commit — correct when ours is the server's confirmed tip (an
+    ordinary merge of some other branch), but wrong when ours itself already lost its OWN
+    ref race and is still sitting in pending_push: the server's actual tip is parents[1]
+    ("theirs", the target this merge is reconciling against), not ours. Using the wrong
+    expectation made the merge's own push spuriously re-race and queue instead of
+    landing — even though resolving that exact divergence is the whole point of the
+    merge. Reproduced with one repo and two commits standing in for "two agents": a real
+    commit+push for "theirs", then the local ref rewound to base before "ours" is made,
+    so ours's own push genuinely loses the CAS race against theirs (all real object
+    content — no fabricated hashes)."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    assert invoke("init", "--mode", "local", "--yes", "--no-repl").exit_code == 0
+
+    cfg = json.loads((root / ".av" / "config").read_text())
+    pid = cfg["project_id"]
+    fake = FakeRemoteClient(root, pid, cfg["project_name"])
+    monkeypatch.setattr(client_module, "VaultClient", lambda *a, **k: fake)
+
+    ref_name = f"{pid}/main"
+    ref_path = root / ".av" / "refs" / "heads" / "main"
+
+    (root / "shared.txt").write_text("base")
+    invoke("add", "shared.txt")
+    assert invoke("commit", "-m", "base").exit_code == 0
+    base_hash = ref_path.read_text().strip()
+    assert fake.recorded_refs[ref_name] == base_hash
+
+    # "The other agent": a real commit + push, landing cleanly since the ref is still at
+    # base_hash — real object content, no fabrication.
+    (root / "shared.txt").write_text("theirs content")
+    invoke("add", "shared.txt")
+    assert invoke("commit", "-m", "their edit").exit_code == 0
+    theirs_hash = ref_path.read_text().strip()
+    assert fake.recorded_refs[ref_name] == theirs_hash
+
+    # Rewind OUR local state back to base, as if we never saw their push — the next local
+    # commit genuinely forks from base, exactly like two agents editing concurrently.
+    ref_path.write_text(base_hash)
+    (root / "shared.txt").write_text("base")
+    invoke("add", "shared.txt")
+
+    (root / "shared.txt").write_text("ours content")
+    invoke("add", "shared.txt")
+    assert invoke("commit", "-m", "our edit").exit_code == 0
+    ours_hash = ref_path.read_text().strip()
+    # Lost the CAS race (expected base_hash, server now holds theirs_hash) — queued, not
+    # landed and never lost.
+    assert fake.recorded_refs[ref_name] == theirs_hash
+    pending = json.loads((root / ".av" / "pending_push").read_text())
+    assert any(e["commit_hash"] == ours_hash for e in pending)
+
+    r = invoke("merge", theirs_hash, "--theirs")
+    assert r.exit_code == 0, r.output
+    merge_hash = ref_path.read_text().strip()
+    assert merge_hash not in (ours_hash, theirs_hash)
+    assert (root / "shared.txt").read_text() == "theirs content"
+
+    # The fix under test: the merge's own ref update must land on the server, not
+    # re-race against "ours" (which the server never actually held).
+    assert fake.recorded_refs[ref_name] == merge_hash, (
+        f"merge push should advance the server ref to {merge_hash!r}, got "
+        f"{fake.recorded_refs[ref_name]!r} instead — did it re-race against 'ours'?"
+    )
+
+
+# ---------------------------------------------------------------------------
 # v1.2.2: signatures and env snapshot ids must SURVIVE clone/pull round trips.
 # ---------------------------------------------------------------------------
 

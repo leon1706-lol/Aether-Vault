@@ -139,28 +139,38 @@ av "$WORK/repoB" push >/dev/null
 echo "repoA's divergent line" > "$WORK/repoA/shared.txt"
 av "$WORK/repoA" add shared.txt >/dev/null
 av "$WORK/repoA" commit -m "repoA edits shared" >/dev/null
+# v1.2.5: repoB already advanced "main" on the server (above), so this push now loses the
+# ref-race compare-and-swap -- it queues locally instead of silently overwriting repoB's
+# push (see Probleme.md). This means the divergence to discover/resolve is now on
+# repoA's side (its local ref points at a commit the server never accepted), not
+# repoB's -- repoB already matches the server exactly, so a pull there would report
+# "Already up to date". Everything below operates from repoA instead of repoB.
 av "$WORK/repoA" push >/dev/null
 
 set +e
-PULL_OUT="$(av "$WORK/repoB" pull 2>&1)"
+PULL_OUT="$(av "$WORK/repoA" pull 2>&1)"
 set -e
 grep -q "have diverged" <<<"$PULL_OUT" || die "pull should report divergence, got: $PULL_OUT"
 REMOTE_TIP7="$(grep -oE '\[[0-9a-f]{7}\]' <<<"$PULL_OUT" | head -1 | tr -d '[]')"
 [[ -n "$REMOTE_TIP7" ]] || die "divergence message should contain the remote tip hash"
 
 set +e
-CONFLICT_OUT="$(av "$WORK/repoB" merge "$REMOTE_TIP7" 2>&1)"
+CONFLICT_OUT="$(av "$WORK/repoA" merge "$REMOTE_TIP7" 2>&1)"
 set -e
 grep -qi "conflict" <<<"$CONFLICT_OUT" || die "merge without policy should abort listing conflicts, got: $CONFLICT_OUT"
 
-MERGE_OUT="$(av "$WORK/repoB" merge "$REMOTE_TIP7" --theirs 2>&1)"
+MERGE_OUT="$(av "$WORK/repoA" merge "$REMOTE_TIP7" --theirs 2>&1)"
 grep -q "auto-resolved via --theirs" <<<"$MERGE_OUT" || die "--theirs resolution failed: $MERGE_OUT"
-grep -q "repoA's divergent line" "$WORK/repoB/shared.txt" || die "shared.txt should hold THEIRS after --theirs"
+grep -q "repoB's divergent line" "$WORK/repoA/shared.txt" || die "shared.txt should hold THEIRS after --theirs"
 
-av "$WORK/repoB" push >/dev/null
-TIP_B="$(cat "$WORK/repoB/.av/refs/heads/main")"
+av "$WORK/repoA" push >/dev/null
+TIP_B="$(cat "$WORK/repoA/.av/refs/heads/main")"
 PARENTS="$(curl -sf "$API/api/commits/$TIP_B" | jsonget "len(d['parents'])")"
 [[ "$PARENTS" == "2" ]] || die "merge commit should carry TWO parents over the wire, got $PARENTS"
+# The merge's own ref update must actually land (not re-race against "ours", which never
+# reached the server) -- confirming the core.py::_finalize_commit fix above.
+SERVER_TIP="$(curl -sf "$API/api/refs/$PROJ_A/main" | jsonget "d['commit_hash']")"
+[[ "$SERVER_TIP" == "$TIP_B" ]] || die "merge push should have landed on the server ref, got $SERVER_TIP (expected $TIP_B — still queued?)"
 pass "Phase A: clone/diverge/conflict/--theirs/two-parent-push"
 
 # ============================================================================

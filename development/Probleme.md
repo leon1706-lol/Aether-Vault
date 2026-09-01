@@ -1132,3 +1132,56 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** every such text call in both commands is now guarded with an explicit `if not json_mode` / `if current_output_mode() != "json"` check, matching the pattern already used everywhere else in the CLI.
 
 **Verification:** JSON-mode tests for both commands assert `stdout` parses as a single JSON document with no leading/trailing text; existing human-mode tests unchanged.
+
+---
+
+### 94. Docker Desktop's WSL2 backend would not start on the primary dev machine
+
+**Severity:** 6/10 (blocks local verification; not a codebase defect) · **Status:** 🟡 `partial` — open, owner will resolve manually (2026-09-01)
+
+**Problem:** After a routine `docker compose up -d --build` (rebuilding the engine image with the V1.2.5 changes), Docker Desktop's `docker-desktop` WSL2 distro stopped coming up: `docker ps` returned "Docker Desktop is unable to start", `docker buildx ls` reported `DeadlineExceeded` for every builder, and the backend log (`com.docker.backend.exe.log`) showed 7+ minutes of `still waiting for the engine to respond to _ping`. This is a host/environment failure, not something in this repo's Docker config — `docker-compose.yml`, the `Dockerfile`, and `engine-entrypoint.sh` were all unaffected and unchanged by this.
+
+**Attempted remediation (all before escalating, none sufficient):**
+1. Force-killed every `Docker Desktop`/`com.docker.*` process and relaunched — backend came up but `docker-desktop` WSL distro still showed `Stopped`.
+2. `wsl --shutdown` (full WSL2 teardown) followed by a clean Docker Desktop relaunch — same result.
+3. Attempted to start the `com.docker.service` Windows service directly (`Start-Service`) — failed with "cannot be opened" (needs admin elevation this session doesn't have).
+
+**Fix:** none applied — this needs either an admin-elevated Docker Desktop restart or a full machine reboot, which the owner will do (owner: "I will do the docker stuff tomorrow"). Concrete next steps for whoever picks this up: reboot (or elevate + `Restart-Service com.docker.service`), then `docker compose up -d --build` and re-run WP-10's manual verification (kill one subservice → confirm only it restarts via `docker inspect --format '{{.RestartCount}}'`; `docker stop` with an in-flight request → confirm the `AV_ENGINE_STOP_GRACE_SECS` drain window is honored; break `AV_DATA_DIR` → confirm `/api/health` stays 200 while `/api/ready` goes 503).
+
+**Verification:** N/A (not yet re-attempted). This is the reason the V1.2.5 "Depth Pass" report could not confirm the rebuilt image was actually running, nor exercise WP-10's live-Docker checks — see the CHANGELOG Phase 57 "Deferred" note.
+
+---
+
+### 95. `/api/ready`'s Redis check silently reported healthy even when Redis was unreachable
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** The v1.2.5 readiness endpoint probed Redis via `cache.check_hash_exists("0" * 64)` — but that method deliberately fails OPEN (catches its own exceptions and returns `True`) by design, because its real caller (an optimistic skip-the-DB-lookup check before a full duplicate-object check) should default to "might exist, verify with DB" on any doubt. Using it as a health probe meant a genuinely unreachable Redis was reported as `"redis": true`. Caught live: `e2e-engine-smoke`'s own new CI step (`REDIS_URL` pointed at a nonexistent host) expected a 503 with `redis: false` and got 200 with `redis: true` instead — the exact regression the step exists to catch, missed by every stack-free unit test because none of them exercised a genuinely-down Redis against `/api/ready` (only the data-dir-unwritable case had a test).
+
+**Fix:** new `RedisCache.ping()` (redis_cache.py) — a raw `self._client.ping()` call that does NOT swallow errors; `/api/ready` now calls that instead of `check_hash_exists()`.
+
+**Verification:** new stack-free `tests/test_server.py::test_readiness_503_when_redis_is_unreachable` (monkeypatches `cache.ping` to raise, asserts 503 + `redis: false` + the other checks unaffected); the live CI step this was caught by will re-verify on the next push.
+
+---
+
+### 96. A merge resolving a genuine ref-race divergence could spuriously re-race its own push
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `_finalize_commit()`'s compare-and-swap `expected_hash` for a push was always `parents[0]` ("ours"). Correct for an ordinary single-parent commit (parents[0] IS the local ref's last-known value) and for an ordinary merge of an unrelated branch (ours still matches the server). But when `av merge <target>` resolves a GENUINE divergence — i.e. "ours" itself already lost its own ref-race and is sitting in `pending_push`, never having reached the server — the server's actual ref is `parents[1]` ("theirs", the target being merged in), not "ours". Using "ours" as the expectation made the merge commit's own push spuriously fail its own compare-and-swap and queue instead of landing, even though resolving that exact divergence is the whole point of the merge. Caught live by `scripts/e2e_scenario.sh`'s Phase A in CI (`pull should report divergence, got: Already up to date` — a downstream symptom of the same underlying ref-race design needing the script's push order updated once the CAS behavior was correctly understood, then the actual merge-push failing its own race once that was fixed).
+
+**Fix:** `_finalize_commit()` now checks, for a two-parent merge commit only, whether `parents[0]` is still present in this repo's own `pending_push` queue for the ref being updated. If so, it uses `parents[1]` ("theirs") as the expected hash instead — the value the merge is actually reconciling against; otherwise it keeps using `parents[0]` (the ordinary, non-diverged case). `scripts/e2e_scenario.sh`'s Phase A was also updated: since the compare-and-swap is working as designed, the losing push (repoA's) is now the side with the local/remote divergence to discover and resolve, not the winner (repoB) — the script now drives pull/merge/push from repoA.
+
+**Verification:** new stack-free `tests/test_sync.py::test_merge_push_lands_when_ours_lost_its_own_ref_race` (one repo, a real commit+push standing in for "the other agent", the local ref rewound to fork a genuine divergence, all real object content — no fabricated hashes); confirmed the test fails without the fix (reverted it locally, re-ran, got the exact same wrong ref value) and passes with it restored. `scripts/e2e_scenario.sh` Phase A will re-verify live on the next push.
+
+---
+
+### 97. `av run start` never registered a run server-side against a reachable registry — every run shipped nameless
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `cmd_run.py::start()`'s `POST /api/runs` payload never included `project_id` — the server's `create_run` handler requires it (`422` without one). `_register_remote()` treats any non-200 response as "not registered" and swallows it with no visible error (by design, so a agent's `run start` never crashes on a flaky server) — so this 422 has been completely silent since `av run` was introduced. Every registration therefore fell back to the server's "lazy-create at push time" path (`server.py`'s commit-push handler), which creates the `DBRun` row but has no way to learn its display name (the commit payload only ever carries `run_id`, never a name) — every run ever created this way was permanently nameless. Every existing test for `run start` ran fully offline (`registered_server_side: False`), so the reachable-server path — and this 422 — was never once exercised until `webui/e2e/runs.spec.ts` (new in this same phase) failed in live CI to find its seeded run by name via `GET /api/runs`.
+
+**Fix:** `start()` now loads `cfg = load_config(repo_root)` and includes `"project_id": cfg["project_id"]` in the registration payload.
+
+**Verification:** new stack-free `tests/test_v120.py::test_run_start_registration_payload_includes_project_id` (fake reachable client capturing the POST payload, asserts `project_id`/`name`/`id` are all present and correct); full `test_v120.py` (21 tests) and `test_av_sdk.py` (5 tests) re-run green. `webui/e2e/runs.spec.ts` will re-verify live on the next push.

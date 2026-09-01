@@ -985,7 +985,25 @@ def _finalize_commit(
     # Passed as expected_hash below so a losing compare-and-swap race is detectable
     # instead of silently overwriting a concurrent agent's ref update (v1.2.5).
     _parents = commit_data.get("parents") or []
-    expected_parent = _parents[0] if _parents else None
+    if len(_parents) == 2 and remote_ref_name:
+        # Two-parent MERGE commit. parents[0] ("ours") is only a valid expected_hash if
+        # OUR OWN prior commit on this ref actually landed on the server — normally true
+        # (an ordinary merge of some other branch/commit into a not-diverged ref), so
+        # "ours" stays the default. But if "ours" is still sitting in our OWN pending-push
+        # queue for this exact ref, it lost its own CAS race earlier (exactly the case
+        # `av merge <target>` resolving a genuine divergence reported by `av pull` is
+        # for) — the server's ref is NOT "ours", it's parents[1] ("theirs", the target
+        # being merged in), so use that instead. Otherwise this merge's own ref update
+        # would spuriously race against a server state "ours" never actually reached,
+        # even though the merge is precisely what reconciles that divergence. See
+        # Probleme.md and scripts/e2e_scenario.sh's Phase A.
+        _still_queued = {
+            e.get("commit_hash") for e in load_pending_push(repo_root)
+            if e.get("ref_name") == remote_ref_name
+        }
+        expected_parent = _parents[1] if _parents[0] in _still_queued else _parents[0]
+    else:
+        expected_parent = _parents[0] if _parents else None
 
     from .client import AuthenticationError, RefRaceError
 

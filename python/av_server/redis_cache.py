@@ -59,6 +59,16 @@ class RedisCache:
             logger.error("Bloom Filter check failed, defaulting to True: %s", exc)
             return True
 
+    async def ping(self) -> None:
+        """v1.2.5: raw connectivity check for /api/ready (server.py). Deliberately does
+        NOT fail open — a connection error propagates to the caller as an exception.
+        check_hash_exists() looks like a connectivity probe but isn't one for this
+        purpose: it catches its own errors and returns True ("might exist, verify with
+        DB") by design, which is the right default for its actual caller (skip-the-DB
+        optimization) but means a downed Redis silently reports as healthy to anything
+        using it as a health check — exactly the bug this method exists to avoid."""
+        await self._client.ping()
+
     async def reset_filter(self) -> None:
         """Delete the existing Bloom Filter (called before GC rebuild)."""
         try:

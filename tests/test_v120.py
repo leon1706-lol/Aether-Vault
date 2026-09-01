@@ -61,6 +61,49 @@ def test_av_commit_upload_env_disables_upload(repo, monkeypatch):
     assert env["queued_reason"] == "upload_deferred"
 
 
+def test_run_start_registration_payload_includes_project_id(repo, monkeypatch):
+    """Regression test (Probleme.md): the POST /api/runs payload built by `av run start`
+    never included project_id — the server requires it (422 without one; see
+    server.py::create_run), so every registration attempt against a REACHABLE server
+    silently failed (_register_remote treats any non-200 as "not registered" with no
+    visible error) and fell back to the server's lazy-create-at-push path, which has no
+    way to learn the run's name (the commit payload never carries it) — the run still
+    gets created, but permanently nameless. Every existing `run start` test ran fully
+    offline (registered_server_side=False), so this never got exercised until
+    webui/e2e/runs.spec.ts failed to find its seeded run by name in live CI."""
+    import python.av_cli.client as client_module
+
+    captured: dict = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "created", "id": captured["payload"]["id"]}
+
+    class _FakeSession:
+        def post(self, url, json=None):
+            captured["url"] = url
+            captured["payload"] = json
+            return _FakeResponse()
+
+    class _ReachableClient(client_module.VaultClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.session = _FakeSession()
+
+        def server_available(self) -> bool:
+            return True
+
+    monkeypatch.setattr(client_module, "VaultClient", _ReachableClient)
+
+    started = jinv("--output", "json", "run", "start", "my-run")["data"]
+    assert started["registered_server_side"] is True
+    assert captured["payload"]["project_id"], "registration payload must include project_id"
+    assert captured["payload"]["name"] == "my-run"
+    assert captured["payload"]["id"] == started["run_id"]
+
+
 def test_run_start_tags_subsequent_commits_and_finishes(repo):
     started = jinv("--output", "json", "run", "start", "smoke-run")["data"]
     rid = started["run_id"]
