@@ -1044,6 +1044,26 @@ def _finalize_commit(
                             "ref": race.ref_name, "current": race.current,
                             "expected": race.expected,
                         }
+                if ref_ok and len(_parents) == 2 and remote_ref_name:
+                    # v1.2.5: this merge just landed on the ref, directly superseding
+                    # both parents as candidates for THIS ref's tip. A parent still
+                    # sitting in pending_push (e.g. "ours" lost its own earlier ref race
+                    # — see the expected_parent selection above) can never legitimately
+                    # become the ref's value on its own again; its content already lives
+                    # on as an ancestor of the merge that just succeeded. Drop it now,
+                    # rather than have it retry-and-fail forever on every future
+                    # flush_pending_push (its expected_hash can never match again once
+                    # the ref has moved past it) — see Probleme.md and
+                    # scripts/e2e_scenario.sh's Phase B, which caught this via a
+                    # never-draining queue right after Phase A's merge landed.
+                    still_pending = load_pending_push(repo_root)
+                    remaining = [
+                        e for e in still_pending
+                        if not (e.get("ref_name") == remote_ref_name
+                                and e.get("commit_hash") in _parents)
+                    ]
+                    if len(remaining) != len(still_pending):
+                        save_pending_push(repo_root, remaining)
                 if not ref_ok:
                     queue_pending_push(repo_root, commit_hash, remote_ref_name)
                     _queued("ref_race" if "ref_race" in result else "ref_update_failed")

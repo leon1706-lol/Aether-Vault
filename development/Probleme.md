@@ -1182,6 +1182,42 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 **Problem:** `cmd_run.py::start()`'s `POST /api/runs` payload never included `project_id` — the server's `create_run` handler requires it (`422` without one). `_register_remote()` treats any non-200 response as "not registered" and swallows it with no visible error (by design, so a agent's `run start` never crashes on a flaky server) — so this 422 has been completely silent since `av run` was introduced. Every registration therefore fell back to the server's "lazy-create at push time" path (`server.py`'s commit-push handler), which creates the `DBRun` row but has no way to learn its display name (the commit payload only ever carries `run_id`, never a name) — every run ever created this way was permanently nameless. Every existing test for `run start` ran fully offline (`registered_server_side: False`), so the reachable-server path — and this 422 — was never once exercised until `webui/e2e/runs.spec.ts` (new in this same phase) failed in live CI to find its seeded run by name via `GET /api/runs`.
 
-**Fix:** `start()` now loads `cfg = load_config(repo_root)` and includes `"project_id": cfg["project_id"]` in the registration payload.
+**Fix:** `start()` now loads `cfg = load_config(repo_root)` and includes `"project_id": cfg["project_id"]` in the registration payload. **Also found the identical bug independently duplicated** in `av_sdk.Repo.run_start()` (`python/av_sdk/repo.py`), which builds its own separate `POST /api/runs` payload rather than reusing `cmd_run.py::start()` — same missing field, same silent 422, same nameless-run outcome; fixed the same way there too.
 
-**Verification:** new stack-free `tests/test_v120.py::test_run_start_registration_payload_includes_project_id` (fake reachable client capturing the POST payload, asserts `project_id`/`name`/`id` are all present and correct); full `test_v120.py` (21 tests) and `test_av_sdk.py` (5 tests) re-run green. `webui/e2e/runs.spec.ts` will re-verify live on the next push.
+**Verification:** new stack-free `tests/test_v120.py::test_run_start_registration_payload_includes_project_id` and `tests/test_av_sdk.py::test_sdk_run_start_registration_payload_includes_project_id` (fake reachable client capturing the POST payload in each, asserting `project_id`/`name`/`id` are all present and correct); full `test_v120.py` (21 tests) and `test_av_sdk.py` (6 tests) re-run green. `webui/e2e/runs.spec.ts` will re-verify live on the next push.
+
+---
+
+### 98. `av run start`'s superseded pending-push entry never drained after the fix to #96
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** Fixing #96 (a merge landing correctly against "theirs" when "ours" lost its own ref race) surfaced a second-order bug: "ours" — now superseded by the landed merge — stayed in `pending_push` forever. Every future `flush_pending_push()` kept retrying its ref update with the SAME stale `expected_hash` (its own original parent), which could never match the ref again once the merge moved it, so the queue never fully drained. Caught live by `scripts/e2e_scenario.sh`'s Phase B, immediately downstream of Phase A now succeeding: `pending_push should be drained after av push` failed because an unrelated, already-resolved entry from Phase A was still sitting in the queue.
+
+**Fix:** `_finalize_commit()` now, after a two-parent merge commit's ref update succeeds, removes any `pending_push` entries for that same ref whose commit hash is one of the merge's own parents — their content already lives on as an ancestor of the commit that just landed, so they can never legitimately become the ref's value again on their own.
+
+**Verification:** extended `tests/test_sync.py::test_merge_push_lands_when_ours_lost_its_own_ref_race` to assert `pending_push` is fully drained (file removed entirely) once the merge lands, not just that the merge itself succeeded.
+
+---
+
+### 99. `e2e-engine-smoke`'s independent-restart CI check used `pkill`, which isn't in the runtime image
+
+**Severity:** 4/10 (CI-only; not a product defect) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** The v1.2.5 CI step proving a killed subservice restarts independently (`docker exec engine-all pkill -f "node server.js"`) failed with `exec: "pkill": executable file not found in $PATH` — `python:3.12-slim-bookworm` (the runtime base image) doesn't ship `procps`, the package `pkill`/`ps`/etc. come from. Never caught locally because the manual verification for this exact scenario needs a live Docker daemon, which was unavailable on the machine that authored WP-10 (see #94).
+
+**Fix:** added `procps` to the runtime stage's `apt-get install` list in the root `Dockerfile` — also generally useful for operational debugging (`docker exec -it aether-vault-engine ps aux`), not just this CI step.
+
+**Verification:** will re-verify live on the next push/CI run (needs the rebuilt image); no local Docker available to confirm on this machine yet (see #94).
+
+---
+
+### 100. `webui/e2e/runs.spec.ts`'s deep-link assertion was a Playwright strict-mode violation waiting to happen
+
+**Severity:** 2/10 (test-only; not a product defect) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** The new deep-link spec asserted `page.getByText(new RegExp(seeded.id.slice(0, 8)))` was visible — but the run's short id legitimately appears in TWO places at once by design once the panel opens from a deep link: the runs table row behind the panel (`<td>9b8df829</td>`) AND the panel's own "Run detail — 9b8df829…" title. Playwright's `getByText` in strict mode (the default) throws rather than picking one when a locator resolves to more than one element — a test-authoring bug in this new spec, not a product regression (the #97 fix made the run itself findable for the first time, which is what let this second, previously-unreached assertion execute at all).
+
+**Fix:** narrowed the locator to `Run detail.*<short id>`, which only matches the panel's own title span.
+
+**Verification:** will re-verify live on the next push (needs a live webui + server); the regex was checked against the exact failing DOM text captured in the CI log (`Run detail — 9b8df829…`).

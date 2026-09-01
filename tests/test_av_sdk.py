@@ -44,6 +44,46 @@ def test_sdk_commit_with_nothing_staged_raises_nothing_to_commit(repo):
     assert ei.value.code == "nothing_to_commit"
 
 
+def test_sdk_run_start_registration_payload_includes_project_id(repo, monkeypatch):
+    """Regression test (Probleme.md): Repo.run_start() built its own POST /api/runs
+    payload independently of cmd_run.py::start() and had the exact same bug —
+    project_id missing entirely, which the server requires (422 without one). Every
+    existing SDK run test ran fully offline, so this never got exercised."""
+    import av_cli.client as client_module
+
+    captured: dict = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"status": "created", "id": captured["payload"]["id"]}
+
+    class _FakeSession:
+        def post(self, url, json=None):
+            captured["url"] = url
+            captured["payload"] = json
+            return _FakeResponse()
+
+    class _ReachableClient(client_module.VaultClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.session = _FakeSession()
+
+        def server_available(self) -> bool:
+            return True
+
+    monkeypatch.setattr(client_module, "VaultClient", _ReachableClient)
+
+    with Repo(repo) as r:
+        started = r.run_start("sdk-run")
+
+    assert started["registered_server_side"] is True
+    assert captured["payload"]["project_id"], "registration payload must include project_id"
+    assert captured["payload"]["name"] == "sdk-run"
+    assert captured["payload"]["id"] == started["run_id"]
+
+
 def test_sdk_run_lifecycle_and_handoff_lineage(repo):
     _stage = repo / "m.ckpt"
     _stage.write_bytes(b"ckpt")

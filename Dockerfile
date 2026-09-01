@@ -43,7 +43,10 @@ RUN npm run build
 FROM python:3.12-slim-bookworm
 # NodeSource Node 20 on top of the python base — node-fetch-style healthchecks
 # and the standalone Next server share this interpreter-free runtime layer.
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+# procps (pkill/ps/etc.) is NOT in python:3.12-slim by default — needed both for
+# `docker exec <container> pkill ...` in e2e-engine-smoke's independent-restart CI
+# check and for real operational debugging (`docker exec -it ... ps aux`).
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg procps \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get purge -y gnupg \

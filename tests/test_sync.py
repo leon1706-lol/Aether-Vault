@@ -270,6 +270,12 @@ def test_merge_push_lands_when_ours_lost_its_own_ref_race(tmp_path, monkeypatch)
         f"merge push should advance the server ref to {merge_hash!r}, got "
         f"{fake.recorded_refs[ref_name]!r} instead — did it re-race against 'ours'?"
     )
+    # Second regression (Probleme.md, found by scripts/e2e_scenario.sh's Phase B right
+    # after Phase A started landing the merge): "ours" is now superseded -- it must not
+    # linger in pending_push forever retrying a ref update that can never succeed again.
+    assert not (root / ".av" / "pending_push").exists(), (
+        "pending_push should be fully drained once the merge superseding 'ours' lands"
+    )
 
 
 # ---------------------------------------------------------------------------

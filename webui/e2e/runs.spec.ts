@@ -44,5 +44,9 @@ test("Runs: a deep-linked URL opens the run detail directly on load", async ({ p
 
   // No click needed — the panel opens straight from the URL on first paint.
   await expect(page.getByText(/Linked commits/)).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByText(new RegExp(seeded!.id.slice(0, 8)))).toBeVisible();
+  // The bare id also appears in the runs table row behind the panel (by design — the
+  // list stays visible), so a plain id-substring match is ambiguous (Playwright's
+  // strict mode rejects a locator resolving to >1 element). The "Run detail — " title
+  // is unique to the opened panel, which is what this test is actually confirming.
+  await expect(page.getByText(new RegExp(`Run detail.*${seeded!.id.slice(0, 8)}`))).toBeVisible();
 });

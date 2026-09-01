@@ -264,9 +264,14 @@ class Repo:
         from av_cli.cmd_run import _register_remote, _state_path
 
         run_id = str(uuid.uuid4())
+        # v1.2.5 fix: project_id was missing here (and independently, in the same way, in
+        # cmd_run.py::start() — see Probleme.md) — the server's POST /api/runs requires it
+        # (422 without one), so this always silently failed to register and fell back to
+        # the server's lazy-create-at-push path, which has no way to learn the run's name.
         registered, _resp = _register_remote(
             self.path,
-            {"id": run_id, "name": name, "parent_run_id": parent_run_id},
+            {"id": run_id, "project_id": self._cfg()["project_id"], "name": name,
+             "parent_run_id": parent_run_id},
         )
         state = {"run_id": run_id, "name": name, "status": "running",
                  "parent_run_ids": [parent_run_id] if parent_run_id else [],
