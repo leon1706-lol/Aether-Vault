@@ -36,6 +36,18 @@ AV_TEST_REDIS_URL = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/
 os.environ["DATABASE_URL"] = AV_TEST_DATABASE_URL
 os.environ["REDIS_URL"] = AV_TEST_REDIS_URL
 os.environ["AV_DATA_DIR"] = tempfile.mkdtemp(prefix="av-server-test-")
+# The periodic webhook-retry worker (server.py's _webhook_retry_worker) is created ONCE
+# at app startup with whatever AV_WEBHOOK_RETRY_INTERVAL_SECS is at that moment (the
+# `client` fixture below is session-scoped — one server, one worker task, for the WHOLE
+# file) and never re-reads it afterward. With the real 30s production default, that
+# worker's first tick lands at a fixed wall-clock offset from session start — which
+# collection order and file runtime can walk right into, racing any test that manually
+# drives webhook delivery via its own monkeypatched `requests.post` (a real bug this
+# caught: test_webhook_health_columns_update_on_success_and_failure flaked when new
+# tests earlier in this file shifted its position to land near the 30s mark — see
+# Probleme.md). A huge interval here means the worker's tick never fires during any
+# realistic test session, full stop.
+os.environ["AV_WEBHOOK_RETRY_INTERVAL_SECS"] = "999999"
 
 import python.av_server.server as server_module  # noqa: E402
 from python.av_server.server import app, validate_ref_name  # noqa: E402

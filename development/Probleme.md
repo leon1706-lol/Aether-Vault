@@ -1221,3 +1221,39 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** narrowed the locator to `Run detail.*<short id>`, which only matches the panel's own title span.
 
 **Verification:** will re-verify live on the next push (needs a live webui + server); the regex was checked against the exact failing DOM text captured in the CI log (`Run detail — 9b8df829…`).
+
+---
+
+### 101. A webhook health test raced the real background retry worker via session-scoped server startup timing
+
+**Severity:** 5/10 (test flakiness; not a product defect) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `tests/test_server.py`'s `client` fixture is `scope="session"` — ONE FastAPI app (and its `_webhook_retry_worker` background task) runs for the WHOLE test file. That worker captures `WEBHOOK_RETRY_INTERVAL_SECS` (real production default: 30s) as a plain function argument at task-creation time and never re-reads it — so per-test `monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", 0)` (used by six webhook tests to speed up backoff math) has no effect on the WORKER's own tick interval, only on the backoff formula it later calls. The worker's first tick therefore lands at a fixed ~30-second wall-clock offset from session start — which the file's cumulative runtime can walk into. It did here: `test_webhook_health_columns_update_on_success_and_failure` monkeypatches `requests.post` to return a fixed `[500, 500, 200]` sequence and manually drives exactly 3 delivery attempts; when the periodic worker's own tick coincidentally fires mid-test, it steals one of those 3 outcomes for itself, leaving the test's own final attempt to hit an exhausted iterator (`StopIteration`, caught and recorded as a 4th failure) instead of the expected `200`. New tests added earlier in this same file during this phase (readiness, policy, etc.) shifted this test's position enough to land it near the 30s mark for the first time.
+
+**Fix:** set `AV_WEBHOOK_RETRY_INTERVAL_SECS=999999` in the environment BEFORE `python.av_server.server` is imported (same place/pattern the file already uses for `DATABASE_URL`/`REDIS_URL`/`AV_DATA_DIR`) — the worker's one-time startup interval becomes effectively infinite for any realistic test session, while every per-test `monkeypatch.setattr(..., "WEBHOOK_RETRY_INTERVAL_SECS", N)` for backoff math keeps working exactly as before (that's a live re-read, unaffected by the startup value).
+
+**Verification:** could not re-run this specific live-stack test locally (no Docker available — see #94); the fix directly addresses the confirmed root cause and preserves every other test's own interval override, verified by static review of all six `monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", ...)` call sites in the file. Will re-verify live on the next push.
+
+---
+
+### 102. `scripts/e2e_scenario.sh` Phase C hardcoded a stale Alembic head after migration 0004 landed
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** Phase C's legacy-volume healing drill asserts `alembic_version.version_num == "0003"` after a simulated pre-Alembic boot heals and stamps the chain — stale since this phase's own migration `0004` (webhook health columns, `runs.avh_object_id`, audit indexes) became the real head. The healing code itself was already correct (`database.py::_ensure_schema_sync` stamps to `script.get_current_head()`, resolved dynamically, not hardcoded) — only the test script's own expectation was stale. Never caught until now because this phase never got far enough to run in this cycle's earlier CI attempts (Phases A and B were failing first — see #96/#98).
+
+**Fix:** updated the assertion to `"0004"`.
+
+**Verification:** confirmed `database.py`'s healing path is version-agnostic by inspection (stamps to the resolved current head, not a literal string); will re-verify live on the next push once Phases A/B/C all run in sequence.
+
+---
+
+### 103. `e2e-engine-smoke`'s subservice-kill step could abort or false-pass depending on `pkill`'s own exit code
+
+**Severity:** 4/10 (CI-only) · **Status:** 🟡 `partial` — diagnostic improved, root mechanism unconfirmed without live Docker (2026-09-02)
+
+**Problem:** After fixing #99 (missing `procps`), the same CI step still failed — `docker exec engine-all pkill -f "node server.js"` returned a non-zero exit under the step's `set -e`, aborting the script before its real assertions (the curl-retry recovery loop, the `RestartCount` check) ever ran. `pkill` exits 1 whenever it matches zero processes, which `set -e` treats identically to a real error; a bare `|| true` guard (the pattern already used for an unrelated `pkill` elsewhere in this same workflow file) would swallow that safely, but would also silently make the step a false pass if the pattern genuinely stopped matching the running process — never actually killing anything, then trivially reporting the webui as "recovered" and `RestartCount` as "unchanged".
+
+**Fix:** replaced the bare `pkill` with an explicit `pgrep -f "node server.js"` lookup, kill by that exact PID, and a loud `::error::` (with a `ps aux` dump) if no matching process is found at all — so a genuine matching failure fails with a real diagnostic instead of either silently aborting or silently passing.
+
+**Verification:** could not reproduce or confirm the exact underlying mechanism live (no Docker available on this machine — see #94); `engine-entrypoint.sh`'s `exec node server.js` (run from `cd /webui`, relative filename) should produce a `/proc/<pid>/cmdline` that matches `-f "node server.js"` exactly, so the specific non-match cause is still open. Re-run this step on the next push — if it now fails with the new `::error::no 'node server.js' process found` diagnostic and a `ps aux` dump, that will reveal the real process name/args to fix the pattern against; if it passes, the earlier failure was transient.

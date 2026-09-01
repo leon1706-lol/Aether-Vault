@@ -305,7 +305,19 @@ jobs:
       - name: Role=all — killing one subservice restarts it, not the container
         run: |
           before=$(docker inspect --format '{{.RestartCount}}' engine-all)
-          docker exec engine-all pkill -f "node server.js"
+          # v1.2.5.3: a bare `pkill -f ...` under this step's `set -e` aborts the whole
+          # step on ITS OWN non-matching-process exit code (1), before the real
+          # assertions below ever run — and swallowing that blindly with `|| true`
+          # would let the step silently "pass" without having killed anything at all if
+          # the pattern ever stops matching. Find the PID explicitly and kill THAT, so a
+          # genuine match failure fails loudly with a diagnostic instead of either way.
+          webui_pid=$(docker exec engine-all pgrep -f "node server.js" | head -1)
+          if [[ -z "$webui_pid" ]]; then
+            echo "::error::no 'node server.js' process found inside engine-all to kill"
+            docker exec engine-all ps aux >&2 || true
+            exit 1
+          fi
+          docker exec engine-all kill "$webui_pid"
           ok=0
           for i in $(seq 1 30); do
             curl -sf http://localhost:3000/ >/dev/null 2>&1 && { ok=1; break; }
