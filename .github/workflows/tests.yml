@@ -305,15 +305,21 @@ jobs:
       - name: Role=all — killing one subservice restarts it, not the container
         run: |
           before=$(docker inspect --format '{{.RestartCount}}' engine-all)
-          # v1.2.5.3: a bare `pkill -f ...` under this step's `set -e` aborts the whole
+          # v1.2.5.3/.4: a bare `pkill -f ...` under this step's `set -e` aborts the whole
           # step on ITS OWN non-matching-process exit code (1), before the real
           # assertions below ever run — and swallowing that blindly with `|| true`
           # would let the step silently "pass" without having killed anything at all if
           # the pattern ever stops matching. Find the PID explicitly and kill THAT, so a
           # genuine match failure fails loudly with a diagnostic instead of either way.
-          webui_pid=$(docker exec engine-all pgrep -f "node server.js" | head -1)
+          # Pattern is "next-server", not "node server.js": Next.js's standalone server
+          # calls process.title = "next-server (vX.Y.Z)" once it starts, which on Linux
+          # overwrites the process's actual argv/proc/<pid>/cmdline — `ps`/`pgrep -f`
+          # both see the renamed title, never the original `node server.js` invocation
+          # engine-entrypoint.sh launched it with (confirmed via this step's own `ps aux`
+          # diagnostic dump in CI — see Probleme.md).
+          webui_pid=$(docker exec engine-all pgrep -f "next-server" | head -1)
           if [[ -z "$webui_pid" ]]; then
-            echo "::error::no 'node server.js' process found inside engine-all to kill"
+            echo "::error::no 'next-server' (webui) process found inside engine-all to kill"
             docker exec engine-all ps aux >&2 || true
             exit 1
           fi
@@ -355,10 +361,15 @@ jobs:
           done
           [[ "$ok" == 1 ]] || { docker logs engine-srv >&2 || true; exit 1; }
           sleep 8
-          # The webui must NOT be running under either server-role container:
-          if docker top engine-srv | grep -q "[n]ode server.js"; then
+          # The webui must NOT be running under either server-role container. Checks for
+          # "next-server" (the running webui's actual, self-renamed process title — see
+          # Probleme.md #103), NOT "node server.js" (the launch invocation, which Next.js
+          # overwrites the instant it finishes booting) — the old pattern silently never
+          # matched even when the webui WAS running, making this assertion a no-op that
+          # always passed regardless of the real answer.
+          if docker top engine-srv | grep -q "[n]ext-server"; then
             echo "::error::AV_ENGINE_ROLE=server started the webui too"; exit 1; fi
-          if docker top engine-legacy | grep -q "[n]ode server.js"; then
+          if docker top engine-legacy | grep -q "[n]ext-server"; then
             echo "::error::legacy auto-detect started the webui too"; exit 1; fi
           # Legacy container's own registry must be healthy on its unmapped :8000:
           docker exec engine-legacy python -c \
