@@ -49,6 +49,10 @@ logger = logging.getLogger("av_server")
 # and are re-driven on an interval until AV_WEBHOOK_MAX_ATTEMPTS is exhausted → dead-letter.
 WEBHOOK_MAX_ATTEMPTS = int(os.environ.get("AV_WEBHOOK_MAX_ATTEMPTS", "5"))
 WEBHOOK_RETRY_INTERVAL_SECS = int(os.environ.get("AV_WEBHOOK_RETRY_INTERVAL_SECS", "30"))
+# v1.2.5: exponential backoff cap and per-webhook auto-disable threshold.
+WEBHOOK_RETRY_MAX_SECS = int(os.environ.get("AV_WEBHOOK_RETRY_MAX_SECS", "3600"))
+# 0 = off (default): a webhook never auto-disables regardless of consecutive failures.
+WEBHOOK_DISABLE_AFTER = int(os.environ.get("AV_WEBHOOK_DISABLE_AFTER", "0"))
 # Terminal-status (delivered/dead) delivery rows are swept with the event retention window.
 AUDIT_RETENTION_DAYS = int(os.environ.get("AV_AUDIT_RETENTION_DAYS", "90"))
 
@@ -105,7 +109,27 @@ AV_API_TOKEN = os.environ.get("AV_API_TOKEN", "").strip()
 # - /docs, /openapi.json, /redoc: FastAPI's bundled Swagger/ReDoc UI has no way to attach our
 #   custom Bearer header, so gating them would just break the webui's "API Docs" link with no
 #   real security benefit — they expose the API's shape, not any actual data.
-_AUTH_EXEMPT_PATHS = {"/api/health", "/docs", "/openapi.json", "/redoc"}
+# v1.2.5: /api/ready joins the exemption list for the same reason as /api/health — a
+# readiness probe that itself requires auth to answer "am I ready" is useless to the
+# orchestration checking it before the server is known-good.
+_AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/docs", "/openapi.json", "/redoc"}
+
+
+def _installed_version() -> str:
+    """v1.2.5: the real installed package version, from ONE source (importlib.metadata)
+    instead of a hardcoded literal — server.py:health_check() used to say "1.4.0" while
+    av_server/__init__.py separately said "1.0.0" and the CLI's own setuptools-scm-derived
+    version was a THIRD, different string; all three could silently drift from the
+    actual release. Deliberately NOT importing av_cli here (the server package has never
+    depended on it — see the run-summary endpoint's note on the same boundary) —
+    importlib.metadata reads the installed DISTRIBUTION's version, which both av_cli and
+    av_server ship as part of (one `aether-vault` package, one version, per pyproject.toml)."""
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        return _pkg_version("aether-vault")
+    except Exception:
+        return "unknown"
 
 
 def _parse_auth_users(raw: str | None) -> dict[str, str]:
@@ -224,6 +248,11 @@ MAX_TAG_LEN = 200
 
 class RefUpdate(BaseModel):
     commit_hash: str
+    # v1.2.5, optional/additive: when set, update_ref only advances the ref if its
+    # CURRENT commit_hash equals expected_hash — compare-and-swap instead of the old
+    # unconditional last-write-wins. Omitted (None) preserves exact pre-1.2.5 behavior,
+    # so existing clients are unaffected. See architecture.md's Remote Sync Contract.
+    expected_hash: Optional[str] = None
 
 
 # Ref names end up as filesystem paths in the legacy CASStorage fallback
@@ -322,7 +351,49 @@ async def build_merkle_tree(db: AsyncSession, tree_data: Dict[str, Any]) -> str:
 
 @app.get("/api/health")
 def health_check() -> dict:
-    return {"status": "ok", "version": "1.4.0"}
+    """Liveness: DB-free, auth-exempt, always answers if the process is up at all. Do
+    NOT add any dependency check here — VaultClient.server_available() and every CI
+    probe key off this staying reachable even when the server is otherwise unhealthy
+    (e.g. an unwritable AV_DATA_DIR — see /api/ready for that check)."""
+    return {"status": "ok", "version": _installed_version()}
+
+
+@app.get("/api/ready")
+async def readiness_check(db: AsyncSession = Depends(get_session)) -> Response:
+    """v1.2.5: readiness — DB connectivity, Redis reachability, and AV_DATA_DIR
+    writability. Targets the failure mode documented as "the most misleading in the
+    project" (development/infrastructure.md): /api/health stays green even when
+    AV_DATA_DIR is unwritable and every object upload 500s. Auth-exempt for the same
+    reason /api/health is (see _AUTH_EXEMPT_PATHS) — an orchestrator checking readiness
+    before the server is known-good can't be expected to already hold a valid token.
+    200 with `ready: true` when every check passes; 503 with per-check detail otherwise
+    — never raises, so a broken check reports itself instead of crashing the probe."""
+    checks: dict[str, bool] = {}
+
+    try:
+        await db.execute(select(1))
+        checks["database"] = True
+    except Exception:
+        checks["database"] = False
+
+    try:
+        await cache.check_hash_exists("0" * 64)  # cheap, real round-trip to Redis
+        checks["redis"] = True
+    except Exception:
+        checks["redis"] = False
+
+    try:
+        probe = storage.base_path / f".ready-probe-{os.getpid()}"
+        probe.write_text("ok")
+        probe.unlink()
+        checks["data_dir_writable"] = True
+    except Exception:
+        checks["data_dir_writable"] = False
+
+    ready = all(checks.values())
+    body = json.dumps({"ready": ready, "checks": checks})
+    return Response(content=body, media_type="application/json",
+                    status_code=200 if ready else 503)
 
 
 # ---------------------------------------------------------------------------
@@ -692,14 +763,29 @@ async def update_ref(
     db: AsyncSession = Depends(get_session),
 ) -> dict:
     ref_name = validate_ref_name(ref_name)
+    project_id = ref_name.split("/", 1)[0] if "/" in ref_name else None
+    # SELECT ... FOR UPDATE serializes concurrent writers on this ref row; the
+    # expected_hash check below (v1.2.5) is what makes that serialization meaningful —
+    # previously the second writer of a race just silently won (last-write-wins).
     stmt = select(DBRef).where(DBRef.name == ref_name).with_for_update()
     result = await db.execute(stmt)
     ref = result.scalar_one_or_none()
+    current_hash = ref.commit_hash if ref else None
+    if payload.expected_hash is not None and current_hash != payload.expected_hash:
+        _audit(db, _identity(request), "ref.update", project_id,
+               {"ref": ref_name, "commit_hash": payload.commit_hash,
+                "expected_hash": payload.expected_hash, "current_hash": current_hash},
+               status_code=409)
+        await db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "ref_race", "ref": ref_name, "current": current_hash,
+                    "expected": payload.expected_hash},
+        )
     if ref:
         ref.commit_hash = payload.commit_hash
     else:
         db.add(DBRef(name=ref_name, commit_hash=payload.commit_hash))
-    project_id = ref_name.split("/", 1)[0] if "/" in ref_name else None
     await _emit_event(db, project_id, "ref", {"ref": ref_name, "commit_hash": payload.commit_hash})
     _audit(db, _identity(request), "ref.update", project_id,
            {"ref": ref_name, "commit_hash": payload.commit_hash}, status_code=200)
@@ -815,7 +901,7 @@ def _collect_alive_in_memory(
 
 
 @app.post("/api/admin/gc")
-async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dict:
+async def run_garbage_collection(request: Request, db: AsyncSession = Depends(get_session)) -> dict:
     """
     Mark-and-sweep GC:
     1. Walk every commit's Merkle Tree to collect live hashes.
@@ -920,6 +1006,13 @@ async def run_garbage_collection(db: AsyncSession = Depends(get_session)) -> dic
             "alive_objects": len(alive_hashes),
             "reused_trees": len(visited_trees),
         })
+        # v1.2.5: GC is destructive (permanently deletes objects/trees) and was the most
+        # notable audit-coverage gap — closing it per the WP-2 coverage matrix.
+        _audit(db, _identity(request), "admin.gc", None, {
+            "deleted_objects": deleted_count,
+            "alive_objects": len(alive_hashes),
+            "reused_trees": len(visited_trees),
+        }, status_code=200)
         await db.commit()
         return {
             "status": "success",
@@ -1187,7 +1280,8 @@ def _event_body(event: dict) -> bytes:
     ).encode()
 
 
-async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict) -> None:
+async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict,
+                       db: AsyncSession | None = None) -> None:
     """One POST attempt for one hook, persisting the outcome onto its delivery row.
 
     Failure handling: attempt++ with next_retry_at scheduled at the retry interval;
@@ -1214,23 +1308,57 @@ async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict) -> None:
             return None, str(exc)
 
     status_code, error = await loop.run_in_executor(None, _post)
+    now = utcnow_naive()
     if status_code is not None and 200 <= status_code < 300:
         delivery.status = "delivered"
         delivery.response_code = status_code
         delivery.last_error = None
         delivery.next_retry_at = None
+        # v1.2.5 per-webhook health: a success clears the failure streak — a webhook
+        # that fails 4 times then succeeds is healthy again, not "3 away from disabled".
+        hook.last_success_at = now
+        hook.consecutive_failures = 0
     else:
         delivery.attempt += 1
         delivery.response_code = status_code
         delivery.last_error = error or f"http_{status_code}"
+        hook.last_failure_at = now
+        hook.consecutive_failures = (hook.consecutive_failures or 0) + 1
         if delivery.attempt >= WEBHOOK_MAX_ATTEMPTS:
             delivery.status = "dead"
             logger.warning("webhook %s dead-lettered after %s attempts", hook.url,
                            delivery.attempt)
         else:
             delivery.status = "failed"
-            delivery.next_retry_at = utcnow_naive() + timedelta(
-                seconds=WEBHOOK_RETRY_INTERVAL_SECS)
+            # v1.2.5 exponential backoff (was a fixed WEBHOOK_RETRY_INTERVAL_SECS every
+            # time): attempt 1->interval, 2->2x, 3->4x, ... capped at WEBHOOK_RETRY_MAX_SECS
+            # so a chronically-broken endpoint doesn't hammer itself OR its subscriber.
+            backoff = min(WEBHOOK_RETRY_INTERVAL_SECS * (2 ** (delivery.attempt - 1)),
+                          WEBHOOK_RETRY_MAX_SECS)
+            delivery.next_retry_at = now + timedelta(seconds=backoff)
+        # v1.2.5 disable-after-N: 0 (default) = never auto-disable. A webhook that's
+        # already inactive stays as the caller left it — this only ever transitions
+        # active -> disabled, never touches a webhook a human already turned off.
+        if (WEBHOOK_DISABLE_AFTER > 0 and hook.active
+                and hook.consecutive_failures >= WEBHOOK_DISABLE_AFTER):
+            hook.active = False
+            hook.disabled_reason = (
+                f"auto-disabled after {hook.consecutive_failures} consecutive failed "
+                f"deliveries (last: {delivery.last_error})"
+            )
+            logger.warning("webhook %s auto-disabled after %s consecutive failures",
+                           hook.url, hook.consecutive_failures)
+            if db is not None:
+                await _emit_event(db, hook.project_id, "webhook_disabled", {
+                    "webhook_id": hook.id, "url": hook.url,
+                    "consecutive_failures": hook.consecutive_failures,
+                })
+                # System-triggered (no HTTP request in the retry-worker path) — username
+                # None reads correctly in the trail as "not a human action", same as any
+                # other Anonymous-mode entry.
+                _audit(db, None, "webhook.auto_disable", hook.project_id, {
+                    "webhook_id": hook.id, "consecutive_failures": hook.consecutive_failures,
+                }, status_code=200)
 
 
 async def process_due_webhook_deliveries() -> int:
@@ -1261,7 +1389,7 @@ async def process_due_webhook_deliveries() -> int:
                 continue
             event = {"id": delivery.event_id or -1, "kind": delivery.event_kind,
                      "project_id": delivery.project_id, "payload": delivery.payload}
-            await _deliver_one(hook, delivery, event)
+            await _deliver_one(hook, delivery, event, db)
             delivered += 1
         await db.commit()
     return delivered
@@ -1293,7 +1421,7 @@ async def _deliver_webhooks(db: AsyncSession, hooks: list, event: dict) -> None:
         )
         db.add(delivery)
         await db.flush()
-        await _deliver_one(hook, delivery, event)
+        await _deliver_one(hook, delivery, event, db)
 
 
 def _audit(db: AsyncSession, username: str | None, action: str,
@@ -1305,6 +1433,25 @@ def _audit(db: AsyncSession, username: str | None, action: str,
         db.add(DBAuditLog(username=username, action=action,
                           project_id=project_id, details=details,
                           status_code=status_code))
+
+
+# v1.2.5: (method, path) pairs for mutating routes DELIBERATELY not audited, each with
+# a reason — kept alongside a coverage test (tests/test_audit_coverage.py) that walks
+# every POST/PUT/PATCH/DELETE route in `app.routes` and asserts it's either audited (an
+# `_audit(` call in its endpoint source) or listed here. This is how the WP-2 "guaranteed
+# coverage matrix" from the V1.2.5 plan stays true after the fact, not just at review time.
+AUDIT_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset({
+    # High-frequency, content-addressed, idempotent (identical bytes -> identical hash;
+    # a 409 "already exists" is a normal, harmless outcome, not a notable event). The
+    # meaningful "who changed what" signal for an upload is captured by the commit.push
+    # audit row that references these object hashes — auditing every individual object/
+    # chunk PUT would dominate the audit_log table without adding attribution value.
+    ("POST", "/api/objects/{hash}"),
+    # Existence-check only (client asks "which of these hashes do you already have?"
+    # before uploading) — never creates, deletes, or mutates anything itself. Same
+    # high-frequency rationale as object upload.
+    ("POST", "/api/sync/batch-objects"),
+})
 
 
 AUDIT_ENABLED = os.environ.get("AV_AUDIT_LOG", "1") not in ("", "0", "false")
@@ -1414,6 +1561,7 @@ def _run_to_dict(r: DBRun) -> dict:
         "id": r.id, "project_id": r.project_id, "name": r.name, "status": r.status,
         "parent_run_id": r.parent_run_id, "created_by": r.created_by,
         "code_pointer": r.code_pointer, "env_snapshot_id": r.env_snapshot_id,
+        "avh_object_id": r.avh_object_id,
         "metrics_summary": r.metrics_summary or {},
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
@@ -1431,6 +1579,138 @@ async def get_run(run_id: str, db: AsyncSession = Depends(get_session)):
     d = _run_to_dict(r)
     d["commit_hashes"] = commit_rows
     return d
+
+
+def _summarize_tree_diff(old_tree: dict, new_tree: dict) -> dict:
+    """v1.2.5: a small, server-OWNED semantic summary for the run-detail endpoint —
+    deliberately NOT importing python/av_cli/semdiff.py (the server package has never
+    depended on av_cli; it ships and deploys standalone, see docker/engine-entrypoint.sh
+    and the Plugin/Release contracts) — this is the added/removed/changed + byte-total
+    subset that matters for a run summary, not semdiff's full layer-movement/chunk-dedup
+    analysis (that stays a client-side/CLI-side concern via `av diff`/`.avh`).
+    """
+    old_tree = old_tree or {}
+    new_tree = new_tree or {}
+    old_keys, new_keys = set(old_tree), set(new_tree)
+    added = sorted(new_keys - old_keys)
+    removed = sorted(old_keys - new_keys)
+    changed = sorted(
+        p for p in (old_keys & new_keys)
+        if (old_tree.get(p) or {}).get("hash") != (new_tree.get(p) or {}).get("hash")
+    )
+    bytes_before = sum((e or {}).get("size") or 0 for e in old_tree.values())
+    bytes_after = sum((e or {}).get("size") or 0 for e in new_tree.values())
+    return {
+        "files": {"added": added, "removed": removed, "changed": changed},
+        "totals": {"bytes_before": bytes_before, "bytes_after": bytes_after},
+        "summary": f"+{len(added)} -{len(removed)} ~{len(changed)} file(s)",
+    }
+
+
+# v1.2.5: caps how many linked commits a run-summary resolves trees/metrics for — same
+# rationale and same number as the WebUI's client-side MAX_DETAIL_COMMITS precedent
+# (webui/src/components/RunsPanel.tsx): bound the response size, never silently drop
+# data without saying so (the endpoint reports total_commits vs commits returned).
+_RUN_SUMMARY_MAX_COMMITS = 20
+# Same precedent (RunsPanel.tsx) for how far up the parent_run_id chain to walk.
+_RUN_SUMMARY_MAX_LINEAGE_DEPTH = 10
+
+
+@app.get("/api/runs/{run_id}/summary")
+async def get_run_summary(run_id: str, db: AsyncSession = Depends(get_session)):
+    """v1.2.5: one aggregate request for the WebUI run-detail view — lineage chain,
+    linked commits (message + metrics, newest first), a SERVER-COMPUTED semantic summary
+    over the two most-recently-linked commits' trees, the env_snapshot_id pointer, and
+    (when the repo owner has opted in via `av handoff --publish`) the avh_object_id
+    pointer for context-memory notes. Replaces the WebUI's previous N individual
+    GET /api/commits/{hash} calls (client-side re-composition in
+    webui/src/lib/runDetail.ts, kept as the pure-function fallback/test surface)."""
+    r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # Lineage chain: walk parent_run_id upward, same depth bound the client used.
+    lineage = []
+    cursor = r
+    seen_ids = set()
+    for _ in range(_RUN_SUMMARY_MAX_LINEAGE_DEPTH):
+        if cursor.id in seen_ids:
+            break  # defensive: a corrupted parent_run_id cycle must never infinite-loop
+        seen_ids.add(cursor.id)
+        lineage.append({"id": cursor.id, "name": cursor.name, "status": cursor.status})
+        if not cursor.parent_run_id:
+            break
+        cursor = (await db.execute(
+            select(DBRun).where(DBRun.id == cursor.parent_run_id)
+        )).scalar_one_or_none()
+        if cursor is None:
+            break
+
+    commit_hashes = (await db.execute(
+        select(DBRunCommit.commit_hash).where(DBRunCommit.run_id == run_id)
+    )).scalars().all()
+    total_commits = len(commit_hashes)
+
+    commit_rows = []
+    if commit_hashes:
+        commit_rows = (await db.execute(
+            select(DBCommit)
+            .where(DBCommit.hash.in_(commit_hashes))
+            .order_by(DBCommit.timestamp.desc())
+            .limit(_RUN_SUMMARY_MAX_COMMITS)
+        )).scalars().all()
+
+    commits_out = [
+        {"hash": c.hash, "message": c.message, "metrics": c.metrics or {},
+         "timestamp": c.timestamp.isoformat() if c.timestamp else None}
+        for c in commit_rows
+    ]
+
+    semantic_summary = None
+    if len(commit_rows) >= 2:
+        newest, previous = commit_rows[0], commit_rows[1]
+        old_tree = await resolve_tree(db, previous.root_tree_hash) if previous.root_tree_hash else {}
+        new_tree = await resolve_tree(db, newest.root_tree_hash) if newest.root_tree_hash else {}
+        semantic_summary = _summarize_tree_diff(old_tree, new_tree)
+
+    return {
+        "run": _run_to_dict(r),
+        "lineage": lineage,
+        "commits": commits_out,
+        "total_commits": total_commits,
+        "semantic_summary": semantic_summary,
+        "env_snapshot_id": r.env_snapshot_id,
+        "avh_object_id": r.avh_object_id,
+    }
+
+
+@app.post("/api/runs/{run_id}/avh")
+async def link_run_avh(run_id: str, request: Request,
+                       body: Dict[str, Any] = Body(...),
+                       db: AsyncSession = Depends(get_session)):
+    """v1.2.5: explicit, OPT-IN pointer from a run to a published `.avh` context-memory
+    object — set only by `av handoff --publish`, never implicitly by a normal commit or
+    push. Context notes can hold private reasoning, so nothing about this route is
+    automatic; the object itself already had to be uploaded through the normal object
+    flow (POST /api/objects/{hash}) before this call links it to the run."""
+    avh_object_id = body.get("avh_object_id")
+    if not avh_object_id or not re.match(r"^[a-f0-9]{64}$", avh_object_id):
+        raise HTTPException(status_code=422, detail="avh_object_id must be a sha256 hex hash")
+    r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    exists = (await db.execute(
+        select(DBObject.hash).where(DBObject.hash == avh_object_id)
+    )).scalar_one_or_none()
+    if not exists:
+        raise HTTPException(status_code=422,
+                            detail="avh_object_id must reference an already-uploaded object "
+                                   "(POST /api/objects/{hash} first)")
+    r.avh_object_id = avh_object_id
+    _audit(db, _identity(request), "run.avh_publish", r.project_id,
+           {"run_id": run_id, "avh_object_id": avh_object_id}, status_code=200)
+    await db.commit()
+    return {"status": "linked", "run_id": run_id, "avh_object_id": avh_object_id}
 
 
 @app.post("/api/runs/{run_id}/complete")
@@ -1474,13 +1754,73 @@ def _parse_iso_dt(value: str, field: str) -> datetime:
     return parsed
 
 
+def _encode_id_cursor(row_id: int) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(f"id:{row_id}".encode()).decode().rstrip("=")
+
+
+def _decode_id_cursor(cursor: str) -> int:
+    import base64
+
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode()).decode()
+        if not raw.startswith("id:"):
+            raise ValueError
+        return int(raw[3:])
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Invalid cursor: {cursor!r}")
+
+
+def _apply_audit_filters(stmt, *, project_id, action, action_prefix, username,
+                          status_code, outcome, since, until):
+    """Shared WHERE-clause builder for the list and export endpoints — kept as one
+    function so the two routes can never drift on what a given filter set matches."""
+    if project_id:
+        stmt = stmt.where(DBAuditLog.project_id == project_id)
+    if action:
+        stmt = stmt.where(DBAuditLog.action == action)
+    if action_prefix:
+        # Escape SQL LIKE wildcards in the user-supplied prefix itself, then append ours.
+        escaped = action_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        stmt = stmt.where(DBAuditLog.action.like(f"{escaped}%", escape="\\"))
+    if username:
+        stmt = stmt.where(DBAuditLog.username == username)
+    if status_code is not None:
+        stmt = stmt.where(DBAuditLog.status_code == status_code)
+    if outcome:
+        if outcome not in ("ok", "error"):
+            raise HTTPException(status_code=422, detail=f"Invalid outcome: {outcome!r} (want 'ok' or 'error')")
+        if outcome == "ok":
+            stmt = stmt.where(DBAuditLog.status_code.is_not(None), DBAuditLog.status_code < 400)
+        else:
+            stmt = stmt.where(DBAuditLog.status_code.is_not(None), DBAuditLog.status_code >= 400)
+    if since:
+        stmt = stmt.where(DBAuditLog.ts >= _parse_iso_dt(since, "since"))
+    if until:
+        stmt = stmt.where(DBAuditLog.ts <= _parse_iso_dt(until, "until"))
+    return stmt
+
+
+def _audit_row_dict(a: "DBAuditLog") -> dict:
+    return {"id": a.id, "ts": a.ts.isoformat() if a.ts else None, "username": a.username,
+            "action": a.action, "project_id": a.project_id, "details": a.details,
+            "status_code": a.status_code}
+
+
 @app.get("/api/admin/audit")
 async def get_audit_log(
     request: Request,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    cursor: Optional[str] = None,
     project_id: Optional[str] = None,
     action: Optional[str] = None,
+    action_prefix: Optional[str] = None,
+    username: Optional[str] = None,
+    status_code: Optional[int] = None,
+    outcome: Optional[str] = None,
     since: Optional[str] = None,
     until: Optional[str] = None,
     db: AsyncSession = Depends(get_session),
@@ -1488,34 +1828,91 @@ async def get_audit_log(
     """Trust surface: recent mutating-call trail with outcome capture. Auth-gated like
     every other route; in Anonymous mode usernames are simply None entries.
 
-    Filters (v1.2.2): action (exact match), project_id, since/until (ISO-8601 ts bounds),
-    limit+offset pagination — all composable."""
-    stmt = select(DBAuditLog)
-    count_stmt = select(func.count()).select_from(DBAuditLog)
-    if project_id:
-        stmt = stmt.where(DBAuditLog.project_id == project_id)
-        count_stmt = count_stmt.where(DBAuditLog.project_id == project_id)
-    if action:
-        stmt = stmt.where(DBAuditLog.action == action)
-        count_stmt = count_stmt.where(DBAuditLog.action == action)
-    if since:
-        cutoff = _parse_iso_dt(since, "since")
-        stmt = stmt.where(DBAuditLog.ts >= cutoff)
-        count_stmt = count_stmt.where(DBAuditLog.ts >= cutoff)
-    if until:
-        cutoff = _parse_iso_dt(until, "until")
-        stmt = stmt.where(DBAuditLog.ts <= cutoff)
-        count_stmt = count_stmt.where(DBAuditLog.ts <= cutoff)
+    Filters (v1.2.2): action (exact match), project_id, since/until (ISO-8601 ts bounds).
+    Filters (v1.2.5): action_prefix (route family, e.g. "commit." matches "commit.push"),
+    username (actor), status_code (exact), outcome ("ok" = 2xx/3xx, "error" = 4xx/5xx).
+
+    Pagination: `offset` (legacy, kept working — a page N stays valid even as new rows are
+    inserted ahead of it, since `id DESC` ordering is stable) OR `cursor` (v1.2.5, stable
+    under concurrent inserts: opaque, encodes the last row's id, and `id < cursor` is exact
+    regardless of how many new rows landed since the previous page was fetched — offset-N
+    can skip or repeat rows under concurrent inserts, cursor cannot). Passing both is a 422;
+    `cursor` is the recommended path for agents polling this endpoint repeatedly.
+    """
+    if cursor and offset:
+        raise HTTPException(status_code=422, detail="Pass either `cursor` or `offset`, not both.")
+    stmt = _apply_audit_filters(
+        select(DBAuditLog), project_id=project_id, action=action, action_prefix=action_prefix,
+        username=username, status_code=status_code, outcome=outcome, since=since, until=until,
+    )
+    count_stmt = _apply_audit_filters(
+        select(func.count()).select_from(DBAuditLog), project_id=project_id, action=action,
+        action_prefix=action_prefix, username=username, status_code=status_code,
+        outcome=outcome, since=since, until=until,
+    )
     total = (await db.execute(count_stmt)).scalar_one()
-    rows = (await db.execute(
-        stmt.order_by(DBAuditLog.id.desc()).limit(limit).offset(offset)
-    )).scalars().all()
-    return {"entries": [
-        {"id": a.id, "ts": a.ts.isoformat() if a.ts else None, "username": a.username,
-         "action": a.action, "project_id": a.project_id, "details": a.details,
-         "status_code": a.status_code}
-        for a in rows
-    ], "total": total, "limit": limit, "offset": offset}
+    if cursor:
+        stmt = stmt.where(DBAuditLog.id < _decode_id_cursor(cursor))
+        rows = (await db.execute(stmt.order_by(DBAuditLog.id.desc()).limit(limit))).scalars().all()
+    else:
+        rows = (await db.execute(
+            stmt.order_by(DBAuditLog.id.desc()).limit(limit).offset(offset)
+        )).scalars().all()
+    next_cursor = _encode_id_cursor(rows[-1].id) if len(rows) == limit else None
+    return {"entries": [_audit_row_dict(a) for a in rows], "total": total,
+            "limit": limit, "offset": offset, "next_cursor": next_cursor}
+
+
+@app.get("/api/admin/audit/export")
+async def export_audit_log(
+    request: Request,
+    format: str = Query("jsonl", pattern="^(jsonl|csv)$"),
+    project_id: Optional[str] = None,
+    action: Optional[str] = None,
+    action_prefix: Optional[str] = None,
+    username: Optional[str] = None,
+    status_code: Optional[int] = None,
+    outcome: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    db: AsyncSession = Depends(get_session),
+):
+    """v1.2.5: streams the FILTERED set (same filters as the list endpoint, no
+    pagination) as jsonl or csv for compliance export — `av audit export` is the CLI
+    surface. Ordered oldest-first (unlike the list endpoint's newest-first) so a csv/jsonl
+    file reads as a natural audit timeline top to bottom."""
+    import csv
+    import io
+    import json as _json
+
+    stmt = _apply_audit_filters(
+        select(DBAuditLog), project_id=project_id, action=action, action_prefix=action_prefix,
+        username=username, status_code=status_code, outcome=outcome, since=since, until=until,
+    ).order_by(DBAuditLog.id.asc())
+    rows = (await db.execute(stmt)).scalars().all()
+
+    if format == "jsonl":
+        body = "\n".join(_json.dumps(_audit_row_dict(a)) for a in rows)
+        if body:
+            body += "\n"
+        media_type, filename = "application/x-ndjson", "audit-export.jsonl"
+    else:
+        buf = io.StringIO()
+        writer = csv.DictWriter(
+            buf, fieldnames=["id", "ts", "username", "action", "project_id", "details", "status_code"]
+        )
+        writer.writeheader()
+        for a in rows:
+            d = _audit_row_dict(a)
+            d["details"] = _json.dumps(d["details"]) if d["details"] is not None else ""
+            writer.writerow(d)
+        body = buf.getvalue()
+        media_type, filename = "text/csv", "audit-export.csv"
+
+    return Response(
+        content=body, media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.delete("/api/admin/audit")
@@ -1558,9 +1955,32 @@ async def list_webhooks(db: AsyncSession = Depends(get_session)):
     return {"webhooks": [
         {"id": w.id, "url": w.url, "project_id": w.project_id,
          "kinds": w.kinds, "active": w.active,
-         "secret": (w.secret[:3] + "…") if w.secret else None}
+         "secret": (w.secret[:3] + "…") if w.secret else None,
+         # v1.2.5 per-webhook health — "is this currently healthy?" without joining
+         # webhook_deliveries.
+         "last_success_at": w.last_success_at.isoformat() if w.last_success_at else None,
+         "last_failure_at": w.last_failure_at.isoformat() if w.last_failure_at else None,
+         "consecutive_failures": w.consecutive_failures or 0,
+         "disabled_reason": w.disabled_reason}
         for w in rows
     ]}
+
+
+@app.post("/api/webhooks/{webhook_id}/enable")
+async def enable_webhook(webhook_id: str, request: Request, db: AsyncSession = Depends(get_session)):
+    """v1.2.5: re-enables a webhook — the explicit counterpart to auto-disable. Clears the
+    failure streak so it starts from a clean slate rather than being one failure from
+    disabling itself again immediately."""
+    row = (await db.execute(select(DBWebhook).where(DBWebhook.id == webhook_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    row.active = True
+    row.disabled_reason = None
+    row.consecutive_failures = 0
+    _audit(db, _identity(request), "webhook.enable", row.project_id, {"webhook_id": webhook_id},
+           status_code=200)
+    await db.commit()
+    return {"status": "enabled"}
 
 
 @app.delete("/api/webhooks/{webhook_id}")
@@ -1576,46 +1996,100 @@ async def delete_webhook(webhook_id: str, request: Request,
 
 
 @app.post("/api/webhooks/{webhook_id}/test")
-async def test_webhook(webhook_id: str, db: AsyncSession = Depends(get_session)):
+async def test_webhook(webhook_id: str, request: Request, db: AsyncSession = Depends(get_session)):
     row = (await db.execute(select(DBWebhook).where(DBWebhook.id == webhook_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Webhook not found")
     await _deliver_webhooks(db, [row], {"id": -1, "kind": "webhook_test",
                                     "project_id": row.project_id, "payload": {"ping": True}})
+    _audit(db, _identity(request), "webhook.test", row.project_id, {"webhook_id": webhook_id},
+           status_code=200)
     await db.commit()
     return {"status": "delivered"}
 
 
 # --- webhook delivery observability (v1.2.2) ----------------------------------
 
+def _delivery_row_dict(d: "DBWebhookDelivery") -> dict:
+    return {"id": d.id, "webhook_id": d.webhook_id, "event_id": d.event_id,
+            "event_kind": d.event_kind, "project_id": d.project_id,
+            "attempt": d.attempt, "status": d.status,
+            "response_code": d.response_code, "last_error": d.last_error,
+            "next_retry_at": d.next_retry_at.isoformat() if d.next_retry_at else None,
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+            "updated_at": d.updated_at.isoformat() if d.updated_at else None}
+
+
 @app.get("/api/admin/webhook-deliveries")
 async def list_webhook_deliveries(
     status: Optional[str] = None,
     webhook_id: Optional[str] = None,
+    event_kind: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    cursor: Optional[str] = None,
     db: AsyncSession = Depends(get_session),
 ):
-    """Delivery-ledger observability: attempts, outcomes, retry schedule, dead-letters."""
+    """Delivery-ledger observability: attempts, outcomes, retry schedule, dead-letters.
+
+    v1.2.5 additions: `event_kind`, `since`/`until` filters, and `cursor` pagination
+    (same opaque-id scheme as /api/admin/audit — see its docstring for the rationale)."""
+    if cursor and offset:
+        raise HTTPException(status_code=422, detail="Pass either `cursor` or `offset`, not both.")
     stmt = select(DBWebhookDelivery)
     count_stmt = select(func.count()).select_from(DBWebhookDelivery)
-    if status:
-        stmt = stmt.where(DBWebhookDelivery.status == status)
-        count_stmt = count_stmt.where(DBWebhookDelivery.status == status)
-    if webhook_id:
-        stmt = stmt.where(DBWebhookDelivery.webhook_id == webhook_id)
-        count_stmt = count_stmt.where(DBWebhookDelivery.webhook_id == webhook_id)
+    for col, val in (
+        (DBWebhookDelivery.status, status),
+        (DBWebhookDelivery.webhook_id, webhook_id),
+        (DBWebhookDelivery.event_kind, event_kind),
+    ):
+        if val:
+            stmt = stmt.where(col == val)
+            count_stmt = count_stmt.where(col == val)
+    if since:
+        cutoff = _parse_iso_dt(since, "since")
+        stmt = stmt.where(DBWebhookDelivery.created_at >= cutoff)
+        count_stmt = count_stmt.where(DBWebhookDelivery.created_at >= cutoff)
+    if until:
+        cutoff = _parse_iso_dt(until, "until")
+        stmt = stmt.where(DBWebhookDelivery.created_at <= cutoff)
+        count_stmt = count_stmt.where(DBWebhookDelivery.created_at <= cutoff)
     total = (await db.execute(count_stmt)).scalar_one()
-    rows = (await db.execute(
-        stmt.order_by(DBWebhookDelivery.id.desc()).limit(limit).offset(offset)
-    )).scalars().all()
-    return {"deliveries": [
-        {"id": d.id, "webhook_id": d.webhook_id, "event_id": d.event_id,
-         "event_kind": d.event_kind, "project_id": d.project_id,
-         "attempt": d.attempt, "status": d.status,
-         "response_code": d.response_code, "last_error": d.last_error,
-         "next_retry_at": d.next_retry_at.isoformat() if d.next_retry_at else None,
-         "created_at": d.created_at.isoformat() if d.created_at else None,
-         "updated_at": d.updated_at.isoformat() if d.updated_at else None}
-        for d in rows
-    ], "total": total, "limit": limit, "offset": offset}
+    if cursor:
+        stmt = stmt.where(DBWebhookDelivery.id < _decode_id_cursor(cursor))
+        rows = (await db.execute(stmt.order_by(DBWebhookDelivery.id.desc()).limit(limit))).scalars().all()
+    else:
+        rows = (await db.execute(
+            stmt.order_by(DBWebhookDelivery.id.desc()).limit(limit).offset(offset)
+        )).scalars().all()
+    next_cursor = _encode_id_cursor(rows[-1].id) if len(rows) == limit else None
+    return {"deliveries": [_delivery_row_dict(d) for d in rows], "total": total,
+            "limit": limit, "offset": offset, "next_cursor": next_cursor}
+
+
+@app.post("/api/admin/webhook-deliveries/{delivery_id}/replay")
+async def replay_webhook_delivery(delivery_id: int, request: Request,
+                                  db: AsyncSession = Depends(get_session)):
+    """v1.2.5: re-queues one failed/dead delivery for immediate retry — the CLI/admin
+    counterpart to waiting for the interval worker (or for a dead row, which the worker
+    never touches again on its own). Resets the attempt counter so a manually-replayed
+    delivery gets the full AV_WEBHOOK_MAX_ATTEMPTS budget again, not just what was left."""
+    row = (await db.execute(
+        select(DBWebhookDelivery).where(DBWebhookDelivery.id == delivery_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    if row.status in ("delivered", "pending"):
+        raise HTTPException(status_code=409,
+                            detail=f"Delivery {delivery_id} is '{row.status}' — only "
+                                   "'failed'/'dead' deliveries can be replayed.")
+    row.status = "pending"
+    row.attempt = 0
+    row.last_error = None
+    row.next_retry_at = utcnow_naive()
+    _audit(db, _identity(request), "webhook.delivery_replay", row.project_id,
+           {"delivery_id": delivery_id, "webhook_id": row.webhook_id}, status_code=200)
+    await db.commit()
+    return {"status": "queued", "delivery": _delivery_row_dict(row)}

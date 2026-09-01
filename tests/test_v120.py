@@ -87,7 +87,9 @@ def test_env_snapshot_and_replay_roundtrip(repo):
     replay = inv("env", "replay").output
     assert "pip install" in replay
     docker = inv("env", "replay", "--dockerfile").output
-    assert docker.startswith("# Recipe-exact") and "FROM python:" in docker
+    # v1.2.5: multi-stage Dockerfile (syntax directive first, builder + runtime stages).
+    assert docker.startswith("# syntax=") and "Recipe-exact" in docker
+    assert "FROM python:" in docker and "AS builder" in docker
 
 
 def test_context_memory_note_survives_handoff_and_export_md(repo):
@@ -111,6 +113,105 @@ def test_context_memory_note_survives_handoff_and_export_md(repo):
 
     val = jinv("--output", "json", "context", "validate")["data"]
     assert val["valid"] is True and val["problems"] == []
+
+
+# ---------------------------------------------------------------------------
+# v1.2.5: av handoff --publish (opt-in .avh publish, linked to the active run)
+# ---------------------------------------------------------------------------
+
+class _FakePublishResp:
+    def __init__(self, status_code=200, text=""):
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakePublishSession:
+    def __init__(self):
+        self.posts = []
+
+    def post(self, url, json=None, timeout=None):
+        self.posts.append((url, json))
+        return _FakePublishResp(200)
+
+
+class _FakePublishClient:
+    def __init__(self, url="http://fake-registry", token=None):
+        self.server_url = url
+        self.session = _FakePublishSession()
+        self.uploaded = []
+
+    def server_available(self):
+        return True
+
+    def upload_object(self, file_path, sha256_hash, known_missing=False):
+        self.uploaded.append((str(file_path), sha256_hash))
+        return True
+
+
+def test_handoff_publish_requires_active_run(repo, monkeypatch):
+    monkeypatch.setattr("python.av_cli.client.VaultClient", _FakePublishClient)
+    result = inv("handoff", "--publish")
+    assert result.exit_code == 15, result.output
+    assert "No active run" in result.output
+
+
+def test_handoff_publish_uploads_and_links_to_active_run(repo, monkeypatch):
+    fake_client = _FakePublishClient()
+    monkeypatch.setattr("python.av_cli.client.VaultClient", lambda *a, **k: fake_client)
+    monkeypatch.setenv("AV_RUN_ID", "publish-run-42")
+
+    result = inv("handoff", "--publish")
+    assert result.exit_code == 0, result.output
+    assert "Published" in result.output
+    assert len(fake_client.uploaded) == 1
+    avh_path, avh_hash = fake_client.uploaded[0]
+    assert avh_path.endswith("handoff.avh")
+
+    url, body = fake_client.session.posts[0]
+    assert url.endswith("/api/runs/publish-run-42/avh")
+    assert body == {"avh_object_id": avh_hash}
+
+
+def test_handoff_publish_json_envelope(repo, monkeypatch):
+    fake_client = _FakePublishClient()
+    monkeypatch.setattr("python.av_cli.client.VaultClient", lambda *a, **k: fake_client)
+    monkeypatch.setenv("AV_RUN_ID", "publish-run-json")
+
+    data = jinv("handoff", "--publish")["data"]
+    assert data["run_id"] == "publish-run-json"
+    assert data["avh_object_id"]
+
+
+def test_handoff_publish_fails_cleanly_when_unreachable(repo, monkeypatch):
+    class _UnreachableClient(_FakePublishClient):
+        def server_available(self):
+            return False
+
+    monkeypatch.setattr("python.av_cli.client.VaultClient", lambda *a, **k: _UnreachableClient())
+    monkeypatch.setenv("AV_RUN_ID", "publish-run-unreachable")
+
+    result = inv("handoff", "--publish")
+    assert result.exit_code == 15, result.output
+    assert "unreachable" in result.output.lower()
+    assert "does not queue" in result.output
+
+
+def test_handoff_publish_link_failure_surfaces_http_error(repo, monkeypatch):
+    class _RejectingSession(_FakePublishSession):
+        def post(self, url, json=None, timeout=None):
+            return _FakePublishResp(422, "run not found or something")
+
+    class _RejectingClient(_FakePublishClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.session = _RejectingSession()
+
+    monkeypatch.setattr("python.av_cli.client.VaultClient", lambda *a, **k: _RejectingClient())
+    monkeypatch.setenv("AV_RUN_ID", "publish-run-reject")
+
+    result = inv("handoff", "--publish")
+    assert result.exit_code == 15, result.output
+    assert "Failed to link" in result.output
 
 
 def test_handoff_v2_lineage_semantic_summary(repo):
@@ -148,6 +249,38 @@ def test_policy_set_list_remove_roundtrip(repo):
     assert pol["main"] == {"metric": "val_loss", "op": "<", "baseline_ref": "main~1"}
     inv("policy", "remove", "main")
     assert jinv("--output", "json", "policy", "list")["data"]["policies"] == {}
+
+
+def test_policy_set_require_signature_alone_is_a_valid_standalone_policy(repo):
+    # v1.2.5: before this, the ONLY way to arm a signature-only policy was to hand-edit
+    # .av/policies.json directly (METRIC/OP were required positional args) — every
+    # require_signature test drove it that way, and `av policy set --require-signature`
+    # with no METRIC/OP had never actually been exercised through the CLI. Real gap, not
+    # a hypothetical: see development/Probleme.md.
+    jinv("--output", "json", "policy", "set", "main", "--require-signature")
+    pol = jinv("--output", "json", "policy", "list")["data"]["policies"]
+    assert pol["main"] == {"require_signature": True}
+
+
+def test_policy_set_combines_metric_and_require_signature(repo):
+    jinv("--output", "json", "policy", "set", "main", "val_loss", "<",
+         "--threshold", "0.45", "--require-signature")
+    pol = jinv("--output", "json", "policy", "list")["data"]["policies"]
+    assert pol["main"] == {
+        "metric": "val_loss", "op": "<", "threshold": 0.45, "require_signature": True,
+    }
+
+
+def test_policy_set_rejects_metric_without_op_and_vice_versa(repo):
+    res = inv("policy", "set", "main", "val_loss")  # METRIC given, OP missing
+    assert res.exit_code != 0
+    res = inv("policy", "set", "main", "--threshold", "0.45")  # --threshold with no METRIC/OP
+    assert res.exit_code != 0
+
+
+def test_policy_set_with_nothing_at_all_is_rejected(repo):
+    res = inv("policy", "set", "main")
+    assert res.exit_code != 0
 
 
 def test_promote_denies_worse_metric_exit_16(repo):

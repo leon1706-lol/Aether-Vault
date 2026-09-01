@@ -191,6 +191,46 @@ def test_health_check_ok(db):
     assert resp.json()["status"] == "ok"
 
 
+def test_health_reports_the_real_installed_version(db):
+    """v1.2.5: /api/health used to hardcode "1.4.0" — a THIRD version string besides
+    av_server/__init__.py's separate "1.0.0" and the CLI's setuptools-scm one. Now reads
+    the actual installed distribution version via importlib.metadata, so it can't drift."""
+    from importlib.metadata import version as pkg_version
+
+    resp = db.get("/api/health")
+    assert resp.json()["version"] == pkg_version("aether-vault")
+
+
+# ---------------------------------------------------------------------------
+# v1.2.5: readiness (DB + Redis + AV_DATA_DIR writability), distinct from liveness
+# ---------------------------------------------------------------------------
+
+def test_readiness_ok_when_everything_is_healthy(db):
+    resp = db.get("/api/ready")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ready"] is True
+    assert body["checks"] == {"database": True, "redis": True, "data_dir_writable": True}
+
+
+def test_readiness_is_auth_exempt_even_when_protected(protected_token, db):
+    resp = db.get("/api/ready")  # no Authorization header at all
+    assert resp.status_code == 200
+
+
+def test_readiness_503_when_data_dir_is_unwritable(db, monkeypatch, tmp_path):
+    """The exact failure mode /api/ready exists to catch: an unwritable AV_DATA_DIR
+    that /api/health would never notice (see infrastructure.md)."""
+    bogus = tmp_path / "does-not-exist" / "nested"  # write into it must fail
+    monkeypatch.setattr(server_module.storage, "base_path", bogus)
+    resp = db.get("/api/ready")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["checks"]["data_dir_writable"] is False
+    assert body["checks"]["database"] is True  # the other checks are unaffected
+
+
 # ---------------------------------------------------------------------------
 # require_token middleware ("Anonymous" vs "Protected" mode)
 # ---------------------------------------------------------------------------
@@ -714,7 +754,7 @@ def test_alembic_brings_schema_to_head(db):
             await conn.close()
 
     version, tables = asyncio.run(_probe())
-    assert version == "0003"
+    assert version == "0004"  # current migration head — bump alongside new revisions
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
@@ -769,7 +809,7 @@ def test_legacy_database_is_healed_and_stamped(db):
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "0003"  # stamps to CURRENT head, not a hardcoded rev
+    assert asyncio.run(_version()) == "0004"  # stamps to CURRENT head, not a hardcoded rev
 
 
 
@@ -954,6 +994,60 @@ def test_multi_agent_same_run_interleaved_pushes(db):
     assert body["status"] == "created"  # lazy-created state, not failed by ordering
 
 
+def test_ref_update_without_expected_hash_is_unconditional_last_write_wins(db):
+    """Pre-1.2.5 behavior is preserved exactly when expected_hash is omitted — additive
+    change, old clients unaffected."""
+    proj = "proj-ref-lww"
+    c1 = _make_commit("ref-lww-1", project_id=proj)
+    c2 = _make_commit("ref-lww-2", project_id=proj)
+    db.post("/api/commits", json=c1)
+    db.post("/api/commits", json=c2)
+
+    assert db.put(f"/api/refs/{proj}/main", json={"commit_hash": c1["hash"]}).status_code == 200
+    # No expected_hash: unconditionally overwrites, exactly like every pre-1.2.5 client.
+    assert db.put(f"/api/refs/{proj}/main", json={"commit_hash": c2["hash"]}).status_code == 200
+    assert db.get(f"/api/refs/{proj}/main").json()["commit_hash"] == c2["hash"]
+
+
+def test_ref_update_expected_hash_compare_and_swap(db):
+    """v1.2.5: two agents racing the same branch ref. The loser's PUT (stale expected_hash)
+    gets 409 with the ref's real current hash, instead of silently overwriting the winner —
+    this is the server-side half of the WP-7 ref-race fix; core.py's _finalize_commit
+    catches the client-side RefRaceError and queues rather than losing the commit."""
+    proj = "proj-ref-race"
+    base = _make_commit("ref-race-base", project_id=proj)
+    agent_a = _make_commit("ref-race-a", project_id=proj, parents=[base["hash"]])
+    agent_b = _make_commit("ref-race-b", project_id=proj, parents=[base["hash"]])
+    for c in (base, agent_a, agent_b):
+        assert db.post("/api/commits", json=c).status_code == 201
+    assert db.put(f"/api/refs/{proj}/main", json={"commit_hash": base["hash"]}).status_code == 200
+
+    # Agent A wins the race: its expected_hash (base) matches the ref's current value.
+    r_a = db.put(f"/api/refs/{proj}/main",
+                 json={"commit_hash": agent_a["hash"], "expected_hash": base["hash"]})
+    assert r_a.status_code == 200
+    assert db.get(f"/api/refs/{proj}/main").json()["commit_hash"] == agent_a["hash"]
+
+    # Agent B loses: it still believes the ref is at `base`, but A already moved it.
+    r_b = db.put(f"/api/refs/{proj}/main",
+                 json={"commit_hash": agent_b["hash"], "expected_hash": base["hash"]})
+    assert r_b.status_code == 409
+    detail = r_b.json()["detail"]
+    assert detail["error"] == "ref_race"
+    assert detail["current"] == agent_a["hash"]  # tells the loser exactly what won
+    assert detail["expected"] == base["hash"]
+    # The ref itself is untouched by the losing attempt — no partial/corrupt write.
+    assert db.get(f"/api/refs/{proj}/main").json()["commit_hash"] == agent_a["hash"]
+    # Both commits remain individually reachable by hash — content addressing never loses
+    # data; only the branch POINTER was contested.
+    assert db.get(f"/api/commits/{agent_b['hash']}").status_code == 200
+
+    # The audit trail records the race as a 409, not a silent 200.
+    rows = db.get(f"/api/admin/audit?action=ref.update&project_id={proj}&limit=20").json()["entries"]
+    statuses = [r["status_code"] for r in rows]
+    assert 409 in statuses
+
+
 def test_run_create_is_idempotent_for_concurrent_agents(db):
     import uuid
 
@@ -1025,15 +1119,18 @@ def test_audit_retention_sweep_runs_during_gc(db, monkeypatch):
 
     commit = _make_commit("audit-retention")
     db.post("/api/commits", json=commit)
-    before = db.get("/api/admin/audit?limit=500").json()["total"]
-    assert before > 0
+    before_ids = {e["id"] for e in db.get("/api/admin/audit?limit=500").json()["entries"]}
+    assert before_ids
 
     # Retention 0 days ⇒ every existing row is past its cutoff at GC time.
     monkeypatch.setattr(server_module, "AUDIT_RETENTION_DAYS", 0)
     gc = db.post("/api/admin/gc")
     assert gc.status_code == 200
-    after = db.get("/api/admin/audit?limit=500").json()["total"]
-    assert after < before
+    # v1.2.5: GC's own admin.gc audit row is written AFTER the retention sweep (correctly
+    # — it postdates the cutoff), so comparing raw totals is no longer a reliable signal
+    # (GC always adds at least one new row). Assert the PRE-GC rows specifically are gone.
+    after_ids = {e["id"] for e in db.get("/api/admin/audit?limit=500").json()["entries"]}
+    assert not (before_ids & after_ids), "retention sweep should have removed the pre-GC rows"
 
 
 def test_webhook_delivery_rows_record_outcome_and_dead_letter(db, monkeypatch):
@@ -1123,6 +1220,277 @@ def test_webhook_delivery_success_path_records_delivered(db, monkeypatch):
     assert rows[0]["next_retry_at"] is None
 
 
+# ---------------------------------------------------------------------------
+# v1.2.5: webhook delivery maturity — health columns, backoff, disable-after-N, replay
+# ---------------------------------------------------------------------------
+
+def test_webhook_health_columns_update_on_success_and_failure(db, monkeypatch):
+    class FakeResp:
+        def __init__(self, code):
+            self.status_code = code
+
+    outcomes = iter([500, 500, 200])  # fail, fail, then succeed
+
+    import requests as requests_mod
+    monkeypatch.setattr(requests_mod, "post",
+                        lambda url, data=None, headers=None, timeout=None: FakeResp(next(outcomes)))
+    monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", 0)
+
+    wid = db.post("/api/webhooks", json={
+        "url": "http://health.test/hook", "secret": "s5",
+        "project_id": "proj-health", "kinds": ["commit"],
+    }).json()["id"]
+
+    db.post("/api/commits", json=_make_commit("health-1", project_id="proj-health"))
+    for _ in range(40):
+        row = next((w for w in db.get("/api/webhooks").json()["webhooks"] if w["id"] == wid), None)
+        if row and row["consecutive_failures"] >= 1:
+            break
+        time.sleep(0.05)
+    assert row["consecutive_failures"] == 1
+    assert row["last_failure_at"] is not None
+    assert row["last_success_at"] is None
+
+    def _drive():
+        fut = db.portal.start_task_soon(server_module.process_due_webhook_deliveries)
+        return fut.result(timeout=30)
+
+    _drive()  # second attempt: also fails (outcomes[1] == 500)
+    row = next(w for w in db.get("/api/webhooks").json()["webhooks"] if w["id"] == wid)
+    assert row["consecutive_failures"] == 2
+
+    _drive()  # third attempt: succeeds (outcomes[2] == 200)
+    row = next(w for w in db.get("/api/webhooks").json()["webhooks"] if w["id"] == wid)
+    assert row["consecutive_failures"] == 0, "a success must clear the failure streak"
+    assert row["last_success_at"] is not None
+
+
+def test_webhook_delivery_backoff_grows_exponentially(db, monkeypatch):
+    """Drives _deliver_one directly (not through process_due_webhook_deliveries' due-time
+    filter) so consecutive attempts can be measured without waiting out real backoff
+    seconds — attempt N's scheduled gap must be interval * 2**(N-1), capped at
+    WEBHOOK_RETRY_MAX_SECS."""
+    class FakeResp:
+        status_code = 500
+
+    import requests as requests_mod
+    monkeypatch.setattr(requests_mod, "post",
+                        lambda url, data=None, headers=None, timeout=None: FakeResp())
+    monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", 10)
+    monkeypatch.setattr(server_module, "WEBHOOK_RETRY_MAX_SECS", 100)
+    monkeypatch.setattr(server_module, "WEBHOOK_MAX_ATTEMPTS", 10)  # stay 'failed', not 'dead'
+
+    wid = db.post("/api/webhooks", json={
+        "url": "http://backoff.test/hook", "secret": "s6",
+        "project_id": "proj-backoff", "kinds": ["commit"],
+    }).json()["id"]
+    db.post("/api/commits", json=_make_commit("backoff-1", project_id="proj-backoff"))
+
+    from datetime import datetime as _dt
+
+    def _gap(d):
+        created = _dt.fromisoformat(d["created_at"])
+        retry = _dt.fromisoformat(d["next_retry_at"])
+        return (retry - created).total_seconds()
+
+    def _expected_gap(attempt: int) -> float:
+        return min(10 * (2 ** (attempt - 1)), 100)
+
+    def _assert_formula_holds(row):
+        expected = _expected_gap(row["attempt"])
+        gap = _gap(row)
+        assert expected - 2 <= gap <= expected + 2, \
+            f"attempt {row['attempt']}: expected ~{expected}s backoff, got {gap}s"
+
+    for _ in range(40):
+        rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={wid}").json()["deliveries"]
+        if rows and rows[0]["attempt"] >= 1:
+            break
+        time.sleep(0.05)
+    assert rows
+    # v1.2.5: the real background retry worker (started once at test-session lifespan,
+    # on whatever interval it had at THAT time) also races for this row, so the attempt
+    # actually observed here isn't guaranteed to be exactly 1 — checking the FORMULA
+    # against whatever attempt is present is what's actually being tested, not a specific
+    # count. See _webhook_retry_worker: its interval is bound once at task creation, so
+    # this test's monkeypatch of the module global can't (and needn't) control its tick.
+    _assert_formula_holds(rows[0])
+
+    async def _force_next_attempt():
+        from sqlalchemy import select as _select
+
+        from python.av_server.database import async_session_factory as _sf
+        from python.av_server.models import DBWebhook as _W, DBWebhookDelivery as _D
+
+        async with _sf() as session:
+            delivery = (await session.execute(
+                _select(_D).where(_D.webhook_id == wid)
+            )).scalars().first()
+            hook = (await session.execute(_select(_W).where(_W.id == wid))).scalar_one()
+            event = {"id": delivery.event_id or -1, "kind": delivery.event_kind,
+                     "project_id": delivery.project_id, "payload": delivery.payload}
+            await server_module._deliver_one(hook, delivery, event, session)
+            await session.commit()
+
+    for _ in range(4):
+        fut = db.portal.start_task_soon(_force_next_attempt)
+        fut.result(timeout=30)
+        rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={wid}").json()["deliveries"]
+        _assert_formula_holds(rows[0])
+        if rows[0]["attempt"] >= 6:  # 10*2**5=320, well past the 100s cap — proven the cap holds
+            break
+    assert rows[0]["attempt"] >= 4, "never observed enough attempts to prove the backoff curve"
+    assert _gap(rows[0]) <= 102, "backoff must respect WEBHOOK_RETRY_MAX_SECS"
+
+
+def test_webhook_disable_after_n_consecutive_failures(db, monkeypatch):
+    class FakeResp:
+        status_code = 500
+
+    import requests as requests_mod
+    monkeypatch.setattr(requests_mod, "post",
+                        lambda url, data=None, headers=None, timeout=None: FakeResp())
+    monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", 0)
+    monkeypatch.setattr(server_module, "WEBHOOK_MAX_ATTEMPTS", 10)  # isolate from dead-lettering
+    monkeypatch.setattr(server_module, "WEBHOOK_DISABLE_AFTER", 2)
+
+    wid = db.post("/api/webhooks", json={
+        "url": "http://disable.test/hook", "secret": "s7",
+        "project_id": "proj-disable", "kinds": ["commit"],
+    }).json()["id"]
+    db.post("/api/commits", json=_make_commit("disable-1", project_id="proj-disable"))
+
+    def _row():
+        return next(w for w in db.get("/api/webhooks").json()["webhooks"] if w["id"] == wid)
+
+    for _ in range(40):
+        if _row()["consecutive_failures"] >= 1:
+            break
+        time.sleep(0.05)
+    assert _row()["active"] is True
+
+    fut = db.portal.start_task_soon(server_module.process_due_webhook_deliveries)
+    fut.result(timeout=30)
+
+    row = _row()
+    assert row["consecutive_failures"] == 2
+    assert row["active"] is False
+    assert row["disabled_reason"] and "auto-disabled" in row["disabled_reason"]
+
+    # The auto-disable is itself an audited, evented transition.
+    audit_rows = db.get("/api/admin/audit?action=webhook.auto_disable&limit=10").json()["entries"]
+    assert any(r["details"].get("webhook_id") == wid for r in audit_rows)
+
+    # An already-disabled webhook is left alone (never toggled back on by more failures).
+    fut2 = db.portal.start_task_soon(server_module.process_due_webhook_deliveries)
+    fut2.result(timeout=30)
+    assert _row()["active"] is False
+
+    # Explicit re-enable clears the streak and reactivates.
+    enable_resp = db.post(f"/api/webhooks/{wid}/enable")
+    assert enable_resp.status_code == 200
+    row = _row()
+    assert row["active"] is True
+    assert row["consecutive_failures"] == 0
+    assert row["disabled_reason"] is None
+
+
+def test_webhook_delivery_replay_requeues_dead_letter(db, monkeypatch):
+    class FakeResp:
+        def __init__(self, code):
+            self.status_code = code
+
+    state = {"fail": True}
+    import requests as requests_mod
+    monkeypatch.setattr(
+        requests_mod, "post",
+        lambda url, data=None, headers=None, timeout=None: FakeResp(500 if state["fail"] else 200),
+    )
+    monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", 0)
+    monkeypatch.setattr(server_module, "WEBHOOK_MAX_ATTEMPTS", 1)  # dead-letter on first failure
+
+    wid = db.post("/api/webhooks", json={
+        "url": "http://replay.test/hook", "secret": "s8",
+        "project_id": "proj-replay", "kinds": ["commit"],
+    }).json()["id"]
+    db.post("/api/commits", json=_make_commit("replay-1", project_id="proj-replay"))
+
+    for _ in range(40):
+        rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={wid}&status=dead").json()["deliveries"]
+        if rows:
+            break
+        time.sleep(0.05)
+    assert rows, "delivery never dead-lettered"
+    delivery_id = rows[0]["id"]
+
+    # Can't replay something that isn't failed/dead.
+    still_delivered = db.get(f"/api/admin/webhook-deliveries?webhook_id={wid}").json()["deliveries"][0]
+    assert still_delivered["status"] == "dead"
+
+    state["fail"] = False  # the endpoint "gets fixed" before the replay
+    replay_resp = db.post(f"/api/admin/webhook-deliveries/{delivery_id}/replay")
+    assert replay_resp.status_code == 200
+    assert replay_resp.json()["delivery"]["status"] == "pending"
+    assert replay_resp.json()["delivery"]["attempt"] == 0
+
+    fut = db.portal.start_task_soon(server_module.process_due_webhook_deliveries)
+    fut.result(timeout=30)
+    final = db.get(f"/api/admin/webhook-deliveries?webhook_id={wid}").json()["deliveries"][0]
+    assert final["status"] == "delivered"
+
+    # A delivered/pending row refuses to replay (409) — no double-delivery via replay.
+    refused = db.post(f"/api/admin/webhook-deliveries/{delivery_id}/replay")
+    assert refused.status_code == 409
+
+    replay_audit = db.get("/api/admin/audit?action=webhook.delivery_replay&limit=10").json()["entries"]
+    assert any(r["details"].get("delivery_id") == delivery_id for r in replay_audit)
+
+
+def test_poison_webhook_does_not_block_a_healthy_sibling(db, monkeypatch):
+    """One endpoint that always 500s must dead-letter on its own schedule without
+    delaying or skipping deliveries to a healthy webhook in the same retry tick."""
+    class FakeResp:
+        def __init__(self, code):
+            self.status_code = code
+
+    def _post(url, data=None, headers=None, timeout=None):
+        return FakeResp(500 if "poison" in url else 200)
+
+    import requests as requests_mod
+    monkeypatch.setattr(requests_mod, "post", _post)
+    monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", 0)
+    monkeypatch.setattr(server_module, "WEBHOOK_MAX_ATTEMPTS", 2)
+
+    proj = "proj-poison"
+    poison_id = db.post("/api/webhooks", json={
+        "url": "http://poison.test/hook", "secret": "sp", "project_id": proj, "kinds": ["commit"],
+    }).json()["id"]
+    healthy_id = db.post("/api/webhooks", json={
+        "url": "http://healthy.test/hook", "secret": "sh", "project_id": proj, "kinds": ["commit"],
+    }).json()["id"]
+    db.post("/api/commits", json=_make_commit("poison-1", project_id=proj))
+
+    for _ in range(40):
+        h_rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={healthy_id}").json()["deliveries"]
+        if h_rows and h_rows[0]["status"] == "delivered":
+            break
+        time.sleep(0.05)
+    assert h_rows and h_rows[0]["status"] == "delivered", \
+        "the healthy webhook must be delivered promptly regardless of the poison one"
+
+    # Drive the poison one to dead-letter without ever affecting the healthy row.
+    for _ in range(10):
+        p_rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={poison_id}").json()["deliveries"]
+        if p_rows and p_rows[0]["status"] == "dead":
+            break
+        fut = db.portal.start_task_soon(server_module.process_due_webhook_deliveries)
+        fut.result(timeout=30)
+    assert p_rows and p_rows[0]["status"] == "dead"
+    h_rows_final = db.get(f"/api/admin/webhook-deliveries?webhook_id={healthy_id}").json()["deliveries"]
+    assert h_rows_final[0]["status"] == "delivered"
+    assert h_rows_final[0]["attempt"] == 1, "the healthy delivery was never re-attempted"
+
+
 def test_commit_signature_round_trips_over_the_wire(db):
     sig_blob = {"algo": "ed25519", "public_key": "ab" * 32,
                 "sig": base64.b64encode(b"\x01" * 64).decode(), "signed_at": "now"}
@@ -1142,6 +1510,101 @@ def test_commit_signature_round_trips_over_the_wire(db):
     db.post("/api/commits", json=unsigned)
     got = db.get(f"/api/commits/{unsigned['hash']}").json()
     assert got["signature"] is None  # unsigned stays valid, honestly represented
+
+
+# ---------------------------------------------------------------------------
+# v1.2.5: WebUI run detail — GET /api/runs/{id}/summary, POST /api/runs/{id}/avh
+# ---------------------------------------------------------------------------
+
+def test_run_summary_aggregates_lineage_commits_and_semantic_diff(db):
+    """One request replaces the WebUI's previous N individual GET /api/commits/{hash}
+    calls — lineage, linked commits, and a server-computed semantic summary."""
+    proj = "proj-run-summary"
+    parent_run = db.post("/api/runs", json={"project_id": proj, "name": "parent"}).json()["id"]
+    child_run = db.post("/api/runs", json={
+        "project_id": proj, "name": "child", "parent_run_id": parent_run,
+    }).json()["id"]
+
+    tree_v1 = {"a.txt": {"hash": "a" * 64, "size": 10, "type": "code"}}
+    tree_v2 = {"a.txt": {"hash": "a" * 64, "size": 10, "type": "code"},
+               "b.txt": {"hash": "b" * 64, "size": 20, "type": "code"}}
+    c1 = _make_commit("summary-1", project_id=proj, tree=tree_v1, run_id=child_run,
+                      metrics={"loss": 1.0})
+    c2 = _make_commit("summary-2", project_id=proj, tree=tree_v2, run_id=child_run,
+                      metrics={"loss": 0.5}, parents=[c1["hash"]])
+    assert db.post("/api/commits", json=c1).status_code == 201
+    assert db.post("/api/commits", json=c2).status_code == 201
+
+    body = db.get(f"/api/runs/{child_run}/summary").json()
+    assert body["run"]["id"] == child_run
+    assert [n["id"] for n in body["lineage"]] == [child_run, parent_run]
+    assert body["total_commits"] == 2
+    assert {c["hash"] for c in body["commits"]} == {c1["hash"], c2["hash"]}
+    assert body["semantic_summary"]["files"]["added"] == ["b.txt"]
+    assert body["semantic_summary"]["files"]["changed"] == []
+    assert body["semantic_summary"]["totals"]["bytes_after"] == 30
+
+
+def test_run_summary_no_semantic_diff_with_fewer_than_two_commits(db):
+    proj = "proj-run-summary-single"
+    run_id = db.post("/api/runs", json={"project_id": proj}).json()["id"]
+    c1 = _make_commit("summary-single", project_id=proj, run_id=run_id)
+    assert db.post("/api/commits", json=c1).status_code == 201
+
+    body = db.get(f"/api/runs/{run_id}/summary").json()
+    assert body["semantic_summary"] is None
+    assert body["total_commits"] == 1
+
+
+def test_run_summary_404_for_unknown_run(db):
+    assert db.get("/api/runs/does-not-exist/summary").status_code == 404
+
+
+def test_run_avh_link_requires_uploaded_object_first(db):
+    import hashlib
+
+    proj = "proj-avh"
+    run_id = db.post("/api/runs", json={"project_id": proj}).json()["id"]
+    avh_content = b'{"avh_version": "2.0"}'
+    avh_hash = hashlib.sha256(avh_content).hexdigest()
+
+    # Not uploaded yet -> 422, not silently accepted.
+    resp = db.post(f"/api/runs/{run_id}/avh", json={"avh_object_id": avh_hash})
+    assert resp.status_code == 422
+
+    # Upload the object for real (hash must match its actual content — the server
+    # re-verifies), then link succeeds.
+    upload_resp = db.post(f"/api/objects/{avh_hash}", content=avh_content)
+    assert upload_resp.status_code == 201
+    linked = db.post(f"/api/runs/{run_id}/avh", json={"avh_object_id": avh_hash})
+    assert linked.status_code == 200
+    assert linked.json() == {"status": "linked", "run_id": run_id, "avh_object_id": avh_hash}
+
+    # The run's summary AND the plain GET /api/runs/{id} both surface the pointer.
+    assert db.get(f"/api/runs/{run_id}").json()["avh_object_id"] == avh_hash
+    summary = db.get(f"/api/runs/{run_id}/summary").json()
+    assert summary["avh_object_id"] == avh_hash
+
+    # It's audited.
+    audit_rows = db.get("/api/admin/audit?action=run.avh_publish&limit=10").json()["entries"]
+    assert any(r["details"].get("run_id") == run_id for r in audit_rows)
+
+
+def test_run_avh_link_rejects_malformed_hash(db):
+    proj = "proj-avh-bad"
+    run_id = db.post("/api/runs", json={"project_id": proj}).json()["id"]
+    resp = db.post(f"/api/runs/{run_id}/avh", json={"avh_object_id": "not-a-hash"})
+    assert resp.status_code == 422
+
+
+def test_run_avh_link_404_for_unknown_run(db):
+    import hashlib
+
+    content = b"x"
+    avh_hash = hashlib.sha256(content).hexdigest()
+    db.post(f"/api/objects/{avh_hash}", content=content)
+    resp = db.post("/api/runs/does-not-exist/avh", json={"avh_object_id": avh_hash})
+    assert resp.status_code == 404
 
 
 def test_push_back_fills_run_env_snapshot_id_once(db):

@@ -41,24 +41,19 @@ def commit(
 
     staged = idx.get_staged_entries()
     if not staged:
-        if current_output_mode() == "json":
-            emit_json(None, "commit", data={
-                "committed": False, "reason": "nothing_to_commit",
-                "hash": None, "queued": False,
-            })
-            return
-        click.secho("Nothing to commit", fg="yellow")
-        return
+        # v1.2.5: exit 11 (nothing_to_commit) via fail(), matching the documented
+        # exit-code registry and av_sdk.Repo.commit()'s existing SDKError("nothing_to_commit")
+        # — previously this exited 0 in both text and JSON mode (Probleme.md).
+        fail(click.get_current_context(silent=True), "nothing_to_commit", "Nothing to commit",
+             data={"reason": "nothing_to_commit"})
 
     # Run linkage (v1.2.0): an active run (av run start / AV_RUN_ID) rides the commit
     # payload so the server can file it under the run without extra round trips.
-    run_id = os.environ.get("AV_RUN_ID")
-    run_state_path = repo_root / ".av" / "run.json"
-    if not run_id and run_state_path.exists():
-        try:
-            run_id = json.loads(run_state_path.read_text(encoding="utf-8")).get("run_id")
-        except (json.JSONDecodeError, OSError):
-            run_id = None
+    # v1.2.5: resolve_run_id() is THE shared precedence (env > state) — see its
+    # docstring for why this used to disagree with commit_scoped_paths/av watch.
+    from .core import resolve_run_id
+
+    run_id = resolve_run_id(repo_root)
     if run_id:
         tags = tuple(tags) + (f"run:{run_id}",) if f"run:{run_id}" not in tags else tags
 
@@ -92,14 +87,16 @@ def commit(
     # THE shared commit path (also used by `av watch` and the av_sdk SDK).
     from .core import commit_staged
 
+    # outcome_sink (v1.2.5) captures the FINAL queued state unconditionally, in both text
+    # and JSON mode, independent of json_sink (which only exists in JSON mode and also
+    # controls _finalize_commit's human-echo suppression) — see core.py's docstring on it.
     head_hash = commit_staged(
         repo_root, message, tags=tags, metrics=metrics,
         run_id=run_id, defer_upload=defer_upload,
-        result_sink=json_sink,
+        result_sink=json_sink, outcome_sink=sink_data.update,
     )
 
     if current_output_mode() == "json":
-        queued_reason = sink_data.get("queued_reason") or ("upload_deferred" if defer_upload else None)
         emit_json(None, "commit", data={
             "committed": True,
             "hash": head_hash,
@@ -108,9 +105,15 @@ def commit(
             "tags": list(tags),
             "metrics": metrics,
             "run_id": run_id,
-            "queued": sink_data.get("queued", False) or bool(defer_upload),
-            "queued_reason": queued_reason,
+            "queued": sink_data.get("queued", False),
+            "queued_reason": sink_data.get("queued_reason"),
         })
+    # Exit 0 even when queued (matches `av push`'s established behavior, cmd_history.py
+    # above: "reachable": False still returns/exits cleanly) — queued is a SAFE, complete
+    # local outcome by design (AGENTS.md non-negotiable #3), not a partial failure; the
+    # exit-code registry's `unreachable_queued`/13 is for commands where reachability IS
+    # the primary outcome (`av audit list`, `av webhooks list` when the registry can't be
+    # read at all — see cmd_audit.py/cmd_webhooks.py), not for commit's local-first design.
 
 
 @click.command()

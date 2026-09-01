@@ -139,26 +139,38 @@ def _golden_repo(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 class _FakeResponse:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, content: bytes | None = None):
         self._payload, self.status_code = payload, status
+        # export/prune (v1.2.5) read .content/.text directly rather than .json() for the
+        # success/error paths respectively — default content mirrors the JSON payload so
+        # tests that don't care about the raw bytes still get something sane.
+        self.content = content if content is not None else json.dumps(payload).encode()
+        self.text = self.content.decode("utf-8", errors="replace")
 
     def json(self):
         return self._payload
 
 
 class _FakeSession:
-    def __init__(self, responder):
+    def __init__(self, responder, delete_responder=None):
         self._responder = responder
+        self._delete_responder = delete_responder
 
     def get(self, url, params=None, timeout=None):
         return self._responder(url, params)
 
+    def delete(self, url, params=None, timeout=None):
+        if self._delete_responder is None:
+            return _FakeResponse({"deleted": 0})
+        return self._delete_responder(url, params)
+
 
 class _FakeClient:
-    def __init__(self, responder=None):
+    def __init__(self, responder=None, delete_responder=None):
         self.server_url = "http://fake"
         self.calls = []
-        self.session = _FakeSession(self._record(responder))
+        self.delete_calls = []
+        self.session = _FakeSession(self._record(responder), self._record_delete(delete_responder))
 
     def _record(self, responder):
         def _get(url, params=None, timeout=None):
@@ -167,6 +179,14 @@ class _FakeClient:
                 return _FakeResponse({"entries": [], "total": 0})
             return responder(url, params)
         return _get
+
+    def _record_delete(self, responder):
+        def _delete(url, params=None):
+            self.delete_calls.append((url, params))
+            if responder is None:
+                return _FakeResponse({"deleted": 0})
+            return responder(url, params)
+        return _delete
 
 
 def test_audit_list_builds_filters_and_defaults(monkeypatch, tmp_path):
@@ -218,3 +238,100 @@ def test_audit_list_json_envelope_shape(monkeypatch, tmp_path):
     assert envelope["ok"] is True
     assert envelope["data"]["entries"][0]["status_code"] == 201
     assert envelope["meta"]["command"] == "audit list"
+
+
+# ---------------------------------------------------------------------------
+# v1.2.5: richer audit filters, cursor pagination, export, prune CLI
+# ---------------------------------------------------------------------------
+
+def test_audit_list_passes_new_filters_through(monkeypatch, tmp_path):
+    fake = _FakeClient()
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, [
+        "audit", "list", "--action-prefix", "commit.", "--username", "alice",
+        "--status-code", "409", "--outcome", "error",
+    ], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    _, params = fake.calls[-1]
+    assert params["action_prefix"] == "commit."
+    assert params["username"] == "alice"
+    assert params["status_code"] == 409
+    assert params["outcome"] == "error"
+
+
+def test_audit_list_cursor_and_offset_are_mutually_exclusive_client_side(monkeypatch, tmp_path):
+    """--cursor replaces --offset in the outgoing request rather than sending both —
+    the server itself also 422s a request carrying both, but the CLI shouldn't even try."""
+    fake = _FakeClient()
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, ["audit", "list", "--cursor", "abc123"], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    _, params = fake.calls[-1]
+    assert params.get("cursor") == "abc123"
+    assert "offset" not in params
+
+
+def test_audit_export_builds_filters_and_format(monkeypatch, tmp_path):
+    fake = _FakeClient(responder=lambda url, params: _FakeResponse(
+        {}, content=b"id,ts\n1,2026-01-01\n"))
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, [
+        "audit", "export", "--format", "csv", "--action", "commit.push",
+    ], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    url, params = fake.calls[-1]
+    assert url.endswith("/api/admin/audit/export")
+    assert params["format"] == "csv"
+    assert params["action"] == "commit.push"
+    assert "id,ts" in res.output
+
+
+def test_audit_export_writes_to_file(monkeypatch, tmp_path):
+    fake = _FakeClient(responder=lambda url, params: _FakeResponse(
+        {}, content=b'{"id": 1}\n'))
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+    out_file = tmp_path / "audit.jsonl"
+
+    res = CliRunner().invoke(cli, ["audit", "export", "--out", str(out_file)],
+                             standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    assert out_file.read_bytes() == b'{"id": 1}\n'
+
+
+def test_audit_prune_confirms_by_default_and_skips_with_yes(monkeypatch, tmp_path):
+    fake = _FakeClient(delete_responder=lambda url, params: _FakeResponse({"deleted": 3}))
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    # Declining the prompt prunes nothing.
+    declined = CliRunner().invoke(cli, ["audit", "prune", "--before-days", "30"],
+                                  input="n\n", standalone_mode=False)
+    assert declined.exit_code == 0, declined.output
+    assert not fake.delete_calls
+
+    # --yes skips the prompt outright.
+    res = CliRunner().invoke(cli, ["audit", "prune", "--before-days", "30", "--yes"],
+                             standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    assert "Pruned 3" in res.output
+    _, params = fake.delete_calls[-1]
+    assert params == {"before_days": 30}
+
+
+def test_audit_prune_json_mode_skips_prompt(monkeypatch, tmp_path):
+    fake = _FakeClient(delete_responder=lambda url, params: _FakeResponse({"deleted": 0}))
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, ["--output", "json", "audit", "prune"], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    envelope = json.loads(res.output)
+    assert envelope["data"]["deleted"] == 0
+    assert fake.delete_calls  # ran without any interactive prompt

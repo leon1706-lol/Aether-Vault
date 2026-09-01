@@ -121,6 +121,81 @@ def load_public_key_hex(repo_root: Path) -> str | None:
     return p.read_bytes().hex()
 
 
+def fingerprint(public_key_bytes: bytes) -> str:
+    """v1.2.5: stable, short, human-comparable identifier for a public key.
+
+    sha256(raw 32-byte public key) rendered as the first 16 hex chars in
+    xxxx:xxxx:xxxx:xxxx groups — a golden-fixture-tested contract (tests/test_signing.py),
+    NOT a trust claim: two different keys are (astronomically) unlikely to share a
+    fingerprint, but a matching fingerprint says nothing about who controls the key.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(public_key_bytes).hexdigest()[:16]
+    return ":".join(digest[i:i + 4] for i in range(0, 16, 4))
+
+
+def archived_keys_dir(repo_root: Path) -> Path:
+    return keys_dir(repo_root) / "archive"
+
+
+def list_keys(repo_root: Path) -> list[dict]:
+    """v1.2.5: every key this repo knows about — the active one (if any) plus every
+    archived one from a previous `rotate`, newest first. Pure filesystem read, no crypto
+    needed (fingerprinting only hashes bytes)."""
+    entries: list[dict] = []
+    pub_path = public_key_path(repo_root)
+    if pub_path.exists():
+        pub_bytes = pub_path.read_bytes()
+        entries.append({
+            "fingerprint": fingerprint(pub_bytes),
+            "active": True,
+            "path": str(pub_path),
+            "created_at": datetime.datetime.fromtimestamp(
+                pub_path.stat().st_mtime, tz=datetime.timezone.utc).isoformat(),
+        })
+    archive_dir = archived_keys_dir(repo_root)
+    if archive_dir.is_dir():
+        for sub in sorted(archive_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            archived_pub = sub / PUBLIC_KEY_PATH
+            if not archived_pub.exists():
+                continue
+            entries.append({
+                "fingerprint": fingerprint(archived_pub.read_bytes()),
+                "active": False,
+                "path": str(archived_pub),
+                "created_at": datetime.datetime.fromtimestamp(
+                    archived_pub.stat().st_mtime, tz=datetime.timezone.utc).isoformat(),
+            })
+    return entries
+
+
+def rotate_keypair(repo_root: Path) -> tuple[Path, Path]:
+    """v1.2.5: archives the current keypair under .av/keys/archive/<fingerprint>/ (if one
+    exists), then generates a fresh one via generate_keypair(). Never deletes a private
+    key — archived keys keep verifying commits signed before the rotation, since the
+    signature blob carries its own public key. Raises FileNotFoundError if there is no
+    current key to rotate (use `av registry keygen` for the first key instead)."""
+    priv_path = private_key_path(repo_root)
+    pub_path = public_key_path(repo_root)
+    if not priv_path.exists():
+        raise FileNotFoundError(
+            f"No signing key to rotate at {priv_path} — run `av registry keygen` first."
+        )
+
+    pub_bytes = pub_path.read_bytes() if pub_path.exists() else b""
+    fp = fingerprint(pub_bytes) if pub_bytes else "unknown"
+    dest = archived_keys_dir(repo_root) / fp.replace(":", "")
+    dest.mkdir(parents=True, exist_ok=True)
+    import shutil
+
+    shutil.move(str(priv_path), str(dest / SIGNING_KEY_PATH))
+    if pub_path.exists():
+        shutil.move(str(pub_path), str(dest / PUBLIC_KEY_PATH))
+
+    return generate_keypair(repo_root)
+
+
 def _canonical_timestamp(value) -> str | None:
     """Normalizes an ISO timestamp to one canonical UTC rendering.
 
@@ -174,6 +249,49 @@ def sign_payload(commit_data: dict, repo_root: Path) -> dict | None:
         "sig": base64.b64encode(sig).decode("ascii"),
         "signed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
+
+
+def export_signature_blob(commit_hash: str, commit_data: dict) -> dict:
+    """v1.2.5: a standalone, portable record of one commit's signature — for handing to
+    an external auditor who has the commit content but not this repo's config/registry
+    access. `canonical_sha256` lets a verifier confirm the commit content matches what
+    was actually signed even before checking the signature itself."""
+    import hashlib
+
+    sig = commit_data.get("signature")
+    if not isinstance(sig, dict):
+        raise ValueError(f"commit {commit_hash} has no signature to export")
+    return {
+        "hash": commit_hash,
+        "algo": sig.get("algo"),
+        "public_key": sig.get("public_key"),
+        "sig": sig.get("sig"),
+        "signed_at": sig.get("signed_at"),
+        "fingerprint": fingerprint(bytes.fromhex(sig["public_key"])) if sig.get("public_key") else None,
+        "canonical_sha256": hashlib.sha256(canonical_commit_bytes(commit_data)).hexdigest(),
+        "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def verify_detached(commit_data: dict, detached: dict) -> tuple[bool, str]:
+    """v1.2.5: verifies a commit against a detached signature record from
+    export_signature_blob(), independent of whatever `commit_data["signature"]` (if any)
+    already says — this is the point of "detached": the verifier trusts the external
+    record, not whatever the commit source claims about itself."""
+    import hashlib
+
+    if commit_data.get("hash") != detached.get("hash"):
+        return False, (f"hash mismatch: commit is {commit_data.get('hash')!r}, "
+                       f"detached record is for {detached.get('hash')!r}")
+    merged = dict(commit_data)
+    merged["signature"] = {
+        "algo": detached.get("algo"), "public_key": detached.get("public_key"),
+        "sig": detached.get("sig"), "signed_at": detached.get("signed_at"),
+    }
+    canonical = canonical_commit_bytes(merged)
+    if detached.get("canonical_sha256") and hashlib.sha256(canonical).hexdigest() != detached["canonical_sha256"]:
+        return False, "canonical bytes mismatch — commit content differs from what was signed"
+    return verify_signature(merged)
 
 
 def verify_signature(commit_data: dict) -> tuple[bool, str]:

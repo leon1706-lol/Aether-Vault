@@ -28,13 +28,14 @@ def test_migration_chain_resolves_to_single_head():
 
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
-    assert heads == ["0003"], f"unexpected heads: {heads}"
+    assert heads == ["0004"], f"unexpected heads: {heads}"
     # walk_revisions() yields every revision reachable from head exactly once —
     # no dangling down_revisions, no surprise second branch. The chain is strictly
-    # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline), and
-    # 0003 (webhook_deliveries/audit outcome/signature) descends from 0002.
+    # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline),
+    # 0003 (webhook_deliveries/audit outcome/signature) descends from 0002, and
+    # 0004 (webhook health tracking/runs.avh_object_id/audit indexes) descends from 0003.
     walked = sorted(rev.revision for rev in script.walk_revisions())
-    assert walked == ["0001", "0002", "0003"]
+    assert walked == ["0001", "0002", "0003", "0004"]
 
 
 def test_env_py_is_valid_python():
@@ -68,7 +69,10 @@ def test_legacy_columns_map_matches_models():
         Path(__file__).resolve().parents[1] / "python" / "av_server" / "models.py",
         encoding="utf-8",
     ).read()
-    model_class = {"commits": "DBCommit", "trees": "DBTree", "audit_log": "DBAuditLog"}
+    model_class = {
+        "commits": "DBCommit", "trees": "DBTree", "audit_log": "DBAuditLog",
+        "webhooks": "DBWebhook", "runs": "DBRun",
+    }
     for table, cols in _LEGACY_COLUMNS.items():
         block = re.search(
             rf"class {model_class[table]}\(Base\):(.*?)(?=\nclass |\Z)",
@@ -168,6 +172,12 @@ def test_chain_renders_complete_postgres_ddl_offline():
     assert "CREATE TABLE webhook_deliveries" in ddl
     for col in ("status_code", "signature", "env_snapshot_id", "next_retry_at"):
         assert col in ddl, f"offline DDL missing 0003 column {col}"
+
+    # v1.2.5 webhook health tracking + avh publish pointer + audit indexes (0004):
+    for col in ("last_success_at", "consecutive_failures", "disabled_reason", "avh_object_id"):
+        assert col in ddl, f"offline DDL missing 0004 column {col}"
+    assert "CREATE INDEX ix_audit_log_username" in ddl
+    assert "CREATE INDEX ix_audit_log_action" in ddl
 
     # Every table from 0001_baseline exists in the rendered schema.
     for table in ("objects", "trees", "commits", "refs"):

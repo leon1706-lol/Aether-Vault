@@ -32,31 +32,28 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
     from .client import VaultClient
     from . import sync
 
+    ctx = click.get_current_context(silent=True)
     target = Path(directory).resolve() if directory else Path.cwd() / project
     if target.exists() and any(target.iterdir()):
-        click.secho(f"Error: '{target}' already exists and is not empty.", fg="red")
-        return
+        fail(ctx, "validation", f"'{target}' already exists and is not empty.")
 
     url = remote_url or os.environ.get("AV_REMOTE_URL") or "http://localhost:8000"
     api_token = token or os.environ.get("AV_API_TOKEN")
     client = VaultClient(url, api_token)
     if not client.server_available():
-        click.secho(f"Error: Registry unreachable at {url} — is the backend running?", fg="red")
-        return
+        fail(ctx, "validation", f"Registry unreachable at {url} — is the backend running?")
 
     try:
         proj = sync.resolve_project(client, project)
     except ValidationError as exc:
-        click.secho(f"Error: {exc.message}", fg="red")
-        return
+        fail(ctx, "validation", exc.message)
 
     pid = proj["project_id"]
     refs = client.list_refs(project_id=pid)
     branch = sync.pick_default_branch(refs, pid)
     commits = sync.fetch_project_commits(client, pid)
     if not commits:
-        click.secho(f"Error: Project '{proj.get('project_name')}' has no commits yet.", fg="red")
-        return
+        fail(ctx, "validation", f"Project '{proj.get('project_name')}' has no commits yet.")
     if branch is None:
         # No refs pushed (e.g. only queued/offline commits): fall back to the newest commit.
         branch = "main"
@@ -91,6 +88,13 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
     downloaded = sync.ensure_objects_local(target, client, tip_tree)
     _materialize_tree(target, client, tip_tree, Index(target))
 
+    if output_is_json(ctx):
+        emit_json(ctx, "clone", data={
+            "project_id": pid, "project_name": proj.get("project_name"),
+            "directory": str(target), "branch": branch, "tip": tip_hash,
+            "commits": len(commits), "downloaded_objects": downloaded,
+        })
+        return
     msg = f"Cloned '{proj.get('project_name')}' ({len(commits)} commit(s)) into {target}"
     click.secho(msg, fg="green")
     detail = f"  branch {branch} @ [{tip_hash[:7]}]"
@@ -126,28 +130,33 @@ def pull(force: bool) -> None:
     from .client import VaultClient
     from . import sync
 
+    ctx = click.get_current_context(silent=True)
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
 
     head_content = (repo_root / ".av" / "HEAD").read_text().strip()
     if not head_content.startswith("ref: refs/heads/"):
-        click.secho("Error: HEAD is detached — check out a branch before pulling.", fg="red")
-        return
+        fail(ctx, "validation", "HEAD is detached — check out a branch before pulling.")
     branch = head_content.split("refs/heads/", 1)[1]
     ref_path = repo_root / ".av" / "refs" / "heads" / branch
     local_tip = ref_path.read_text().strip() if ref_path.exists() else ""
 
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
     if not client.server_available():
-        click.secho(f"Error: Registry unreachable at {cfg.get('remote_url')}.", fg="red")
-        return
+        fail(ctx, "validation", f"Registry unreachable at {cfg.get('remote_url')}.")
 
     remote_ref = f"{cfg['project_id']}/{branch}"
     remote_tip = client.get_ref(remote_ref)
     if not remote_tip:
+        if output_is_json(ctx):
+            emit_json(ctx, "pull", data={"pulled": False, "reason": "no_remote_branch", "branch": branch})
+            return
         click.secho(f"No remote branch '{branch}' on the registry — nothing to pull.", fg="yellow")
         return
     if remote_tip == local_tip:
+        if output_is_json(ctx):
+            emit_json(ctx, "pull", data={"pulled": False, "reason": "up_to_date", "tip": local_tip})
+            return
         click.secho("Already up to date.")
         return
 
@@ -166,12 +175,9 @@ def pull(force: bool) -> None:
             break
         row = client.get_commit(cursor)
         if not row:
-            click.secho(
-                f"Error: Remote history is broken — commit {cursor[:7]}… is referenced but "
-                "missing from the registry.",
-                fg="red",
-            )
-            return
+            fail(ctx, "validation",
+                 f"Remote history is broken — commit {cursor[:7]}… is referenced but "
+                 "missing from the registry.")
         data = sync.normalize_commit_row(row)
         sync.write_fetched_commit(repo_root, data)
         fetched.append(data)
@@ -187,35 +193,52 @@ def pull(force: bool) -> None:
                                         local_tip, remote_tip)
     )
     if not ff_allowed:
-        click.secho(
-            f"Local and remote '{branch}' have diverged.\n"
-            f"The remote tip [{remote_tip[:7]}] and its history are now local — resolve with:\n"
-            f"  av merge {remote_tip[:7]}",
-            fg="yellow",
-        )
         # v1.2.2: surface the runs the two tips belong to, so an agent orchestrating
         # multiple training efforts can tell WHICH experiments diverged without walking
-        # commits by hand. Best-effort: untagged tips simply contribute no line.
+        # commits by hand. Best-effort: untagged tips simply contribute no line/field.
         local_run = _tip_run_id(repo_root, local_tip)
         remote_run = _tip_run_id(repo_root, remote_tip)
-        if local_run or remote_run:
-            fmt = lambda rid: f"run:{rid[:8]}…" if rid else "(no run)"
-            click.echo(f"  local  tip [{local_tip[:7]}] belongs to {fmt(local_run)}")
-            click.echo(f"  remote tip [{remote_tip[:7]}] belongs to {fmt(remote_run)}")
-        return
+        remediation = [f"av merge {remote_tip[:7]}"]
+        if not output_is_json(ctx):
+            click.secho(
+                f"Local and remote '{branch}' have diverged.\n"
+                f"The remote tip [{remote_tip[:7]}] and its history are now local — resolve with:\n"
+                f"  av merge {remote_tip[:7]}",
+                fg="yellow",
+            )
+            if local_run or remote_run:
+                fmt = lambda rid: f"run:{rid[:8]}…" if rid else "(no run)"
+                click.echo(f"  local  tip [{local_tip[:7]}] belongs to {fmt(local_run)}")
+                click.echo(f"  remote tip [{remote_tip[:7]}] belongs to {fmt(remote_run)}")
+        # v1.2.5: routed through fail() reusing "merge_conflict" (exit 14) — a divergence
+        # is resolved by exactly the same command family as a conflicting merge, and the
+        # exit-code registry is deliberately kept closed rather than growing a new code
+        # per divergence flavor. error.data carries what the text-mode lines above said;
+        # quiet_text=True avoids a redundant generic "Error: ..." line under them.
+        fail(ctx, "merge_conflict", f"Local and remote '{branch}' have diverged.",
+             data={
+                 "reason": "diverged", "branch": branch,
+                 "local_tip": local_tip, "remote_tip": remote_tip,
+                 "local_run_id": local_run, "remote_run_id": remote_run,
+                 "remediation": remediation,
+             }, quiet_text=True)
 
     idx = Index(repo_root)
     if not force:
         dirty = _collect_dirty_paths(repo_root, idx)
         if dirty:
-            click.secho(
-                "Error: You have uncommitted changes that would be overwritten by pull:",
-                fg="red",
-            )
-            for d in dirty[:20]:
-                click.echo(f"  {d}")
-            click.secho("Commit them (or use --force to discard), then pull again.", fg="yellow")
-            return
+            if not output_is_json(ctx):
+                click.secho(
+                    "Error: You have uncommitted changes that would be overwritten by pull:",
+                    fg="red",
+                )
+                for d in dirty[:20]:
+                    click.echo(f"  {d}")
+                click.secho("Commit them (or use --force to discard), then pull again.", fg="yellow")
+            fail(ctx, "validation",
+                 "You have uncommitted changes that would be overwritten by pull.",
+                 data={"dirty": dirty[:20], "remediation": ["av commit -m ...", "av pull --force"]},
+                 quiet_text=True)
 
     tip_data = sync.load_local_commit(repo_root, remote_tip)
     tree = tip_data.get("tree", {}) if tip_data else {}
@@ -223,6 +246,12 @@ def pull(force: bool) -> None:
     _materialize_tree(repo_root, client, tree, idx)
     atomic_write_text(ref_path, remote_tip)
 
+    if output_is_json(ctx):
+        emit_json(ctx, "pull", data={
+            "pulled": True, "branch": branch, "from": local_tip or None, "to": remote_tip,
+            "new_commits": len(fetched),
+        })
+        return
     click.secho(
         f"Fast-forwarded {branch}: {local_tip[:7] or '(empty)'} → {remote_tip[:7]} "
         f"({len(fetched)} new commit(s))",
@@ -255,23 +284,21 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
     from . import sync
     from .merge import find_merge_base, three_way_tree_merge, tree_is_flat, summarize_changes
 
+    ctx = click.get_current_context(silent=True)
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
     idx = Index(repo_root)
 
     head_content = (repo_root / ".av" / "HEAD").read_text().strip()
     if not head_content.startswith("ref: refs/heads/"):
-        click.secho("Error: HEAD is detached — check out a branch before merging.", fg="red")
-        return
+        fail(ctx, "validation", "HEAD is detached — check out a branch before merging.")
     branch = head_content.split("refs/heads/", 1)[1]
     our_ref_path = repo_root / ".av" / "refs" / "heads" / branch
     ours = our_ref_path.read_text().strip() if our_ref_path.exists() else ""
     if not ours:
-        click.secho(f"Error: Branch '{branch}' has no commits yet — commit first.", fg="red")
-        return
+        fail(ctx, "validation", f"Branch '{branch}' has no commits yet — commit first.")
     if policy_ours and policy_theirs:
-        click.secho("Error: --ours and --theirs are mutually exclusive.", fg="red")
-        return
+        fail(ctx, "validation", "--ours and --theirs are mutually exclusive.")
 
     # Promotion guardrail (v1.2.0): a policy armed for the CURRENT branch is evaluated
     # against OUR latest metrics before any merge lands on it. --force bypasses.
@@ -282,6 +309,7 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
             repo_root, branch,
             candidate_metrics=_latest_metrics_for_ref(repo_root, "HEAD"),
             baseline_metrics_fn=lambda ref: _latest_metrics_for_ref(repo_root, ref),
+            candidate_ref="HEAD",  # v1.2.5: require_signature, same "ours" semantics as above
         )
 
     heads_dir = repo_root / ".av" / "refs" / "heads"
@@ -295,8 +323,7 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
         except FileNotFoundError:
             return None
         except AmbiguousCommitHash as exc:
-            click.secho(f"Error: {exc.message}", fg="red")
-            return None
+            fail(ctx, "validation", exc.message)
 
     theirs = _resolve_target()
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
@@ -307,9 +334,11 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
             sync.write_fetched_commit(repo_root, data)
             theirs = data["hash"]
     if not theirs:
-        click.secho(f"Error: Branch or commit '{target}' not found.", fg="red")
-        return
+        fail(ctx, "validation", f"Branch or commit '{target}' not found.")
     if theirs == ours:
+        if output_is_json(ctx):
+            emit_json(ctx, "merge", data={"merged": False, "reason": "up_to_date", "tip": ours})
+            return
         click.secho("Already up to date.")
         return
 
@@ -325,6 +354,9 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
 
     base = find_merge_base(load, ours, theirs)
     if base == theirs:
+        if output_is_json(ctx):
+            emit_json(ctx, "merge", data={"merged": False, "reason": "up_to_date", "tip": ours})
+            return
         click.secho("Already up to date.")
         return
 
@@ -336,18 +368,28 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
         sync.ensure_objects_local(repo_root, client, tree)
         _materialize_tree(repo_root, client, tree, idx)
         atomic_write_text(our_ref_path, theirs)
+        if output_is_json(ctx):
+            emit_json(ctx, "merge", data={
+                "merged": True, "fast_forward": True, "branch": branch,
+                "from": ours, "to": theirs,
+            })
+            return
         click.secho(f"Fast-forwarded {branch}: {ours[:7]} → {theirs[:7]}", fg="green")
         return
 
     if dirty:
-        click.secho(
-            "Error: You have uncommitted changes that would be overwritten by merge:",
-            fg="red",
-        )
-        for d in dirty[:20]:
-            click.echo(f"  {d}")
-        click.secho("Commit them (or stash them), then merge again.", fg="yellow")
-        return
+        if not output_is_json(ctx):
+            click.secho(
+                "Error: You have uncommitted changes that would be overwritten by merge:",
+                fg="red",
+            )
+            for d in dirty[:20]:
+                click.echo(f"  {d}")
+            click.secho("Commit them (or stash them), then merge again.", fg="yellow")
+        fail(ctx, "validation",
+             "You have uncommitted changes that would be overwritten by merge.",
+             data={"dirty": dirty[:20], "remediation": ["av commit -m ...", "av stash"]},
+             quiet_text=True)
 
     base_tree = (load(base) or {}).get("tree", {}) if base else {}
     ours_tree = (load(ours) or {}).get("tree", {})
@@ -355,30 +397,50 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
     theirs_tree = theirs_data.get("tree", {})
 
     if not all(tree_is_flat(t) for t in (base_tree, ours_tree, theirs_tree)):
-        click.secho(
-            "Error: Merge targets a legacy-format commit ({code/artifacts} tree); "
-            "only unified flat-tree commits (post-PR #8) can be merged.",
-            fg="red",
-        )
-        return
+        fail(ctx, "validation",
+             "Merge targets a legacy-format commit ({code/artifacts} tree); "
+             "only unified flat-tree commits (post-PR #8) can be merged.")
 
     merged, conflicts = three_way_tree_merge(base_tree, ours_tree, theirs_tree)
     if conflicts and not (policy_ours or policy_theirs):
-        click.secho(
-            f"Merge conflicts in {len(conflicts)} file(s) — both branches changed them "
-            "differently. Nothing was modified. Resolve with:",
-            fg="red",
-        )
-        for p in conflicts[:20]:
-            click.echo(f"  {p}")
-        if len(conflicts) > 20:
-            click.echo(f"  … and {len(conflicts) - 20} more")
-        click.secho(
-            '  av merge <target> --ours     keep this branch\'s versions\n'
-            '  av merge <target> --theirs   take the target\'s versions',
-            fg="yellow",
-        )
-        return
+        # v1.2.5: run attribution on the conflict path too, matching pull's divergence
+        # message — reuses _tip_run_id so an agent sees WHICH runs collided, not just
+        # which files. See the "Three real bugs" note in the V1.2.5 plan: this path used
+        # to return None (exit 0) despite EXIT_CONFLICT=14 being documented for it.
+        ours_run = _tip_run_id(repo_root, ours)
+        theirs_run = _tip_run_id(repo_root, theirs)
+        remediation = [
+            f"av merge {target} --ours     # keep this branch's versions",
+            f"av merge {target} --theirs   # take the target's versions",
+        ]
+        if not output_is_json(ctx):
+            click.secho(
+                f"Merge conflicts in {len(conflicts)} file(s) — both branches changed them "
+                "differently. Nothing was modified. Resolve with:",
+                fg="red",
+            )
+            for p in conflicts[:20]:
+                click.echo(f"  {p}")
+            if len(conflicts) > 20:
+                click.echo(f"  … and {len(conflicts) - 20} more")
+            click.secho(
+                '  av merge <target> --ours     keep this branch\'s versions\n'
+                '  av merge <target> --theirs   take the target\'s versions',
+                fg="yellow",
+            )
+            if ours_run or theirs_run:
+                fmt = lambda rid: f"run:{rid[:8]}…" if rid else "(no run)"
+                click.echo(f"  ours   [{ours[:7]}] belongs to {fmt(ours_run)}")
+                click.echo(f"  theirs [{theirs[:7]}] belongs to {fmt(theirs_run)}")
+        fail(ctx, "merge_conflict",
+             f"Merge conflicts in {len(conflicts)} file(s) — both branches changed them "
+             "differently. Nothing was modified.",
+             data={
+                 "conflicts": conflicts[:20], "conflict_count": len(conflicts),
+                 "ours": ours, "theirs": theirs,
+                 "ours_run_id": ours_run, "theirs_run_id": theirs_run,
+                 "remediation": remediation,
+             }, quiet_text=True)
 
     policy_side = ours_tree if policy_ours else theirs_tree
     resolved_conflicts = 0
@@ -406,13 +468,28 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
         "project_id": cfg["project_id"],
         "project_name": cfg["project_name"],
     }
+    finalize_result: dict = {}
     merge_hash = _finalize_commit(
         repo_root, cfg, client,
         commit_data=commit_data, tree=merged, ref_path=our_ref_path,
         head_path=head_path, idx=Index(repo_root),
+        # In JSON mode, suppress _finalize_commit's own human echo — this command emits
+        # ONE envelope covering both the merge and the resulting commit's queue outcome.
+        result_sink=(finalize_result.update if output_is_json(ctx) else None),
     )
 
     added, removed, changed = summarize_changes(ours_tree, merged)
+    if output_is_json(ctx):
+        emit_json(ctx, "merge", data={
+            "merged": True, "fast_forward": False, "branch": branch,
+            "hash": merge_hash, "parents": [ours, theirs],
+            "added": added, "removed": removed, "changed": changed,
+            "conflicts_resolved": resolved_conflicts,
+            "resolution": ("ours" if policy_ours else "theirs") if resolved_conflicts else None,
+            "queued": finalize_result.get("queued", False),
+            "queued_reason": finalize_result.get("queued_reason"),
+        })
+        return
     note = f", {resolved_conflicts} conflict(s) auto-resolved via --{'ours' if policy_ours else 'theirs'}" \
         if resolved_conflicts else ""
     click.secho(

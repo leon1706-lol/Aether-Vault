@@ -33,6 +33,9 @@ const TAB_TITLES: Record<string, string> = {
 
 export default function DashboardPage() {
   const [active, setActive] = useState("dashboard");
+  // The run id to deep-link into (?run=<id>) — read once on mount and handed down;
+  // RunsPanel owns updating this param itself as the user navigates within the tab.
+  const [initialRunId, setInitialRunId] = useState<string | null>(null);
   // null = no project selected, dashboard shows every project on the shared registry
   // (preserves the original pre-Projects-tab behavior). Persisted across reloads.
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -46,14 +49,32 @@ export default function DashboardPage() {
         window.localStorage.removeItem(SELECTED_PROJECT_KEY);
       }
     }
+    // v1.2.5 deep linking: ?tab=<id>&run=<id> in the URL — read once after mount
+    // (not a lazy useState initializer, to avoid an SSR/client hydration mismatch on
+    // this "use client" page) so a shared/reloaded link lands on the right tab/run.
+    // Query params, not real Next.js routes: this stays a single-page tab-state app —
+    // no per-panel mount/state restructuring — see the WebUI Contract in
+    // development/architecture.md for the rationale.
+    const params = new URLSearchParams(window.location.search);
+    const tab = params.get("tab");
+    if (tab && tab in TAB_TITLES) setActive(tab);
+    setInitialRunId(params.get("run"));
   }, []);
+
+  function selectTab(tab: string) {
+    setActive(tab);
+    const params = new URLSearchParams(window.location.search);
+    params.set("tab", tab);
+    if (tab !== "runs") params.delete("run"); // leaving the tab drops the deep link
+    window.history.replaceState(null, "", `?${params.toString()}`);
+  }
 
   const { data, loading, refresh } = useDashboard(15000, selectedProject?.project_id ?? null);
 
   function openProject(project: Project) {
     setSelectedProject(project);
     window.localStorage.setItem(SELECTED_PROJECT_KEY, JSON.stringify(project));
-    setActive("dashboard");
+    selectTab("dashboard");
   }
 
   function clearProject() {
@@ -63,7 +84,7 @@ export default function DashboardPage() {
 
   return (
     <div className="app-shell">
-      <Sidebar active={active} onSelect={setActive} />
+      <Sidebar active={active} onSelect={selectTab} />
       <div className="main-content">
         <TopBar
           health={data?.health ?? null}
@@ -79,7 +100,7 @@ export default function DashboardPage() {
           ) : active === "projects" ? (
             <ProjectsPanel selectedProjectId={selectedProject?.project_id ?? null} onOpen={openProject} />
           ) : active === "runs" ? (
-            <RunsPanel projectId={selectedProject?.project_id ?? null} />
+            <RunsPanel projectId={selectedProject?.project_id ?? null} initialRunId={initialRunId} />
           ) : active === "commits" ? (
             <CommitsPanel refs={data?.refs ?? {}} projectId={selectedProject?.project_id ?? null} />
           ) : active === "branches" ? (

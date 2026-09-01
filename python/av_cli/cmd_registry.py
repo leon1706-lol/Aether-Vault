@@ -241,6 +241,122 @@ def keygen() -> None:
                 fg="cyan")
 
 
+@registry.group("keys")
+def keys_group() -> None:
+    """v1.2.5: signing-key management — list, fingerprint, rotate.
+
+    Tamper evidence, not a PKI: none of these commands bind a key to an identity — they
+    only manage which bytes THIS repo signs with next."""
+
+
+@keys_group.command("list")
+def keys_list() -> None:
+    """List every signing key this repo knows about (active + archived from past rotations)."""
+    from .signing import list_keys
+
+    repo_root = ensure_repo()
+    entries = list_keys(repo_root)
+    if current_output_mode() == "json":
+        emit_json(None, "registry keys list", data={"keys": entries})
+        return
+    if not entries:
+        click.secho("No signing keys — run `av registry keygen` first.", fg="yellow")
+        return
+    for e in entries:
+        state = "active" if e["active"] else "archived"
+        click.echo(f"  [{state}] {e['fingerprint']}  (created {e['created_at']})")
+
+
+@keys_group.command("fingerprint")
+def keys_fingerprint() -> None:
+    """Print just this repo's active-key fingerprint (scriptable)."""
+    from .signing import fingerprint, public_key_path
+
+    repo_root = ensure_repo()
+    pub_path = public_key_path(repo_root)
+    if not pub_path.exists():
+        fail(None, "validation", "No signing key — run `av registry keygen` first.")
+    fp = fingerprint(pub_path.read_bytes())
+    if current_output_mode() == "json":
+        emit_json(None, "registry keys fingerprint", data={"fingerprint": fp})
+        return
+    click.echo(fp)
+
+
+@keys_group.command("rotate")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip the confirmation prompt.")
+def keys_rotate(yes: bool) -> None:
+    """Archive the current signing key and generate a fresh one.
+
+    Tamper evidence, not a PKI: old commits keep verifying (their signature carries the
+    OLD public key embedded), new commits sign with the new key. The archived private
+    key is never deleted."""
+    from .signing import fingerprint, public_key_path, rotate_keypair
+
+    repo_root = ensure_repo()
+    pub_path = public_key_path(repo_root)
+    old_fp = fingerprint(pub_path.read_bytes()) if pub_path.exists() else None
+
+    if not yes and current_output_mode() != "json":
+        label = f"key {old_fp}" if old_fp else "the current key"
+        if not click.confirm(f"Archive {label} and generate a new signing key?", default=False):
+            click.secho("Aborted — nothing rotated.", fg="yellow")
+            return
+
+    try:
+        priv, pub = rotate_keypair(repo_root)
+    except FileNotFoundError as exc:
+        fail(None, "validation", str(exc))
+    new_fp = fingerprint(pub.read_bytes())
+    if current_output_mode() == "json":
+        emit_json(None, "registry keys rotate", data={
+            "archived_fingerprint": old_fp, "new_fingerprint": new_fp,
+            "private_key": str(priv), "public_key": str(pub),
+        })
+        return
+    click.secho(f"Rotated: {old_fp or '(none)'} → {new_fp}", fg="green")
+    click.secho("Old commits still verify (their signature embeds the old public key); "
+               "new commits sign with the new key.", fg="cyan")
+
+
+@registry.command("export-signature")
+@click.argument("commit_hash")
+@click.option("--out", "out_path", default=None, type=click.Path(dir_okay=False),
+              help="Write to this file instead of stdout.")
+def export_signature(commit_hash: str, out_path: str | None) -> None:
+    """v1.2.5: export COMMIT_HASH's signature as a standalone record for external audit
+    — verify it elsewhere with `av registry verify <hash> --signature FILE`, without that
+    verifier needing this repo's config or registry access.
+
+    Tamper evidence, not a PKI: this proves the exported record matches what the signer
+    produced, not who the signer is."""
+    from .handoff import load_commit
+    from .signing import export_signature_blob
+
+    repo_root = ensure_repo()
+    commit = load_commit(repo_root, commit_hash)
+    if not commit:
+        fail(None, "validation", f"Unknown commit: {commit_hash}")
+    try:
+        blob = export_signature_blob(commit_hash, commit)
+    except ValueError as exc:
+        fail(None, "validation", str(exc))
+
+    rendered = json.dumps(blob, indent=2, sort_keys=True)
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(rendered + "\n")
+        if current_output_mode() == "json":
+            emit_json(None, "registry export-signature", data={**blob, "path": out_path})
+        else:
+            click.secho(f"Wrote signature record to {out_path}", fg="green")
+        return
+    if current_output_mode() == "json":
+        emit_json(None, "registry export-signature", data=blob)
+        return
+    click.echo(rendered)
+
+
 @registry.command()
 @click.argument("commit_hash")
 def attest(commit_hash: str) -> None:
@@ -283,9 +399,16 @@ def invoke_mergeless_attest_tag(repo_root, tags):
 
 @registry.command()
 @click.argument("commit_hash")
-def verify(commit_hash: str) -> None:
+@click.option("--signature", "signature_file", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="v1.2.5: verify against a detached signature record (from "
+                   "`av registry export-signature`) instead of the commit's own embedded "
+                   "signature — for auditing a commit without this repo's config.")
+def verify(commit_hash: str, signature_file: str | None) -> None:
     """Verify COMMIT_HASH: an ed25519 commit signature when present, else a legacy
     HMAC attestation tag.
+
+    Tamper evidence, not a PKI — this proves the payload wasn't modified after
+    signing, not who the signer is (see SECURITY.md).
 
     v1.2.2 verification order:
     1. `signature` blob on the commit → validate the ed25519 signature over the
@@ -295,13 +418,32 @@ def verify(commit_hash: str) -> None:
     3. Neither → UNSIGNED (exit 0 in text mode; unsigned commits are valid — this is
        tamper EVIDENCE, not a trust gate)."""
     from .handoff import load_commit
-    from .signing import SigningUnavailable, load_public_key_hex, verify_signature
+    from .signing import SigningUnavailable, load_public_key_hex, verify_detached, verify_signature
 
     repo_root = ensure_repo()
 
     commit = load_commit(repo_root, commit_hash)
     if not commit:
         fail(None, "validation", f"Unknown commit: {commit_hash}")
+
+    if signature_file:
+        with open(signature_file, "r", encoding="utf-8") as f:
+            detached = json.load(f)
+        try:
+            ok, reason = verify_detached(commit, detached)
+        except SigningUnavailable as exc:
+            fail(None, "validation", str(exc))
+        data = {"verified": ok, "reason": reason, "scheme": "ed25519-detached",
+               "detached_fingerprint": detached.get("fingerprint")}
+        if current_output_mode() == "json":
+            emit_json(None, "registry verify", data=data)
+            return
+        if ok:
+            click.secho(f"VERIFIED (detached record, {detached.get('fingerprint')})", fg="green")
+        else:
+            click.secho(f"TAMPERED OR INVALID: {reason}", fg="red")
+            ctx_exit(EXIT_VALIDATION)
+        return
 
     if isinstance(commit.get("signature"), dict):
         try:

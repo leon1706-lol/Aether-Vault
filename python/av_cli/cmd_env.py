@@ -14,6 +14,7 @@ import datetime
 import json
 import os
 import pathlib
+import platform as _platform
 import sys
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
@@ -29,6 +30,88 @@ from .core import (
 _CURATED = ["torch", "torchvision", "lightning", "pytorch_lightning", "transformers",
             "datasets", "numpy", "pandas", "safetensors", "scikit-learn", "mlflow",
             "aether-vault"]
+
+# v1.2.5: env vars captured into the HASHED `env.env_vars` (they change training
+# behavior, so they're part of identity) — overridable via AV_ENV_CAPTURE_VARS
+# (comma-separated) for projects with their own critical vars.
+_DEFAULT_CAPTURE_VARS = [
+    "CUDA_VISIBLE_DEVICES", "PYTORCH_CUDA_ALLOC_CONF", "OMP_NUM_THREADS",
+    "TOKENIZERS_PARALLELISM", "HF_HOME", "TORCH_HOME",
+]
+
+
+def _capture_var_names() -> list[str]:
+    raw = os.environ.get("AV_ENV_CAPTURE_VARS")
+    if raw:
+        return [v.strip() for v in raw.split(",") if v.strip()]
+    return list(_DEFAULT_CAPTURE_VARS)
+
+
+def _gpu_and_cuda_info() -> dict:
+    """Best-effort GPU/driver/CUDA-toolkit introspection — every probe is wrapped so a
+    missing nvidia-smi/nvcc/torch (the overwhelmingly common non-GPU-machine case) never
+    fails the capture; it just leaves these fields None/empty."""
+    import re
+    import subprocess
+
+    names: list[str] = []
+    driver_version = None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            for line in out.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if parts and parts[0]:
+                    names.append(parts[0])
+                    if len(parts) > 1 and parts[1]:
+                        driver_version = parts[1]
+    except Exception:
+        pass
+
+    if not names:
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+        except Exception:
+            pass
+
+    cuda_toolkit_version = None
+    try:
+        out = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            m = re.search(r"release (\d+\.\d+)", out.stdout)
+            if m:
+                cuda_toolkit_version = m.group(1)
+    except Exception:
+        pass
+    if cuda_toolkit_version is None:
+        try:
+            import torch  # type: ignore
+
+            cuda_toolkit_version = getattr(torch.version, "cuda", None)
+        except Exception:
+            pass
+
+    return {
+        "gpu_names": names,
+        "driver_version": driver_version,
+        "device_count": len(names),
+        "cuda_toolkit_version": cuda_toolkit_version,
+    }
+
+
+def _safe_hostname() -> str | None:
+    try:
+        import socket
+
+        return socket.gethostname()
+    except Exception:
+        return None
 
 
 def _collect(full: bool) -> dict:
@@ -52,13 +135,45 @@ def _collect(full: bool) -> dict:
     except Exception:
         pass
 
+    pins = {name: ver for name in _CURATED if (ver := v(name))}
+    gpu = _gpu_and_cuda_info()
+    env_vars = {name: os.environ[name] for name in _capture_var_names() if name in os.environ}
+
+    # snapshot_version 2 (v1.2.5): split into HASHED identity (`env`, reproducibility-
+    # relevant) vs unhashed OBSERVED context (`observed`, machine-specific) — see
+    # core.py::canonical_env_bytes for the rationale. Top-level flat fields (python,
+    # platform, cuda_visible_devices, seeds, pins) are kept for backward compatibility
+    # with every existing reader (render_recipe, .avh replay section, etc.) — `env`/
+    # `observed` exist purely to define what participates in the snapshot's identity.
     snap: dict = {
+        "snapshot_version": 2,
         "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "python": sys.version.split()[0],
         "platform": sys.platform,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "seeds": seeds,
-        "pins": {name: ver for name in _CURATED if (ver := v(name))},
+        "pins": pins,
+        "env": {
+            "python": sys.version.split()[0],
+            "os_family": _platform.system(),
+            "pins": pins,
+            "seeds": seeds,
+            "cuda_toolkit_version": gpu["cuda_toolkit_version"],
+            "env_vars": env_vars,
+        },
+        "observed": {
+            "gpu_names": gpu["gpu_names"],
+            "driver_version": gpu["driver_version"],
+            "device_count": gpu["device_count"],
+            "hostname": _safe_hostname(),
+            "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
+            "interpreter": {
+                "executable": sys.executable,
+                "prefix": sys.prefix,
+                "base_prefix": getattr(sys, "base_prefix", sys.prefix),
+                "conda_prefix": os.environ.get("CONDA_PREFIX"),
+            },
+        },
     }
     if full:
         try:
@@ -192,16 +307,46 @@ def resolve_replay_target(repo_root: Path, target: str | None):
     return None, None
 
 
-def render_recipe(snap: dict, dockerfile: bool) -> str:
-    """Pure renderer shared by all replay paths (and the golden fixture test)."""
+def render_recipe(snap: dict, dockerfile: bool, cuda_tag: str | None = None) -> str:
+    """Pure renderer shared by all replay paths (and the golden fixture test).
+
+    v1.2.5: `cuda_tag` switches the Dockerfile base to an nvidia/cuda runtime image
+    (e.g. "12.1.0") instead of plain python:slim, and the Dockerfile itself became
+    multi-stage (builder installs pins into a venv, runtime copies just that venv) with
+    a non-root user — closer to what a real training image looks like."""
     pins = snap.get("freeze") or [f"{k}=={v}" for k, v in (snap.get("pins") or {}).items()]
-    install_block = "\n".join(f"RUN pip install {pin}" for pin in pins) if dockerfile else \
-        "\n".join(f"  pip install {pin}" for pin in pins)
+    py_version = snap.get("python", "3.12")
     if dockerfile:
+        if cuda_tag:
+            builder_base = f"nvidia/cuda:{cuda_tag}-runtime-ubuntu22.04"
+            runtime_base = builder_base
+            py_install = (
+                f"RUN apt-get update && apt-get install -y --no-install-recommends "
+                f"python{py_version.rsplit('.', 1)[0]} python3-pip python3-venv && \\\n"
+                "    rm -rf /var/lib/apt/lists/*\n"
+            )
+        else:
+            builder_base = f"python:{py_version}-slim"
+            runtime_base = builder_base
+            py_install = ""
+        pip_lines = "\n".join(f"RUN /opt/venv/bin/pip install --no-cache-dir {pin}" for pin in pins)
         recipe = (
-            "# Recipe-exact base — adjust CUDA tag to match your drivers.\n"
-            "FROM python:" + snap.get("python", "3.12") + "-slim\n\n"
-            + install_block + "\n\n"
+            "# syntax=docker/dockerfile:1\n"
+            "# Recipe-exact reproduction of a captured training environment (av env replay "
+            "--dockerfile).\n"
+            f"# Adjust the CUDA tag ({cuda_tag or '(none — CPU base)'}) to match your drivers "
+            "if this drifts.\n\n"
+            f"FROM {builder_base} AS builder\n"
+            + py_install +
+            "RUN python3 -m venv /opt/venv\n"
+            f"{pip_lines}\n\n"
+            f"FROM {runtime_base}\n"
+            + py_install +
+            "RUN useradd --create-home --shell /bin/bash av\n"
+            "COPY --from=builder /opt/venv /opt/venv\n"
+            "ENV PATH=\"/opt/venv/bin:$PATH\"\n"
+            "USER av\n"
+            "WORKDIR /workspace\n\n"
             "# Data & weights come from Aether itself:\n"
             "#   av clone <project> --remote-url <registry>\n"
             "#   av checkout <commit>\n"
@@ -209,8 +354,9 @@ def render_recipe(snap: dict, dockerfile: bool) -> str:
             f"#   CUDA_VISIBLE_DEVICES={snap.get('cuda_visible_devices')}\n"
         )
     else:
+        install_block = "\n".join(f"  pip install {pin}" for pin in pins)
         recipe = (
-            f"python=={snap.get('python')}\n"
+            f"python=={py_version}\n"
             f"CUDA_VISIBLE_DEVICES={snap.get('cuda_visible_devices')}\n"
             "packages:\n" + install_block
         )
@@ -244,13 +390,85 @@ def snapshot(full: bool) -> None:
                 + ("  · linked to the active run" if linked else ""), fg="cyan")
 
 
+def _resolve_pip_invocation(target_venv: str | None, conda_env: str | None):
+    """v1.2.5: where --execute actually installs. Returns (argv_prefix, description).
+
+    Default (neither flag) now correctly uses `sys.executable -m pip` — the pre-1.2.5
+    code shelled a bare `pip`, which can silently resolve to a DIFFERENT interpreter's
+    pip than the one running this command (Probleme.md: a real interpreter-mismatch
+    risk, not hypothetical, on any machine with more than one Python on PATH)."""
+    import shutil
+
+    if conda_env:
+        if shutil.which("conda") is None:
+            fail(None, "validation",
+                 "--conda-env was given but `conda` is not on PATH — install/activate "
+                 "conda first, or use --target-venv instead.")
+        return ["conda", "run", "-n", conda_env, "python", "-m", "pip"], f"conda env '{conda_env}'"
+    if target_venv:
+        venv_path = pathlib.Path(target_venv)
+        if not venv_path.exists():
+            import venv as _venv_mod
+
+            click.secho(f"Creating venv at {venv_path}...", fg="cyan")
+            _venv_mod.create(venv_path, with_pip=True)
+        py = venv_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        activate = (venv_path / "Scripts" / "activate") if os.name == "nt" else \
+            (venv_path / "bin" / "activate")
+        return [str(py), "-m", "pip"], f"venv at {venv_path} (activate: {activate})"
+    return [sys.executable, "-m", "pip"], f"the running interpreter ({sys.executable})"
+
+
+def _validate_pins(pins: list[str]) -> list[dict]:
+    """v1.2.5: resolves each pin via `pip install --dry-run` (real dependency
+    resolution against PyPI, no package actually written to disk) — this is
+    '--validate', the answer to "can this recipe resolve?" without installing anything."""
+    import subprocess
+
+    results = []
+    for pin in pins:
+        try:
+            out = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--dry-run", "--ignore-installed",
+                 "--quiet", pin],
+                capture_output=True, text=True, timeout=60,
+            )
+            if out.returncode == 0:
+                status, detail = "resolvable", None
+            else:
+                combined = (out.stdout + out.stderr).strip()
+                if "No matching distribution" in combined or "Could not find a version" in combined:
+                    status = "version-not-found"
+                else:
+                    status = "unknown"
+                detail = combined.splitlines()[-1] if combined else None
+        except FileNotFoundError:
+            status, detail = "unknown", "pip not found"
+        except Exception as exc:
+            status, detail = "unknown", str(exc)
+        results.append({"pin": pin, "status": status, "detail": detail})
+    return results
+
+
 @env.command()
 @click.argument("target", required=False, default=None)
 @click.option("--dockerfile", is_flag=True, default=False, help="Emit a Dockerfile draft.")
+@click.option("--cuda", "cuda_tag", default=None, metavar="TAG",
+              help="With --dockerfile: nvidia/cuda:<TAG>-runtime-ubuntu22.04 base instead of python:slim.")
+@click.option("--out", "out_path", default=None, type=click.Path(dir_okay=False),
+              help="Write the recipe/Dockerfile to this file (atomically) instead of stdout.")
+@click.option("--validate", "validate_mode", is_flag=True, default=False,
+              help="Resolve every pin against PyPI WITHOUT installing; exit 15 if any pin fails.")
 @click.option("--execute", "execute_mode", is_flag=True, default=False,
-              help="Execute the recipe's pip installs after showing it (asks first unless -y).")
+              help="Install the recipe's pins after showing it (asks first unless -y).")
+@click.option("--target-venv", "target_venv", default=None, metavar="PATH",
+              help="With --execute: create (if absent) and install into this venv, not the running interpreter.")
+@click.option("--conda-env", "conda_env", default=None, metavar="NAME",
+              help="With --execute: install into this conda environment via `conda run -n NAME`.")
 @click.option("-y", "--yes", is_flag=True, default=False, help="Skip the execute confirmation.")
-def replay(target: str | None, dockerfile: bool, execute_mode: bool, yes: bool) -> None:
+def replay(target: str | None, dockerfile: bool, cuda_tag: str | None, out_path: str | None,
+          validate_mode: bool, execute_mode: bool, target_venv: str | None,
+          conda_env: str | None, yes: bool) -> None:
     """Print (or execute) the reproduction recipe for TARGET (a run id, commit hash, or
     snapshot id) — or the latest local snapshot when omitted.
 
@@ -261,6 +479,11 @@ def replay(target: str | None, dockerfile: bool, execute_mode: bool, yes: bool) 
     carry env_snapshot_id server-side) or by the raw snapshot id from `.avh.replay` —
     commit-payload ids live in local commit files only.
     """
+    if cuda_tag and not dockerfile:
+        fail(None, "validation", "--cuda only applies together with --dockerfile.")
+    if target_venv and conda_env:
+        fail(None, "validation", "--target-venv and --conda-env are mutually exclusive.")
+
     repo_root = ensure_repo()
     snap, source = resolve_replay_target(repo_root, target)
     if snap is None:
@@ -268,35 +491,61 @@ def replay(target: str | None, dockerfile: bool, execute_mode: bool, yes: bool) 
              "No snapshot found — `av env snapshot` first, or pass a run/commit whose "
              "environment was captured and pushed.")
 
-    recipe = render_recipe(snap, dockerfile)
-    if source and source != "local":
-        click.secho(f"# snapshot {source}", fg="cyan")
+    recipe = render_recipe(snap, dockerfile, cuda_tag=cuda_tag)
+    pins = snap.get("freeze") or [f"{k}=={v}" for k, v in (snap.get("pins") or {}).items()]
+    json_mode = current_output_mode() == "json"
 
-    click.echo(recipe)
+    validation_result = None
+    if validate_mode:
+        validation_result = _validate_pins(pins)
+        if any(r["status"] != "resolvable" for r in validation_result):
+            if not json_mode:
+                for r in validation_result:
+                    color = "green" if r["status"] == "resolvable" else "red"
+                    suffix = f"  ({r['detail']})" if r.get("detail") else ""
+                    click.secho(f"  [{r['status']}] {r['pin']}{suffix}", fg=color)
+            fail(None, "validation", "One or more pins failed to resolve — see the "
+                 "per-pin table above (or error.data.validation in JSON mode).",
+                 data={"validation": validation_result})
 
+    if out_path:
+        atomic_write_text(pathlib.Path(out_path), recipe)
+    elif not json_mode:
+        if source and source != "local":
+            click.secho(f"# snapshot {source}", fg="cyan")
+        click.echo(recipe)
+        if validate_mode:
+            for r in validation_result:
+                click.secho(f"  [{r['status']}] {r['pin']}", fg="green")
+
+    executed = False
+    exec_target_desc = None
     if execute_mode:
-        pip_lines = [
-            ln.strip()[len("pip install "):]
-            for ln in recipe.splitlines() if ln.strip().startswith("pip install ")
-        ]
-        if not pip_lines:
+        if not pins:
             fail(None, "validation", "Nothing to install — snapshot has no pins.")
-        import subprocess as _sp
-
-        if not yes:
-            click.secho(f"About to run {len(pip_lines)} pip install command(s) "
-                        "in THIS interpreter. Continue? [y/N]", fg="yellow", nl=False)
+        pip_prefix, exec_target_desc = _resolve_pip_invocation(target_venv, conda_env)
+        if not yes and not json_mode:
+            click.secho(f"About to run {len(pins)} pip install command(s) into "
+                        f"{exec_target_desc}. Continue? [y/N]", fg="yellow", nl=False)
             if input().strip().lower() not in ("y", "yes"):
                 click.secho("Aborted — nothing executed.", fg="yellow")
                 return
-        for pin in pip_lines:
-            rc = _sp.call(["pip", "install", pin])
-            if rc != 0:
-                fail(None, "validation", f"pip install failed for: {pin}")
-        click.secho("Environment reproduced (pip level).", fg="green")
+        import subprocess as _sp
 
-    if current_output_mode() == "json":
-        emit_json(None, "env replay", data={"recipe": recipe, "snapshot": snap,
-                                            "source": source or "local",
-                                            "executed": bool(execute_mode)})
+        for pin in pins:
+            rc = _sp.call(pip_prefix + ["install", pin])
+            if rc != 0:
+                fail(None, "validation",
+                     f"pip install failed for: {pin} (target: {exec_target_desc})")
+        executed = True
+        if not json_mode:
+            click.secho(f"Environment reproduced into {exec_target_desc}.", fg="green")
+
+    if json_mode:
+        data = {"recipe": recipe, "snapshot": snap, "source": source or "local",
+                "executed": executed, "execute_target": exec_target_desc,
+                "out_path": out_path}
+        if validate_mode:
+            data["validation"] = validation_result
+        emit_json(None, "env replay", data=data)
         return

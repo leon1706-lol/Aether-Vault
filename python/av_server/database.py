@@ -25,12 +25,20 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 # pre-Alembic startup) may lack them; they are healed zero-touch at first boot with the
 # Alembic adoption and then stamped onto the migration chain. Kept in sync with the
 # additive migrations: 0002-era drift is healed for volumes adopted before 0003 existed;
-# 0003 adds audit_log.status_code and commits.signature.
+# 0003 adds audit_log.status_code and commits.signature; 0004 adds webhook health
+# tracking columns and runs.avh_object_id.
 _LEGACY_COLUMNS = {
     "commits": {"extra_parents": "TEXT", "signature": "TEXT",
                 "env_snapshot_id": "TEXT"},
     "trees": {"chunks": "JSON"},
     "audit_log": {"status_code": "INTEGER"},
+    "webhooks": {
+        "last_success_at": "TIMESTAMP",
+        "last_failure_at": "TIMESTAMP",
+        "consecutive_failures": "INTEGER DEFAULT 0",
+        "disabled_reason": "TEXT",
+    },
+    "runs": {"avh_object_id": "TEXT"},
 }
 
 

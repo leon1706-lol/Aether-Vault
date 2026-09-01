@@ -95,14 +95,44 @@ AV_AUDIT_RETENTION_DAYS  90   (default)
 AV_WEBHOOK_MAX_ATTEMPTS  5   (default)
                 Webhook delivery attempts before a row dead-letters (status='dead').
 AV_WEBHOOK_RETRY_INTERVAL_SECS  30   (default)
-                Worker interval AND retry backoff step for failed webhook deliveries.
+                Worker tick interval AND the base of the v1.2.5 exponential backoff
+                (next_retry_at = now + this * 2^(attempt-1), capped by the var below —
+                this is no longer a flat retry step, only the base/tick).
+AV_WEBHOOK_RETRY_MAX_SECS  3600   (default)
+                Ceiling on the exponential backoff above — a delivery never waits longer
+                than this between attempts no matter how high the attempt count climbs.
+AV_WEBHOOK_DISABLE_AFTER  0 = off   (default)
+                Consecutive delivery failures before a webhook auto-disables (active=false
+                + disabled_reason set, a webhook_disabled event + audit row emitted).
+                `av webhooks enable <id>` re-enables and clears the counter.
 AV_ENGINE_ROLE  all   (container-side default)
                 Engine dispatch: all | server | webui. Legacy alias containers WITHOUT
                 this var auto-detect: DATABASE_URL set → server; NEXT_PUBLIC_API_URL
-                without it → webui.
+                without it → webui (v1.2.5: this path now logs a deprecation warning).
+AV_ENGINE_STOP_GRACE_SECS  25   (default)
+                Seconds engine-entrypoint.sh waits after TERM/INT before SIGKILLing a
+                still-running subservice. Both compose files set stop_grace_period: 30s
+                so Docker's own 10s default doesn't SIGKILL the container first.
+AV_ENGINE_RESTART_SUBSERVICE  1 = on   (default)
+                role=all: a dying subservice restarts just itself instead of tearing the
+                whole engine down. =0 reverts to pre-v1.2.5 behavior (any child dying
+                takes the container down, relying on `restart: unless-stopped`).
+AV_ENGINE_MAX_RESTARTS  5   (default)
+                Sliding-window restart budget (paired with the var below) — exceeding it
+                shuts the engine down loudly instead of crash-looping forever silently.
+AV_ENGINE_RESTART_WINDOW_SECS  300   (default)
+                Window the restart budget above is measured over.
 AV_REMOTE_URL  (CLI-side) default registry for av clone; else http://localhost:8000.
 AV_AUTHOR      (CLI-side) commit author string; defaults to "anonymous".
 AV_RUN_ID      (CLI-side) file subsequent commits under this run.
+AV_ENV_CAPTURE_VARS  (CLI-side) comma-separated env var names captured into a snapshot's
+               HASHED env.env_vars (default: CUDA_VISIBLE_DEVICES,
+               PYTORCH_CUDA_ALLOC_CONF, OMP_NUM_THREADS, TOKENIZERS_PARALLELISM,
+               HF_HOME, TORCH_HOME). Overrides, not appends, the default list.
+AV_PERF_BUDGET_MULTIPLIER  (dev-only, tests/test_perf_gate.py) unset = the built-in
+               per-class multipliers (CPU 2.0x, disk 3.0x, +1.5x more on Windows disk).
+               Set to a float to override BOTH classes outright (not stack with them) for
+               a genuinely slow/noisy machine — one number is the whole story for that run.
 ```
 
 **Caution:** `AV_DATA_DIR`'s `/data` default is container-oriented. Bare-metal uvicorn MUST point it at a writable directory, or every object upload fails with PermissionError while `/api/health` stays green — the most misleading failure mode in the project. This exact failure broke CI `webui-e2e` once: uploads 500ed, seed pushes queued offline, the dashboard rendered empty, Playwright failed on element-not-found. Documented in [CHANGELOG.md](CHANGELOG.md); the fix lives as explicit env vars on both uvicorn-starting CI jobs.
@@ -192,7 +222,7 @@ Every product surface and the workflow that guards it (Tests workflow unless not
 | Server live stack (Postgres+Redis): TestClient + real-wire | `server-tests` |
 | Same, native Windows services | `server-tests-windows` |
 | Product flows via real CLI: merge collaboration, offline drain, legacy upgrade, per-user auth, GC | `e2e-suite` (`scripts/e2e_scenario.sh`) |
-| Engine image smoke (Phase I): role dispatch + dual healthchecks from ONE container | `e2e-engine-smoke` |
+| Engine image smoke (Phase I): role dispatch + dual healthchecks from ONE container; v1.2.5: `/api/ready` degrading independently of `/api/health`, killing one subservice restarts only it | `e2e-engine-smoke` |
 | Plugins incl. real Lightning training loop + signed-commit gate (`[sign]` extra) | `plugin-tests` |
 | WebUI lint/typecheck/Vitest | `webui-tests` |
 | WebUI browser E2E: dashboard, weight-diff, token gate | `webui-e2e` |
@@ -201,9 +231,8 @@ Every product surface and the workflow that guards it (Tests workflow unless not
 | Sdist compile-install smoke (Windows venv, MSVC path) | `smoke-sdist-windows` |
 | `:edge` images on master pushes | `docker-edge.yml` |
 | Wheels cp310–314 ×3 OS, PyPI, GitHub Release, GHCR | `release.yml` (tags) |
-| Dependency freshness | Dependabot (pip/npm/actions, weekly) |
 
-Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` flow test, no macOS install smoke, Dependabot PRs need human merges.
+Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` flow test, no macOS install smoke. Dependabot was removed (Phase 55, owner decision — config deleted, all open PRs closed); dependency freshness review is manual now.
 
 ## Database Migrations
 

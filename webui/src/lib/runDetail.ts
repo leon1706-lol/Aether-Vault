@@ -106,8 +106,13 @@ export interface RunCommitRow {
   metrics: Record<string, number | string>;
 }
 
+// v1.2.5: structural (not nominal) so this accepts both the full `Commit` type AND the
+// lighter { hash, message, metrics, timestamp } shape GET /api/runs/{id}/summary returns
+// (RunsPanel's primary path since v1.2.5) — one function, two call sites, no duplication.
+type MinimalCommit = Pick<Commit, "hash" | "message" | "metrics">;
+
 /** Flattens linked commits into table rows (newest-first as given). */
-export function commitMetricsRows(commits: Commit[]): RunCommitRow[] {
+export function commitMetricsRows(commits: MinimalCommit[]): RunCommitRow[] {
   return commits.map((c) => ({
     hash: c.hash,
     short: c.hash.slice(0, 7),

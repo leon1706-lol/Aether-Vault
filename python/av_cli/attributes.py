@@ -13,23 +13,36 @@ from pathlib import Path
 
 # Flags this version actually understands. Unknown flags on a matching line are ignored
 # (forward compatibility — older CLIs won't choke on newer files).
-KNOWN_FLAGS = frozenset({"no-chunk", "no-layer-split"})
+KNOWN_FLAGS = frozenset({"no-chunk", "no-layer-split", "chunk"})
 
 ATTRIBUTES_TEMPLATE = """\
 # .avattributes — per-path staging directives for Aether-Vault
 #
 # Format:    <glob-pattern> <flag> [<flag> ...]
-# Matching:  fnmatch globs against repo-relative paths; the LAST matching line wins.
+# Matching:  fnmatch globs against repo-relative paths; the LAST matching line wins
+#            (a later line's flag set REPLACES an earlier one for the same path — flags
+#            don't merge across lines).
 #
 # Supported flags:
 #   no-chunk         Store as a single whole-file blob instead of content-defined chunks
-#                    (applies to opaque checkpoints: .pt / .pth / .ckpt above the LFS threshold)
+#                    (applies above the LFS threshold to: .pt .pth .ckpt .npz .h5 .hdf5
+#                    .pb .msgpack .bin .onnx .model .arrow .feather .pkl .pickle)
+#   chunk            Force-enable content-defined chunking for a glob that wouldn't
+#                    otherwise qualify (any extension not in the default list above) —
+#                    e.g. a dataset dump you've confirmed is edited append-only. `no-chunk`
+#                    on the same matching line always wins over `chunk` (safety first).
+#                    Best for uncompressed / block-aligned formats; COMPRESSED containers
+#                    (.parquet with per-column compression, .zip/.gz/.tar/.7z) usually
+#                    rewrite their whole stream on any logical edit, so CDC boundaries
+#                    won't survive and chunking just adds overhead with no dedup payoff —
+#                    only opt them in if you've verified otherwise for your export path.
 #   no-layer-split   Never split safetensors into per-layer shards; store the whole file
 #
 # Examples:
 #   *.pt no-chunk
 #   models/frozen/** no-chunk no-layer-split
 #   experiments/*.safetensors no-layer-split
+#   datasets/exports/*.parquet chunk        # opted in: this pipeline only appends rows
 """
 
 

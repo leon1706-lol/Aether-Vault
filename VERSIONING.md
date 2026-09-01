@@ -38,9 +38,25 @@ Known standing deprecation candidates (tracked, not yet scheduled):
 - **Legacy GHCR alias tags** `ghcr.io/leon1706-lol/aether-vault-server` and
   `.../aether-vault-webui` — since v1.2.2 they are ALIASES of the consolidated
   `aether-vault-engine` image (same digest, role auto-detected per container).
-  Announced in the v1.2.2 release notes + CHANGELOG Phase 56; removal lands in the NEXT
-  release (one full MINOR grace cycle honored). Pinned installs should switch compose
-  files / pulls to `aether-vault-engine`.
+  Announced in the v1.2.2 release notes + CHANGELOG Phase 56; the original entry named
+  "the next release" as the removal point, but v1.2.3/v1.2.4/v1.2.5 all kept publishing
+  them (owner decision, reaffirmed each cycle — grace windows only ever extend, they are
+  never shortened by a missed removal) — **earliest possible removal is v1.3.0** (the next
+  MINOR boundary; still not yet scheduled). v1.2.5 adds a runtime nudge: a container
+  started without `AV_ENGINE_ROLE` set (i.e. relying on legacy auto-detect) now prints a
+  one-line `[engine] DEPRECATED: ...` warning to its logs naming the inferred role and
+  this section.
+  - **What breaks when they go:** pulls/references to `aether-vault-server` or
+    `aether-vault-webui` (any tag) will 404 — nothing else changes, since both are today
+    just tags on the exact same image as `aether-vault-engine`.
+  - **The exact edit to make now** (safe today, not just at removal time): in your
+    compose file / pull command, replace `ghcr.io/leon1706-lol/aether-vault-server` or
+    `.../aether-vault-webui` with `ghcr.io/leon1706-lol/aether-vault-engine`, and set
+    `AV_ENGINE_ROLE` explicitly (`all` for the one-container topology both `docker-compose.yml`
+    and `python/av_cli/docker/docker-compose.release.yml` use; `server` or `webui` only if
+    you deliberately still run the two-container split) instead of relying on
+    auto-detection from `DATABASE_URL`/`NEXT_PUBLIC_API_URL`. This silences the new
+    deprecation warning and is a no-op change otherwise — same image, same digest.
 
 ## v1.2.0 additive surfaces
 
@@ -70,6 +86,65 @@ All additive MINOR changes, per surface:
 - **Docker**: ONE engine image/container replaces the two-image split; legacy image names
   remain published as aliases of the same image for this cycle ONLY (see deprecation list).
 
+## v1.2.5 additive surfaces
+
+Most of this release is additive MINOR, per surface — but it also contains ONE deliberate
+behavior CHANGE, called out first because it is the one a script checking `$?` will notice.
+
+- **Behavior change (fix, not additive) — the exit-code registry is now honored.**
+  `AGENTS.md`/`README.md`/`architecture.md` have always published exit codes 10–16 as a
+  stable agent contract; four commands never actually raised the documented code. This
+  release makes them match the docs:
+  - `av commit` with nothing staged: exit **0 → 11** (`nothing_to_commit`).
+  - `av merge` with unresolved conflicts: exit **0 → 14** (`merge_conflict`).
+  - `not_a_repo` / `auth_failed` paths: exit **1 → 10 / 1 → 12** respectively.
+  This is a fix (the documented contract wins over undocumented behavior — it's what
+  agents key off), not a new feature — but any script or CI step that branches on the
+  literal exit code of these four paths should re-check its assumptions.
+- **HTTP API**: `PUT /api/refs/{ref_name}` gains optional `expected_hash` — omitted, it's
+  exactly today's last-write-wins; present, a mismatch returns 409 instead of overwriting
+  silently (compare-and-swap, additive/opt-in). NEW `GET /api/ready` (readiness, separate
+  from the existing DB-free `/api/health` liveness check), `GET /api/runs/{id}/summary`,
+  `POST /api/runs/{id}/avh`, `GET /api/admin/audit/export`,
+  `POST /api/webhooks/{id}/enable`, `POST /api/admin/webhook-deliveries/{id}/replay`.
+  `/api/admin/audit` and `/api/admin/webhook-deliveries` both gain optional filter params
+  and an opaque `cursor`/`next_cursor` pagination scheme alongside the existing `offset`
+  (offset keeps working; cursor is the recommended path for repeated/agent polling).
+  Envelope's `error.data` is a new optional field (structured failure context — conflict
+  file lists, racing run ids, etc.) alongside the existing `error.code`/`error.message`.
+- **Commit payloads**: unchanged in shape; `env_snapshot_id`-bearing commits made with a
+  `snapshot_version: 2` snapshot hash a narrower, machine-independent identity (see below)
+  — this is a hashing-INPUT change for NEW snapshots only, not a payload schema change.
+- **Env snapshot identity (`snapshot_version: 2`)**: the snapshot document splits into a
+  HASHED `env` (python, os_family, pins, seeds, cuda_toolkit_version, a configurable
+  critical-env-var set) and an unhashed `observed` context (gpu_names, driver_version,
+  hostname, conda_env, interpreter path). `env_snapshot_id` now hashes `{snapshot_version,
+  env}` only, enabling identical ids for equivalent environments across machines/OSes.
+  **Ids are only comparable within the same `snapshot_version`** — a v1 id and a v2 id for
+  the "same" environment will differ; both remain independently resolvable (content-
+  addressed lookup is unchanged, so old snapshots never stop working, they just don't
+  compare equal to a new capture of the same setup).
+- **CLI**: NEW `av audit export`/`prune`; `av webhooks show`/`enable`/`deliveries`/`replay`;
+  `av registry keys list`/`fingerprint`/`rotate`, `av registry export-signature`,
+  `av verify --signature FILE`; `av policy set --require-signature` (METRIC/OP now
+  optional, for a signature-only policy); `av env replay --validate`/`--target-venv`/
+  `--conda-env`/`--out`/`--dockerfile --cuda`; `av handoff --publish`. `av pull`/`merge`/
+  `clone` gain full `--output json` support (previously human-text only).
+- **DB schema**: migration `0004` adds `webhooks.{last_success_at, last_failure_at,
+  consecutive_failures, disabled_reason}`, indexes on `audit_log.{username, action}`,
+  `runs.avh_object_id` — applied automatically at startup, legacy volumes healed
+  zero-touch, same as every prior migration.
+- **Docker**: engine-entrypoint.sh restarts a dying subservice independently instead of
+  always tearing the whole container down (opt-out via `AV_ENGINE_RESTART_SUBSERVICE=0`);
+  graceful drain on stop (`AV_ENGINE_STOP_GRACE_SECS`); legacy image aliases keep
+  publishing (see the deprecation-candidates entry above for the updated removal timeline)
+  but now log a deprecation warning when their auto-detect path fires.
+- **Dataset CDC**: `CHUNKABLE_EXTS` grows from 8 to 15 extensions (additive — a previously
+  whole-file-staged format now gets CDC by default; `no-chunk` still opts any glob out).
+  New `chunk` `.avattributes` flag force-enables CDC for a glob outside the default set.
+  `semdiff`'s `chunks.status` (`"measured"`/`"no_chunks"`) is a new, always-present field
+  alongside the existing (still-nullable) `dedup_efficiency`.
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades
@@ -88,7 +163,7 @@ to 10/minute by default. Both pre-1.1.x behaviors remain available explicitly vi
 
 ## How a release happens
 
-1. Merge work to `master`; CI (5 test jobs) must be green.
+1. Merge work to `master`; CI (all `tests.yml` jobs — see `development/infrastructure.md`'s CI Job Map for the current list) must be green.
 2. Curate the release notes: collect the `CHANGELOG.md` phase entries since the previous
    tag into a short highlights list.
 3. `git tag vX.Y.Z && git push origin vX.Y.Z`.

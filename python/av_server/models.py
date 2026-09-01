@@ -139,6 +139,10 @@ class DBRun(Base):
     created_by = Column(String, nullable=True)  # resolved auth identity ('owner'/username)
     config_hash = Column(String, nullable=True)
     code_pointer = Column(JSON, nullable=True)  # {git_remote, git_sha, dirty}
+    # v1.2.5: opt-in pointer to a published `.avh` context-memory object (`av handoff
+    # --publish`). Null unless the repo owner explicitly published — notes can hold
+    # private reasoning, so this is never set implicitly by a normal commit/push.
+    avh_object_id = Column(Text, nullable=True)
     env_snapshot_id = Column(String, nullable=True)
     # Latest value per metric name: {"val_loss": 0.31, "steps": 12000} — refreshed on
     # every linked commit push. Query-friendly without walking commit trees.
@@ -194,6 +198,14 @@ class DBWebhook(Base):
     kinds = Column(JSON, nullable=True)  # null = all kinds; else list of kind strings
     active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, default=utcnow_naive)
+    # v1.2.5 delivery health — updated by _deliver_one() on every attempt outcome, so
+    # "is this webhook currently healthy?" doesn't require joining webhook_deliveries.
+    last_success_at = Column(DateTime, nullable=True)
+    last_failure_at = Column(DateTime, nullable=True)
+    consecutive_failures = Column(Integer, nullable=False, default=0)
+    # Set (with `active` flipped false) when consecutive_failures crosses
+    # AV_WEBHOOK_DISABLE_AFTER; cleared by `av webhooks enable`.
+    disabled_reason = Column(Text, nullable=True)
 
 
 class DBAuditLog(Base):

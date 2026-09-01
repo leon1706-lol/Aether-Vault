@@ -85,9 +85,15 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
                                    attr_mod.flags_for(rules, rel))
                     idx.save()
                     from .core import commit_staged as _commit
+                    from .core import resolve_run_id
 
+                    # v1.2.5 fix: av watch never resolved AV_RUN_ID/active-run state at
+                    # all — auto-commits were silently never filed under the active run
+                    # regardless of `av run start`, breaking the documented "AV_RUN_ID
+                    # joins ANY process' commits" contract (Probleme.md). Same precedence
+                    # as every other commit path now (resolve_run_id: env > state).
                     _commit(repo_root, f"watch: {rel} @ {time.strftime('%H:%M:%S')}",
-                            defer_upload=True)
+                            run_id=resolve_run_id(repo_root), defer_upload=True)
                     commits_made += 1
                     pending_since.pop(rel, None)
 

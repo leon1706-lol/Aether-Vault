@@ -940,11 +940,11 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ---
 
-### 78. `core.fail(None, �)` raised AttributeError after printing the error message
+### 78. `core.fail(None, �)` raised AttributeError after printing the error message
 
-**Severity:** 4/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 4/10 � **Status:** ? `fixed` (2026-08-26)
 
-**Problem:** Roughly a dozen call sites (`cmd_run`, `cmd_env`, `cmd_registry`, �) invoke the shared failure helper as `fail(None, "validation", msg)`. `fail()` ended with `ctx.exit(exit_code)` � on `None` that is an `AttributeError` raised AFTER the message printed. Users saw a clean error line followed by a full Python traceback, and the documented exit codes (10�16) were lost outside CliRunner's accidental catching.
+**Problem:** Roughly a dozen call sites (`cmd_run`, `cmd_env`, `cmd_registry`, �) invoke the shared failure helper as `fail(None, "validation", msg)`. `fail()` ended with `ctx.exit(exit_code)` � on `None` that is an `AttributeError` raised AFTER the message printed. Users saw a clean error line followed by a full Python traceback, and the documented exit codes (10�16) were lost outside CliRunner's accidental catching.
 
 **Fix:** `core.fail()` now calls `ctx.exit()` only when a context exists and otherwise raises `SystemExit(exit_code)`. One-line fix at the single choke point; every None-ctx caller inherits it.
 
@@ -952,9 +952,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ---
 
-### 79. `cmd_registry.restore` referenced an undefined `ctx_exit` � latent NameError on every failed restore
+### 79. `cmd_registry.restore` referenced an undefined `ctx_exit` � latent NameError on every failed restore
 
-**Severity:** 3/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 3/10 � **Status:** ? `fixed` (2026-08-26)
 
 **Problem:** `restore()`'s incomplete-archive branch called `ctx_exit(EXIT_VALIDATION)`, a name defined in sibling modules (`cmd_policy`, `cmd_context`) but never in `cmd_registry` nor exported by `core`. Any failed restore crashed with `NameError` instead of the intended exit-15 validation failure. Invisible because no test exercised the failed-restore path and the module imports fine.
 
@@ -966,9 +966,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 80. Legacy-volume adoption stamped the whole migration chain WITHOUT creating post-create_all tables
 
-**Severity:** 7/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 7/10 � **Status:** ? `fixed` (2026-08-26)
 
-**Problem:** `database._ensure_schema_sync` adopts a pre-Alembic volume by stamping the ENTIRE current chain as applied. A true v1.1.x-era create_all volume therefore got stamped straight to head � and every table introduced AFTER the create_all era (`runs`, `run_commits`, `events`, `webhooks`, `audit_log`, v1.2.2's `webhook_deliveries`) silently NEVER existed on it. Startup stayed green; the first runs/events write would 500. The existing heal covered column drift only.
+**Problem:** `database._ensure_schema_sync` adopts a pre-Alembic volume by stamping the ENTIRE current chain as applied. A true v1.1.x-era create_all volume therefore got stamped straight to head � and every table introduced AFTER the create_all era (`runs`, `run_commits`, `events`, `webhooks`, `audit_log`, v1.2.2's `webhook_deliveries`) silently NEVER existed on it. Startup stayed green; the first runs/events write would 500. The existing heal covered column drift only.
 
 **Fix:** New `_create_missing_tables()` runs during adoption: any models.py table missing from the volume is created from the metadata (checkfirst semantics), then column drift heals, then the chain stamps. Existing tables are never touched.
 
@@ -978,9 +978,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 81. `.avh` semantic summary compared against an EMPTY baseline for local commits
 
-**Severity:** 6/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 6/10 � **Status:** ? `fixed` (2026-08-26)
 
-**Problem:** Locally-authored commit files store a `parents` LIST; only registry-fetched commits carry `parent_hash`. `handoff.build_semantic_summary()` and `_metrics_history_tail()` read ONLY `parent_hash` � so for locally-made commits (i.e., every repo's normal case) the semantic summary diffed against an empty tree (all chunks "new", dedup_efficiency 0) and the metrics trend stopped after one hop. Found by the v1.2.2 dedup_efficiency flow-through test, which pinned engine output vs `.avh` output and caught them disagreeing.
+**Problem:** Locally-authored commit files store a `parents` LIST; only registry-fetched commits carry `parent_hash`. `handoff.build_semantic_summary()` and `_metrics_history_tail()` read ONLY `parent_hash` � so for locally-made commits (i.e., every repo's normal case) the semantic summary diffed against an empty tree (all chunks "new", dedup_efficiency 0) and the metrics trend stopped after one hop. Found by the v1.2.2 dedup_efficiency flow-through test, which pinned engine output vs `.avh` output and caught them disagreeing.
 
 **Fix:** Shared `_commit_parent()` tolerates both shapes; both consumers route through it.
 
@@ -988,11 +988,11 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ---
 
-### 82. Clone/pull dropped `signature` and `env_snapshot_id` � clones could neither verify nor replay
+### 82. Clone/pull dropped `signature` and `env_snapshot_id` � clones could neither verify nor replay
 
-**Severity:** 8/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 8/10 � **Status:** ? `fixed` (2026-08-26)
 
-**Problem:** `sync.normalize_commit_row()` rebuilt fetched commit dicts from a fixed field whitelist, silently discarding the v1.2.2 `signature` blob and `env_snapshot_id`. Every cloned repository therefore reported UNSIGNED on `av verify` (false negative � the worst kind for a tamper-evidence feature) and could not resolve replay snapshots by commit. Found by the manual wire pass: keygen ? commit ? push ? clone ? verify said UNSIGNED in the clone.
+**Problem:** `sync.normalize_commit_row()` rebuilt fetched commit dicts from a fixed field whitelist, silently discarding the v1.2.2 `signature` blob and `env_snapshot_id`. Every cloned repository therefore reported UNSIGNED on `av verify` (false negative � the worst kind for a tamper-evidence feature) and could not resolve replay snapshots by commit. Found by the manual wire pass: keygen ? commit ? push ? clone ? verify said UNSIGNED in the clone.
 
 **Fix:** Server persists both fields (migration 0003 columns, echo in GET/list endpoints); `normalize_commit_row` passes them through verbatim; fake registry mirrors the real row shape so stack-free tests exercise the same contract.
 
@@ -1002,9 +1002,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 83. Timestamp timezone-spelling broke cloned signatures even after #82
 
-**Severity:** 8/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 8/10 � **Status:** ? `fixed` (2026-08-26)
 
-**Problem:** The authoring client signs a payload whose `timestamp` carries `+00:00`; the registry stores naive UTC and echoes timestamps WITHOUT the suffix. Canonical signing bytes are sorted-keys JSON of the whole payload � one character of tz-spelling difference made every cloned verification fail ("TAMPERED") despite byte-identical meaning. Found immediately after fixing #82 in the same manual pass.
+**Problem:** The authoring client signs a payload whose `timestamp` carries `+00:00`; the registry stores naive UTC and echoes timestamps WITHOUT the suffix. Canonical signing bytes are sorted-keys JSON of the whole payload � one character of tz-spelling difference made every cloned verification fail ("TAMPERED") despite byte-identical meaning. Found immediately after fixing #82 in the same manual pass.
 
 **Fix:** `signing.canonical_commit_bytes()` normalizes the timestamp to one canonical UTC rendering parsed from the instant (aware, naive and Z forms all collapse to identical bytes; genuinely different instants still differ).
 
@@ -1012,9 +1012,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ---
 
-### 84. Env snapshot uploaded with non-canonical bytes � server 400, cross-machine replay impossible
+### 84. Env snapshot uploaded with non-canonical bytes � server 400, cross-machine replay impossible
 
-**Severity:** 5/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 5/10 � **Status:** ? `fixed` (2026-08-26)
 
 **Problem:** A snapshot's id hashes its CANONICAL bytes (compact JSON minus `captured_at`), but the push path uploaded the pretty-printed `.av/env_snapshot.json`. The registry's own sha256 verification rejected the upload (400), so snapshots never reached the registry and `av replay <commit>` on any other machine failed with "No snapshot found". Silent: the client treats a failed object upload as non-fatal by design.
 
@@ -1036,3 +1036,99 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** post-mount effect in TokenGate re-strips the param (idempotent no-op when the render-phase pass won). The CONSUME stays render-phase - that part is load-bearing for first-fetch authentication (Probleme #79).
 
 **Verification:** new Vitest test simulates the override (first replaceState restores the entry URL) and asserts the URL is clean after effects run; existing TokenGate suite unchanged-green. Browser-level confirmation lands with CI's own token-gate spec on the next push.
+
+---
+
+### 86. The documented exit-code registry (10–16) was largely fiction
+
+**Severity:** 8/10 · **Status:** 🟢 `fixed` (2026-09-01)
+
+**Problem:** `AGENTS.md`/`README.md`/`architecture.md` all publish exit codes 10–16 as a stable agent contract, but of the seven only `unreachable_queued`/`validation`/`policy_denied` were ever actually raised. `ensure_repo()` raised a bare `ValidationError` → exit **1** instead of `not_a_repo` (10); `_AuthRetryGroup.invoke()` called `sys.exit(1)` instead of `auth_failed` (12); `av commit` with nothing staged returned `ok:true`/exit **0** instead of `nothing_to_commit` (11); `av merge` with conflicts printed text and returned `None`/exit **0** instead of `merge_conflict` (14). An orchestrating agent keying off the documented registry (the whole point of publishing one) could not distinguish "nothing to do" from "conflict" from "success" by exit code alone. The SDK's parallel table (`av_sdk/exceptions.py`) already had it right — only the CLI drifted.
+
+**Fix:** all four paths now route through `fail()`, which — after also fixing #91 below — reliably raises the documented code. `av commit`/`av merge`'s exit-0 behavior on nothing-staged/conflict is a deliberate, called-out contract CHANGE (see `VERSIONING.md`'s v1.2.5 section): the documented registry wins over undocumented history.
+
+**Verification:** `tests/test_exit_codes.py` (new) — table-driven, provokes each of the seven codes through the real CLI and asserts the exact exit code, so the registry can't silently drift from the docs again.
+
+---
+
+### 87. `av pull`/`av merge`/`av clone` had no `--output json` support at all
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-09-01)
+
+**Problem:** `cmd_sync.py` never called `emit_json`/`fail` — the three CLI commands most likely to be hit by an autonomous loop reacting to a collision (`pull`, `merge`, `clone`) returned human-formatted text unconditionally, even under `--output json`. An agent parsing stdout as JSON would crash or silently misparse on exactly the code path where structured failure detail matters most.
+
+**Fix:** all three commands now emit proper JSON envelopes (success and `fail()` paths), with a new optional `error.data` field on the envelope carrying machine-readable context (conflict file lists, remediation strings, the racing local/remote run ids and tips) — populated everywhere a human remediation message already existed. The human-text path is byte-for-byte unchanged.
+
+**Verification:** new JSON-envelope tests in `tests/test_merge.py`/`tests/test_sync.py`; manual repro — two clones with distinct `AV_RUN_ID`s race a push to `main`, `av --output json pull` returns a parseable divergence envelope naming both runs.
+
+---
+
+### 88. `av watch`'s auto-commits were never tagged with the active run
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-01)
+
+**Problem:** Three call sites resolved the active run id with three different precedence orders — `av commit` checked env then state, `cmd_run.current_run_id()` checked state then env, and `cmd_watch.py:87` didn't resolve either at all, passing no `run_id` to `commit_staged()`. Auto-committed checkpoints from `av watch` were therefore silently never filed under the active run even with `av run start` active or `AV_RUN_ID` set — directly contradicting the documented "`AV_RUN_ID` joins ANY process' commits with zero integration" promise, for exactly the unattended, long-running process that promise is aimed at.
+
+**Fix:** one resolver, `core.resolve_run_id(repo_root, explicit=None)`, with a single documented precedence (explicit arg > `AV_RUN_ID` env > `.av/run.json` state). All three call sites, plus `commit_scoped_paths()` (the plugin seam), now route through it.
+
+**Verification:** regression tests for each precedence pair plus one asserting `av watch`'s auto-commits carry the `run:` tag; manual repro in a scratch repo with `AV_RUN_ID` set confirms watch-driven commits now link to the run.
+
+---
+
+### 89. `require_signature` branch policy always denied when the policy had no `metric` key
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-01)
+
+**Problem:** `enforce_policy()`/`promote()` both called `evaluate()` unconditionally once a policy entry existed, even when the entry's only field was `require_signature` (no `metric`). `evaluate()` on a metric-less policy reported a denial ("policy has no metric" style failure), so a signature-only policy denied EVERY candidate regardless of signature validity — the opposite of the intended behavior.
+
+**Fix:** both call sites now only invoke `evaluate()` when `pol.get("metric")` is truthy, treating a metric-less policy as a pure signature gate.
+
+**Verification:** `tests/test_v120.py::test_evaluate_operator_matrix` plus new `tests/test_signing.py` cases (`test_require_signature_policy_does_not_affect_policies_without_it` and the standalone-armed variants) exercise a metric-less policy end to end.
+
+---
+
+### 90. No CLI path ever existed to actually arm a `require_signature` policy
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-01)
+
+**Problem:** `av policy set` required `METRIC` and `OP` as positional arguments with no `--require-signature` flag — there was no way to create a `require_signature: true` policy entry through the CLI at all, signature-only or combined with a metric. Every test and the plan's own manual-verify script armed it by hand-writing `.av/policies.json` directly, which is how the gap went unnoticed through the rest of WP-4's implementation and review.
+
+**Fix:** `METRIC`/`OP` are now optional (`required=False`); a new `--require-signature` flag can be used alone (signature-only policy) or combined with a metric gate, with the trust-callout ("tamper evidence, not a PKI") in its help text per the docs' existing convention.
+
+**Verification:** `tests/test_v120.py::test_policy_set_require_signature_alone_is_a_valid_standalone_policy`, `test_policy_set_combines_metric_and_require_signature`, and two rejection-path tests for the new argument validation (metric without op, and neither metric nor `--require-signature`).
+
+---
+
+### 91. `click.Context.exit()` silently loses its exit code under `CliRunner(standalone_mode=False)`
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-09-01)
+
+**Problem:** `ctx.exit(code)` raises `click.exceptions.Exit`, which `CliRunner.invoke(..., standalone_mode=False)` — used throughout this test suite for JSON-mode assertions — silently swallows, leaving `result.exit_code` at 0 regardless of the code passed to `ctx.exit()`. `core.py::fail()` used exactly this pattern, so 42 call sites' documented exit codes were untestable (and, worse, `fail(None, ...)` never even reached the exit call, since `output_is_json(None)` was always `False` — see the ctx-resolution half of this same fix). Found empirically with isolated repro scripts, not by reading — this is a genuinely non-obvious Click/pytest interaction.
+
+**Fix:** `fail()` now always resolves a real context via `click.get_current_context(silent=True)` when none is passed, and always `raise SystemExit(exit_code)` — which behaves identically under both `standalone_mode=True` and `False`, unlike `ctx.exit()`.
+
+**Verification:** isolated bash/Python repro scripts proving the `ctx.exit()` vs `SystemExit` discrepancy directly; `tests/test_exit_codes.py`; full regression sweep after the change (`test_env_snapshot`/`test_exit_codes`/`test_signing`/`test_v122`/`test_webhooks_cli`/`test_merge`/`test_sync` — 124 passed). Saved as a persistent cross-session note given how non-obvious it is.
+
+---
+
+### 92. Bash command substitution silently discarded the engine's restart-budget state
+
+**Severity:** 8/10 · **Status:** 🟢 `fixed` (2026-09-01)
+
+**Problem:** `docker/engine-entrypoint.sh`'s restart-budget tracker was written as `count=$(record_and_count_restarts)` — calling a function via command substitution forks a subshell, so the function's mutation of the `RESTART_TIMES` array was invisible to the caller the instant the subshell exited. The restart count would silently never accumulate across restarts, meaning `AV_ENGINE_MAX_RESTARTS` could never actually trip: a genuinely crash-looping subservice would restart forever instead of the engine shutting down loudly as designed. This would have shipped invisibly — no unit test exercises the real supervision loop, and the bug produces no error, just a budget that silently never enforces.
+
+**Fix:** renamed to `record_restart()`, which sets a global `RESTART_COUNT` variable directly instead of echoing a return value — no subshell, no lost mutation.
+
+**Verification:** a custom empirical bash test harness driving the real script's structure (iterated twice to get the harness itself right — an early version's PIDs weren't direct children of the monitoring subshell, which `wait -n PID` rejected) confirms correct 1→2→3 restart-count progression and the budget correctly tripping shutdown on the 3rd restart within the window.
+
+---
+
+### 93. Two commands leaked human-text output ahead of their own `--output json` envelope
+
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-09-01)
+
+**Problem:** `av env replay` and `av handoff --publish` both had `click.secho`/`click.echo` calls that ran unconditionally before their JSON-mode envelope, so `--output json` output was JSON preceded (or interrupted) by stray human-readable lines — not valid JSON on its own, breaking any consumer parsing stdout directly.
+
+**Fix:** every such text call in both commands is now guarded with an explicit `if not json_mode` / `if current_output_mode() != "json"` check, matching the pattern already used everywhere else in the CLI.
+
+**Verification:** JSON-mode tests for both commands assert `stdout` parses as a single JSON document with no leading/trailing text; existing human-mode tests unchanged.

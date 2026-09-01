@@ -1,9 +1,14 @@
 """av branch protect / av promote — promotion guardrails for autonomous loops (v1.2.0).
 
 Policies live in .av/policies.json: {"<branch>": {"metric": str, "op": "<"|"<="|">"|">=",
-"baseline_ref": str}}. Enforcement is CLIENT-SIDE at merge/push-to-protected-branch time
-(server-side authz is an enterprise-tier item); `av promote` evaluates the policy by
-comparing the candidate's latest metrics against the baseline ref's tip metrics.
+"baseline_ref": str, "require_signature": bool}}. `metric"/"op"` and `require_signature`
+(v1.2.5) are independent gates — either or both may be present; a policy with only
+`require_signature` denies an unsigned candidate regardless of metrics. Enforcement is
+CLIENT-SIDE at merge/push-to-protected-branch time (server-side authz is an enterprise-tier
+item); `av promote` evaluates the metric policy by comparing the candidate's latest metrics
+against the baseline ref's tip metrics, and (v1.2.5) the signature policy by verifying the
+candidate's own embedded signature — tamper evidence, not a PKI; this does not bind a key
+to an identity.
 """
 
 import json
@@ -99,21 +104,45 @@ def policy() -> None:
 
 @policy.command("set")
 @click.argument("branch")
-@click.argument("metric")
-@click.argument("op", type=click.Choice(["<", "<=", ">", ">="]))
+@click.argument("metric", required=False, default=None)
+@click.argument("op", type=click.Choice(["<", "<=", ">", ">="]), required=False, default=None)
 @click.option("--baseline-ref", default=None, help="Compare against this ref's latest metrics.")
 @click.option("--threshold", type=float, default=None, help="Absolute threshold instead of a baseline.")
-def policy_set(branch: str, metric: str, op: str, baseline_ref: str | None, threshold: float | None):
-    """Require METRIC OP baseline/threshold before writes land on BRANCH."""
+@click.option("--require-signature", "require_signature", is_flag=True, default=False,
+              help="v1.2.5: deny promotion/merge of a candidate with no valid embedded "
+                   "signature on this branch. Tamper evidence, not a PKI — this does not "
+                   "bind a key to an identity. Combine with METRIC/OP for both gates, or "
+                   "pass alone (with no METRIC/OP) for a signature-only policy.")
+def policy_set(branch: str, metric: str | None, op: str | None, baseline_ref: str | None,
+               threshold: float | None, require_signature: bool):
+    """Require METRIC OP baseline/threshold and/or a valid signature before writes land on BRANCH.
+
+    METRIC and OP are optional when --require-signature is used alone (a signature-only
+    policy, e.g. `av policy set main --require-signature`)."""
     repo_root = ensure_repo()
     pol = load_policies(repo_root)
-    entry: dict = {"metric": metric, "op": op}
-    if baseline_ref:
-        entry["baseline_ref"] = baseline_ref
-    if threshold is not None:
-        entry["threshold"] = threshold
-    if "baseline_ref" not in entry and "threshold" not in entry:
-        fail(None, "validation", "Provide --baseline-ref or --threshold.")
+
+    if (metric is None) != (op is None):
+        fail(None, "validation", "METRIC and OP must be given together (or both omitted for a signature-only policy).")
+
+    entry: dict = {}
+    if metric is not None:
+        entry["metric"] = metric
+        entry["op"] = op
+        if baseline_ref:
+            entry["baseline_ref"] = baseline_ref
+        if threshold is not None:
+            entry["threshold"] = threshold
+        if "baseline_ref" not in entry and "threshold" not in entry:
+            fail(None, "validation", "Provide --baseline-ref or --threshold.")
+    elif baseline_ref or threshold is not None:
+        fail(None, "validation", "--baseline-ref/--threshold require METRIC and OP.")
+
+    if require_signature:
+        entry["require_signature"] = True
+    if not entry:
+        fail(None, "validation", "Provide METRIC OP (with --baseline-ref/--threshold) and/or --require-signature.")
+
     pol[branch] = entry
     save_policies(repo_root, pol)
     if current_output_mode() == "json":
@@ -149,11 +178,46 @@ def policy_remove(branch: str):
         click.secho(f"No policy for '{branch}'.", fg="yellow")
 
 
+def candidate_is_signed(repo_root, candidate_ref) -> tuple[bool, str]:
+    """v1.2.5: for `require_signature` policies — verifies the candidate's OWN embedded
+    signature (not a detached one; the candidate must carry it itself to promote/merge).
+    Returns (signed_and_valid, reason) so a denial message can say WHY."""
+    from .handoff import load_commit
+    from .signing import SigningUnavailable, verify_signature
+
+    commit = load_commit(repo_root, candidate_ref) if candidate_ref else None
+    if not commit:
+        return False, "candidate commit not found"
+    if not isinstance(commit.get("signature"), dict):
+        return False, "candidate commit is unsigned"
+    try:
+        ok, reason = verify_signature(commit)
+    except SigningUnavailable as exc:
+        return False, str(exc)
+    return ok, reason
+
+
 def enforce_policy(repo_root, target_branch: str, candidate_metrics: dict | None,
-                   baseline_metrics_fn) -> None:
-    """Raises PolicyDenied (via fail) when TARGET_BRANCH is protected and policy fails."""
+                   baseline_metrics_fn, candidate_ref=None) -> None:
+    """Raises PolicyDenied (via fail) when TARGET_BRANCH is protected and policy fails.
+
+    v1.2.5: `candidate_ref` (optional — pass the commit being merged/promoted) enables
+    the `require_signature` policy field. Omitting it preserves exact pre-1.2.5 behavior
+    for policies that don't set it (existing policies never fail a new, unrelated check)."""
     pol = load_policies(repo_root).get(target_branch)
     if not pol:
+        return
+    if pol.get("require_signature"):
+        signed, sig_reason = candidate_is_signed(repo_root, candidate_ref)
+        if not signed:
+            fail(None, "policy_denied",
+                 f"promotion to '{target_branch}' denied: require_signature is armed and "
+                 f"the candidate is not validly signed ({sig_reason}). "
+                 "Sign it (`av registry keygen` then re-commit) or override consciously "
+                 "with --force.")
+    # v1.2.5: require_signature is usable standalone — a policy with no "metric" key is a
+    # signature-only gate, not an incomplete metric policy (matches promote()'s handling).
+    if not pol.get("metric"):
         return
     base_ref = pol.get("baseline_ref")
     baseline = baseline_metrics_fn(base_ref) if base_ref else None
@@ -184,9 +248,24 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool) -> None:
 
     allowed, reason = True, "no policy armed"
     if pol_entry and not force:
-        base_ref = pol_entry.get("baseline_ref")
-        baseline = _latest_metrics_for_ref(repo_root, base_ref) if base_ref else None
-        allowed, reason = evaluate(pol_entry, cand_metrics, baseline)
+        # v1.2.5: require_signature is checked FIRST — a denial here should say "unsigned",
+        # not a misleading metric-comparison message when the metrics happen to also fail.
+        if pol_entry.get("require_signature"):
+            signed, sig_reason = candidate_is_signed(repo_root, cand_ref)
+            if not signed:
+                allowed, reason = False, (
+                    f"require_signature is armed and the candidate is not validly signed "
+                    f"({sig_reason})"
+                )
+        # v1.2.5: require_signature is usable standalone — a policy with no "metric" key
+        # is a signature-only gate, not an incomplete metric policy. evaluate() runs only
+        # when a metric IS configured (existing metric-only policies are unaffected).
+        if allowed and pol_entry.get("metric"):
+            base_ref = pol_entry.get("baseline_ref")
+            baseline = _latest_metrics_for_ref(repo_root, base_ref) if base_ref else None
+            allowed, reason = evaluate(pol_entry, cand_metrics, baseline)
+        elif allowed and pol_entry.get("require_signature"):
+            reason = "require_signature: candidate is validly signed"
     elif force and pol_entry:
         reason = f"policy BYPASSED via --force on '{into_branch}'"
 

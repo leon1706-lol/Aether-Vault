@@ -1,10 +1,13 @@
 """Shared helpers for framework plugins (Lightning, Transformers, MLflow).
 
 v1.2.2 migration: add/commit no longer shells through the CLI — plugins call
-`core.commit_scoped_paths()` directly (the same internal seam av_sdk.Repo uses), so
-there is no chdir dance and exactly one commit writer for CLI, SDK, watch, AND
-plugins. `run_av` remains ONLY for `push` (the deliberate CLI-flush at training end)
-and is kept for backward compatibility with external callers.
+`core.commit_scoped_paths()` directly (the same internal seam av_sdk.Repo uses).
+
+v1.2.5: `push` closes the last CLI hop too — `push_pending()` calls
+`core.flush_pending_push()` directly (the exact same call `av_sdk.Repo.push()` makes),
+so plugins now have ZERO remaining chdir/CLI-invocation assumptions. `run_av` and
+`build_metric_args` are kept as thin deprecated shims for one release cycle
+(VERSIONING.md's grace-window policy) for any external caller still importing them.
 """
 import os
 from pathlib import Path
@@ -28,11 +31,9 @@ def resolve_repo_root(start: Path) -> Path:
 
 
 def run_av(repo_root: Path, args: list[str]) -> None:
-    """Invokes the `av` CLI in-process with `args`, as if run from `repo_root`.
-
-    Kept for the plugin `push` flush (a CLI-flush by design — it drains the
-    pending_push queue through the exact code an interactive user runs). `add`/`commit`
-    no longer route here (see commit_scoped below).
+    """DEPRECATED (v1.2.5) — chdir + in-process CLI invocation. No longer called by any
+    plugin in this package (see push_pending() for the `push` replacement); kept only as
+    a shim for external callers still importing it, for one release's grace window.
     """
     previous_cwd = Path.cwd()
     os.chdir(repo_root)
@@ -42,6 +43,24 @@ def run_av(repo_root: Path, args: list[str]) -> None:
         cli.main(args=args, prog_name="av", standalone_mode=False)
     finally:
         os.chdir(previous_cwd)
+
+
+def push_pending(repo_root: Path) -> dict:
+    """v1.2.5: drains `.av/pending_push` via `core.flush_pending_push()` — the same call
+    `av_sdk.Repo.push()` makes, no chdir, no CLI hop. Replaces `run_av(repo_root,
+    ["push"])` as the training-end flush in every plugin callback.
+    """
+    from av_cli.client import VaultClient
+    from av_cli.core import flush_pending_push, load_config, load_pending_push
+
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"),
+                         cfg.get("remote_api_token"))
+    pending = load_pending_push(repo_root)
+    if not pending:
+        return {"drained": 0, "still_queued": 0}
+    still = flush_pending_push(repo_root, client)
+    return {"drained": len(pending) - len(still), "still_queued": len(still)}
 
 
 def build_metric_args(metrics: dict) -> list[str]:

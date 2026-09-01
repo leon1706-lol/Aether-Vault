@@ -155,3 +155,45 @@ def test_avattributes_unknown_flags_ignored_everywhere(tmp_path):
     )
     flags = flags_for(load_attributes(tmp_path), "x.h5")
     assert flags == {"no-chunk"}, "unknown flags must be ignored (forward compat)"
+
+
+# ---------------------------------------------------------------------------
+# v1.2.5: broadened default extension set + the `chunk` opt-in flag
+# ---------------------------------------------------------------------------
+
+def test_new_default_extensions_are_actually_in_chunkable_exts():
+    """Pins the specific v1.2.5 additions so a future refactor can't silently drop one."""
+    for ext in (".bin", ".onnx", ".model", ".arrow", ".feather", ".pkl", ".pickle"):
+        assert ext in CHUNKABLE_EXTS
+
+
+def test_chunk_flag_force_enables_a_non_default_extension(small_threshold_repo, tmp_path):
+    """.parquet is deliberately NOT in CHUNKABLE_EXTS (compressed-by-default risk) — the
+    `chunk` flag must still force it on for a glob the repo owner has vetted."""
+    assert ".parquet" not in CHUNKABLE_EXTS
+    (tmp_path / ".avattributes").write_text("*.parquet chunk\n")
+    entry = _stage(small_threshold_repo, "d.parquet", PAYLOAD)
+    assert entry.get("chunks"), "chunk flag did not force CDC for a non-default extension"
+    assert not entry.get("layers")
+
+
+def test_without_chunk_flag_non_default_extension_stays_whole_file(small_threshold_repo, tmp_path):
+    entry = _stage(small_threshold_repo, "d.parquet", PAYLOAD)
+    assert not entry.get("chunks"), "an extension outside CHUNKABLE_EXTS chunked by default"
+    obj = small_threshold_repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
+    assert obj.exists()
+
+
+def test_no_chunk_wins_over_chunk_on_the_same_line(small_threshold_repo, tmp_path):
+    """Safety over opt-in: `no-chunk` always wins when both flags are on one matching line."""
+    (tmp_path / ".avattributes").write_text("*.parquet chunk no-chunk\n")
+    entry = _stage(small_threshold_repo, "d.parquet", PAYLOAD)
+    assert not entry.get("chunks"), "no-chunk should have overridden chunk on the same line"
+
+
+def test_chunk_flag_is_a_no_op_for_already_default_chunkable_extensions(small_threshold_repo, tmp_path):
+    """Redundant but harmless: `chunk` on an extension already in CHUNKABLE_EXTS changes
+    nothing (still chunks), it just doesn't need to be there."""
+    (tmp_path / ".avattributes").write_text("*.npz chunk\n")
+    entry = _stage(small_threshold_repo, "d.npz", PAYLOAD)
+    assert entry.get("chunks")

@@ -48,16 +48,21 @@ def test_run_av_add_and_commit_checkpoint(tmp_path):
     assert "model.pt" in commit_data["tree"]
 
 
-def test_run_av_commit_with_no_changes_does_not_raise(tmp_path):
+def test_run_av_commit_with_no_changes_raises_nothing_to_commit(tmp_path):
     repo_root = _init_repo(tmp_path)
     ckpt = repo_root / "model.pt"
     ckpt.write_text("dummy weights")
     run_av(repo_root, ["add", str(ckpt)])
     run_av(repo_root, ["commit", "-m", "first"])
 
-    # Nothing staged the second time around -- must hit the "Nothing to
-    # commit" path in av_cli/main.py, not raise.
-    run_av(repo_root, ["commit", "-m", "second"])
+    # v1.2.5: nothing staged the second time around now hits fail("nothing_to_commit")
+    # -> SystemExit(11) (see tests/test_exit_codes.py), matching the documented registry
+    # — pre-1.2.5 this exited 0/didn't raise, which is what this test used to assert.
+    # run_av's cli.main(standalone_mode=False) doesn't catch SystemExit (unlike
+    # CliRunner), so it propagates here exactly as it would to any real caller.
+    with pytest.raises(SystemExit) as exc:
+        run_av(repo_root, ["commit", "-m", "second"])
+    assert exc.value.code == 11
 
     commits_dir = repo_root / ".av" / "commits"
     assert len(list(commits_dir.glob("*.json"))) == 1
@@ -653,6 +658,163 @@ def test_seam_parity_plugin_vs_sdk_vs_cli(tmp_path, monkeypatch):
         assert seam_tree[field] == sdk_tree[field] == cli_tree[field], \
             f"parity broken on {field}: seam={seam_tree[field]} " \
             f"sdk={sdk_tree[field]} cli={cli_tree[field]}"
+
+    # v1.2.5: schema parity — not just matching VALUES on a hand-picked field subset,
+    # but the same PAYLOAD KEY SET across all three surfaces (catches one surface
+    # silently gaining/losing a top-level field the others don't have).
+    def _payload_keys(repo):
+        raw = json_mod.loads(next(iter((repo / ".av" / "commits").glob("*.json"))).read_text())
+        return set(raw.keys())
+
+    seam_keys = _payload_keys(seam_repo)
+    sdk_keys = _payload_keys(sdk_repo)
+    cli_keys = _payload_keys(cli_repo)
+    assert seam_keys == sdk_keys == cli_keys, \
+        f"payload schema drift: seam={seam_keys ^ sdk_keys ^ cli_keys}"
+
+
+def test_seam_parity_run_id_linkage(tmp_path, monkeypatch):
+    """v1.2.5: the same AV_RUN_ID produces the same run: tag + run_id field across all
+    three surfaces (previously only asserted for the seam alone)."""
+    import json as json_mod
+
+    from av_sdk import Repo
+    from python.av_cli.core import commit_scoped_paths
+
+    monkeypatch.setenv("AV_RUN_ID", "parity-run-xyz")
+
+    def _run_fields(commit_file):
+        data = json_mod.loads(commit_file.read_text())
+        return {"run_id": data.get("run_id"),
+                "run_tag": next((t for t in data.get("tags", []) if t.startswith("run:")), None)}
+
+    seam_repo = _init_repo(_mkdir(tmp_path / "seam-run"))
+    (seam_repo / "artifact.bin").write_bytes(b"x")
+    commit_scoped_paths(seam_repo, ["artifact.bin"], "via seam")
+    seam_run = _run_fields(next(iter((seam_repo / ".av" / "commits").glob("*.json"))))
+
+    sdk_repo = _init_repo(_mkdir(tmp_path / "sdk-run"))
+    with Repo(sdk_repo) as r:
+        (r.path / "artifact.bin").write_bytes(b"x")
+        r.add("artifact.bin")
+        r.commit("via sdk")
+    sdk_run = _run_fields(next(iter((sdk_repo / ".av" / "commits").glob("*.json"))))
+
+    cli_repo = _mkdir(tmp_path / "cli-run")
+    _init_repo(cli_repo)
+    (cli_repo / "artifact.bin").write_bytes(b"x")
+    run_av(cli_repo, ["add", "artifact.bin"])
+    run_av(cli_repo, ["commit", "-m", "via cli"])
+    cli_run = _run_fields(next(iter((cli_repo / ".av" / "commits").glob("*.json"))))
+
+    assert seam_run == sdk_run == cli_run == {
+        "run_id": "parity-run-xyz", "run_tag": "run:parity-run-xyz",
+    }
+
+
+def test_seam_parity_env_snapshot_id(tmp_path):
+    """v1.2.5: env_snapshot_id, when a snapshot exists, rides the commit identically
+    across all three surfaces."""
+    import json as json_mod
+
+    from av_sdk import Repo
+    from python.av_cli.core import commit_scoped_paths
+
+    def _write_snapshot(repo):
+        from python.av_cli.core import env_snapshot_file
+
+        env_snapshot_file(repo).write_text(json_mod.dumps({
+            "snapshot_version": 2, "captured_at": "2026-01-01T00:00:00+00:00",
+            "python": "3.12.0", "env": {"python": "3.12.0", "pins": {}, "seeds": {}},
+        }))
+
+    def _sid(commit_file):
+        return json_mod.loads(commit_file.read_text()).get("env_snapshot_id")
+
+    seam_repo = _init_repo(_mkdir(tmp_path / "seam-env"))
+    _write_snapshot(seam_repo)
+    (seam_repo / "artifact.bin").write_bytes(b"x")
+    commit_scoped_paths(seam_repo, ["artifact.bin"], "via seam")
+    seam_sid = _sid(next(iter((seam_repo / ".av" / "commits").glob("*.json"))))
+    assert seam_sid  # sanity: the snapshot actually rode the commit
+
+    sdk_repo = _init_repo(_mkdir(tmp_path / "sdk-env"))
+    _write_snapshot(sdk_repo)
+    with Repo(sdk_repo) as r:
+        (r.path / "artifact.bin").write_bytes(b"x")
+        r.add("artifact.bin")
+        r.commit("via sdk")
+    sdk_sid = _sid(next(iter((sdk_repo / ".av" / "commits").glob("*.json"))))
+
+    cli_repo = _mkdir(tmp_path / "cli-env")
+    _init_repo(cli_repo)
+    _write_snapshot(cli_repo)
+    (cli_repo / "artifact.bin").write_bytes(b"x")
+    run_av(cli_repo, ["add", "artifact.bin"])
+    run_av(cli_repo, ["commit", "-m", "via cli"])
+    cli_sid = _sid(next(iter((cli_repo / ".av" / "commits").glob("*.json"))))
+
+    assert seam_sid == sdk_sid == cli_sid
+
+
+def test_seam_parity_queued_when_server_unreachable(tmp_path):
+    """v1.2.5: all three surfaces queue (never fail/lose the commit) identically when
+    the registry is unreachable — matches the queued/queued_reason contract."""
+    from av_sdk import Repo
+    from python.av_cli.core import commit_scoped_paths, load_pending_push
+
+    seam_repo = _init_repo(_mkdir(tmp_path / "seam-q"))
+    (seam_repo / "artifact.bin").write_bytes(b"x")
+    commit_scoped_paths(seam_repo, ["artifact.bin"], "via seam")
+    assert load_pending_push(seam_repo), "seam commit should have queued (server unreachable)"
+
+    sdk_repo = _init_repo(_mkdir(tmp_path / "sdk-q"))
+    with Repo(sdk_repo) as r:
+        (r.path / "artifact.bin").write_bytes(b"x")
+        r.add("artifact.bin")
+        result = r.commit("via sdk")
+    assert result.get("queued") is True
+    assert load_pending_push(sdk_repo)
+
+    cli_repo = _mkdir(tmp_path / "cli-q")
+    _init_repo(cli_repo)
+    (cli_repo / "artifact.bin").write_bytes(b"x")
+    run_av(cli_repo, ["add", "artifact.bin"])
+    run_av(cli_repo, ["commit", "-m", "via cli"])
+    assert load_pending_push(cli_repo)
+
+
+def test_seam_parity_error_codes_not_a_repo_and_nothing_staged(tmp_path):
+    """v1.2.5: the same failure conditions map to the documented codes across the SDK
+    (SDKError.code/.exit_code) and the seam (return-value contract). The CLI side of this
+    same parity (exit 10/11 via fail()) is proven directly in tests/test_exit_codes.py —
+    this test is the plugin/SDK-side half of the WP-7 exit-code registry fix.
+    """
+    from av_sdk import Repo
+    from av_sdk.exceptions import SDKError
+    from python.av_cli.core import EXIT_NOT_A_REPO, EXIT_NOTHING_TO_COMMIT, commit_scoped_paths
+
+    # not_a_repo:
+    not_a_repo_dir = _mkdir(tmp_path / "not-a-repo")
+    with pytest.raises(SDKError) as sdk_exc:
+        Repo(not_a_repo_dir)
+    assert sdk_exc.value.code == "not_a_repo"
+    assert sdk_exc.value.exit_code == EXIT_NOT_A_REPO
+
+    # nothing_to_commit: the seam returns None (its documented no-op contract) — it's
+    # intentionally scoped to only ever commit what was just staged, so "nothing to
+    # commit" is a normal, silent no-op there, not a failure — while the SDK raises with
+    # the dedicated code, matching what av commit now does (see test_exit_codes.py).
+    seam_repo = _init_repo(_mkdir(tmp_path / "seam-empty"))
+    result = commit_scoped_paths(seam_repo, [], "empty")
+    assert result is None
+
+    sdk_repo = _init_repo(_mkdir(tmp_path / "sdk-empty"))
+    with Repo(sdk_repo) as r:
+        with pytest.raises(SDKError) as exc:
+            r.commit("empty")
+    assert exc.value.code == "nothing_to_commit"
+    assert exc.value.exit_code == EXIT_NOTHING_TO_COMMIT
 
 
 def _mkdir(p):

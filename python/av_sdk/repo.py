@@ -315,3 +315,35 @@ class Repo:
         from av_cli.handoff import build_handoff_dict
 
         return build_handoff_dict(self.path, None)
+
+    def publish_handoff(self) -> dict:
+        """v1.2.5: generates/updates handoff.avh and links it to the active run so the
+        WebUI run-detail view can render context-memory notes — the SDK counterpart to
+        `av handoff --publish`. OPT-IN and explicit only: notes can hold private
+        reasoning, so nothing publishes them without calling this. Requires an active
+        run (run_start() / AV_RUN_ID) and a reachable registry — raises SDKError
+        ("validation") for either failure rather than queuing (no offline-retry queue
+        exists for run-level metadata, unlike commits)."""
+        from av_cli.core import hash_file_safe
+        from av_cli.handoff import generate_handoff
+
+        run_id = self._run_id()
+        if not run_id:
+            self._fail("validation", "No active run (run_start() / AV_RUN_ID) — "
+                       "publish_handoff() links the .avh to a run.")
+
+        avh_path, _md_path = generate_handoff(self.path, update=True, agent_instructions=None)
+
+        client = self._client()
+        if not client.server_available():
+            self._fail("validation", f"Registry unreachable at {client.server_url} — "
+                       "could not publish.")
+        avh_hash = hash_file_safe(str(avh_path))
+        if not client.upload_object(avh_path, avh_hash):
+            self._fail("validation", "Failed to upload the .avh object to the registry.")
+        resp = client.session.post(f"{client.server_url}/api/runs/{run_id}/avh",
+                                   json={"avh_object_id": avh_hash}, timeout=30)
+        if resp.status_code != 200:
+            self._fail("validation",
+                       f"Failed to link the .avh to run {run_id}: HTTP {resp.status_code}")
+        return {"run_id": run_id, "avh_object_id": avh_hash, "path": str(avh_path)}

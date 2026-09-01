@@ -60,7 +60,8 @@ v1.2.0 trust surfaces: the audit trail (audit_log, on by default, disable with
 AV_AUDIT_LOG=0) records who performed each mutation; webhook signing secrets are stored
 registry-side because deliveries must be signed — treat registry compromise as secret
 compromise for subscribers; commit attestations are HMAC-based integrity-v0 (tamper
-evidence vs. key-holders only), asymmetric signing is enterprise-tier.
+evidence vs. key-holders only). Asymmetric (ed25519) commit signing is a regular,
+free-tier feature since v1.2.2 (`av registry keygen`) — see the next section.
 
 ## Signed commits (v1.2.2) - the trust model, stated plainly
 
@@ -85,3 +86,29 @@ DOES NOT mean:
 - **Threat-model boundary**: anyone who can write to `.av/keys/` can sign as you - protect
   it like an SSH private key. Registry compromise lets an attacker DELETE signatures but
   not forge new ones without the private key.
+
+### Key management and rotation (v1.2.5)
+
+`av registry keys list` shows every key this repo knows (active + archived) with its
+fingerprint (`sha256` of the raw public key, first 16 hex chars, `xxxx:xxxx:xxxx:xxxx`) and
+creation time; `av registry keys fingerprint` prints just the active one, for scripting.
+`av registry keys rotate` archives the current keypair to `.av/keys/archive/<fingerprint>/`
+(never deletes it) and generates a fresh one — old commits keep verifying against their
+own embedded (archived) public key, new commits sign with the new one. Rotate on suspected
+key compromise, or on a schedule your policy dictates; there is no server-side revocation,
+because there is no PKI to revoke against — see "not a trust network" above.
+
+For sharing a signature outside this repo's config, `av registry export-signature <hash>`
+produces a standalone `{hash, algo, public_key, sig, canonical_sha256, exported_at}`
+record; `av verify <hash> --signature FILE` verifies from that file alone, without needing
+local repo config or registry access — useful for a third-party auditor.
+
+### Signature requirement policy (v1.2.5)
+
+`av policy set <branch> --require-signature` (optionally combined with a metric gate) denies
+promotion/merge of a candidate with no valid signature embedded in its OWN commit (exit 16,
+`policy_denied`) — a detached signature does not satisfy this, by design: the point is
+enforcing that commits landing on a protected branch are themselves signed, not that a
+signature exists somewhere. This is still tamper evidence, not an identity check: arming it
+raises the bar to "every commit on this branch was signed by someone holding a private key
+at commit time," not "signed by a specific, verified person."

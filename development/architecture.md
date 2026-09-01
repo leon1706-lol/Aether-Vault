@@ -111,10 +111,10 @@ The cheap short-circuit comes before any hashing: when the recorded size and mti
 Artifacts above the LFS threshold — default 50 MB via the `lfs_threshold_mb` config key, changed with `av config <N>` — get structure-aware storage, in priority order:
 
 1. **Layer split** — `.safetensors` files go through `aether_core.split_and_hash_safetensors`, producing one shard per tensor layer plus an `__header__` pseudo-layer holding the header bytes, so unchanged layers dedup across checkpoint epochs and single layers can be fetched alone.
-2. **CDC chunking** — `.pt`/`.pth`/`.ckpt` files (the `CHUNKABLE_EXTS` set) go through `aether_core.chunk_and_hash_file`: gear-hash rolling cut points with min 512 KB, avg 2 MB, max 8 MB. The max is a soft cap of `max + min − 1` because a cut is only taken when at least `min_chunk` bytes remain after it — the tail never becomes a sliver.
+2. **CDC chunking** — files matching the `CHUNKABLE_EXTS` set go through `aether_core.chunk_and_hash_file`: gear-hash rolling cut points with min 512 KB, avg 2 MB, max 8 MB. The max is a soft cap of `max + min − 1` because a cut is only taken when at least `min_chunk` bytes remain after it — the tail never becomes a sliver. `CHUNKABLE_EXTS` (v1.2.5, broadened from 8 to 15): `.pt .pth .ckpt .npz .h5 .hdf5 .pb .msgpack .bin .onnx .model .arrow .feather .pkl .pickle` — uncompressed/block-structured formats where a local edit only shifts nearby chunks. Compressed/columnar containers (`.parquet`, `.zip`/`.gz`/`.tar`/`.7z`) are deliberately excluded by default — an edit there usually rewrites the whole compressed stream, so CDC boundaries wouldn't survive it — but are reachable per-glob via the `chunk` `.avattributes` flag when a repo owner has verified their export path is safe.
 3. **Whole-file blob** — anything that did not split or chunk stores as one object.
 
-Per-path overrides come from `.avattributes`, parsed by `python/av_cli/attributes.py::flags_for()` with fnmatch globs and last-match-wins semantics: `no-chunk` forces an opaque checkpoint down the whole-file path, `no-layer-split` keeps a safetensors file unsplit. Both splits fall back to whole-file on any exception rather than failing the stage.
+Per-path overrides come from `.avattributes`, parsed by `python/av_cli/attributes.py::flags_for()` with fnmatch globs and last-match-wins semantics: `no-chunk` forces a file down the whole-file path, `chunk` (v1.2.5) force-enables CDC for a glob outside `CHUNKABLE_EXTS` (`no-chunk` wins when both are on the same matching line), `no-layer-split` keeps a safetensors file unsplit. Both splits fall back to whole-file on any exception rather than failing the stage.
 
 Determinism is a dedup invariant, not a nicety: the gear table in `src/core.cpp` is generated from splitmix64 with a fixed seed, so identical bytes produce identical chunk boundaries — and therefore identical chunk hashes — on every machine and every version. A nondeterministic chunker would silently break cross-version dedup and make pushed histories unreconstructable.
 
@@ -261,11 +261,12 @@ Two credential sources, one middleware:
 - `AV_API_TOKEN` — the owner's shared secret (the original single-key mode, unchanged). Resolves to the identity `owner`.
 - `AV_AUTH_USERS` — JSON map `{username: token}` of per-user tokens (`av auth add-user/list-users/remove-user`). Invalid JSON fails startup loudly rather than silently looking like Anonymous mode. Each entry resolves to its username.
 
-The single `require_token` middleware resolves Bearer tokens through both sources with `secrets.compare_digest` (owner checked first), stores the resolved username on `request.state.username`, and exempts exactly four paths:
+The single `require_token` middleware resolves Bearer tokens through both sources with `secrets.compare_digest` (owner checked first), stores the resolved username on `request.state.username`, and exempts exactly five paths:
 
 | Exempt path | Why it stays open |
 |---|---|
-| `/api/health` | Docker healthchecks and the CLI's reachability probes depend on credential-free checks — gating it would make a freshly-protected server look permanently down to the very code restarting it |
+| `/api/health` | Docker healthchecks and the CLI's reachability probes depend on credential-free checks — gating it would make a freshly-protected server look permanently down to the very code restarting it. Liveness only: DB-free, always green, and (a pre-existing, now-fixed staleness) reports the real installed package version instead of a hardcoded string. |
+| `/api/ready` (v1.2.5) | Readiness, not liveness — checks DB connectivity, Redis, and `AV_DATA_DIR` writability, returning 503 with per-check detail on failure. Same auth-exemption rationale as `/api/health` (compose healthchecks and restart logic must reach it credential-free), but it is allowed to go red when the container is genuinely unusable — that's the whole point of separating it from `/api/health`, which never does. |
 | `/docs` | Swagger/ReDoc cannot attach the custom Bearer header; they expose API shape, not data |
 | `/openapi.json` | Same rationale as `/docs` |
 | `/redoc` | Same rationale as `/docs` |
@@ -327,9 +328,13 @@ delegates to `core.commit_scoped_paths()` — the same function agent tooling us
 stages via `stage_one_file` directly (no chdir, no CLI invocation) and funnels into
 `commit_staged` → `_finalize_commit`. Scoped-commit semantics are unchanged: isolation
 without destroying the change-detection baseline (#38/#71), missing-path tolerance (#76),
-AV_RUN_ID flow. `run_av()` remains ONLY for `push` (the deliberate CLI flush at training
-end). The historical rationale for the old in-process CLI bridge is preserved here because
-`run_av` itself survives for that one path.
+AV_RUN_ID flow via `core.resolve_run_id()` (v1.2.5: explicit > `AV_RUN_ID` env >
+`.av/run.json` state — the one precedence rule shared with `av commit`/`av watch`; before
+this, three call sites silently disagreed, and `av watch`'s auto-commits weren't tagged
+under the active run at all). Training-end flush is `_shared.push_pending()` (v1.2.5,
+delegates to `core.flush_pending_push()` directly) — as of v1.2.5 no plugin has any
+remaining chdir or in-process CLI invocation; `run_av()`/`build_metric_args()` are
+deprecated shims kept one release for external callers.
 
 **Scoped commits (v1.1.9, seam v1.2.2):** every plugin add+commit pair (callbacks AND import backfills) runs through the scoping seam, which isolates one commit without destroying the change-detection baseline: staging runs against the untouched index, the scope is computed as exactly what that staging touched (new keys, changed content, staged transitions), committed through the real single code path, and everything else merges back with its staged flag untouched — an import or checkpoint commit therefore never sweeps unrelated human-staged files into its tree (Probleme.md #38), and unchanged re-imports stay "Nothing to commit" no-ops (Probleme.md #71). Plain `av commit` keeps full-snapshot semantics; only machine-driven plugin events are scoped.
 
@@ -396,15 +401,41 @@ verbatim, persists in `commits.signature` (0003), and survives clone/pull so `av
 <hash>` works on any copy: signature-first, legacy HMAC attest-tag fallback, honest UNSIGNED
 verdict (exit 0 — unsigned commits are valid). Signing never blocks or fails a commit.
 
-## Env Snapshot Contract (v1.2.2)
+**Key management (v1.2.5):** `av registry keys list/fingerprint/rotate` — fingerprint is
+`sha256(raw pubkey)[:16 hex]` in `xxxx:xxxx:xxxx:xxxx` form (golden-fixture tested). Rotate
+archives the current keypair under `.av/keys/archive/<fingerprint>/` (never deletes it —
+old commits keep verifying via their embedded public key) and generates a fresh active
+key. `av registry export-signature <hash> [--out FILE]` produces a standalone,
+portable signature record (adds `canonical_sha256` + `fingerprint`) for
+`av registry verify <hash> --signature FILE` — detached verification needs only the
+commit content and the record, no local config or registry access.
 
-A snapshot's id IS `sha256(canonical bytes)` where canonical = compact sorted-keys JSON of
-the snapshot minus `captured_at` — equal environments produce equal ids (determinism is a
-tested contract). Snapshots upload through the NORMAL object flow at push; commits carry
+## Env Snapshot Contract (v1.2.2, `snapshot_version: 2` v1.2.5)
+
+A snapshot's id IS `sha256(canonical bytes)`. Since v1.2.5 (`snapshot_version: 2`),
+canonical bytes = compact sorted-keys JSON of ONLY `{snapshot_version, env}` — `env`
+holds reproducibility-relevant identity (python, os family, curated pins, seeds, CUDA
+*toolkit* version, a configurable critical-env-var set); machine-specific `observed`
+context (GPU model, driver version, hostname, conda env name, interpreter path,
+`captured_at`) is captured but deliberately excluded from the hash, so two equivalent
+environments on DIFFERENT machines/OSes produce the SAME id (the golden cross-machine
+fixtures in `tests/test_env_snapshot.py`, run across every CI matrix leg, are the
+determinism proof). Top-level flat fields (`python`, `pins`, `seeds`,
+`cuda_visible_devices`) are kept for backward compatibility with every existing reader.
+Legacy (no `snapshot_version`) snapshots hash exactly as before (whole dict minus
+`captured_at`) — ids are only comparable within one `snapshot_version`.
+
+Snapshots upload through the NORMAL object flow at push; commits carry
 `env_snapshot_id` in the hashed payload; the server persists it on commits AND back-fills
 linked runs on first link (first-link wins). Readers: `av env replay [target]` /
 top-level `av replay <run-id|commit-hash|snapshot-id>` resolve from local CAS or registry;
-`.avh.replay.snapshot_id` carries the pointer into agent context memory.
+`.avh.replay.snapshot_id` carries the pointer into agent context memory. `av env replay`
+flags (v1.2.5): `--validate` resolves every pin via `pip install --dry-run` without
+installing (exit 15 on any unresolvable pin); `--execute` now always uses
+`sys.executable -m pip` (previously a bare `pip` string, which could silently resolve to
+the wrong interpreter) and accepts `--target-venv PATH` (create-if-absent) or
+`--conda-env NAME`; `--dockerfile` renders a multi-stage, non-root Dockerfile and accepts
+`--cuda TAG` (nvidia/cuda base) and `--out FILE`.
 
 ## Audit Trail Contract (v1.2.2)
 
@@ -414,15 +445,18 @@ attempt. Read surface: `GET /api/admin/audit?action&project_id&since&until&limit
 (invalid timestamps → 422), CLI `av audit list`. Retention: `AV_AUDIT_RETENTION_DAYS`
 (default 90) swept during GC plus manual prune endpoint.
 
-## Semantic Diff Contract (v1.2.0, dedup_efficiency v1.2.2)
+## Semantic Diff Contract (v1.2.0, dedup_efficiency v1.2.2, chunks.status v1.2.5)
 
 `python/av_cli/semdiff.py::diff_trees(old_tree, new_tree)` is pure: added/removed/changed,
 per-model layer movement (count/pct/largest movers), chunk reuse ratio across CDC-chunked
 files (+ `chunks.dedup_efficiency` = reused/(reused+new), None when no chunks — flows into
-`.avh.semantic_summary`), dataset classification (extension+name heuristics), byte totals,
-and a one-sentence human summary. Consumers: `av diff`, `.avh.semantic_summary`, WebUI
-expanded commits and the v1.2.2 run-detail panel (client-side re-composition in
-`webui/src/lib/runDetail.ts`). The dict shape is additive-only by policy.
+`.avh.semantic_summary`; `chunks.status` (v1.2.5) is a sibling field ALWAYS present as
+`"measured"`/`"no_chunks"`, so consumers get a stable field to branch on without a
+null-check on the float — `None` stays meaningful as "no signal", not "0%"), dataset
+classification (extension+name heuristics), byte totals, and a one-sentence human
+summary. Consumers: `av diff`, `.avh.semantic_summary`, WebUI expanded commits and the
+v1.2.2 run-detail panel (client-side re-composition in `webui/src/lib/runDetail.ts`). The
+dict shape is additive-only by policy.
 
 ## .avh v2 — Agent Context Memory Contract (v1.2.0)
 
@@ -433,13 +467,16 @@ and: `lineage{run_id,parent_run_ids,code_pointer{git_remote,git_sha,dirty}}`,
 `.av/context/memory.jsonl` (`av context note`) and survive every regeneration.
 Readers must tolerate unknown sections; writers must run `validate_handoff()` in CI paths.
 
-## Promotion Policy Contract (v1.2.0)
+## Promotion Policy Contract (v1.2.0, `require_signature` v1.2.5)
 
 Policies live in `.av/policies.json`: `{branch: {metric, op∈{<,<=,>,>=},
-baseline_ref|threshold}}`. Enforcement points: `av merge` (current branch armed → deny,
-exit 16, unless --force) and `av promote CANDIDATE --into BRANCH` (authoritative eval —
-merge-side check intentionally bypassed there to avoid comparing the baseline against
-itself). Enforcement is CLIENT-SIDE v1; server-side authz is enterprise-tier.
+baseline_ref|threshold, require_signature}}` — `require_signature` (v1.2.5, additive) is
+usable standalone (no `metric` required) as a pure signature gate, checked BEFORE any
+metric comparison so a denial reports "unsigned", not a misleading metric mismatch.
+Enforcement points: `av merge` (current branch armed → deny, exit 16, unless --force) and
+`av promote CANDIDATE --into BRANCH` (authoritative eval — merge-side check intentionally
+bypassed there to avoid comparing the baseline against itself). Enforcement is
+CLIENT-SIDE v1; server-side authz is enterprise-tier.
 
 ## Testing And Verification Map
 
@@ -459,7 +496,7 @@ itself). Enforcement is CLIENT-SIDE v1; server-side authz is enterprise-tier.
 | Dataset CDC matrix | `tests/test_dataset_cdc.py` | Boundary stability/determinism across every CHUNKABLE_EXT + `.avattributes` enforcement matrix |
 | V1.2.2 units | `tests/test_v122.py` | dedup_efficiency→.avh flow, avh schema-file validation path, audit-list param contract |
 | Agent surface (v1.2.0) | `tests/test_v120.py`, `tests/test_av_sdk.py`, `tests/test_semdiff.py`, `tests/test_webhooks_cli.py` | Envelope/exit codes, SDK seam, semdiff math, webhooks CLI |
-| Perf gate | `tests/test_perf_gate.py` | speedcheck synthetic probes within 2× budget (strictened from 3× in v1.2.2; incl. semdiff probe) |
+| Perf gate | `tests/test_perf_gate.py` | speedcheck synthetic probes, median-of-N (v1.2.5) vs. per-class budgets — CPU 2×, disk 3× (+1.5× more on Windows); fails only when the median AND ≥2/N samples exceed budget; `AV_PERF_BUDGET_MULTIPLIER` escape hatch; incl. semdiff, commit_staged, compute_status, log probes |
 | Web UI units | `webui/` Vitest suite (`npm test`) | Components plus pure logic incl. `diffWeights` and `runDetail` (lineage chain + client-side tree-diff summary) |
 | Web UI browser E2E | `webui/e2e/*.spec.ts` (Playwright, CI `webui-e2e`) | Seeded live stack: dashboard, weight-diff, and Protected-mode token gate |
 | Product E2E scenarios | `scripts/e2e_scenario.sh` (CI `e2e-suite`) | Real CLI ↔ real server: merge collaboration, offline drain, legacy-volume upgrade, per-user auth attribution/revocation, zero-grace GC, SDK loop, event reactiveness, promotion policy, signed roundtrip (J), audit query (K) |

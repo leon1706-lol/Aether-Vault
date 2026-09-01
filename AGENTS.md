@@ -2,7 +2,15 @@
 
 You are working on **Aether-Vault**, a high-performance artifact version-control system
 for ML (models/datasets) with an autonomous-training focus. Read this before changing
-anything.
+anything. `Aether-vault-Obsidian-Vault/Essential-Tasks.md` is the wrap-up checklist this
+file defers to — treat it as part of this contract, not optional extra credit.
+
+## Before touching anything
+
+- **Sub-readmes** — every folder has a short one; read the one for whatever you're touching.
+- **`development/*.md`** — read all of them; they hold the structure/plan context.
+- **`Aether-vault-Obsidian-Vault/`** — a generated dependency/function graph for orientation.
+  Cross-check against source before relying on it; it can be stale.
 
 ## Non-negotiables
 
@@ -12,12 +20,15 @@ anything.
 2. **Single restore/materialization path.** Working-tree writes go through
    `_materialize_tree()`.
 3. **Offline resilience is sacred.** Any network failure must queue work
-   (`.av/pending_push`), never lose it. `unreachable_queued` = safe.
+   (`.av/pending_push`), never lose it. `unreachable_queued` = safe, not an error.
 4. **Contracts are versioned.** JSON envelope shapes, exit codes 10–16, `.avh`
-   (`avh_version`), and HTTP payloads are user-facing contracts. Additive changes only
-   without a MINOR bump + CHANGELOG entry.
-5. **Tests travel with code.** New behavior lands together with its tests; the CI map
-   lives in `development/infrastructure.md`. Run `pytest tests/ -q` before declaring done.
+   (`avh_version`), and HTTP payloads are user-facing contracts. Additive changes only,
+   with a MINOR bump + CHANGELOG entry.
+5. **Nothing is done until it's verified.** New behavior ships with its own tests
+   (`pytest tests/ -q` green) *and* a manual, real-CLI repro in a scratch repo outside
+   this checkout — unit tests alone have repeatedly missed real bugs here. Full sequence
+   — manual debug → tests → docs → vault regen → sanity check — lives in
+   `Aether-vault-Obsidian-Vault/Essential-Tasks.md`; run it before declaring done.
 
 ## Where things live
 
@@ -35,8 +46,7 @@ anything.
 - Agent-facing output: use `emit_json/fail` from core; never print human text in json mode.
 - DB changes: append an Alembic revision (`0003…`), update `test_migrations.py` heads.
 - Docs move with code: README CLI reference, architecture.md contract section,
-  infrastructure.md env vars, CHANGELOG phase entry, Probleme.md only for real bugs.
-- Wrap-up checklist: `Aether-vault-Obsidian-Vault/Essential-Tasks.md`.
+  infrastructure.md env vars, CHANGELOG.md phase entry, Probleme.md only for real bugs found.
 
 ---
 
@@ -138,21 +148,12 @@ av promote <candidate> --into main     # exit 16 on DENY
 
 ---
 
-## Operational guardrails for agents working on this codebase
+## Wrap-up checklist
 
-### Context — what to read before changing anything
+Run the full sequence in `Aether-vault-Obsidian-Vault/Essential-Tasks.md` (scratch-repo
+debug → tests → docs → vault regen → sanity check) — it's the canonical detail, don't
+duplicate it here. Two things it doesn't say explicitly:
 
-- **README + sub-readmes**: every folder has a short sub readme for introduction and overview — read the one for whatever you're touching.
-- **`development/` folder**: read every `.md` file; they all hold important context for structure and plan.
-- **`Aether-vault-Obsidian-Vault/`**: contains a generated graph of all dependencies and functions etc. to get a general overview — but always verify against source, as it can sometimes be out of date.
-
-### Verification tasks — do these before declaring done
-
-1. **Add test scripts** for everything you added.
-2. **Run them** and debug if needed.
-3. **Do manual debugging** — automated tests alone are not sufficient.
-4. **Update documentation**: README + sub-readmes, test via `av test` suite, development folder, `Probleme.md`, `CHANGELOG.md`, `architecture.md`, `infrastructure.md`.
-5. **Update `av --help`** if you added or changed a CLI command.
-6. **Run vault scripts + handoff** (`av graph`, `av handoff`) if relevant.
-7. **Tell the user** if the Docker image needs rebuilding, or if a git commit should be saved.
-8. **Complete all essential tasks** from `Aether-vault-Obsidian-Vault/Essential-Tasks.md` at the end if not already done.
+- Update `av --help` / README CLI reference for any added or changed command.
+- Ask, don't act: tell the user if the Docker image needs rebuilding or a commit should
+  be saved — don't do either unprompted.

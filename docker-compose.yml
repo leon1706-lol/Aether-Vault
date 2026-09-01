@@ -40,10 +40,17 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    # Both runtimes exist in-engine (python + node), so both health legs are
-    # checked without adding any package: python-urllib for :8000, node fetch :3000.
+    # v1.2.5: matches AV_ENGINE_STOP_GRACE_SECS' default (engine-entrypoint.sh drains
+    # for up to 25s before SIGKILL) — Docker's own default stop-timeout is 10s, which
+    # would SIGKILL the container before that drain window ever finishes.
+    stop_grace_period: 30s
+    # Both runtimes exist in-engine (python + node), so both health legs are checked
+    # without adding any package: python-urllib for :8000, node fetch :3000. The server
+    # leg checks /api/ready (v1.2.5), not /api/health — health is liveness-only (DB-free,
+    # stays green even with an unwritable AV_DATA_DIR); ready also checks DB/Redis/data-dir
+    # writability, which is what "is this container actually usable" should mean here.
     healthcheck:
-      test: ['CMD-SHELL', 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/health\").read()" && node -e "fetch(\"http://localhost:3000/\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
+      test: ['CMD-SHELL', 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/ready\").read()" && node -e "fetch(\"http://localhost:3000/\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
       interval: 10s
       timeout: 15s
       retries: 5

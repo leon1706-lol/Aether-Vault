@@ -281,7 +281,9 @@ def test_merge_conflict_aborts_without_touching_anything(forked_repo):
     main_before = _ref(repo)
 
     result = invoke("merge", "feature")
-    assert result.exit_code == 0, result.output
+    # v1.2.5: a conflicting merge now honors the documented exit-code registry (14 =
+    # merge_conflict) instead of exiting 0 — see AGENTS.md / the exit-code table fix.
+    assert result.exit_code == 14, result.output
     assert "conflict" in result.output.lower()
     assert "shared.txt" in result.output
     assert "--ours" in result.output and "--theirs" in result.output

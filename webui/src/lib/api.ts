@@ -150,6 +150,48 @@ export interface Run {
   // v1.2.2 env snapshot/replay: content id of the run's environment snapshot object
   // (fetchable via GET /api/objects/{id}; `av replay <run-id>` renders it).
   env_snapshot_id?: string | null;
+  // v1.2.5: opt-in pointer to a published .avh context-memory object (`av handoff
+  // --publish`) — null unless the repo owner explicitly published one.
+  avh_object_id?: string | null;
+}
+
+// v1.2.5: server-computed semantic summary shape returned by GET /api/runs/{id}/summary
+// — a smaller sibling of webui/src/lib/runDetail.ts's client-side TreeDiffSummary (no
+// chunk-dedup/layer-movement fields; those stay a CLI/`.avh` concern per the Semantic
+// Diff Contract). null when the run has fewer than two linked commits with tree data.
+export interface RunServerSemanticSummary {
+  files: { added: string[]; removed: string[]; changed: string[] };
+  totals: { bytes_before: number; bytes_after: number };
+  summary: string;
+}
+
+export interface RunLineageEntry {
+  id: string;
+  name: string | null;
+  status: Run["status"];
+}
+
+export interface RunSummary {
+  run: Run;
+  lineage: RunLineageEntry[];
+  commits: Array<{
+    hash: string;
+    message: string;
+    metrics: Record<string, number | string>;
+    timestamp: string | null;
+  }>;
+  total_commits: number;
+  semantic_summary: RunServerSemanticSummary | null;
+  env_snapshot_id: string | null;
+  avh_object_id: string | null;
+}
+
+// v1.2.5: ONE request for the run-detail view (lineage + linked commits + a
+// server-computed semantic summary) — replaces the previous fetchRun() + N
+// fetchCommit() fan-out. webui/src/lib/runDetail.ts's pure client-side functions stay
+// as the fallback/test surface and are still exercised by RunsPanel's own tests.
+export async function fetchRunSummary(runId: string): Promise<RunSummary> {
+  return fetchJSON<RunSummary>(`/api/runs/${encodeURIComponent(runId)}/summary`);
 }
 
 export async function fetchRuns(

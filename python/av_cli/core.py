@@ -174,9 +174,12 @@ def find_repo_root() -> Path | None:
 def ensure_repo() -> Path:
     repo_root = find_repo_root()
     if not repo_root:
-        raise ValidationError(
-            "Not an Aether-Vault repository (or any of the parent directories)."
-        )
+        # v1.2.5: routed through fail() so this honors the documented exit-code registry
+        # (exit 10, not ClickException's default 1) and gets a proper JSON envelope under
+        # --output json instead of styled text. get_current_context(silent=True) is safe
+        # here — every real caller runs inside a live click command invocation.
+        fail(click.get_current_context(silent=True), "not_a_repo",
+             "Not an Aether-Vault repository (or any of the parent directories).")
     return repo_root
 
 
@@ -233,22 +236,21 @@ class _AuthRetryGroup(click.Group):
         try:
             return super().invoke(ctx)
         except AuthenticationError:
-            if not ui.is_interactive():
-                click.secho(
-                    "Error: this registry is protected and needs a valid access token. Set "
-                    "one with `av auth set-token <token>` (ask whoever manages this registry "
-                    "for the current one), then retry.",
-                    fg="red",
-                )
-                sys.exit(1)
+            # v1.2.5: exit 12 (auth_failed) via fail() in all three outcomes below, not a
+            # bare sys.exit(1) — honors the documented exit-code registry and, in the
+            # non-interactive case, emits a proper JSON envelope under --output json.
+            if not ui.is_interactive() or output_is_json(ctx):
+                fail(ctx, "auth_failed",
+                     "This registry is protected and needs a valid access token. Set "
+                     "one with `av auth set-token <token>` (ask whoever manages this registry "
+                     "for the current one), then retry.")
 
             click.secho("This registry is protected — enter the access token to continue.", fg="yellow")
             import questionary
 
             token = questionary.password("Access token:").ask()
             if not token:
-                click.secho("No token entered — aborting.", fg="red")
-                sys.exit(1)
+                fail(ctx, "auth_failed", "No token entered — aborting.")
 
             repo_root = find_repo_root()
             if repo_root is not None:
@@ -262,7 +264,9 @@ class _AuthRetryGroup(click.Group):
                     "re-run `av auth set-token` from inside the repo.",
                     fg="yellow",
                 )
-            sys.exit(1)
+            # The info line above already told the human what happened; exit 12 (not 0)
+            # because THIS invocation still did nothing — the caller must re-run it.
+            sys.exit(EXIT_AUTH_FAILED)
 
 
 def load_registry(repo_root: Path) -> dict:
@@ -303,10 +307,21 @@ def env_snapshot_file(repo_root: Path) -> Path:
 def canonical_env_bytes(snap: dict) -> bytes:
     """Canonical bytes of an env snapshot: sorted-keys JSON minus volatile fields.
 
-    `captured_at` is deliberately excluded — two captures of the same environment
-    MUST produce the same id (that's the determinism contract the replay tests pin),
-    so a timestamp can never leak into the hash."""
-    canon = {k: v for k, v in snap.items() if k not in ("captured_at",)}
+    v1.2.5 (`snapshot_version: 2`): hashes ONLY `snap["env"]` (python, os family, pins,
+    seeds, CUDA TOOLKIT version, critical env vars) — machine-specific `snap["observed"]`
+    context (GPU model, driver version, hostname, conda env, interpreter path) is
+    deliberately excluded, so two genuinely-equivalent environments on different
+    machines/OSes produce the SAME id (see tests/test_env_snapshot.py's golden
+    cross-machine fixtures). `captured_at` was already excluded for the same reason.
+
+    Legacy (no `snapshot_version`, or version 1) snapshots hash exactly as before —
+    minus `captured_at` only — so pre-1.2.5 objects already in a CAS/registry keep
+    resolving to the same id; ids are only comparable WITHIN one snapshot_version.
+    """
+    if snap.get("snapshot_version") == 2 and isinstance(snap.get("env"), dict):
+        canon = {"snapshot_version": 2, "env": snap["env"]}
+    else:
+        canon = {k: v for k, v in snap.items() if k not in ("captured_at",)}
     return json.dumps(canon, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -446,7 +461,7 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
     if not pending or not client.server_available():
         return pending
 
-    from .client import AuthenticationError
+    from .client import AuthenticationError, RefRaceError
 
     still_pending: list[dict] = []
     for i, entry in enumerate(pending):
@@ -460,7 +475,19 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
             if client.push_commit(commit_data):
                 ref_ok = True
                 if entry.get("ref_name"):
-                    ref_ok = client.update_ref(entry["ref_name"], entry["commit_hash"])
+                    _parents = commit_data.get("parents") or []
+                    try:
+                        ref_ok = client.update_ref(
+                            entry["ref_name"], entry["commit_hash"],
+                            expected_hash=_parents[0] if _parents else None,
+                        )
+                    except RefRaceError:
+                        # v1.2.5: lost the compare-and-swap race again — someone else's
+                        # commit is still ahead of this one on the ref. Keep it queued
+                        # (never lose the commit) and keep draining the rest of the
+                        # queue; unlike AuthenticationError this isn't systemic, so it
+                        # shouldn't abort every other entry too.
+                        ref_ok = False
                 if ref_ok:
                     continue
         except AuthenticationError:
@@ -652,7 +679,23 @@ def resolve_head_tree(repo_root: Path) -> dict:
 
 # v1.2.0: generalized dataset chunking - serialization formats that benefit from
 # CDC dedup on re-exports. Per-file override stays with .avattributes.
-CHUNKABLE_EXTS = {".pt", ".pth", ".ckpt", ".npz", ".h5", ".hdf5", ".pb", ".msgpack"}
+#
+# v1.2.5: broadened to every UNCOMPRESSED/block-structured format we could confirm
+# survives content-defined boundaries across a small edit (a byte changed mid-file
+# shifts at most the chunks touching it, not the whole stream) — .bin/.onnx/.model are
+# the same "raw tensor/graph dump" shape as .pt/.ckpt; .arrow/.feather are Arrow's
+# columnar IPC format (fixed-size record batches, block-aligned); .pkl/.pickle are
+# Python's own serialization, uncompressed by default. Deliberately NOT default-chunked:
+# COMPRESSED or otherwise non-block-aligned containers (.parquet often uses per-column
+# compression, .zip/.gz/.tar/.7z always do) — a one-byte logical change there can rewrite
+# the entire compressed stream, so CDC boundaries wouldn't survive an edit and chunking
+# would just add overhead for no dedup benefit. Force-enable chunking for a specific glob
+# regardless of extension (accepting that tradeoff deliberately) via the `chunk`
+# .avattributes flag; `no-chunk` still wins over `chunk` on the same line (safety).
+CHUNKABLE_EXTS = {
+    ".pt", ".pth", ".ckpt", ".npz", ".h5", ".hdf5", ".pb", ".msgpack",
+    ".bin", ".onnx", ".model", ".arrow", ".feather", ".pkl", ".pickle",
+}
 
 
 def stage_one_file(
@@ -729,8 +772,12 @@ def stage_one_file(
         if not layers:
             suffix = Path(rel_path).suffix.lower()
             core_cdc = _get_aether_core()
+            # v1.2.5: `chunk` in .avattributes force-enables CDC for a glob regardless of
+            # extension (e.g. a .parquet dataset the user has confirmed edits append-only
+            # to); `no-chunk` still wins when both are set on the matching line — safety
+            # over the opt-in, never the reverse.
             if (
-                suffix in CHUNKABLE_EXTS
+                (suffix in CHUNKABLE_EXTS or "chunk" in attr_flags)
                 and "no-chunk" not in attr_flags
                 and core_cdc is not None
                 and hasattr(core_cdc, "chunk_and_hash_file")
@@ -860,6 +907,7 @@ def _finalize_commit(
     metrics: dict | None = None,
     result_sink=None,
     defer_upload: bool = False,
+    outcome_sink=None,
 ) -> str:
     """Everything `av commit` does after its tree snapshot and parents are resolved: hash
     the payload deterministically over sorted JSON (preserves DAG integrity — two projects
@@ -916,22 +964,30 @@ def _finalize_commit(
         result["queued"] = True
         result["queued_reason"] = reason
 
-    if result_sink is not None:
-        result_sink(result)
-        result["committed"] = True  # marker for the sink path; humans see the echo below
-    else:
+    if result_sink is None:
         click.secho(f"[{commit_hash[:7]}] {message}", fg="green")
         if tags:
             click.secho(f"  Tags: {', '.join(tags)}", fg="cyan")
         if metrics:
             click.secho(f"  Metrics: {metrics}", fg="cyan")
+    # result_sink(result) itself is deferred to just before `return` (below) — v1.2.5 fix:
+    # calling it HERE, before the push-or-queue section runs, froze queued/queued_reason
+    # at their pre-push defaults (False/None) for every machine caller (JSON mode, the
+    # SDK), so `av --output json commit` against an unreachable server always reported
+    # queued:false — the exit-code 13 (unreachable_queued) contract had nothing correct
+    # to key off of. See Probleme.md and tests/test_exit_codes.py.
 
     # --- Push to remote if available ---
     # Refs are namespaced as "<project_id>/<branch>" on the shared registry so two projects
     # can each have a branch named "main" without overwriting each other's ref.
     remote_ref_name = f"{cfg['project_id']}/{ref_path.name}" if ref_path else None
+    # The parent this commit advances the ref FROM — None for a ref's first-ever commit.
+    # Passed as expected_hash below so a losing compare-and-swap race is detectable
+    # instead of silently overwriting a concurrent agent's ref update (v1.2.5).
+    _parents = commit_data.get("parents") or []
+    expected_parent = _parents[0] if _parents else None
 
-    from .client import AuthenticationError
+    from .client import AuthenticationError, RefRaceError
 
     try:
         flush_pending_push(repo_root, client)
@@ -955,12 +1011,33 @@ def _finalize_commit(
             if client.push_commit(commit_data):
                 ref_ok = True
                 if remote_ref_name:
-                    ref_ok = client.update_ref(remote_ref_name, commit_hash)
+                    try:
+                        ref_ok = client.update_ref(remote_ref_name, commit_hash,
+                                                    expected_hash=expected_parent)
+                    except RefRaceError as race:
+                        # Another agent's commit landed on this ref first. The commit
+                        # itself is already durable (pushed above, content-addressed —
+                        # never lost); only the ref pointer lost the race. Queue it —
+                        # non-negotiable #3 (offline resilience is sacred) applies to lost
+                        # ref races exactly as it does to network failures. `av pull` on
+                        # the next attempt will surface the divergence with run attribution.
+                        ref_ok = False
+                        result["ref_race"] = {
+                            "ref": race.ref_name, "current": race.current,
+                            "expected": race.expected,
+                        }
                 if not ref_ok:
                     queue_pending_push(repo_root, commit_hash, remote_ref_name)
-                    _queued("ref_update_failed")
+                    _queued("ref_race" if "ref_race" in result else "ref_update_failed")
                     if result_sink is None:
-                        click.secho("  Ref update failed — commit queued for retry (run `av push` later)", fg="yellow")
+                        if "ref_race" in result:
+                            click.secho(
+                                f"  Another agent updated '{ref_path.name if ref_path else remote_ref_name}' "
+                                "first — commit queued for retry (run `av pull` then `av push`)",
+                                fg="yellow",
+                            )
+                        else:
+                            click.secho("  Ref update failed — commit queued for retry (run `av push` later)", fg="yellow")
             else:
                 queue_pending_push(repo_root, commit_hash, remote_ref_name)
                 _queued("push_failed")
@@ -987,6 +1064,16 @@ def _finalize_commit(
         if result_sink is None:
             click.secho("  Server unreachable — commit queued for push (run `av push` later)", fg="yellow")
 
+    if result_sink is not None:
+        result["committed"] = True  # marker for the sink path; humans see the echo above
+        result_sink(result)  # now reflects the FINAL queued/queued_reason/ref_race state
+    # outcome_sink (v1.2.5) fires unconditionally, independent of result_sink/output mode —
+    # it exists purely so callers can learn the final queued state to decide on an exit
+    # code (EXIT_UNREACHABLE_QUEUED=13) WITHOUT also suppressing text-mode's human echoes,
+    # which result_sink's "is not None" check is what controls.
+    if outcome_sink is not None:
+        outcome_sink(result)
+
     return commit_hash
 
 
@@ -998,6 +1085,7 @@ def commit_staged(
     run_id: str | None = None,
     defer_upload: bool = False,
     result_sink=None,
+    outcome_sink=None,
 ) -> str | None:
     """Commit whatever is currently staged — THE shared entry point.
 
@@ -1074,8 +1162,37 @@ def commit_staged(
         repo_root, cfg, client,
         commit_data=commit_data, tree=tree, ref_path=ref_path, head_path=head_path,
         idx=idx, tags=tags, metrics=metrics or {},
-        result_sink=result_sink, defer_upload=defer_upload,
+        result_sink=result_sink, defer_upload=defer_upload, outcome_sink=outcome_sink,
     )
+
+
+def resolve_run_id(repo_root: Path, explicit: str | None = None) -> str | None:
+    """v1.2.5: THE single run-id precedence rule — explicit argument > AV_RUN_ID env >
+    .av/run.json state — used by every commit path (`av commit`, `av watch`,
+    `commit_scoped_paths`/plugins) so `AV_RUN_ID=<id> <any av command>` behaves
+    identically everywhere, as the docs already advertise ("joins ANY process' commits
+    with zero integration").
+
+    Before this existed, three call sites disagreed: `av commit` checked env before
+    state, `cmd_run.current_run_id()` (used by the plugin/SDK seam) checked state before
+    env, and `av watch` didn't resolve either at all — its auto-commits were silently
+    never filed under the active run regardless of `av run start`/AV_RUN_ID (see
+    Probleme.md). Env wins over state because it's the documented, deliberate
+    per-process override; state is the ambient "someone ran `av run start` in this
+    repo" default.
+    """
+    if explicit:
+        return explicit
+    env_run_id = os.environ.get("AV_RUN_ID")
+    if env_run_id:
+        return env_run_id
+    state_path = repo_root / ".av" / "run.json"
+    if state_path.exists():
+        try:
+            return json.loads(state_path.read_text(encoding="utf-8")).get("run_id")
+        except (OSError, json.JSONDecodeError):
+            return None
+    return None
 
 
 def commit_scoped_paths(
@@ -1123,12 +1240,10 @@ def commit_scoped_paths(
     threshold_bytes = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
     rules = load_attributes(repo_root)
 
-    if run_id is None:
-        # AV_RUN_ID / active-run state flow for free: machine commits join the ambient
-        # run exactly like CLI commits do.
-        from .cmd_run import current_run_id
-
-        run_id = current_run_id(repo_root)
+    # v1.2.5: resolve_run_id() is now THE one precedence rule (explicit > env > state),
+    # shared with av commit/av watch — see its docstring for why this used to disagree
+    # across call sites.
+    run_id = resolve_run_id(repo_root, run_id)
 
     try:
         for raw_path in paths:
@@ -1312,8 +1427,15 @@ def output_is_json(ctx) -> bool:
 
 
 def json_envelope(command: str, data=None, error_code: str | None = None,
-                  error_message: str | None = None) -> dict:
-    """Builds the one-and-only agent-facing response shape."""
+                  error_message: str | None = None, error_data: dict | None = None) -> dict:
+    """Builds the one-and-only agent-facing response shape.
+
+    `error_data` (v1.2.5, additive) is an optional dict of machine-readable failure
+    context — conflict file lists, racing run/commit ids, remediation command lines —
+    for the failure modes where a plain message string used to be the only signal
+    (merge conflicts, ref races). Omitted entirely when empty/None so old clients that
+    only look at `error.code`/`error.message` see no shape change.
+    """
     from . import _version
 
     try:
@@ -1328,6 +1450,8 @@ def json_envelope(command: str, data=None, error_code: str | None = None,
     }
     if error_code is not None:
         env["error"] = {"code": error_code, "message": error_message or ""}
+        if error_data:
+            env["error"]["data"] = error_data
     return env
 
 
@@ -1336,21 +1460,43 @@ def emit_json(ctx, command: str, data=None) -> None:
     click.echo(json.dumps(json_envelope(command, data=data)))
 
 
-def fail(ctx, code: str, message: str, command: str | None = None):
+def fail(ctx, code: str, message: str, command: str | None = None, data: dict | None = None,
+         quiet_text: bool = False):
     """Uniform failure path: JSON envelope + documented exit code in one raise.
 
     In text mode the message prints plainly (no traceback); in JSON mode the envelope
-    carries the machine-readable code. Always raises — call sites stop here.
+    carries the machine-readable code plus, when given, `error.data` (v1.2.5). Always
+    raises — call sites stop here.
+
+    `quiet_text=True` (v1.2.5) skips the generic "Error: {message}" line in text mode —
+    for call sites that already printed a richer, purpose-formatted explanation (a
+    conflict file list, a divergence's run attribution) and would otherwise duplicate it.
+    JSON mode is unaffected either way; the envelope is the only output there.
     """
+    if ctx is None:
+        # v1.2.5 fix: ~40 call sites across the CLI pass ctx=None here (no live context
+        # handy at that point in the call chain) — output_is_json(None) is unconditionally
+        # False, so EVERY one of those silently ignored `--output json` and always printed
+        # plain text instead of an envelope. click.get_current_context(silent=True) finds
+        # the REAL context of whichever command is actually running (always live during a
+        # real invocation), so a bare `fail(None, ...)` now correctly honors JSON mode
+        # instead of requiring every call site to thread ctx through by hand.
+        ctx = click.get_current_context(silent=True)
     exit_code = _EXIT_CODES.get(code, EXIT_VALIDATION)
     cmd = command or (ctx.command.name if ctx and getattr(ctx, "command", None) else "av")
     if output_is_json(ctx):
-        click.echo(json.dumps(json_envelope(cmd, error_code=code, error_message=message)))
-    else:
+        click.echo(json.dumps(json_envelope(cmd, error_code=code, error_message=message,
+                                             error_data=data)))
+    elif not quiet_text:
         click.secho(f"Error: {message}", fg="red", err=True)
     # Many call sites pass ctx=None (they run outside a click context or before one is
     # handy). Context.exit on None used to raise AttributeError AFTER the message printed,
     # so users saw a Python traceback under every clean validation failure (Probleme.md).
-    if ctx is not None:
-        ctx.exit(exit_code)
+    # v1.2.5: always SystemExit, never ctx.exit() — empirically, Context.exit() raises
+    # click.exceptions.Exit, which CliRunner.invoke(standalone_mode=False) (the pattern
+    # this test suite uses throughout: test_signing.py, test_v122.py, this file's own
+    # tests, ...) silently swallows, leaving result.exit_code at 0 regardless of the
+    # code passed. A bare SystemExit propagates correctly under standalone_mode True
+    # AND False, and in real (non-test) CLI usage — so it's the only mechanism used here
+    # now, resolving ctx (above) purely for output_is_json() detection.
     raise SystemExit(exit_code)

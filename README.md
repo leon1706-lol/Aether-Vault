@@ -24,7 +24,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 
 - **Benchmark #5 (cold clone)** — `av clone` shipped in v1.1.1 but the measured row in the comparison table is still "capture pending". Lands on the next `av benchmark --markdown` run against a live registry.
 - **Perf #4 (no-op status/add)** — ~15x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
-- **Legacy image aliases** — the historical `aether-vault-server`/`-webui` images are published as aliases of the engine image for one transition cycle; removed next release.
+- **Legacy image aliases** — the historical `aether-vault-server`/`-webui` images are published as aliases of the engine image; earliest possible removal is v1.3.0, not yet scheduled (see `VERSIONING.md`'s deprecation policy). Switch pulls/composes to `ghcr.io/leon1706-lol/aether-vault-engine` with an explicit `AV_ENGINE_ROLE` now to silence the runtime deprecation warning.
 
 ## Table of Contents
 
@@ -63,6 +63,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
   - [`av env`](#av-env)
   - [`av watch`](#av-watch)
   - [`av registry`](#av-registry)
+  - [`av webhooks`](#av-webhooks)
   - [`av audit`](#av-audit)
   - [`av stash`](#av-stash)
   - [`av webui`](#av-webui)
@@ -83,7 +84,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 
 ```bash
 pip install aether-vault                # CLI + registry server + plugins
-docker pull ghcr.io/leon1706/aether-vault-engine:latest   # the engine image (registry + dashboard)
+docker pull ghcr.io/leon1706-lol/aether-vault-engine:latest   # the engine image (registry + dashboard)
 ```
 
 ## Getting Started
@@ -420,7 +421,19 @@ av file --avignore       # writes a .avignore template
 av file --avattributes   # writes a .avattributes template
 ```
 
-Refuses to overwrite an existing file. `.avattributes` is gitattributes-style: glob patterns with staging directives, last matching line wins. Supported flags: `no-chunk` (store opaque checkpoints as whole-file blobs instead of CDC chunks) and `no-layer-split` (never split safetensors into per-layer shards).
+Refuses to overwrite an existing file. `.avattributes` is gitattributes-style: glob patterns with staging directives, a later matching line's flags *replace* an earlier line's for the same path (they don't merge). Supported flags:
+
+- `no-chunk` — store as a whole-file blob instead of content-defined chunks. Applies above the LFS threshold to the default chunkable set: `.pt .pth .ckpt .npz .h5 .hdf5 .pb .msgpack .bin .onnx .model .arrow .feather .pkl .pickle` (broadened from 8 to 15 extensions in v1.2.5 — uncompressed/block-structured formats where a local edit only shifts nearby chunk boundaries).
+- `chunk` (v1.2.5) — force-enable CDC for a glob outside that default set, e.g. a dataset export you've confirmed is edited append-only. `no-chunk` on the same matching line always wins over `chunk`. Deliberately *not* a default for compressed/columnar containers (`.parquet` with per-column compression, `.zip`/`.gz`/`.tar`/`.7z`) — a small logical edit there usually rewrites the whole compressed stream, so chunk boundaries don't survive and chunking adds overhead with no dedup payoff unless you've verified your export path is safe.
+- `no-layer-split` — never split `.safetensors` into per-layer shards; store the whole file.
+
+Worked example — a repo mixing model checkpoints, a safetensors head, and a parquet dataset the export pipeline only appends to:
+
+```
+models/frozen/** no-chunk no-layer-split
+experiments/*.safetensors no-layer-split
+datasets/exports/*.parquet chunk
+```
 
 #### `av unstage`
 
@@ -560,26 +573,36 @@ Promotion guardrails for autonomous loops: arm a per-branch metric policy, evalu
 ```bash
 av policy set main val_loss "<" --baseline-ref "main~1"
 av policy set release val_loss "<" --threshold 0.35
+av policy set main --require-signature                          # (v1.2.5) signature-only gate, no metric
+av policy set release val_loss "<" --threshold 0.35 --require-signature   # (v1.2.5) both gates
 av policy list / av policy remove main
 av promote <candidate> --into main      # evaluate → checkout main → merge (two-parent)
 av promote <candidate> --force          # conscious bypass, recorded in the merge message
 av merge <target> --force               # same bypass at merge level (exit code 16 on deny)
 ```
 
+`--require-signature` denies promotion/merge of a candidate with no valid embedded signature (exit 16) — tamper evidence, not a PKI; it does not bind a key to an identity. See `av registry keygen` under [`av registry`](#av-registry).
+
 #### `av env`
 
-Recipe-exact environment snapshots and reproduction recipes. Snapshots are content-addressed (the canonical snapshot's hash IS its id) and upload through the normal object flow at push, so any clone can reproduce an experiment's environment.
+Recipe-exact environment snapshots and reproduction recipes. Snapshots are content-addressed (the canonical snapshot's hash IS its id) and upload through the normal object flow at push, so any clone can reproduce an experiment's environment. Since v1.2.5 (`snapshot_version: 2`) the id hashes only reproducibility-relevant identity (python, pins, seeds, CUDA toolkit version, a critical-env-var set) — machine-specific context (GPU model, driver, hostname, conda env, interpreter path) is captured but excluded, so equivalent environments on different machines/OSes share an id.
 
 ```bash
 av env snapshot              # python + curated package pins → .av/env_snapshot.json + CAS
 av env snapshot --full       # include complete pip freeze
 av env replay                # print the reproduction recipe for the latest local snapshot
-av env replay --dockerfile   # emit a Dockerfile draft
+av env replay --dockerfile   # emit a multi-stage, non-root Dockerfile draft
+av env replay --dockerfile --cuda 12.1.0   # nvidia/cuda base instead of python:slim (v1.2.5)
+av env replay --out FILE     # write the recipe/Dockerfile to a file instead of stdout (v1.2.5)
 av env replay <target>       # TARGET = run id, commit hash, or snapshot id
-av env replay --execute      # execute the pip installs after showing them (-y skips ask)
+av env replay --validate     # resolve every pin against PyPI WITHOUT installing (v1.2.5)
+av env replay --execute      # install the pins after showing them (-y skips ask); uses
+                             # sys.executable -m pip — the correct interpreter, always
+av env replay --execute --target-venv PATH   # create (if absent) + install into this venv
+av env replay --execute --conda-env NAME     # install via `conda run -n NAME`
 ```
 
-`av replay` works as a top-level alias; on another machine resolve by run id or the id in `.avh.replay`.
+`av replay` works as a top-level alias; on another machine resolve by run id or the id in `.avh.replay`. Which env vars ride the hashed identity is configurable via `AV_ENV_CAPTURE_VARS` (comma-separated; default `CUDA_VISIBLE_DEVICES,PYTORCH_CUDA_ALLOC_CONF,OMP_NUM_THREADS,TOKENIZERS_PARALLELISM,HF_HOME,TORCH_HOME`).
 
 #### `av watch`
 
@@ -600,9 +623,36 @@ av attest  <commit-hash>               # HMAC attestation tag via metadata commi
 av verify  <commit-hash>               # verify the ed25519 commit signature (or a legacy attestation
                                        # tag); tampering after signing exits non-zero. Unsigned commits
                                        # are valid — tamper evidence, not a trust network
-av auth keygen                         # generate an ed25519 signing keypair (.av/keys/, private 0600;
+av verify  <hash> --signature FILE     # verify a DETACHED signature record instead (v1.2.5) — no
+                                       # local config/registry access needed by the verifier
+av registry keygen                     # generate an ed25519 signing keypair (.av/keys/, private 0600;
                                        # requires the [sign] extra) — commits are then AUTO-SIGNED
+av registry keys list                  # every signing key this repo knows (active + archived) (v1.2.5)
+av registry keys fingerprint           # this repo's active-key fingerprint, scriptable (v1.2.5)
+av registry keys rotate                # archive the current key, generate a fresh one (v1.2.5) — old
+                                       # commits keep verifying against their embedded old key
+av registry export-signature <hash>    # standalone signature record for external audit (v1.2.5)
 ```
+
+#### `av webhooks`
+
+Signed event-webhook subscriptions on the registry — a subscriber gets an HMAC-SHA256-signed POST for every matching event, with per-webhook delivery health, exponential backoff, and dead-letter replay (v1.2.5).
+
+```bash
+av webhooks add <url> --secret <secret>            # subscribe (--project to scope, --kind repeatable)
+av webhooks list                                   # every webhook, secrets masked, health inline
+av webhooks show <webhook-id>                      # config + health summary + last 5 delivery outcomes
+av webhooks test <webhook-id>                      # deliver a signed ping now
+av webhooks remove <webhook-id>                    # unsubscribe
+
+av webhooks deliveries                             # this registry's delivery ledger, newest first
+av webhooks deliveries --status dead               # only dead-lettered attempts
+av webhooks deliveries --webhook-id <id> --kind commit --since 2026-08-01
+av webhooks replay <delivery-id>                   # re-drive a failed/dead delivery (409 if already in flight)
+av webhooks enable <webhook-id>                    # re-enable after auto-disable; clears the failure streak
+```
+
+A webhook auto-disables after `AV_WEBHOOK_DISABLE_AFTER` consecutive failures (0 = off, the default); retries back off exponentially up to `AV_WEBHOOK_RETRY_MAX_SECS` before a delivery dead-letters.
 
 #### `av audit`
 
@@ -613,6 +663,11 @@ av audit list                          # newest entries
 av audit list --action commit.push     # exact action filter
 av audit list --project <project-id>   # scope to one project
 av audit list --since 2026-08-01 --limit 100
+av audit list --username alice --outcome error     # (v1.2.5) actor + 4xx/5xx-only filter
+av audit list --action-prefix commit.  --cursor <next_cursor>   # (v1.2.5) route-family filter, stable pagination
+
+av audit export --format jsonl --out audit.jsonl   # (v1.2.5) filtered export for compliance (jsonl or csv)
+av audit prune --before-days 90                    # (v1.2.5) admin-only, irreversible; prompts unless --yes
 ```
 
 #### `av stash`
@@ -768,7 +823,7 @@ This then automatically runs (no manual version bump anywhere in the repo,
 
 1. The test suite (`pytest`), a failure blocks the release entirely.
 2. PyPI publishing via Trusted Publishing (OIDC), no PyPI token is stored as a GitHub secret.
-3. Docker image build and push to `ghcr.io/leon1706/aether-vault-engine`, tagged with the version number and `:latest`.
+3. Docker image build and push to `ghcr.io/leon1706-lol/aether-vault-engine`, tagged with the version number and `:latest`.
 
 
 **One-time manual setup, before the first tag is ever pushed** (can't be

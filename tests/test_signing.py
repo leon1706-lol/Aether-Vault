@@ -314,3 +314,251 @@ def test_verify_unknown_commit_is_validation_error(tmp_path, monkeypatch):
     res = CliRunner().invoke(cli, ["registry", "verify", "f" * 64],
                              standalone_mode=False)
     assert res.exit_code == 15
+
+
+# ---------------------------------------------------------------------------
+# v1.2.5: key management — fingerprint, list, rotate
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_is_stable_and_golden():
+    """Golden fixture: sha256(pubkey)[:16 hex], grouped xxxx:xxxx:xxxx:xxxx — a real
+    contract other tools/humans compare by eye, so the exact rendering is pinned."""
+    pubkey = bytes(range(32))  # deterministic 32 bytes
+    fp = signing.fingerprint(pubkey)
+    import hashlib
+
+    expected_hex = hashlib.sha256(pubkey).hexdigest()[:16]
+    expected = ":".join(expected_hex[i:i + 4] for i in range(0, 16, 4))
+    assert fp == expected
+    assert fp.count(":") == 3
+    assert len(fp.replace(":", "")) == 16
+
+
+def test_fingerprint_differs_for_different_keys():
+    fp_a = signing.fingerprint(bytes(range(32)))
+    fp_b = signing.fingerprint(bytes(range(1, 33)))
+    assert fp_a != fp_b
+
+
+def test_keys_list_shows_active_key(signed_repo):
+    repo_root, priv, pub = signed_repo
+    entries = signing.list_keys(repo_root)
+    assert len(entries) == 1
+    assert entries[0]["active"] is True
+    assert entries[0]["fingerprint"] == signing.fingerprint(pub.read_bytes())
+
+
+def test_keys_list_empty_when_no_key(tmp_path, monkeypatch):
+    _init_repo(tmp_path, monkeypatch)
+    assert signing.list_keys(tmp_path) == []
+
+
+def test_rotate_archives_old_key_and_generates_new_one(signed_repo):
+    repo_root, priv, pub = signed_repo
+    old_pub_bytes = pub.read_bytes()
+    old_fp = signing.fingerprint(old_pub_bytes)
+
+    new_priv, new_pub = signing.rotate_keypair(repo_root)
+    new_fp = signing.fingerprint(new_pub.read_bytes())
+
+    assert new_fp != old_fp
+    assert new_priv.exists() and new_pub.exists()
+    entries = signing.list_keys(repo_root)
+    fps = {e["fingerprint"]: e["active"] for e in entries}
+    assert fps[new_fp] is True
+    assert fps[old_fp] is False
+    # The archived PRIVATE key survives too (rotation never deletes signing capability).
+    archive_dir = signing.archived_keys_dir(repo_root)
+    archived_privs = list(archive_dir.rglob(signing.SIGNING_KEY_PATH))
+    assert len(archived_privs) == 1
+
+
+def test_rotate_without_existing_key_raises(tmp_path, monkeypatch):
+    _init_repo(tmp_path, monkeypatch)
+    with pytest.raises(FileNotFoundError):
+        signing.rotate_keypair(tmp_path)
+
+
+def test_commit_signed_before_and_after_rotation_both_verify(signed_repo):
+    """The whole point of rotation: old commits keep verifying against their OWN
+    embedded (now-archived) public key; new commits verify against the new one."""
+    repo_root, priv, pub = signed_repo
+    old_hash = _stage_and_commit(repo_root, name="before.txt", message="before rotation")
+    old_commit = _commit_file(repo_root, old_hash)
+    assert verify_signature(old_commit) == (True, "verified")
+
+    signing.rotate_keypair(repo_root)
+
+    new_hash = _stage_and_commit(repo_root, name="after.txt", message="after rotation")
+    new_commit = _commit_file(repo_root, new_hash)
+    assert verify_signature(new_commit) == (True, "verified")
+    assert old_commit["signature"]["public_key"] != new_commit["signature"]["public_key"]
+
+    # Re-verify the OLD commit again post-rotation — nothing about it changed.
+    old_commit_again = _commit_file(repo_root, old_hash)
+    assert verify_signature(old_commit_again) == (True, "verified")
+
+
+def test_cli_keys_list_and_fingerprint(signed_repo):
+    repo_root, priv, pub = signed_repo
+    res = CliRunner().invoke(cli, ["registry", "keys", "list"], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    assert "active" in res.output
+
+    fp_res = CliRunner().invoke(cli, ["registry", "keys", "fingerprint"], standalone_mode=False)
+    assert fp_res.exit_code == 0, fp_res.output
+    assert fp_res.output.strip() == signing.fingerprint(pub.read_bytes())
+
+
+def test_cli_keys_rotate_with_yes_skips_prompt(signed_repo):
+    repo_root, priv, pub = signed_repo
+    old_fp = signing.fingerprint(pub.read_bytes())
+    res = CliRunner().invoke(cli, ["registry", "keys", "rotate", "--yes"], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    assert old_fp in res.output
+    new_fp = signing.fingerprint(pub.read_bytes())
+    assert new_fp != old_fp
+
+
+def test_cli_keys_rotate_declines_without_yes(signed_repo):
+    repo_root, priv, pub = signed_repo
+    old_fp = signing.fingerprint(pub.read_bytes())
+    res = CliRunner().invoke(cli, ["registry", "keys", "rotate"], input="n\n", standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    assert "Aborted" in res.output
+    assert signing.fingerprint(pub.read_bytes()) == old_fp  # untouched
+
+
+# ---------------------------------------------------------------------------
+# v1.2.5: detached signature export/verify
+# ---------------------------------------------------------------------------
+
+def test_export_and_verify_detached_signature_roundtrip(signed_repo):
+    repo_root, priv, pub = signed_repo
+    commit_hash = _stage_and_commit(repo_root)
+    commit = _commit_file(repo_root, commit_hash)
+
+    blob = signing.export_signature_blob(commit_hash, commit)
+    assert blob["hash"] == commit_hash
+    assert blob["algo"] == "ed25519"
+    assert blob["fingerprint"] == signing.fingerprint(pub.read_bytes())
+
+    ok, reason = signing.verify_detached(commit, blob)
+    assert (ok, reason) == (True, "verified")
+
+
+def test_verify_detached_rejects_hash_mismatch(signed_repo):
+    repo_root, priv, pub = signed_repo
+    commit_hash = _stage_and_commit(repo_root)
+    commit = _commit_file(repo_root, commit_hash)
+    blob = signing.export_signature_blob(commit_hash, commit)
+    blob["hash"] = "f" * 64  # tampered/mismatched record
+
+    ok, reason = signing.verify_detached(commit, blob)
+    assert ok is False
+    assert "hash mismatch" in reason
+
+
+def test_verify_detached_rejects_tampered_canonical_bytes(signed_repo):
+    repo_root, priv, pub = signed_repo
+    commit_hash = _stage_and_commit(repo_root)
+    commit = _commit_file(repo_root, commit_hash)
+    blob = signing.export_signature_blob(commit_hash, commit)
+
+    tampered_commit = dict(commit)
+    tampered_commit["message"] = "not what was signed"
+    ok, reason = signing.verify_detached(tampered_commit, blob)
+    assert ok is False
+
+
+def test_export_signature_blob_raises_for_unsigned_commit(tmp_path, monkeypatch):
+    _init_repo(tmp_path, monkeypatch)
+    commit_hash = _stage_and_commit(tmp_path)
+    commit = _commit_file(tmp_path, commit_hash)
+    assert commit.get("signature") is None
+    with pytest.raises(ValueError):
+        signing.export_signature_blob(commit_hash, commit)
+
+
+def test_cli_export_signature_writes_file_and_cli_verify_roundtrips(signed_repo, tmp_path):
+    repo_root, priv, pub = signed_repo
+    commit_hash = _stage_and_commit(repo_root)
+    out_file = tmp_path / "sig.json"
+
+    export_res = CliRunner().invoke(
+        cli, ["registry", "export-signature", commit_hash, "--out", str(out_file)],
+        standalone_mode=False,
+    )
+    assert export_res.exit_code == 0, export_res.output
+    assert out_file.exists()
+    exported = json.loads(out_file.read_text())
+    assert exported["hash"] == commit_hash
+
+    verify_res = CliRunner().invoke(
+        cli, ["registry", "verify", commit_hash, "--signature", str(out_file)],
+        standalone_mode=False,
+    )
+    assert verify_res.exit_code == 0, verify_res.output
+    assert "VERIFIED" in verify_res.output
+
+
+def test_cli_verify_detached_exits_15_on_tamper(signed_repo, tmp_path):
+    repo_root, priv, pub = signed_repo
+    commit_hash = _stage_and_commit(repo_root)
+    out_file = tmp_path / "sig.json"
+    CliRunner().invoke(cli, ["registry", "export-signature", commit_hash, "--out", str(out_file)],
+                       standalone_mode=False)
+
+    blob = json.loads(out_file.read_text())
+    blob["sig"] = base64.b64encode(b"\x00" * 64).decode()
+    out_file.write_text(json.dumps(blob))
+
+    res = CliRunner().invoke(cli, ["registry", "verify", commit_hash, "--signature", str(out_file)],
+                             standalone_mode=False)
+    assert res.exit_code == 15
+
+
+# ---------------------------------------------------------------------------
+# v1.2.5: signature requirement branch policy (require_signature)
+# ---------------------------------------------------------------------------
+
+def test_promote_denies_unsigned_candidate_when_require_signature_armed(tmp_path, monkeypatch):
+    _init_repo(tmp_path, monkeypatch)
+    _stage_and_commit(tmp_path, name="base.txt", message="baseline")
+
+    # Arm require_signature on main WITHOUT a signing key ever having been generated.
+    policies_path = tmp_path / ".av" / "policies.json"
+    policies_path.write_text(json.dumps({"main": {"require_signature": True}}))
+
+    _stage_and_commit(tmp_path, name="candidate.txt", message="unsigned candidate")
+
+    res = CliRunner().invoke(cli, ["promote", "--into", "main"], standalone_mode=False)
+    assert res.exit_code == 16, res.output
+    assert "require_signature" in res.output
+    assert "unsigned" in res.output.lower()
+
+
+def test_promote_allows_signed_candidate_when_require_signature_armed(signed_repo):
+    repo_root, priv, pub = signed_repo
+    _stage_and_commit(repo_root, name="signed-candidate.txt", message="signed candidate")
+
+    policies_path = repo_root / ".av" / "policies.json"
+    policies_path.write_text(json.dumps({"main": {"require_signature": True}}))
+
+    res = CliRunner().invoke(cli, ["promote", "--into", "main"], standalone_mode=False)
+    assert res.exit_code == 0, res.output
+
+
+def test_require_signature_policy_does_not_affect_policies_without_it(tmp_path, monkeypatch):
+    """Additive-only: an existing metric-only policy behaves exactly as before."""
+    _init_repo(tmp_path, monkeypatch)
+    _stage_and_commit(tmp_path, name="m.txt", message="baseline", )
+
+    policies_path = tmp_path / ".av" / "policies.json"
+    policies_path.write_text(json.dumps({"main": {"metric": "val_loss", "op": "<", "threshold": 999}}))
+
+    # No metric on this commit at all -> denied for the pre-existing metric reason,
+    # not any new require_signature reason (the field is simply absent from the policy).
+    res = CliRunner().invoke(cli, ["promote", "--into", "main"], standalone_mode=False)
+    assert res.exit_code == 16, res.output
+    assert "require_signature" not in res.output

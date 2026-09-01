@@ -16,7 +16,12 @@ export default defineConfig({
     // component tests need a real DOM, so they get "jsdom" instead — set per-glob rather than
     // globally, since jsdom is slower and unnecessary for the pure-logic tests already in place.
     environment: "node",
-    environmentMatchGlobs: [["src/components/**", "jsdom"]],
+    // v1.2.5: src/hooks/** joins components under jsdom — renderHook() needs a real DOM
+    // exactly like a component test does (useDashboard.test.ts is the first hook test).
+    environmentMatchGlobs: [
+      ["src/components/**", "jsdom"],
+      ["src/hooks/**", "jsdom"],
+    ],
     setupFiles: ["./vitest.setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
   },

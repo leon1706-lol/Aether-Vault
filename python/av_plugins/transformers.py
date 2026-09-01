@@ -7,7 +7,7 @@ Usage:
 import json
 from pathlib import Path
 
-from ._shared import commit_scoped, resolve_repo_root, run_av
+from ._shared import commit_scoped, push_pending, resolve_repo_root
 
 try:
     from transformers import TrainerCallback
@@ -69,7 +69,7 @@ class AetherVaultTrainerCallback(TrainerCallback):
 
     def on_train_end(self, args, state, control, **kwargs) -> None:
         repo_root = resolve_repo_root(Path(args.output_dir))
-        run_av(repo_root, ["push"])
+        push_pending(repo_root)  # v1.2.5: no chdir, no CLI hop (was run_av(..., ["push"]))
 
 
 def import_checkpoint(checkpoint_dir: str, repo_root: Path | None = None, tag: str | None = None) -> None:

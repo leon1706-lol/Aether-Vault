@@ -6,7 +6,7 @@ Usage:
 """
 from pathlib import Path
 
-from ._shared import commit_scoped, filter_existing_files, resolve_repo_root, run_av
+from ._shared import commit_scoped, filter_existing_files, push_pending, resolve_repo_root
 
 try:
     from lightning.pytorch.callbacks import Callback
@@ -87,7 +87,7 @@ class AetherVaultCallback(Callback):
         if not paths:
             return
         repo_root = resolve_repo_root(Path(paths[0]).parent)
-        run_av(repo_root, ["push"])
+        push_pending(repo_root)  # v1.2.5: no chdir, no CLI hop (was run_av(..., ["push"]))
 
 
 def import_checkpoint(

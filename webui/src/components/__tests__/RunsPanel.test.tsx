@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { RunsPanel } from "../RunsPanel";
@@ -7,11 +7,19 @@ import * as api from "../../lib/api";
 vi.mock("../../lib/api", () => ({
   fetchRuns: vi.fn(),
   fetchLatestEventId: vi.fn(),
-  fetchRun: vi.fn(),
-  fetchCommit: vi.fn(),
+  fetchRunSummary: vi.fn(),
+  // MetricsChart.tsx (rendered internally once there's enough run history) imports
+  // shortHash directly from this module — a pure function, safe to reimplement here
+  // rather than importOriginal-ing the whole module just for one helper.
+  shortHash: (hash: string) => hash.slice(0, 7),
 }));
 
 const mocked = vi.mocked(api);
+
+beforeEach(() => {
+  // v1.2.5 deep linking touches window.history — keep each test's URL state isolated.
+  window.history.replaceState(null, "", "/");
+});
 
 function baseRun(overrides: Partial<api.Run> = {}): api.Run {
   return {
@@ -80,7 +88,8 @@ describe("RunsPanel", () => {
 });
 
 // ---------------------------------------------------------------------------
-// v1.2.2 Run detail (expandable row → lineage + linked commits + client-side summary)
+// v1.2.5 run detail: ONE request (GET /api/runs/{id}/summary) instead of the old
+// fetchRun()+N×fetchCommit() fan-out; dedicated panel below the table; deep linking.
 // ---------------------------------------------------------------------------
 
 describe("RunsPanel detail", () => {
@@ -88,89 +97,141 @@ describe("RunsPanel detail", () => {
     id: "child000000000000000000000000001",
     name: "fine-tune",
     parent_run_id: "parent0000000000000000000000001",
-    commit_hashes: [
-      "c" + "0".repeat(63),
-      "c" + "1".repeat(63),
-    ],
+    commit_hashes: ["c" + "0".repeat(63), "c" + "1".repeat(63)],
     metrics_summary: { loss: 0.2 },
   });
-  const parentRun = baseRun({
-    id: "parent0000000000000000000000001",
-    name: "baseline",
-    parent_run_id: null,
-  });
 
-  function mockDetailApi() {
-    mocked.fetchRuns.mockResolvedValue([childRun]);
-    mocked.fetchLatestEventId.mockResolvedValue(0);
-    mocked.fetchRun.mockImplementation(async (id) =>
-      id === childRun.id ? childRun : parentRun
-    );
-    mocked.fetchCommit.mockImplementation(async (hash) => ({
-      hash,
-      message: hash.endsWith("0") ? "latest work" : "earlier work",
-      author: "agent",
-      timestamp: hash.endsWith("0") ? "2026-08-25T02:00:00" : "2026-08-25T01:00:00",
-      parent_hash: null,
-      root_tree_hash: null,
-      tags: [],
-      metrics: { loss: hash.endsWith("0") ? 0.2 : 0.5 },
-      tree:
-        hash.endsWith("0")
-          ? { "model.pt": { hash: "n1", size: 100, type: "artifact", chunks: [{ hash: "ch1" }, { hash: "ch2" }] } }
-          : { "model.pt": { hash: "n0", size: 100, type: "artifact", chunks: [{ hash: "ch1" }, { hash: "ch3" }] }, "old.txt": { hash: "o", size: 5, type: "code", chunks: [] } },
-    }));
+  function baseSummary(overrides: Partial<api.RunSummary> = {}): api.RunSummary {
+    return {
+      run: childRun,
+      lineage: [
+        { id: childRun.id, name: "fine-tune", status: "running" },
+        { id: "parent0000000000000000000000001", name: "baseline", status: "completed" },
+      ],
+      commits: [
+        { hash: "c" + "0".repeat(63), message: "latest work", metrics: { loss: 0.2 },
+          timestamp: "2026-08-25T02:00:00" },
+        { hash: "c" + "1".repeat(63), message: "earlier work", metrics: { loss: 0.5 },
+          timestamp: "2026-08-25T01:00:00" },
+      ],
+      total_commits: 2,
+      semantic_summary: {
+        files: { added: [], removed: ["old.txt"], changed: ["model.pt"] },
+        totals: { bytes_before: 105, bytes_after: 100 },
+        summary: "+0 -1 ~1 file(s)",
+      },
+      env_snapshot_id: null,
+      avh_object_id: null,
+      ...overrides,
+    };
   }
 
-  async function expand() {
+  function mockDetailApi(summaryOverrides: Partial<api.RunSummary> = {}) {
+    mocked.fetchRuns.mockResolvedValue([childRun]);
+    mocked.fetchLatestEventId.mockResolvedValue(0);
+    mocked.fetchRunSummary.mockResolvedValue(baseSummary(summaryOverrides));
+  }
+
+  async function open() {
     render(<RunsPanel projectId="p" />);
     await waitFor(() => expect(screen.getByText("fine-tune")).toBeInTheDocument());
     fireEvent.click(screen.getByTestId(`run-row-${childRun.id.slice(0, 8)}`));
-    await waitFor(() =>
-      expect(screen.getByText(/Linked commits/)).toBeInTheDocument()
-    );
+    await waitFor(() => expect(screen.getByText(/Linked commits/)).toBeInTheDocument());
   }
 
   it("shows the parent lineage chain", async () => {
     mockDetailApi();
-    await expand();
-    // Chain rendered self → root: child row, then the parent indented with its name.
-    // ids slice(0,8): "child000" / "parent00".
+    await open();
     expect(screen.getByText(/↳ child000 \(fine-tune\)/)).toBeInTheDocument();
     expect(screen.getByText(/↳ +parent00 \(baseline\)/)).toBeInTheDocument();
   });
 
-  it("lists linked commits with messages and a metric table", async () => {
+  it("lists linked commits with messages and a metric table (below the chart threshold)", async () => {
     mockDetailApi();
-    await expand();
+    await open();
     expect(screen.getByText("latest work")).toBeInTheDocument();
     expect(screen.getByText("earlier work")).toBeInTheDocument();
-    // union of metric keys becomes columns; both rows' values render
     expect(screen.getByText("loss")).toBeInTheDocument();
     expect(screen.getAllByText("0.2").length).toBeGreaterThan(0);
     expect(screen.getAllByText("0.5").length).toBeGreaterThan(0);
   });
 
-  it("composes the semantic summary from the last two linked commits' trees", async () => {
-    mockDetailApi();
-    await expand();
-    // old tree {model.pt(ch1,ch3), old.txt} → new tree {model.pt(ch1,ch2)}:
-    // 0 added · 1 removed (old.txt) · 1 changed file; chunks reused 1/2 → dedup 50%.
-    const text = screen.getByText(/Latest change/i).parentElement!.textContent ?? "";
-    expect(text).toContain("0 added");
-    expect(text).toContain("1 changed");
-    expect(text).toContain("1 removed");
-    expect(text).toContain("chunks reused 1/2");
-    expect(text).toMatch(/dedup 50\.0%/);
+  it("switches to a metrics chart once there are 3+ points of history", async () => {
+    mockDetailApi({
+      commits: [
+        { hash: "c" + "0".repeat(63), message: "c0", metrics: { loss: 0.2 }, timestamp: "2026-08-25T03:00:00" },
+        { hash: "c" + "1".repeat(63), message: "c1", metrics: { loss: 0.3 }, timestamp: "2026-08-25T02:00:00" },
+        { hash: "c" + "2".repeat(63), message: "c2", metrics: { loss: 0.5 }, timestamp: "2026-08-25T01:00:00" },
+      ],
+      total_commits: 3,
+    });
+    await open();
+    // MetricsChart renders "ML Metrics Over Time" as its card title; the plain
+    // per-commit table (with a "Message" column header) should NOT be present.
+    expect(screen.getByText("ML Metrics Over Time")).toBeInTheDocument();
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
   });
 
-  it("surfaces per-run fetch failures instead of blank space", async () => {
+  it("shows the server-computed semantic summary", async () => {
+    mockDetailApi();
+    await open();
+    const text = screen.getByText(/Latest change/i).parentElement!.textContent ?? "";
+    expect(text).toContain("+0 -1 ~1 file(s)");
+    expect(text).toContain("105");
+    expect(text).toContain("100");
+  });
+
+  it("shows a needs-more-history message with fewer than two commits", async () => {
+    mockDetailApi({
+      commits: [{ hash: "c" + "0".repeat(63), message: "only one", metrics: {}, timestamp: null }],
+      total_commits: 1,
+      semantic_summary: null,
+    });
+    await open();
+    expect(screen.getByText(/needs at least two linked commits/i)).toBeInTheDocument();
+  });
+
+  it("shows env snapshot and published-notes pointers when present", async () => {
+    mockDetailApi({
+      env_snapshot_id: "e".repeat(64),
+      avh_object_id: "a".repeat(64),
+    });
+    await open();
+    expect(screen.getByText(/env snapshot:/)).toBeInTheDocument();
+    expect(screen.getByText(/context notes published/i)).toBeInTheDocument();
+  });
+
+  it("shows an opt-in hint when no context notes have been published", async () => {
+    mockDetailApi(); // avh_object_id: null by default
+    await open();
+    expect(screen.getByText(/av handoff --publish/)).toBeInTheDocument();
+  });
+
+  it("surfaces summary fetch failures with a retry button, not blank space", async () => {
     mocked.fetchRuns.mockResolvedValue([childRun]);
     mocked.fetchLatestEventId.mockResolvedValue(0);
-    mocked.fetchRun.mockRejectedValue(new Error("HTTP 404"));
+    mocked.fetchRunSummary.mockRejectedValue(new Error("HTTP 404"));
     render(<RunsPanel projectId="p" />);
     await waitFor(() => expect(screen.getByText("fine-tune")).toBeInTheDocument());
     fireEvent.click(screen.getByTestId(`run-row-${childRun.id.slice(0, 8)}`));
     await waitFor(() => expect(screen.getByText(/HTTP 404/)).toBeInTheDocument());
+    expect(screen.getByText("Retry")).toBeInTheDocument();
+  });
+
+  it("updates the URL's ?run= param on open and clears it on close", async () => {
+    mockDetailApi();
+    await open();
+    expect(new URLSearchParams(window.location.search).get("run")).toBe(childRun.id);
+
+    fireEvent.click(screen.getByText("Close"));
+    await waitFor(() => expect(screen.queryByText(/Linked commits/)).not.toBeInTheDocument());
+    expect(new URLSearchParams(window.location.search).get("run")).toBeNull();
+  });
+
+  it("opens the detail panel immediately when given an initialRunId (deep link)", async () => {
+    mockDetailApi();
+    render(<RunsPanel projectId="p" initialRunId={childRun.id} />);
+    await waitFor(() => expect(screen.getByText(/Linked commits/)).toBeInTheDocument());
+    expect(mocked.fetchRunSummary).toHaveBeenCalledWith(childRun.id);
   });
 });

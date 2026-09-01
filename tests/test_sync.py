@@ -129,9 +129,17 @@ class FakeRemoteClient(client_module.VaultClient):
     def push_commit(self, commit_data: dict) -> bool:
         return not self.reject_pushes
 
-    def update_ref(self, ref_name: str, commit_hash: str) -> bool:
+    def update_ref(self, ref_name: str, commit_hash: str, expected_hash: str | None = None) -> bool:
+        # v1.2.5: mirrors the real server's compare-and-swap semantics (server.py's
+        # update_ref) — expected_hash=None keeps the pre-1.2.5 unconditional-write
+        # behavior every existing test here relies on; when given, a mismatch raises
+        # RefRaceError exactly like the real client does on a live 409.
         if self.reject_pushes:
             return False
+        if expected_hash is not None and self.recorded_refs.get(ref_name) != expected_hash:
+            from python.av_cli.client import RefRaceError
+
+            raise RefRaceError(ref_name, self.recorded_refs.get(ref_name), expected_hash)
         self.recorded_refs[ref_name] = commit_hash
         return True
 
@@ -245,13 +253,60 @@ def test_clone_preserves_signature_for_offline_verify(fake_registry, tmp_path, m
     del base64
 
 
+def test_pull_preserves_signature_for_offline_verify(fake_registry, tmp_path, monkeypatch):
+    """v1.2.5: the fast-forward path (not just clone's full-history fetch) must also
+    carry the signature through — `av pull` writes fetched commits via the same
+    sync.write_fetched_commit()/normalize_commit_row() path as clone, but this is the
+    dedicated regression test for that fact rather than an inference from clone's."""
+    pytest.importorskip("cryptography")
+
+    from python.av_cli.signing import generate_keypair, verify_signature
+
+    source, fake = fake_registry["source"], fake_registry["fake"]
+    monkeypatch.chdir(tmp_path)
+    assert invoke("clone", "source", "workcopy").exit_code == 0
+    work = tmp_path / "workcopy"
+
+    monkeypatch.chdir(source)
+    generate_keypair(source)
+    (source / "signed_after_clone.txt").write_text("v")
+    invoke("add", "signed_after_clone.txt")
+    r = invoke("commit", "-m", "signed after clone")
+    assert r.exit_code == 0, r.output
+    signed_hash = (source / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    monkeypatch.chdir(work)
+    pull_result = invoke("pull")
+    assert pull_result.exit_code == 0, pull_result.output
+
+    pulled_commit_file = work / ".av" / "commits" / f"{signed_hash}.json"
+    assert pulled_commit_file.exists(), "signed commit missing after pull"
+    data = json.loads(pulled_commit_file.read_text(encoding="utf-8"))
+    assert isinstance(data.get("signature"), dict), \
+        "pull dropped the signature — verify would falsely report UNSIGNED"
+    ok, reason = verify_signature(data)
+    assert ok, f"pulled signature failed verification: {reason}"
+
+    # And the CLI's own verify path agrees, on a machine with no signing key of its own.
+    verify_res = invoke("registry", "verify", signed_hash)
+    assert verify_res.exit_code == 0, verify_res.output
+    assert "VERIFIED" in verify_res.output
+
+
 def test_clone_materializes_tip_full_history_and_identity(fake_registry, tmp_path, monkeypatch):
     source, pid = fake_registry["source"], fake_registry["pid"]
     monkeypatch.chdir(tmp_path)
 
-    result = invoke("clone", "source")
+    # Explicit target dir, distinct from the "source" fixture repo's own directory name —
+    # omitting it defaults the clone target to Path.cwd()/"source", which collided with
+    # fake_registry["source"] itself (both are tmp_path/"source"). Pre-1.2.5 that silently
+    # hit the "target already exists and is not empty" early-return (exit 0, no real clone
+    # performed) and every assertion below passed trivially by comparing source to itself;
+    # the v1.2.5 exit-code fix (that path now fails loudly, exit 15) surfaced it. Found
+    # during the V1.2.5 conflict-UX work, not a regression from that work itself.
+    result = invoke("clone", "source", "cloned")
     assert result.exit_code == 0, result.output
-    cloned = tmp_path / "source"
+    cloned = tmp_path / "cloned"
     assert (cloned / "train.py").read_text() == "print('v2')"
     assert (cloned / "model.bin").read_bytes() == (source / "model.bin").read_bytes()
 
@@ -316,7 +371,8 @@ def test_clone_refuses_nonempty_target(fake_registry, tmp_path, monkeypatch):
     (occupied / "keepme.txt").write_text("precious")
 
     result = invoke("clone", "source", "occupied")
-    assert result.exit_code == 0, result.output  # style: secho+return like checkout errors
+    # v1.2.5: routed through fail("validation") — exit 15, not the old secho+return exit 0.
+    assert result.exit_code == 15, result.output
     assert "not empty" in result.output
     assert (occupied / "keepme.txt").exists()
 
@@ -395,7 +451,9 @@ def test_pull_diverged_when_local_has_unpushed_commits(fake_registry, tmp_path, 
 
     diverged_tip = (work / ".av" / "refs" / "heads" / "main").read_text().strip()
     result = invoke("pull")
-    assert result.exit_code == 0, result.output
+    # v1.2.5: a divergence reuses merge_conflict's exit code (14) instead of exiting 0 —
+    # it's resolved by the same `av merge` command family; see the exit-code registry fix.
+    assert result.exit_code == 14, result.output
     assert "diverged" in result.output
     assert "av merge" in result.output
     # ref untouched; the fetched remote tip is available locally for av merge

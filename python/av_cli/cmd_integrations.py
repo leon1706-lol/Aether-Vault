@@ -45,8 +45,15 @@ def graph(update: bool) -> None:
 @click.option("--since", default=None, help="Diff weights/metrics against this commit hash instead of the direct parent.")
 @click.option("--with-memory/--no-memory", default=True, show_default=True,
               help="Include the agent context-memory layer (notes + metric trend).")
+@click.option("--publish", is_flag=True, default=False,
+              help="v1.2.5: upload this .avh to the registry and link it to the active run, "
+                   "so the WebUI run-detail view can render context-memory notes. OPT-IN "
+                   "and explicit only — notes can hold private reasoning; nothing publishes "
+                   "them without this flag. Requires an active run (av run start / AV_RUN_ID) "
+                   "and a reachable registry.")
 @click.pass_context
-def handoff(ctx: click.Context, update: bool, note: str | None, instructions_file: str | None, diff_weights: bool, since: str | None, with_memory: bool) -> None:
+def handoff(ctx: click.Context, update: bool, note: str | None, instructions_file: str | None,
+           diff_weights: bool, since: str | None, with_memory: bool, publish: bool) -> None:
     """Generate (or update) a .avh agent handoff snapshot and a Markdown log entry in Aether-Handoff/."""
     if ctx.invoked_subcommand is not None:
         return
@@ -58,8 +65,59 @@ def handoff(ctx: click.Context, update: bool, note: str | None, instructions_fil
         repo_root, update=update, agent_instructions=note_text, diff_weights=diff_weights,
         since=since, with_memory=with_memory,
     )
-    click.secho(f"Handoff snapshot written: {avh_path.relative_to(repo_root)}", fg="green")
-    click.secho(f"Markdown log entry: {md_path.relative_to(repo_root)}", fg="cyan")
+    # v1.2.5: guarded so --publish's JSON envelope (below) is the only thing on stdout
+    # in JSON mode — these two lines had no such guard before because this command had
+    # no JSON output path at all until --publish added one.
+    if current_output_mode() != "json":
+        click.secho(f"Handoff snapshot written: {avh_path.relative_to(repo_root)}", fg="green")
+        click.secho(f"Markdown log entry: {md_path.relative_to(repo_root)}", fg="cyan")
+
+    if publish:
+        _publish_avh(repo_root, avh_path)
+    elif current_output_mode() == "json":
+        emit_json(None, "handoff", data={
+            "avh_path": str(avh_path), "markdown_path": str(md_path), "published": False,
+        })
+
+
+def _publish_avh(repo_root: Path, avh_path: Path) -> None:
+    """v1.2.5: uploads `avh_path` through the NORMAL object flow (same path env
+    snapshots use — POST /api/objects/{hash}, hash re-verified server-side) and links it
+    to the active run via POST /api/runs/{run_id}/avh. Never silent: any failure here is
+    a clear error, not a queued retry — publishing is a deliberate, explicit action with
+    no established offline-retry queue for run-level metadata (unlike commits)."""
+    from .client import VaultClient
+    from .core import hash_file_safe, resolve_run_id
+
+    run_id = resolve_run_id(repo_root)
+    if not run_id:
+        fail(None, "validation",
+             "No active run (av run start / AV_RUN_ID) — --publish links the .avh to a "
+             "run, so one must be active.")
+
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"),
+                         cfg.get("remote_api_token"))
+    if not client.server_available():
+        fail(None, "validation", f"Registry unreachable at {cfg.get('remote_url')} — "
+             "could not publish (--publish does not queue; retry once reachable).")
+
+    avh_hash = hash_file_safe(str(avh_path))
+    if not client.upload_object(avh_path, avh_hash):
+        fail(None, "validation", "Failed to upload the .avh object to the registry.")
+
+    resp = client.session.post(
+        f"{client.server_url}/api/runs/{run_id}/avh",
+        json={"avh_object_id": avh_hash}, timeout=30,
+    )
+    if resp.status_code != 200:
+        fail(None, "validation",
+             f"Failed to link the .avh to run {run_id}: HTTP {resp.status_code} {resp.text[:200]}")
+
+    if current_output_mode() == "json":
+        emit_json(None, "handoff publish", data={"run_id": run_id, "avh_object_id": avh_hash})
+        return
+    click.secho(f"Published: run {run_id[:8]}… now points at .avh object {avh_hash[:16]}…", fg="green")
 
 
 @handoff.command("init")

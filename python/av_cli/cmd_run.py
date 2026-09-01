@@ -195,11 +195,12 @@ def show(run_id: str) -> None:
 
 
 def current_run_id(repo_root) -> str | None:
-    """The active run id, if any (used by commit's auto-tagging)."""
-    path = _state_path(repo_root)
-    if not path.exists():
-        return os.environ.get("AV_RUN_ID")
-    try:
-        return json.loads(path.read_text(encoding="utf-8")).get("run_id")
-    except (OSError, json.JSONDecodeError):
-        return os.environ.get("AV_RUN_ID")
+    """The active run id, if any (used by commit's auto-tagging).
+
+    v1.2.5: delegates to core.resolve_run_id() (explicit > AV_RUN_ID env > .av/run.json
+    state) — kept as a thin wrapper so `av_sdk.Repo` and any other existing import of
+    this name keep working unchanged; the actual precedence logic lives in one place now.
+    """
+    from .core import resolve_run_id
+
+    return resolve_run_id(repo_root)

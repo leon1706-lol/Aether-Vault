@@ -77,5 +77,34 @@ def main() -> None:
     print(f"Seeded 2 commits with a layer-split checkpoint, from {repo_root}")
 
 
+def seed_run() -> None:
+    """v1.2.5: a real run with 3 linked commits + metrics, for webui/e2e/runs.spec.ts —
+    a distinctive name ("e2e-runs-spec-run") rather than a fixed id, since the run id
+    is server-generated; the spec resolves it by querying GET /api/runs itself."""
+    repo_root = Path(tempfile.mkdtemp(prefix="av-e2e-run-seed-"))
+    os.chdir(repo_root)
+    runner = CliRunner()
+
+    def run(*args):
+        result = runner.invoke(cli, list(args))
+        if result.exit_code != 0:
+            print(result.output, file=sys.stderr)
+            raise SystemExit(f"av {' '.join(args)} failed: {result.exit_code}")
+        return result
+
+    run("init")
+    run("config", "--remote-url", "http://localhost:8000")
+    run("run", "start", "e2e-runs-spec-run")
+
+    for i, loss in enumerate((0.9, 0.5, 0.2), start=1):
+        (repo_root / "model.pt").write_bytes(f"weights-v{i}".encode())
+        run("add", "model.pt")
+        run("commit", "-m", f"e2e run step {i}", "--metric", f"loss={loss}")
+
+    run("run", "finish")
+    print(f"Seeded run 'e2e-runs-spec-run' with 3 commits, from {repo_root}")
+
+
 if __name__ == "__main__":
     main()
+    seed_run()

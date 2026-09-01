@@ -11,6 +11,22 @@ class AuthenticationError(Exception):
     look like a generic network/not-found failure."""
 
 
+class RefRaceError(Exception):
+    """v1.2.5: raised when update_ref(expected_hash=...) loses a compare-and-swap race — the
+    server's current commit_hash for the ref no longer matches what this client believed it
+    was advancing from. `.current`/`.expected` carry both hashes so the caller can attribute
+    the race (e.g. to a run id) instead of just reporting a generic push failure."""
+
+    def __init__(self, ref_name: str, current: str | None, expected: str):
+        self.ref_name = ref_name
+        self.current = current
+        self.expected = expected
+        super().__init__(
+            f"ref '{ref_name}' race: expected {expected[:7] if expected else expected}, "
+            f"server has {current[:7] if current else '(none)'}"
+        )
+
+
 class VaultClient:
     def __init__(self, server_url: str = 'http://localhost:8000', api_token: str | None = None):
         self.server_url = server_url.rstrip('/')
@@ -137,11 +153,30 @@ class VaultClient:
         except requests.exceptions.RequestException:
             return None
 
-    def update_ref(self, ref_name: str, commit_hash: str) -> bool:
+    def update_ref(self, ref_name: str, commit_hash: str, expected_hash: str | None = None) -> bool:
+        """Advances `ref_name` to `commit_hash`.
+
+        `expected_hash` (v1.2.5, optional) requests compare-and-swap: the server only
+        applies the update if its CURRENT commit_hash for this ref equals `expected_hash`.
+        Omitted (default) preserves the pre-1.2.5 unconditional last-write-wins behavior —
+        existing callers are unaffected. On a lost race the server returns 409, which this
+        raises as `RefRaceError` (caught by `_finalize_commit`, never a bare `return False`,
+        so a race is distinguishable from an ordinary network/server failure).
+        """
         url = f"{self.server_url}/api/refs/{ref_name}"
+        payload: dict = {"commit_hash": commit_hash}
+        if expected_hash is not None:
+            payload["expected_hash"] = expected_hash
         try:
-            resp = self.session.put(url, json={"commit_hash": commit_hash})
+            resp = self.session.put(url, json=payload)
             self._raise_for_auth(resp)
+            if resp.status_code == 409:
+                detail = {}
+                try:
+                    detail = resp.json().get("detail") or {}
+                except ValueError:
+                    pass
+                raise RefRaceError(ref_name, detail.get("current"), expected_hash or "")
             return resp.status_code == 200
         except requests.exceptions.RequestException:
             return False

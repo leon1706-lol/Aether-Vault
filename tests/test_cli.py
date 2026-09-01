@@ -444,7 +444,10 @@ def test_status_reports_untracked_staged_modified(repo):
 
 def test_commit_with_nothing_staged_is_noop(repo):
     result = invoke("commit", "-m", "empty")
-    assert result.exit_code == 0
+    # v1.2.5: exit 11 (nothing_to_commit) via fail(), matching the documented exit-code
+    # registry (previously exited 0 in both text and JSON mode — see tests/test_exit_codes.py
+    # and development/Probleme.md).
+    assert result.exit_code == 11
     assert "nothing to commit" in result.output.lower()
     assert list((repo / ".av" / "commits").iterdir()) == []
 

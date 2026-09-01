@@ -9,6 +9,7 @@ them from `.main`, to avoid a circular import (main.py imports this module).
 
 import json
 import os
+import statistics
 import subprocess
 import time
 import uuid
@@ -18,10 +19,29 @@ from typing import Callable
 from .index import Index
 
 Probe = tuple[str, float]  # (label, elapsed_ms)
+# v1.2.5: (label, samples_ms, median_ms, budget_ms, budget_class) — the perf gate's
+# median-of-N view of a probe. budget_class is "cpu" or "disk" (see _BUDGET_CLASS below);
+# the gate (tests/test_perf_gate.py) owns what multiplier each class gets — this module
+# only classifies, it never judges pass/fail.
+SampledProbe = tuple[str, list, float, float | None, str]
 
 SYNTHETIC_ENTRY_COUNT = 500
 SYNTHETIC_FILE_COUNT = 2000
 SYNTHETIC_OBJECT_COUNT = 1000
+SYNTHETIC_COMMIT_ENTRY_COUNT = 300
+# 150, not 500 — still 5x `av log`'s default --limit (30), enough depth to catch a real
+# algorithmic regression (e.g. walk_history() turning quadratic), while keeping the
+# probe's absolute cost reasonable: it opens+reads+json.loads() one file per commit
+# sequentially (unlike iter_working_files()/Storage stats(), which only stat/enumerate),
+# so its per-item cost is structurally higher and doesn't need as large an N to be useful.
+SYNTHETIC_LOG_COMMIT_COUNT = 150
+
+# v1.2.5: how many times the perf gate samples each probe (see run_synthetic_probes_sampled).
+# The first sample is always discarded as a warm-up — first-touch disk cache / OS scheduler
+# noise was the dominant source of the single-shot flakiness that forced the old single
+# global BUDGET_MULTIPLIER up three times (3.0 -> 2.0 -> 2.5, see test_perf_gate.py's
+# docstring) — median-of-N removes that without loosening the real threshold.
+PROBE_SAMPLES = 5
 
 # Soft advisory budgets in ms, keyed by label prefix — exceeding one only flags a
 # row as SLOW in the printed table, it never fails the command or the test suite.
@@ -37,6 +57,25 @@ _BUDGETS_MS = {
     # v1.2.2: semdiff joined the hot-path family (it runs per handoff/diff and now also
     # inside the perf gate) — budget sized for the synthetic 500-entry tree below.
     "semdiff.diff_trees()": 100.0,
+    # v1.2.5: per-surface probes the todo asked for — commit/status/log each get their own
+    # budget instead of being implied by Index.save()/iter_working_files(). compute_status()
+    # and log() were both revised upward from their first-cut estimates after a real
+    # measurement run showed the initial guesses (300/150) were too tight even before
+    # applying the disk-class multiplier — see test_perf_gate.py's docstring history for
+    # why "measure, then set the budget" beats guessing here same as it does for the
+    # multiplier itself.
+    "commit_staged()": 250.0,
+    "compute_status()": 600.0,
+    "log()": 300.0,
+}
+
+# v1.2.5: which multiplier family (see test_perf_gate.py) each probe belongs to. CPU probes
+# (pure in-memory work) are far more repeatable across runs/machines than disk probes
+# (filesystem I/O — subject to antivirus scanning, cache state, and Windows' notoriously
+# slow small-file I/O), so they get a tighter multiplier. Unrecognized labels default to
+# "disk" — the more lenient class — rather than silently getting no classification.
+_BUDGET_CLASS = {
+    "semdiff.diff_trees()": "cpu",
 }
 
 
@@ -45,6 +84,13 @@ def _budget_for(label: str) -> float | None:
         if label.startswith(prefix):
             return budget
     return None
+
+
+def _budget_class_for(label: str) -> str:
+    for prefix, cls in _BUDGET_CLASS.items():
+        if label.startswith(prefix):
+            return cls
+    return "disk"
 
 
 def _time_ms(fn: Callable[[], object]) -> float:
@@ -184,7 +230,148 @@ def run_synthetic_probes(
     results.append((label, _time_ms(lambda: diff_trees(old_tree, new_tree)),
                     _budget_for(label)))
 
+    # v1.2.5 per-surface probe: commit_staged() end-to-end — deterministic hash over sorted
+    # JSON, atomic local persist, ref advance, index clear+resave. Imported lazily (not at
+    # module level) because core.py imports this module (`from . import speedcheck`), so a
+    # top-level `from .core import commit_staged` here would be circular; by the time this
+    # function actually runs, core.py has always finished importing.
+    from .core import commit_staged
+
+    commit_dir = tmp_root / "commit_probe"
+    commit_av_dir = commit_dir / ".av"
+    (commit_av_dir / "commits").mkdir(parents=True)
+    (commit_av_dir / "refs" / "heads").mkdir(parents=True)
+    (commit_av_dir / "objects").mkdir()
+    (commit_av_dir / "HEAD").write_text("ref: refs/heads/main\n")
+    (commit_av_dir / "refs" / "heads" / "main").write_text("")
+    (commit_av_dir / "config").write_text(json.dumps({
+        "lfs_threshold_mb": 50,
+        # Deliberately a closed port, not the default localhost:8000 — this machine may
+        # genuinely have a real av_server listening there (e.g. `docker compose up`), and
+        # this probe must never depend on luck (or worse, push a synthetic commit into a
+        # live registry) to stay network-free. defer_upload=True below skips the network
+        # entirely regardless, but this is the belt to that braces.
+        "remote_url": "http://127.0.0.1:1",
+    }))
+    commit_idx = Index(commit_dir)
+    for i in range(SYNTHETIC_COMMIT_ENTRY_COUNT):
+        commit_idx.entries[f"commit_file_{i}.py"] = {
+            "hash": uuid.uuid4().hex,
+            "size": 1024,
+            "mtime_ns": 0,
+            "type": "code",
+            "staged": True,
+            "pointer": None,
+        }
+    commit_idx.save()
+    label = f"commit_staged() ({SYNTHETIC_COMMIT_ENTRY_COUNT} entries)"
+    results.append((
+        label,
+        _time_ms(lambda: commit_staged(
+            commit_dir, "speedcheck probe", defer_upload=True, result_sink=lambda _r: None,
+        )),
+        _budget_for(label),
+    ))
+
+    # v1.2.5 per-surface probe: compute_status() — reuses the 2000-file working tree already
+    # built for iter_working_files() above (compute_status() calls iter_working_files()
+    # internally plus a per-file stat/compare, so this measures that combined real cost) with
+    # a fresh Index deliberately mismatched against it: every 4th file untracked (no entry),
+    # the rest split staged/needs-compare, so all four status branches actually execute.
+    from .core import compute_status
+
+    status_idx = Index(tmp_root)
+    for i in range(SYNTHETIC_FILE_COUNT):
+        if i % 4 == 0:
+            continue  # left untracked on purpose
+        status_idx.entries[f"src/f_{i}.txt"] = {
+            "hash": "deadbeef",
+            "size": 1,
+            "mtime_ns": 0,
+            "type": "code",
+            "staged": (i % 4 == 1),
+            "pointer": None,
+        }
+    label = f"compute_status() ({SYNTHETIC_FILE_COUNT} files)"
+    results.append((
+        label, _time_ms(lambda: compute_status(tmp_root, status_idx)), _budget_for(label),
+    ))
+
+    # v1.2.5 per-surface probe: log() — walk_history() over a synthetic linear chain, built
+    # by writing commit JSON directly (real commit_staged() calls would be far slower to set
+    # up at this scale and the walk itself, not commit creation, is what this times).
+    from . import history
+
+    log_dir = tmp_root / "log_probe"
+    log_commits_dir = log_dir / ".av" / "commits"
+    log_commits_dir.mkdir(parents=True)
+    log_refs_dir = log_dir / ".av" / "refs" / "heads"
+    log_refs_dir.mkdir(parents=True)
+    prev_hash: str | None = None
+    tip_hash = ""
+    for i in range(SYNTHETIC_LOG_COMMIT_COUNT):
+        h = uuid.uuid4().hex + uuid.uuid4().hex[:32]  # 64 hex chars, sha256-shaped
+        commit_data = {
+            "hash": h,
+            "parents": [prev_hash] if prev_hash else [],
+            "author": "speedcheck",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "message": f"synthetic commit {i}",
+            "tree": {},
+            "tags": [],
+            "metrics": {},
+        }
+        (log_commits_dir / f"{h}.json").write_text(json.dumps(commit_data))
+        prev_hash = h
+        tip_hash = h
+    (log_dir / ".av" / "HEAD").write_text("ref: refs/heads/main\n")
+    (log_refs_dir / "main").write_text(tip_hash)
+    label = f"log() ({SYNTHETIC_LOG_COMMIT_COUNT} commits)"
+    results.append((
+        label,
+        _time_ms(lambda: history.walk_history(log_dir, tip_hash, SYNTHETIC_LOG_COMMIT_COUNT)),
+        _budget_for(label),
+    ))
+
     return results
+
+
+def run_synthetic_probes_sampled(
+    load_config: Callable[[Path], dict],
+    iter_working_files: Callable[[Path], object],
+    tmp_root: Path,
+    samples: int = PROBE_SAMPLES,
+) -> list[SampledProbe]:
+    """Median-of-N view of run_synthetic_probes(), for the perf gate (test_perf_gate.py).
+
+    Runs the full probe battery `samples` times, each in its own fresh subdirectory (the
+    probes create/mutate files, so a run can't reuse another run's directory), discards the
+    first run as a warm-up (see PROBE_SAMPLES' docstring), and returns the median of the
+    rest alongside the full sample vector and each probe's budget class — the gate applies
+    its own tolerance policy (median-exceeds-budget AND >=2 samples over) on top of this
+    rather than this module baking one policy in, so `av test --speed`'s single-shot
+    printed table (run_synthetic_probes(), unchanged) and the gate's stricter view can
+    each want different things without duplicating the probe bodies themselves.
+    """
+    if samples < 1:
+        raise ValueError("samples must be >= 1")
+
+    per_run: list[list[tuple[str, float, float | None]]] = []
+    for i in range(samples):
+        sample_dir = tmp_root / f"sample_{i}"
+        sample_dir.mkdir()
+        per_run.append(run_synthetic_probes(load_config, iter_working_files, sample_dir))
+
+    # Drop the warm-up run when there's more than one sample to drop it from.
+    kept = per_run[1:] if len(per_run) > 1 else per_run
+    labels = [label for label, _, _ in per_run[0]]
+
+    sampled: list[SampledProbe] = []
+    for pos, label in enumerate(labels):
+        values = [run[pos][1] for run in kept]
+        budget = per_run[0][pos][2]
+        sampled.append((label, values, statistics.median(values), budget, _budget_class_for(label)))
+    return sampled
 
 
 # ---------------------------------------------------------------------------

@@ -282,6 +282,47 @@ jobs:
           [[ "$ok" == 1 ]] || { docker logs engine-all >&2 || true; exit 1; }
           echo "::notice::role=all: registry :8000 AND webui :3000 healthy in one container"
 
+      # v1.2.5: /api/health (liveness) and /api/ready (readiness) must actually diverge —
+      # this container's REDIS_URL points at a host that doesn't exist, so /api/ready
+      # SHOULD report the redis check failing while /api/health stays green regardless
+      # (that gap is exactly the "most misleading failure mode" infrastructure.md warns
+      # about, now made visible instead of silent).
+      - name: Role=all — /api/ready degrades independently of /api/health
+        run: |
+          curl -sf http://localhost:8000/api/health >/dev/null 2>&1 || {
+            echo "::error::health should stay up regardless of readiness"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/api/ready)
+          [[ "$code" == "503" ]] || {
+            echo "::error::expected 503 from /api/ready (redis intentionally unreachable), got $code"
+            curl -s http://localhost:8000/api/ready; exit 1; }
+          curl -s http://localhost:8000/api/ready | grep -q '"redis": *false' || {
+            echo "::error::/api/ready did not report the redis check as failing"; exit 1; }
+          echo "::notice::role=all: /api/health stayed green while /api/ready correctly reported 503"
+
+      # v1.2.5: killing ONE subservice must restart just that subservice, not the whole
+      # container — RestartCount unchanged proves engine-entrypoint.sh's own restart
+      # loop handled it, not Docker's `restart: unless-stopped` policy on the container.
+      - name: Role=all — killing one subservice restarts it, not the container
+        run: |
+          before=$(docker inspect --format '{{.RestartCount}}' engine-all)
+          docker exec engine-all pkill -f "node server.js"
+          ok=0
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3000/ >/dev/null 2>&1 && { ok=1; break; }
+            sleep 1
+          done
+          [[ "$ok" == 1 ]] || {
+            echo "::error::webui did not come back after being killed"
+            docker logs engine-all >&2; exit 1; }
+          after=$(docker inspect --format '{{.RestartCount}}' engine-all)
+          [[ "$before" == "$after" ]] || {
+            echo "::error::container RestartCount changed ($before -> $after) — the whole"
+            echo "::error::container restarted instead of just the killed subservice"; exit 1; }
+          # The server leg (never touched) must still answer throughout.
+          curl -sf http://localhost:8000/api/health >/dev/null 2>&1 || {
+            echo "::error::server leg went down during a webui-only restart"; exit 1; }
+          echo "::notice::role=all: killing webui restarted just that subservice (container RestartCount unchanged: $before)"
+
       - name: Role=server + legacy auto-detect dispatch
         run: |
           docker stop engine-all >/dev/null
@@ -536,7 +577,7 @@ jobs:
 
       - name: Run Playwright E2E tests (anonymous-mode specs)
         working-directory: webui
-        run: npx playwright test dashboard.spec.ts weight-diff.spec.ts
+        run: npx playwright test dashboard.spec.ts weight-diff.spec.ts runs.spec.ts
 
       # Browser-level Protected-mode coverage: restart THE SAME server in Protected mode
       # (same DB/data, so seeded content stays visible), then drive the ?av_token= handoff

@@ -1330,3 +1330,140 @@ findings (resolved and still-open).
   roundtrip + tamper + unsigned-ok) and K (live audit filters + outcome capture + CLI path).
 - **Deferred:** benchmark #5 measured row + full cross-tool re-run (needs a Docker session —
   owner-acknowledged deferral, see infrastructure.md ops note).
+
+## Phase 57 — V1.2.5 "Depth Pass": closing the ten V1.2 gap areas
+
+`todo.md`'s ten gap areas, closed in one sequenced pass (WP-0 baseline → WP-1 migration →
+WP-7 contracts, since every later area consumes its exit-code/JSON-mode plumbing → WP-2
+through WP-9 → WP-10 engine supervision → WP-11 perf gates, tuned against final code → WP-12
+this wrap-up). Each area shipped a *working first cut* in earlier V1.2 phases; this phase
+finishes the edges — plus three real contract bugs exploration surfaced along the way,
+fixed rather than just documented (see Probleme #86–93).
+
+- **Files:** `python/av_server/migrations/versions/0004_webhook_health_audit_indexes.py`
+  (new), `python/av_server/{models,server,database}.py`,
+  `python/av_cli/{core,client,cmd_audit,cmd_env,cmd_history,cmd_integrations,cmd_policy,
+  cmd_registry,cmd_run,cmd_sync,cmd_watch,cmd_webhooks,semdiff,signing,speedcheck}.py`,
+  `python/av_plugins/{README,_shared,lightning,transformers}.py`, `python/av_sdk/repo.py`,
+  `docker/engine-entrypoint.sh`, `docker-compose.yml`,
+  `python/av_cli/docker/docker-compose.release.yml`, `.github/workflows/tests.yml`,
+  `webui/src/{app/page,components/RunsPanel,lib/api,lib/runDetail}.{tsx,ts}`,
+  `webui/e2e/{seed_data.py,runs.spec.ts}` (new), `webui/vitest.config.ts`, new
+  `webui/src/components/__tests__/ProjectsPanel.test.tsx` + `src/hooks/__tests__/`, tests
+  (`test_exit_codes`, `test_audit_coverage`, `test_env_snapshot` new;
+  `test_cli/dataset_cdc/merge/migrations/perf_gate/plugins/semdiff/server/signing/
+  speedcheck/sync/v120/v122/webhooks_cli` updated), docs (README, architecture,
+  infrastructure, VERSIONING, SECURITY, `python/av_plugins/README.md`, Probleme #86–93,
+  this file).
+- **Area 1 — engine image supervision:** `engine-entrypoint.sh` gained graceful drain
+  (TERM/INT forwards to both children, waits `AV_ENGINE_STOP_GRACE_SECS` before SIGKILL;
+  both compose files set `stop_grace_period: 30s` so Docker's 10s default can't cut the
+  drain short) and independent subservice restart with a sliding-window budget
+  (`AV_ENGINE_RESTART_SUBSERVICE`/`AV_ENGINE_MAX_RESTARTS`/`AV_ENGINE_RESTART_WINDOW_SECS`)
+  — one child dying no longer always tears the whole container down. New `GET /api/ready`
+  (DB + Redis + `AV_DATA_DIR`-writability checks, 503 on failure, auth-exempt) separates
+  readiness from the existing DB-free `/api/health` liveness check; both compose
+  healthchecks now probe `/api/ready` on the server leg. Legacy role auto-detect now logs
+  a deprecation warning; `VERSIONING.md`'s alias-removal entry updated (earliest removal
+  v1.3.0, not yet scheduled — v1.2.3/4/5 all kept publishing them).
+- **Area 2 — env snapshot & replay:** `snapshot_version: 2` splits the document into a
+  HASHED `env` (python, os_family, pins, seeds, cuda_toolkit_version, a configurable
+  `AV_ENV_CAPTURE_VARS` critical-env-var set) and an unhashed `observed` context (GPU
+  names, driver version, hostname, conda env, interpreter path) — equivalent environments
+  on different machines/OSes now share an id; golden fixtures pin exact ids per Python
+  version across the CI matrix. `--execute` always uses `sys.executable -m pip` (was bare
+  `pip`); new `--target-venv`/`--conda-env` give it a real install target; new `--validate`
+  resolves every pin without installing (exit 15 on any unresolvable pin); `--dockerfile`
+  is now multi-stage with a `--cuda` base option and a non-root user, `--out` writes to a
+  file.
+- **Area 3 — dataset CDC generalization:** `CHUNKABLE_EXTS` grows from 8 to 15
+  (`.bin .onnx .model .arrow .feather .pkl .pickle` added, each with a rationale comment);
+  new `chunk` `.avattributes` flag force-enables CDC outside the default set for verified-
+  safe exports (`no-chunk` wins when both are on one line). `semdiff` gains an
+  always-present `chunks.status` (`"measured"`/`"no_chunks"`) alongside the existing
+  nullable `dedup_efficiency`, wired through `.avh`. README/architecture docs +
+  `ATTRIBUTES_TEMPLATE` gained a real worked example.
+- **Area 4 — audit log depth:** the four previously-unaudited mutating routes
+  (`object.upload`, `admin.gc`, `objects.batch_check` exemption documented, `webhook.test`)
+  now record; a static coverage test walks every mutating route and asserts it's either
+  audited or explicitly exempted, so a future unaudited route fails CI. `GET
+  /api/admin/audit` gained `username`/`status_code`/`outcome`/`action_prefix` filters and
+  an opaque `cursor`/`next_cursor` pagination scheme (stable under concurrent inserts,
+  unlike `offset`, which stays supported). New `av audit export --format jsonl|csv` and
+  `av audit prune --before-days N` (admin-only, irreversible, confirms unless `--yes`).
+- **Area 5 — signed commits:** `av registry keys list/fingerprint/rotate` (fingerprint =
+  `sha256` of the raw public key, first 16 hex chars); rotation archives the old keypair
+  under `.av/keys/archive/<fingerprint>/` rather than deleting it — old commits keep
+  verifying against their embedded key. New `.av/policies.json` `require_signature: bool`
+  field, enforced in both `enforce_policy()` and `promote()` (checked before any metric
+  gate, so a denial says "unsigned" not a misleading metric message); `av policy set` now
+  takes an optional `--require-signature` flag with `METRIC`/`OP` made optional to support
+  a signature-only policy (Probleme #90). `av registry export-signature`/`av verify
+  --signature FILE` support fully detached, out-of-repo verification. Golden-bytes
+  canonicalization tests extended across a real clone→verify and pull→verify round trip
+  and a timestamp-spelling matrix (naive/aware/`Z` all verify identically).
+- **Area 6 — WebUI run detail:** new `GET /api/runs/{id}/summary` (lineage chain, linked
+  commits, a server-computed semantic summary reusing `semdiff.diff_trees()`,
+  `env_snapshot_id`, the `.avh` pointer when published) replaces N sequential per-commit
+  fetches with one request. New dedicated `RunDetailPanel` (was an expandable row),
+  deep-linkable via `?tab=runs&run=<id>` query params synced through
+  `history.replaceState`. New opt-in `av handoff --publish` / `Repo.publish_handoff()`
+  uploads `.avh` as a normal CAS object and records `runs.avh_object_id` — notes stay
+  private by default; the WebUI only renders them when that pointer exists. Closed the
+  last two untested surfaces (`ProjectsPanel.test.tsx`, a `useDashboard` hook test) and
+  added `webui/e2e/runs.spec.ts` (seeded run → deep link → lineage/metrics/summary render).
+- **Area 7 — plugin migration:** one run-id resolver, `core.resolve_run_id()` (explicit
+  arg > `AV_RUN_ID` env > `.av/run.json` state), used by every commit path including the
+  now-fixed `av watch` (Probleme #88). Lightning/Transformers' `on_train_end` callbacks
+  call `core.flush_pending_push()` directly instead of shelling out to `av push` — the
+  package's last `os.chdir` is gone. `mlflow.py::import_run()` no longer defaults to
+  `Path.cwd()`. Parity tests extended to assert identical commit payload KEY SETS (schema,
+  not just values), matching `run:`/`env_snapshot_id`/signature presence, and identical
+  error codes for nothing-staged/not-a-repo across CLI/SDK/seam. New "Adding a new
+  framework" walkthrough in `python/av_plugins/README.md`.
+- **Area 8 — webhook delivery maturity:** migration `0004` adds per-webhook
+  `last_success_at`/`last_failure_at`/`consecutive_failures`/`disabled_reason`, updated on
+  every delivery attempt. New `AV_WEBHOOK_DISABLE_AFTER` (default 0/off) auto-disables a
+  webhook after N consecutive failures (emits a `webhook_disabled` event + audit row);
+  `av webhooks enable` clears it. Retry backoff is now exponential
+  (`AV_WEBHOOK_RETRY_INTERVAL_SECS * 2^(attempt-1)`, capped by new
+  `AV_WEBHOOK_RETRY_MAX_SECS`) instead of the old flat interval. New `av webhooks
+  show/deliveries/replay` give delivery-ledger visibility and dead-letter replay
+  (`POST /api/admin/webhook-deliveries/{id}/replay`) that the CLI never had before this
+  phase; proved a poison endpoint dead-lettering doesn't delay a healthy sibling in the
+  same tick.
+- **Area 9 — perf regression gates:** replaced single-shot timing + one global
+  `BUDGET_MULTIPLIER` (walked 3.0→2.0→2.5 across three prior phases) with median-of-N
+  (`speedcheck.run_synthetic_probes_sampled`, N=5, first sample discarded as warm-up) and
+  a genuine cpu/disk budget-class split (`CPU_MULTIPLIER=2.0`, `DISK_MULTIPLIER=3.0`, a
+  further Windows-disk bump) — the gate now fails only when the median AND at least 2 of
+  N samples exceed budget, printing the full run vector on failure.  New per-surface
+  `commit_staged()`/`compute_status()`/`log()` probes (previously implied only by
+  `Index.save()`/`iter_working_files()`). New `AV_PERF_BUDGET_MULTIPLIER` escape hatch
+  overrides both classes outright for a genuinely slow/noisy machine.
+- **Area 10 — multi-agent conflict UX:** this is WP-7 above — the exit-code registry fix,
+  `av pull`/`merge`/`clone` JSON mode, and `error.data` (Probleme #86, #87). Also: `PUT
+  /api/refs/{ref}` gained optional compare-and-swap (`expected_hash`; a mismatch now
+  returns 409 instead of silently overwriting — omitted, behavior is unchanged); a losing
+  ref race queues for retry rather than being lost (non-negotiable #3 applied to ref races
+  exactly as it already applied to network failures), and `av pull`'s existing run-id
+  attribution is now reused in `av merge`'s conflict path too, so every divergence names
+  both runs in both human and JSON output.
+- **Real bugs found by this cycle's own verification (details in Probleme):** #86 the
+  exit-code registry was largely fiction, #87 `pull`/`merge`/`clone` had no JSON mode at
+  all, #88 `av watch` never tagged its auto-commits with the active run, #89
+  `require_signature` policies with no metric key always denied every candidate, #90 no
+  CLI path ever existed to arm a `require_signature` policy, #91 `click.Context.exit()`
+  silently loses its exit code under `CliRunner(standalone_mode=False)`, #92 a bash
+  command-substitution subshell silently discarded the engine's restart-budget state
+  (meaning `AV_ENGINE_MAX_RESTARTS` could never actually trip), #93 two commands leaked
+  human-text output ahead of their own `--output json` envelope.
+- **CI:** `e2e-engine-smoke` gained readiness-degrades-independently-of-health and
+  killing-one-subservice-restarts-just-it assertions; `webui-e2e` gained `runs.spec.ts`.
+  The perf gate keeps running inside the `test` matrix, now median-of-N (slower per-probe,
+  same job).
+- **Deferred:** none — all ten areas landed. A live Docker/WSL2 backend failure on the
+  verifying machine (unrelated to this phase's code — diagnosed as an environment issue,
+  not a regression) blocked the final manual `docker compose` restart/drain repro and
+  fresh image rebuild; the owner should re-run that verification once Docker Desktop is
+  healthy again (see the phase's own report for exact repro steps).

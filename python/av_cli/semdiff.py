@@ -108,7 +108,12 @@ def diff_trees(old_tree: Tree | None, new_tree: Tree | None) -> dict:
         },
         "models": models,
         "chunks": {"reused": chunks_reused, "new": chunks_new,
-                   "dedup_efficiency": dedup_efficiency},
+                   "dedup_efficiency": dedup_efficiency,
+                   # v1.2.5: dedup_efficiency stays None when there's no signal (that's
+                   # real information — "no chunked files changed" isn't "0% reuse"), but
+                   # `status` is ALWAYS one of these two strings, so .avh/agent consumers
+                   # get a stable field to branch on without a null-check on the float.
+                   "status": "measured" if chunk_total else "no_chunks"},
         "datasets": datasets,
         "totals": {
             "bytes_before": _bytes(old_tree),
