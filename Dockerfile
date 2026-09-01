@@ -6,15 +6,18 @@
 # single multi-stage build producing ghcr.io/leon1706-lol/aether-vault-engine.
 # Both runtimes ship in the final layer: Python 3.12 runs the FastAPI registry,
 # Node 20 serves the Next.js standalone dashboard; docker/engine-entrypoint.sh
-# supervises both inside one container (AV_ENGINE_ROLE=all default).
+# supervises both inside one container. AV_ENGINE_ROLE has NO default at the
+# image level (see the ENV block below) — both compose files set it explicitly
+# (=all); a container with it unset falls through to the entrypoint's own
+# runtime auto-detect/default logic instead.
 #
-# Legacy aliasing (one transition cycle, removed next release): the release and
-# edge workflows ALSO push this exact image under the historical
-# aether-vault-server / aether-vault-webui repository names, so existing
-# installs whose pinned compose files pull those tags keep working unchanged —
-# the entrypoint auto-detects which role a legacy per-service container wants
-# from its environment (DATABASE_URL set → server-only; NEXT_PUBLIC_API_URL set
-# without it → webui-only).
+# Legacy aliasing (earliest removal v1.3.0, not yet scheduled — see
+# VERSIONING.md): the release and edge workflows ALSO push this exact image
+# under the historical aether-vault-server / aether-vault-webui repository
+# names, so existing installs whose pinned compose files pull those tags keep
+# working unchanged — the entrypoint auto-detects which role a legacy
+# per-service container wants from its environment (DATABASE_URL set →
+# server-only; NEXT_PUBLIC_API_URL set without it → webui-only).
 #
 # Stage invariant (Probleme.md #69): the runtime Python minor MUST match the
 # py-builder's (a cp312 wheel is rejected by a 3.11 interpreter). Keep them in sync.
@@ -66,8 +69,18 @@ COPY --from=web-builder /build/webui/public /webui/public
 COPY docker/engine-entrypoint.sh /engine-entrypoint.sh
 RUN chmod +x /engine-entrypoint.sh
 
+# v1.2.5.4: AV_ENGINE_ROLE is deliberately NOT defaulted here. Both docker-compose.yml
+# and python/av_cli/docker/docker-compose.release.yml already set it explicitly
+# (AV_ENGINE_ROLE=all), so the consolidated topology is unaffected either way — but a
+# Dockerfile-level default here would make engine-entrypoint.sh's own runtime env var
+# ALWAYS non-empty, which silently disables its legacy auto-detect entirely (infers
+# "server" from DATABASE_URL / "webui" from NEXT_PUBLIC_API_URL when AV_ENGINE_ROLE is
+# unset) for every container from this image — exactly the scenario a pre-1.2.2 pinned
+# compose file relies on, since it never sets AV_ENGINE_ROLE at all. Found live: an
+# `engine-legacy`-style container (DATABASE_URL only, no AV_ENGINE_ROLE) started the
+# webui too, because it silently inherited "all" from here instead of the entrypoint
+# ever seeing an empty value to detect from. See Probleme.md.
 ENV AV_DATA_DIR=/data \
-    AV_ENGINE_ROLE=all \
     WEBUI_PORT=3000 \
     HOSTNAME=0.0.0.0 \
     NODE_ENV=production
