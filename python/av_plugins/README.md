@@ -12,10 +12,11 @@ artifacts that already exist. Installed via extras:
 - `_shared.py` - the seam every plugin is built on: `commit_scoped()` delegates to
   `av_cli.core.commit_scoped_paths()` (direct staging + single-writer commit, no CLI
   hop, no chdir); `push_pending()` (v1.2.5) delegates to `av_cli.core.flush_pending_push()`
-  the same way, for the training-end flush. `run_av()`/`build_metric_args()` are
-  deprecated shims kept for one release's grace window (VERSIONING.md) — no plugin in
-  this package calls either anymore; every framework's staging AND push are zero-chdir,
-  zero-CLI-hop as of v1.2.5.
+  the same way, for the training-end flush — every framework's staging AND push are
+  zero-chdir, zero-CLI-hop as of v1.2.5. The deprecated `run_av()`/`build_metric_args()`
+  shims' one-release grace window (VERSIONING.md) closed at the v1.3.0 MINOR boundary;
+  both are removed from this package (the test suite keeps its own private `_run_av()`
+  CLI-invocation helper for parity tests, unrelated to this production seam).
 
 ## Contracts
 
@@ -58,7 +59,8 @@ staging/commit/push logic. Using `transformers.py` as the template:
    functions directly or shell out to the CLI.
 3. **A training-end flush**: call `_shared.push_pending(repo_root)` from whatever
    end-of-training hook your framework offers (mirrors `lightning.py`/`transformers.py`'s
-   `on_train_end`). Do not use `run_av()` — it's deprecated.
+   `on_train_end`). `run_av()` no longer exists in this package (removed at the v1.3.0
+   MINOR boundary) — never shell out to the CLI.
 4. **A symmetric `import_*()` backfill function** for artifacts that already exist
    outside a live training run (mirrors `mlflow.py::import_run()` or the
    `import_checkpoint()` functions in `lightning.py`/`transformers.py`) — same

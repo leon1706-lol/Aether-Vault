@@ -31,10 +31,15 @@ def note(note: str, agent: str | None) -> None:
     repo_root = ensure_repo()
     path = _memory_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # v1.3.0 (todo.md item 8): stamp the active run (if any) at write time — additive
+    # field, so `av context search --run ID` can scope notes to the run they were
+    # written under. resolve_run_id() is the same single precedence rule every other
+    # commit path already shares (explicit > AV_RUN_ID env > .av/run.json state).
     entry = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "agent": agent or os.environ.get("AV_AUTHOR", "anonymous"),
         "note": note,
+        "run_id": resolve_run_id(repo_root),
     }
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
@@ -43,6 +48,51 @@ def note(note: str, agent: str | None) -> None:
         emit_json(None, "context note", data={"appended": True, "entry": entry})
         return
     click.secho(f"Noted ({len(entry['note'])} chars). Memory now carries the note forward.", fg="green")
+
+
+@context.command()
+@click.argument("query")
+@click.option("--run", "run_id_filter", default=None, help="Only notes written under this run id.")
+@click.option("--since", "since_ts", default=None,
+              help="Only notes at/after this ISO-8601 timestamp.")
+@click.option("--case-sensitive", is_flag=True, default=False)
+def search(query: str, run_id_filter: str | None, since_ts: str | None, case_sensitive: bool) -> None:
+    """Search context-memory notes by substring (todo.md item 8: "notes mentioning X").
+
+    Plain substring match over each note's text — no full-text index, this is a small
+    append-only JSONL file per repo, not a search-engine-scale corpus. --run and --since
+    narrow first; QUERY then filters by substring within whatever's left.
+    """
+    from .handoff import _context_notes
+
+    repo_root = ensure_repo()
+    notes = _context_notes(repo_root)
+
+    if run_id_filter:
+        notes = [n for n in notes if n.get("run_id") == run_id_filter]
+    if since_ts:
+        notes = [n for n in notes if (n.get("ts") or "") >= since_ts]
+
+    needle = query if case_sensitive else query.lower()
+
+    def _matches(n: dict) -> bool:
+        haystack = n.get("note") or ""
+        return needle in (haystack if case_sensitive else haystack.lower())
+
+    matches = [n for n in notes if _matches(n)]
+
+    if current_output_mode() == "json":
+        emit_json(None, "context search", data={"query": query, "matches": matches,
+                                                 "count": len(matches)})
+        return
+    if not matches:
+        click.secho(f"No notes match {query!r}.", fg="yellow")
+        return
+    for n in matches:
+        who = n.get("agent") or "?"
+        when = (n.get("ts") or "")[:19]
+        run_suffix = f"  [run {n['run_id'][:8]}…]" if n.get("run_id") else ""
+        click.echo(f"[{when}] {who}: {n.get('note')}{run_suffix}")
 
 
 @context.command()
@@ -160,10 +210,18 @@ def diff(against_path: str | None) -> None:
 @click.option("--out", default=None, help="Write to file instead of stdout.")
 def export(fmt: str, out: str | None) -> None:
     """Export the current .avh v2 document (freshly built)."""
-    from .handoff import build_handoff_dict
+    from .handoff import build_handoff_dict, validate_handoff
 
     repo_root = ensure_repo()
     doc = build_handoff_dict(repo_root, None)
+    # v1.3.0 (todo.md item 8): validate on this read path too, not just at write time —
+    # a bug in build_handoff_dict() should surface here just as loudly as it would in
+    # `av handoff`, rather than silently exporting a document that fails the contract.
+    problems = validate_handoff(doc)
+    if problems:
+        fail(None, "validation",
+             "The freshly built .avh document failed validation (this is a bug in "
+             "build_handoff_dict, not your input) — " + "; ".join(problems))
     if fmt == "avh":
         rendered = json.dumps(doc, indent=2)
     elif fmt == "json":
@@ -195,6 +253,13 @@ def export(fmt: str, out: str | None) -> None:
             emit_json(None, "context export", data={"written": out, "format": fmt})
             return
         click.secho(f"Wrote {out}", fg="green")
+        return
+    # `--format` (avh/md/json) is this command's OWN content-type flag — independent of
+    # the global `--output json` envelope flag. When both are json-shaped, still wrap in
+    # the standard envelope (`data.document`) so this command doesn't leak a bare,
+    # un-enveloped JSON blob under --output json the way every other command wouldn't.
+    if current_output_mode() == "json":
+        emit_json(None, "context export", data={"format": fmt, "document": rendered})
         return
     click.echo(rendered)
 

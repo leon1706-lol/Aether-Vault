@@ -93,9 +93,13 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
     already run inside webui/. This is not a tool for inspecting an end user's .av/ repository;
     see `av doctor` for that.
     """
+    json_mode = current_output_mode() == "json"
     source_root = _root._find_source_root()
     tests_dir = source_root / "tests"
     if not tests_dir.is_dir():
+        if json_mode:
+            fail(None, "validation", "av test requires a development install; run from a "
+                 "git clone with `pip install -e .[dev]`", command="test")
         click.secho(
             "av test requires a development install; run from a git clone with `pip install -e .[dev]`",
             fg="red",
@@ -113,22 +117,27 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
     if speed:
         args += ["--durations=20"]
 
-    click.secho("=== Python test suite ===", bold=True, fg="cyan")
-    click.secho(f"Running Aether-Vault's test suite (pytest {' '.join(args[3:])})...", fg="cyan")
+    if not json_mode:
+        click.secho("=== Python test suite ===", bold=True, fg="cyan")
+        click.secho(f"Running Aether-Vault's test suite (pytest {' '.join(args[3:])})...", fg="cyan")
     # Stream pytest's output live (line by line, as it would print unbuffered) while also
     # collecting it, so the final "N passed, M failed" summary can be parsed afterward to keep
-    # README.md's test-count badge honest without a second, redundant pytest run.
+    # README.md's test-count badge honest without a second, redundant pytest run. In JSON mode
+    # nothing streams to stdout (an agent wants one clean envelope, not scrollback mixed with
+    # it) — the full text still ends up in the envelope's data.log for anyone who wants it.
     process = subprocess.Popen(
         args, cwd=source_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
     output_lines: list[str] = []
     assert process.stdout is not None
     for line in process.stdout:
-        click.echo(line, nl=False)
+        if not json_mode:
+            click.echo(line, nl=False)
         output_lines.append(line)
     process.wait()
     exit_code = process.returncode
 
+    passed_n = failed_n = None
     if test_filter is None:
         # Strip ANSI escapes (forced on above via --color=yes) before parsing — color codes can
         # otherwise sit between a number and "passed"/"failed" and break the regex match.
@@ -143,41 +152,57 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
             )
             _root._update_readme_test_badge(passed_n, failed_n)
 
+    webui_exit = None
     if run_webui:
         webui_dir = source_root / "webui"
         if not webui_dir.is_dir() or not (webui_dir / "package.json").exists():
-            click.secho(
-                "av test --webui requires a development install with the webui/ source present "
-                "(run from a git clone, not a built wheel).",
-                fg="red",
-            )
+            msg = ("av test --webui requires a development install with the webui/ source "
+                   "present (run from a git clone, not a built wheel).")
+            if json_mode:
+                fail(None, "validation", msg, command="test")
+            click.secho(msg, fg="red")
             sys.exit(1)
 
-        click.secho("\n=== Web UI test suite (webui/) ===", bold=True, fg="cyan")
+        if not json_mode:
+            click.secho("\n=== Web UI test suite (webui/) ===", bold=True, fg="cyan")
         # shutil.which (not a bare "npm" argv) — on Windows, `npm` resolves to `npm.cmd`, which
         # subprocess.run(["npm", ...]) frequently fails to locate/execute even when npm is
         # genuinely installed and on PATH; resolving the full path first (as `which` does, via
         # PATHEXT) avoids a false "npm not found" on a machine that actually has it.
         npm_path = shutil.which("npm")
         if npm_path is None:
-            click.secho(
-                "npm not found on PATH — install Node.js to run the webui/ Vitest suite, "
-                "or omit --webui.",
-                fg="red",
-            )
+            msg = ("npm not found on PATH — install Node.js to run the webui/ Vitest suite, "
+                   "or omit --webui.")
+            if json_mode:
+                fail(None, "validation", msg, command="test")
+            click.secho(msg, fg="red")
             sys.exit(1)
-        webui_result = subprocess.run([npm_path, "test"], cwd=webui_dir)
+        # capture_output/text only passed when actually True — an always-present kwarg
+        # (even =False) would change subprocess.run's call signature versus plain text
+        # mode's bare call, breaking any caller/test that mocks subprocess.run with a
+        # narrower (args, cwd=None) signature (see tests/test_cli.py's webui tests).
+        extra = {"capture_output": True, "text": True} if json_mode else {}
+        webui_result = subprocess.run([npm_path, "test"], cwd=webui_dir, **extra)
+        webui_exit = webui_result.returncode
         if webui_result.returncode != 0:
             exit_code = webui_result.returncode
 
         if speed:
-            click.secho("\n=== Web UI speed bench (webui/) ===", bold=True, fg="cyan")
-            bench_result = subprocess.run([npm_path, "run", "bench"], cwd=webui_dir)
+            if not json_mode:
+                click.secho("\n=== Web UI speed bench (webui/) ===", bold=True, fg="cyan")
+            bench_result = subprocess.run([npm_path, "run", "bench"], cwd=webui_dir, **extra)
             if bench_result.returncode != 0:
                 exit_code = bench_result.returncode
 
-    if speed:
+    if speed and not json_mode:
         _print_synthetic_speed_check()
+
+    if json_mode:
+        emit_json(None, "test", data={
+            "exit_code": exit_code, "passed": passed_n, "failed": failed_n,
+            "webui_exit_code": webui_exit, "log": "".join(output_lines),
+        })
+        sys.exit(exit_code)
 
     sys.exit(exit_code)
 
@@ -213,19 +238,23 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_
     for installing DVC/MLflow as comparison targets. A tool not found on PATH is skipped and
     labeled "not installed" in the output, never given a fabricated number.
     """
+    json_mode = current_output_mode() == "json"
     source_root = _root._find_source_root()
     benchmarks_dir = source_root / "benchmarks"
     if not benchmarks_dir.is_dir():
-        click.secho(
-            "av benchmark requires a development install; run from a git clone with `pip install -e .[dev]`",
-            fg="red",
-        )
+        msg = "av benchmark requires a development install; run from a git clone with `pip install -e .[dev]`"
+        if json_mode:
+            fail(None, "validation", msg, command="benchmark")
+        click.secho(msg, fg="red")
         sys.exit(1)
 
     names = list(only) if only else BENCHMARK_NAMES
     invalid = [n for n in names if n not in BENCHMARK_NAMES]
     if invalid:
-        click.secho(f"Unknown benchmark name(s): {', '.join(invalid)}. Valid names: {', '.join(BENCHMARK_NAMES)}", fg="red")
+        msg = f"Unknown benchmark name(s): {', '.join(invalid)}. Valid names: {', '.join(BENCHMARK_NAMES)}"
+        if json_mode:
+            fail(None, "validation", msg, command="benchmark")
+        click.secho(msg, fg="red")
         sys.exit(1)
 
     if str(source_root) not in sys.path:
@@ -243,7 +272,10 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_
     valid_competitors = {"git-lfs", "dvc", "mlflow"}
     invalid_tools = [t for t in vs_tools if t not in valid_competitors]
     if invalid_tools:
-        click.secho(f"Unknown --vs tool(s): {', '.join(invalid_tools)}. Valid: {', '.join(sorted(valid_competitors))}", fg="red")
+        msg = f"Unknown --vs tool(s): {', '.join(invalid_tools)}. Valid: {', '.join(sorted(valid_competitors))}"
+        if json_mode:
+            fail(None, "validation", msg, command="benchmark")
+        click.secho(msg, fg="red")
         sys.exit(1)
     tool_order = ["av", *[t for t in vs_tools]]
 
@@ -252,22 +284,40 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_
     for name in names:
         module = importlib.import_module(f"benchmarks.bench_{name}")
         result = module.run(tool_order=tool_order)
-        print_table(result)
+        if not json_mode:
+            print_table(result)
         results.append(result)
         markdown_chunks.append(result_to_markdown(result))
 
     if markdown_out:
         doc = render_doc_header(source_root) + METHODOLOGY_NOTES + "\n".join(markdown_chunks)
         Path(markdown_out).write_text(doc, encoding="utf-8")
-        click.echo(f"\nWrote {markdown_out}")
+        if not json_mode:
+            click.echo(f"\nWrote {markdown_out}")
 
     if save_json_out:
         Path(save_json_out).write_text(json.dumps(results_to_json(results), indent=2), encoding="utf-8")
-        click.echo(f"Saved benchmark snapshot to {save_json_out}")
+        if not json_mode:
+            click.echo(f"Saved benchmark snapshot to {save_json_out}")
 
+    regressed = False
+    findings = None
     if baseline_path:
         baseline = json.loads(Path(baseline_path).read_text(encoding="utf-8"))
         findings = compare_to_baseline(results, baseline)
-        regressed = print_regression_report(findings)
+        if not json_mode:
+            regressed = print_regression_report(findings)
+        else:
+            regressed = any(f.get("regressed") for f in findings)
+
+    if json_mode:
+        emit_json(None, "benchmark", data={
+            "results": results_to_json(results), "markdown_path": markdown_out,
+            "json_snapshot_path": save_json_out, "regressions": findings, "regressed": regressed,
+        })
         if regressed:
             sys.exit(1)
+        return
+
+    if regressed:
+        sys.exit(1)

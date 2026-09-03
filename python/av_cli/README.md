@@ -30,6 +30,11 @@ shared logic lives in `core.py`, commands live one-feature-per `cmd_*.py`, and
   (`.avattributes` directives), `client.py` (`VaultClient`), `pointer.py`,
   `fsutil.py`, `handoff.py`, `repl.py`, `docker_runtime.py`, `update_check.py`,
   `speedcheck.py`, `signing.py` (ed25519 commit signatures).
+- `schemas/` - every published JSON Schema contract (`envelope-1.0`, `event-1.0`,
+  `run-1.0`, `webhook-payload-1.0`, `semdiff-1.0`, `avh-2.0`), shipped in the wheel via
+  `package_data` so an external validator can check against the exact schema this project
+  enforces structurally. Loaded via `core.load_contract_schema()`. See
+  [`docs/contracts.md`](../../docs/contracts.md) for the stability policy.
 
 ## Design invariants
 

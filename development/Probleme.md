@@ -940,11 +940,11 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ---
 
-### 78. `core.fail(None, �)` raised AttributeError after printing the error message
+### 78. `core.fail(None, …)` raised AttributeError after printing the error message
 
-**Severity:** 4/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-08-26)
 
-**Problem:** Roughly a dozen call sites (`cmd_run`, `cmd_env`, `cmd_registry`, �) invoke the shared failure helper as `fail(None, "validation", msg)`. `fail()` ended with `ctx.exit(exit_code)` � on `None` that is an `AttributeError` raised AFTER the message printed. Users saw a clean error line followed by a full Python traceback, and the documented exit codes (10�16) were lost outside CliRunner's accidental catching.
+**Problem:** Roughly a dozen call sites (`cmd_run`, `cmd_env`, `cmd_registry`, …) invoke the shared failure helper as `fail(None, "validation", msg)`. `fail()` ended with `ctx.exit(exit_code)` — calling it on `None` that is an `AttributeError` raised AFTER the message printed. Users saw a clean error line followed by a full Python traceback, and the documented exit codes (10–16) were lost outside CliRunner's accidental catching.
 
 **Fix:** `core.fail()` now calls `ctx.exit()` only when a context exists and otherwise raises `SystemExit(exit_code)`. One-line fix at the single choke point; every None-ctx caller inherits it.
 
@@ -952,9 +952,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ---
 
-### 79. `cmd_registry.restore` referenced an undefined `ctx_exit` � latent NameError on every failed restore
+### 79. `cmd_registry.restore` referenced an undefined `ctx_exit` — latent NameError on every failed restore
 
-**Severity:** 3/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-08-26)
 
 **Problem:** `restore()`'s incomplete-archive branch called `ctx_exit(EXIT_VALIDATION)`, a name defined in sibling modules (`cmd_policy`, `cmd_context`) but never in `cmd_registry` nor exported by `core`. Any failed restore crashed with `NameError` instead of the intended exit-15 validation failure. Invisible because no test exercised the failed-restore path and the module imports fine.
 
@@ -966,9 +966,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 80. Legacy-volume adoption stamped the whole migration chain WITHOUT creating post-create_all tables
 
-**Severity:** 7/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-08-26)
 
-**Problem:** `database._ensure_schema_sync` adopts a pre-Alembic volume by stamping the ENTIRE current chain as applied. A true v1.1.x-era create_all volume therefore got stamped straight to head � and every table introduced AFTER the create_all era (`runs`, `run_commits`, `events`, `webhooks`, `audit_log`, v1.2.2's `webhook_deliveries`) silently NEVER existed on it. Startup stayed green; the first runs/events write would 500. The existing heal covered column drift only.
+**Problem:** `database._ensure_schema_sync` adopts a pre-Alembic volume by stamping the ENTIRE current chain as applied. A true v1.1.x-era create_all volume therefore got stamped straight to head — and every table introduced AFTER the create_all era (`runs`, `run_commits`, `events`, `webhooks`, `audit_log`, v1.2.2's `webhook_deliveries`) silently NEVER existed on it. Startup stayed green; the first runs/events write would 500. The existing heal covered column drift only.
 
 **Fix:** New `_create_missing_tables()` runs during adoption: any models.py table missing from the volume is created from the metadata (checkfirst semantics), then column drift heals, then the chain stamps. Existing tables are never touched.
 
@@ -978,9 +978,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 81. `.avh` semantic summary compared against an EMPTY baseline for local commits
 
-**Severity:** 6/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-08-26)
 
-**Problem:** Locally-authored commit files store a `parents` LIST; only registry-fetched commits carry `parent_hash`. `handoff.build_semantic_summary()` and `_metrics_history_tail()` read ONLY `parent_hash` � so for locally-made commits (i.e., every repo's normal case) the semantic summary diffed against an empty tree (all chunks "new", dedup_efficiency 0) and the metrics trend stopped after one hop. Found by the v1.2.2 dedup_efficiency flow-through test, which pinned engine output vs `.avh` output and caught them disagreeing.
+**Problem:** Locally-authored commit files store a `parents` LIST; only registry-fetched commits carry `parent_hash`. `handoff.build_semantic_summary()` and `_metrics_history_tail()` read ONLY `parent_hash` — so for locally-made commits (i.e., every repo's normal case) the semantic summary diffed against an empty tree (all chunks "new", dedup_efficiency 0) and the metrics trend stopped after one hop. Found by the v1.2.2 dedup_efficiency flow-through test, which pinned engine output vs `.avh` output and caught them disagreeing.
 
 **Fix:** Shared `_commit_parent()` tolerates both shapes; both consumers route through it.
 
@@ -988,33 +988,33 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ---
 
-### 82. Clone/pull dropped `signature` and `env_snapshot_id` � clones could neither verify nor replay
+### 82. Clone/pull dropped `signature` and `env_snapshot_id` — clones could neither verify nor replay
 
-**Severity:** 8/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 8/10 · **Status:** 🟢 `fixed` (2026-08-26)
 
-**Problem:** `sync.normalize_commit_row()` rebuilt fetched commit dicts from a fixed field whitelist, silently discarding the v1.2.2 `signature` blob and `env_snapshot_id`. Every cloned repository therefore reported UNSIGNED on `av verify` (false negative � the worst kind for a tamper-evidence feature) and could not resolve replay snapshots by commit. Found by the manual wire pass: keygen ? commit ? push ? clone ? verify said UNSIGNED in the clone.
+**Problem:** `sync.normalize_commit_row()` rebuilt fetched commit dicts from a fixed field whitelist, silently discarding the v1.2.2 `signature` blob and `env_snapshot_id`. Every cloned repository therefore reported UNSIGNED on `av verify` (false negative — the worst kind for a tamper-evidence feature) and could not resolve replay snapshots by commit. Found by the manual wire pass: keygen → commit → push → clone → verify said UNSIGNED in the clone.
 
 **Fix:** Server persists both fields (migration 0003 columns, echo in GET/list endpoints); `normalize_commit_row` passes them through verbatim; fake registry mirrors the real row shape so stack-free tests exercise the same contract.
 
-**Verification:** `test_sync.py::test_clone_preserves_signature_for_offline_verify` (clone verifies offline), `normalize` unit test, live wire round-trip test in `test_server.py`, plus the manual keygen?commit?push?clone?verify loop now reporting VERIFIED.
+**Verification:** `test_sync.py::test_clone_preserves_signature_for_offline_verify` (clone verifies offline), `normalize` unit test, live wire round-trip test in `test_server.py`, plus the manual keygen→commit→push→clone→verify loop now reporting VERIFIED.
 
 ---
 
 ### 83. Timestamp timezone-spelling broke cloned signatures even after #82
 
-**Severity:** 8/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 8/10 · **Status:** 🟢 `fixed` (2026-08-26)
 
-**Problem:** The authoring client signs a payload whose `timestamp` carries `+00:00`; the registry stores naive UTC and echoes timestamps WITHOUT the suffix. Canonical signing bytes are sorted-keys JSON of the whole payload � one character of tz-spelling difference made every cloned verification fail ("TAMPERED") despite byte-identical meaning. Found immediately after fixing #82 in the same manual pass.
+**Problem:** The authoring client signs a payload whose `timestamp` carries `+00:00`; the registry stores naive UTC and echoes timestamps WITHOUT the suffix. Canonical signing bytes are sorted-keys JSON of the whole payload — one character of tz-spelling difference made every cloned verification fail ("TAMPERED") despite byte-identical meaning. Found immediately after fixing #82 in the same manual pass.
 
 **Fix:** `signing.canonical_commit_bytes()` normalizes the timestamp to one canonical UTC rendering parsed from the instant (aware, naive and Z forms all collapse to identical bytes; genuinely different instants still differ).
 
-**Verification:** `test_canonical_form_is_timezone_spelling_insensitive` (+00:00 / naive / Z equal; shifted instant differs); manual wire loop re-run end-to-end ? VERIFIED in fresh clone.
+**Verification:** `test_canonical_form_is_timezone_spelling_insensitive` (+00:00 / naive / Z equal; shifted instant differs); manual wire loop re-run end-to-end → VERIFIED in fresh clone.
 
 ---
 
-### 84. Env snapshot uploaded with non-canonical bytes � server 400, cross-machine replay impossible
+### 84. Env snapshot uploaded with non-canonical bytes — server 400, cross-machine replay impossible
 
-**Severity:** 5/10 � **Status:** ? `fixed` (2026-08-26)
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-08-26)
 
 **Problem:** A snapshot's id hashes its CANONICAL bytes (compact JSON minus `captured_at`), but the push path uploaded the pretty-printed `.av/env_snapshot.json`. The registry's own sha256 verification rejected the upload (400), so snapshots never reached the registry and `av replay <commit>` on any other machine failed with "No snapshot found". Silent: the client treats a failed object upload as non-fatal by design.
 
@@ -1029,7 +1029,7 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 85. TokenGate URL-strip could be overridden by Next.js patched history - Protected-mode handoff left ?av_token= in the address bar
 
-**Severity:** 3/10 - **Status:** fixed (2026-08-26)
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-08-26)
 
 **Problem:** webui-e2e's token-gate spec failed: the handoff token was correctly consumed and persisted (first fetch wave authenticated), but the render-phase `window.history.replaceState` strip did not stick - Next.js patches history methods for App Router integration and can restore the ENTRY URL when hydration completes after a pre-hydration replaceState. Result: `?av_token=...` lingered in the address bar/history (cosmetic, but exactly what the spec exists to prevent).
 
@@ -1271,3 +1271,288 @@ Caught immediately once #103's fix made the CI assertion that checks for this ac
 **Fix:** removed `AV_ENGINE_ROLE=all` from the Dockerfile's `ENV` block. Both `docker-compose.yml` and `python/av_cli/docker/docker-compose.release.yml` already set it explicitly in their own `environment:` blocks, so the normal one-container topology is completely unaffected; a container with no `AV_ENGINE_ROLE` set now genuinely reaches the entrypoint's own auto-detect logic (falling through to `all` as the final default only when neither `DATABASE_URL` nor `NEXT_PUBLIC_API_URL` is set either).
 
 **Verification:** live CI — the `engine-legacy` container (`DATABASE_URL` only) is exactly the scenario this bug broke; will re-verify green (webui absent, only the registry serving) on the next push.
+
+---
+
+### 105. `av --output json add`/`commit` leaked plain human text ahead of the JSON envelope
+
+**Severity:** 7/10 (breaks the JSON-mode contract for the two most-used agent commands) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `core.py::stage_one_file()` (the shared staging function `add`, `commit`'s pre-stage, `av watch`, and `av stash push` all funnel through) called `click.secho(f"Staged [...] {rel_path}", ...)` unconditionally — with no `current_output_mode() == "json"` guard. Every `av --output json add <file>` (and therefore every `commit` that stages inline) printed `Staged [ARTIFACT] file.txt` as a bare line BEFORE its JSON envelope, so `json.loads(result.output)` on the real stdout raised `JSONDecodeError` for any agent actually parsing it. Never caught before because no existing test asserted the FULL stdout was clean JSON — only that a JSON *substring* somewhere in the output parsed.
+
+**Fix:** guarded both `click.secho` call sites in `stage_one_file()` on `current_output_mode() != "json"`. Found by building `tests/test_contract_matrix.py`'s generic anti-leakage sweep (todo.md item 6) and manually driving `av --output json add`/`commit` for real in a scratch repo per AGENTS.md's own verification standard — not caught by any existing unit test.
+
+**Verification:** `tests/test_contract_matrix.py::TestAntiLeakage` (parametrized over every CLI command) plus a manual repro (`av --output json add x.pt` — single clean JSON line, confirmed).
+
+---
+
+### 106. `av --output json watch` leaked multiple human echo lines per auto-commit
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `_finalize_commit()`'s human-echo lines (commit hash/message, upload-deferred notice, ref-race/push-failure messages) are all gated on `result_sink is None` — `cmd_history.py`'s `commit` command already passes a `json_sink` in JSON mode for exactly this reason, but `cmd_watch.py`'s call into the same shared commit path never did. `av --output json watch` therefore printed plain text ahead of (and between) every per-auto-commit JSON envelope.
+
+**Fix:** `cmd_watch.py` now builds the same `json_sink`/`outcome_sink` pair `cmd_history.py` does (only non-None in JSON mode) and passes both into the shared commit call, exactly mirroring the established pattern.
+
+**Verification:** manual repro (`av --output json watch --max-commits 1` against a real staged checkpoint) — output is now exactly two clean JSON lines (`auto_commit`, `stopped`), each independently parseable; pinned by `tests/test_contract_matrix.py::TestWatchStreamsNdjson`.
+
+---
+
+### 107. Four more commands leaked human text under `--output json`: `context export`, `handoff init`, `handoff log`, and (defensively) `handoff show`
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `tests/test_contract_matrix.py`'s anti-leakage sweep (driving every CLI command with `--output json` and asserting clean stdout) found four more commands with no JSON-mode branch at all: `context export` (fell through to a bare `click.echo` even in JSON mode when `--out` wasn't given), `handoff init`, `handoff log`, and `handoff show` (only reachable with a positional arg, so the sweep's no-args pass missed it — fixed anyway).
+
+**Fix:** added `current_output_mode() == "json"` branches to all four, each emitting a proper envelope (`context export` wraps its rendered document in `data.document` rather than emitting a bare, un-enveloped blob even when its OWN `--format json` flag happens to also say "json" — that flag is independent of the global `--output json` envelope flag).
+
+**Verification:** `tests/test_contract_matrix.py::TestAntiLeakage` (all four now pass); manual repro confirmed clean JSON for each.
+
+---
+
+### 108. `av_sdk.Repo.log()` read field names that don't exist in the real commit schema — silently returned at most one commit, always
+
+**Severity:** 8/10 (a core, documented SDK method has never worked correctly) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `Repo.log()` read `c.get("parent_hash")` and `c.get("extra_parents")` to walk the commit chain — but the real LOCAL commit JSON schema (`core.py::commit_staged()`, `history.py::walk_history()`) stores a single `"parents"` LIST, never `parent_hash`/`extra_parents` (those are `av_server`'s DATABASE column names, a completely different schema the local commit files never use). Since `c.get("parent_hash")` was always `None` on every real repo, `Repo.log()`'s walk loop terminated after exactly one commit — `log(limit=30)` silently behaved identically to `log(limit=1)`, for every repo, since the method was written. No existing test caught it because the one prior `Repo.log()`-adjacent test only checked a single-commit repo.
+
+**Fix:** read `c.get("parents")` (a list) and walk `parents[0]` (first-parent, matching `history.py::walk_history()`'s own rule for merge commits).
+
+**Verification:** new full-surface SDK≡CLI parity test (`tests/test_av_sdk.py::test_log_parity_sdk_vs_cli`, todo.md item 5) — a 2-commit repo now returns 2 entries from `Repo.log()` matching the CLI's own `log` output on every shared field, where it previously returned 1.
+
+---
+
+### 109. `av_sdk.Repo.push()` reported `reachable` incorrectly in both directions
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** Two bugs in one method, both found by the same new parity test. (a) When nothing was pending, `Repo.push()` called `client.server_available()` anyway and reported its real boolean — the CLI's `push` reports `reachable: None` ("not checked, nothing to check for") in this exact case; the SDK's extra network round trip and different payload shape were an undocumented divergence. (b) When something WAS pending, `Repo.push()` never checked reachability at all and unconditionally reported `reachable: true` — even when the server was genuinely down and `flush_pending_push()` re-queued everything without draining anything, which is precisely the case that should report `false`.
+
+**Fix:** matched `cmd_history.py::push()`'s logic exactly: report `reachable: None` when nothing is pending; check `client.server_available()` FIRST when something is, reporting `False` (and `still_queued` = the full pending count) before ever attempting a flush.
+
+**Verification:** `tests/test_av_sdk.py::test_push_parity_sdk_vs_cli_when_nothing_pending` and `test_push_parity_sdk_vs_cli_when_queued`.
+
+---
+
+### 110. `av registry export`/`restore` raised `NameError` on every single real invocation — the entire command has never worked
+
+**Severity:** 9/10 (a documented, agent-facing trust-surface command was completely non-functional) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `cmd_registry.py` uses `pathlib.Path(...)` (module-qualified) throughout `export()`/`restore()`, but the file only ever did `from .core import *` (which brings in the `Path` *class* core.py imports, never the `pathlib` *module* itself) and never its own `import pathlib`. Every real call to `av registry export OUT_DIR` or `av registry restore ARCHIVE_DIR` raised `NameError: name 'pathlib' is not defined` on the very first line that touched it — a 100% reproduction rate, on every version since this code was written. Explains exactly why "no test anywhere invokes `av registry export`/`restore`" (todo.md item 18's own stated gap) — nothing had ever exercised it through the real CLI. Found only by following AGENTS.md's own non-negotiable — a manual real-CLI repro in a scratch repo.
+
+**Fix:** added `import pathlib` to `cmd_registry.py`'s top-level imports.
+
+**Verification:** manual repro (`av --output json registry export ./out --project X` in a scratch repo — was an immediate traceback, now runs); `tests/test_server.py::test_registry_export_restore_round_trip` (live-registry-gated, verifies the full round trip end to end).
+
+---
+
+### 111. `av registry export`/`restore` let an unreachable-server `ConnectionError` escape as a raw traceback
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** Found immediately after fixing #110 and re-testing: neither command checked `client.server_available()` before making requests — an unreachable registry surfaced as an unhandled `requests.exceptions.ConnectionError` traceback instead of a clean `fail()` envelope, unlike every other network-touching command in this codebase.
+
+**Fix:** both commands now call `client.server_available()` first and `fail(None, "unreachable_queued", ...)` cleanly (exit 13) when it's down, matching the established pattern elsewhere (e.g. `cmd_maintenance.py::doctor()`).
+
+**Verification:** manual repro — `av --output json registry export`/`restore` against an unreachable server now returns a clean unreachable_queued envelope instead of a traceback.
+
+---
+
+### 112. `av registry export`'s manifest recorded every object as `"ok": true` regardless of whether the download actually succeeded
+
+**Severity:** 4/10 (silent data-quality bug in an audit/backup artifact) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** the per-object manifest entry was built from an expression that evaluates to `True` unconditionally by operator precedence, regardless of the actual per-object outcome — a failed object download still recorded `"ok": true` in the manifest, making the archive's own self-description unreliable for exactly the case (a partial/corrupted export) where it matters most.
+
+**Fix:** rewritten alongside the progress-bar/resume work (todo.md item 18) to track a genuine per-object boolean through the download/skip/fail branches and record that.
+
+**Verification:** `tests/test_server.py::test_registry_export_restore_round_trip` asserts every object's `ok` field on a clean export.
+
+---
+
+### 113. `av watch`'s new (v1.3.0) watchdog-backed change detection never discovered files that existed before the command started — an indefinite hang
+
+**Severity:** 6/10 (self-caught before release — see Note) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** While implementing the optional `watchdog` extra (todo.md item 13) for `av watch`'s change detection, the first version only re-stat'd paths a *real filesystem event* had touched — but a file already sitting on disk when `av watch` starts never generates an event (watchdog only reports changes from the moment it starts observing), so it was never discovered at all. With `--max-commits N` and a pre-existing matching file, the command looped forever waiting for a commit that could never happen.
+
+**Fix:** the watchdog path's very first tick now does one full directory scan (identical to the polling path's own scan) to seed state with every pre-existing matching file; only subsequent ticks rely purely on drained watchdog events.
+
+**Verification:** `tests/test_v120.py::test_watch_uses_real_watchdog_events_when_installed` (real `watchdog` package, not mocked) and `test_watch_commits_new_matching_file_then_exits` (pre-existing-file case) both pass; the hang was caught by running the real test suite with the real `watchdog` package installed before ever shipping this code — the "manual repro catches what unit tests alone would miss" pattern, applied to code written in this same session.
+
+---
+
+### 114. `av --output json promote` printed a SECOND top-level JSON object for a real (non-dry-run, non-force-denied) promotion — `json.loads()` over the full output failed outright
+
+**Severity:** 7/10 (breaks every JSON-mode consumer of the single most-cited autonomous-loop command the moment a policy actually lands something) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `promote()` always emitted its own `{"ok": true, "data": {"allowed": ..., ...}}` envelope right after deciding, then — for the ALLOWED path — went on to `ctx.invoke(merge_cmd, ...)`, which in JSON mode unconditionally emits its OWN `{"ok": true, "data": {"merged": ..., ...}}` envelope too. One `av promote` invocation therefore printed two newline-separated top-level JSON objects, which no ordinary `json.loads(stdout)` consumer can parse (envelope-1.0 is documented as one object per command). Every existing test for `promote` used either `--dry-run` (a single-envelope, no-landing path) or drove `evaluate()` directly rather than the real CLI end to end, so this had never been exercised. Found by this cycle's own new coverage for WP-13's policy-outcome reporting (todo.md item 7), which for the first time invoked a real, landing, JSON-mode `av promote`.
+
+**Fix:** `promote()` no longer emits its own envelope before landing on the allowed path. It runs the nested `merge_cmd` invocation with stdout captured (`contextlib.redirect_stdout`) instead of letting it reach the terminal directly, then emits exactly one combined envelope (`allowed`/`forced`/`reason`/`rule` plus the parsed `merge` result) once landing succeeds. On a merge failure (conflict, validation, ...), the captured buffer already holds merge's own correct failure envelope with the correct error code — that buffer is forwarded verbatim to real stdout and the `SystemExit` is re-raised, so the caller still sees the real, single, correct envelope. Text mode is unaffected (the nested invoke isn't captured there; both promote's and merge's human lines print exactly as before).
+
+**Verification:** `tests/test_v120.py::test_promote_reports_policy_outcome_for_the_active_run`, `test_promote_reporting_failure_never_blocks_the_promotion`, and the existing `test_example_policies_apply_via_the_real_cli` / exit-code dry-run tests all exercise the real CLI in JSON mode; manual repro in a scratch repo (`av --output json policy set main val_loss "<" --threshold 0.45`, commit a passing candidate, `av --output json promote --into main`) now prints exactly one parseable JSON line.
+
+---
+
+### 115. `av --output json promote` also leaked a plain `click.secho("Policy PASS: ...")` human line ahead of its own envelope on the landing path
+
+**Severity:** 5/10 (same bug class as #105-107, just on a code path nothing had exercised yet) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** Found while fixing #114: `if pol_entry: click.secho(f"Policy PASS: {reason}", fg="green")` ran unconditionally regardless of `current_output_mode()`, so `av --output json promote` with an armed, passing policy printed `Policy PASS: ...` as a bare line before its JSON envelope — invalidating `json.loads()` on the full output exactly like #105-107, just on a code path (a real, landing, policy-armed, JSON-mode promotion) no prior test had ever driven.
+
+**Fix:** gated behind `current_output_mode() != "json"`, matching every other human-text echo in this command.
+
+**Verification:** same tests as #114 (they would fail on either bug independently); confirmed the text-mode path (`av promote --into main` with no `--output json`) still prints the line unchanged.
+
+---
+
+### 116. `tests/test_contract_matrix.py`'s generic per-command sweep silently mutated the REAL `.env` and restarted the REAL running `aether-vault-engine` container, three times per test run, on any machine with Docker up
+
+**Severity:** 8/10 (destructive-ish side effect from a read-only-looking test, on any developer's real local infrastructure — not sandboxed CI) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `test_contract_matrix.py::TestAntiLeakage` invokes every zero-required-argument leaf command with `["--output", "json", *args]` from inside the `repo` fixture's sandboxed `tmp_path`. That sandbox only sets `cwd` — `av auth set-token`/`clear`/`rotate` (none of which need a required argument, so none are `_LEAKAGE_EXEMPT` and all three run in the sweep) resolve their target `.env`/compose file via `_find_source_root()` (`main.py`), which returns `Path(__file__).parents[2]` — the actual checked-out repo root for an editable install, completely independent of `cwd` or the `repo` fixture. `tests/test_cli.py` already has a `_sandbox_compose_dir` fixture built specifically to prevent exactly this ("a real, dangerous side effect a manual run of these tests already caused once during development," per its own docstring) for its own dedicated auth tests — but the new generic sweep (this same cycle, todo.md item 6) didn't reuse it. Confirmed by direct observation: `docker ps` showed `aether-vault-engine`'s uptime reset (restarted) immediately after running this test file with Docker up, and running it again reset it a second time. This is very likely the actual root cause of the "mystery `AV_API_TOKEN` in `.env` changing value across sessions" anomaly flagged earlier in this same development cycle and attributed at the time to an unknown external actor — every `pytest tests/` run on a machine with Docker running silently generates a new token via `auth set-token`'s bare (TOKEN-omitted → random) invocation, writes it to the real `.env`, restarts the real container, then `auth clear` removes it and restarts again, then `auth rotate` mints yet another and restarts a third time — leaving whichever of the three ran last as the value an unrelated later session would observe.
+
+**Fix:** the sweep now applies the same sandboxing technique as `test_cli.py::_sandbox_compose_dir` (writes a dummy `docker-compose.yml` into the sandboxed repo and monkeypatches `_find_source_root` to return it) unconditionally, before invoking ANY command — not just the three known-affected `auth` commands — so a future command that gains a similar real-infrastructure touch is safe by default rather than by someone remembering to exempt or sandbox it individually.
+
+**Verification:** manual repro — `docker ps` before/after `pytest tests/test_contract_matrix.py -k "auth set-token or auth clear or auth rotate"` now shows the real `aether-vault-engine` container's uptime UNCHANGED (previously reset every run); the three tests still pass (still proving clean JSON, now against the sandboxed `.env`/compose file instead of the real one).
+
+**Note for the user:** if the real `.env`'s `AV_API_TOKEN` needs to be restored to a known value after this was discovered, run `av auth set-token <value>` (or `av auth clear` for Anonymous mode) once from the real checkout — this fix stops future test runs from touching it again, but doesn't retroactively know what the value "should" be.
+
+---
+
+### 117. The untargeted `docker build .` / `docker compose build` silently built the WRONG image the moment WP-19's slim targets were added — a container with no Python at all published under the `aether-vault-engine` name
+
+**Severity:** 9/10 (would have shipped a genuinely broken production image to GHCR on the next tagged release — the "engine" container would have had no Python interpreter, only Node, and crash-looped indefinitely) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** WP-19 (todo.md item 19) added `server` and `webui` build targets to the Dockerfile, appended AFTER the original single (unnamed) runtime stage. Docker builds the LAST stage in a file when no `--target`/`target:` is given — appending new stages after the original one silently changed the untargeted-build default from the intended all-in-one stage to `webui` (now the last stage in the file). Every consumer that built without an explicit target was affected: `docker-compose.yml`'s `aether-vault-engine` service (`build: .`, no `target:`), `release.yml`'s and `docker-edge.yml`'s "Build and push engine image" steps (`docker/build-push-action@v6` with no `target:`), and `e2e-engine-smoke`'s own build step (`docker build -t aether-vault-engine:smoke .`). Discovered live: rebuilding the real dev engine container for this cycle's verification pass produced a container that crash-looped forever (`/engine-entrypoint.sh: line 100: python: command not found`, `[engine] 'server' exceeded 5 restarts within 300s`) — `/api/health` and `/api/ready` briefly reported healthy (the `webui` stage's own Next.js server came up fine on :3000) before the whole engine shut down once the server subservice exhausted its restart budget. A large chunk of investigation time went into a red herring (whether `apt-get autoremove` in the real "all"-stage's apt sequence could strip the base image's own Python — plausible in isolation, given nodesource's `nodejs` package pulls in a conflicting Debian `python3` as a build dependency, but NOT what was actually happening here) before `docker top`/`docker exec ... find /` on the actual built image confirmed there was no Python installation anywhere at all — i.e. the running container was never the intended stage in the first place.
+
+**Fix:** named the original stage explicitly (`FROM python:3.12-slim-bookworm AS engine`) as a belt-and-suspenders measure that survives future reordering, AND pinned `target: engine` explicitly on every build site that previously relied on the implicit default: `docker-compose.yml`, `release.yml`, `docker-edge.yml`, and `tests.yml`'s `e2e-engine-smoke` job. The `server`/`webui` targets themselves were never broken — both were manually built and smoke-tested successfully in isolation earlier in this same cycle specifically BECAUSE those tests always passed `--target server`/`--target webui` explicitly, which is exactly why this gap in the DEFAULT path went unnoticed until a truly untargeted build was tried.
+
+**Verification:** `docker compose build aether-vault-engine` (no target override, exactly how a real operator or CI would invoke it) rebuilt cleanly with the fix; `docker exec aether-vault-engine which python python3 node` finds all three (`/usr/local/bin/python`, `/usr/local/bin/python3`, `/usr/bin/node`); `docker compose up -d aether-vault-engine` came up with no restart-loop log lines (`uvicorn` and the Next.js standalone server both started cleanly on the first try); `GET /api/health` → `{"status":"ok",...}`, `GET /api/ready` → `{"ready": true, "checks": {"database": true, "redis": true, "data_dir_writable": true}}`, webui root → HTTP 200.
+
+---
+
+### 118. New files this session weren't `git add`ed — a Docker rebuild's wheel silently packaged an OLDER `python/av_server` tree, missing migration `0005` entirely, and the live database was never actually migrated past `0004`
+
+**Severity:** 8/10 (any operator relying on the documented "the server migrates its own database at every startup" guarantee would have silently kept running on a stale schema indefinitely — no error, no warning, just a 500 the first time anything touched the new column) · **Status:** 🟢 `fixed` (2026-09-02 — a fresh Docker rebuild eventually completed on this RAM-constrained machine and confirmed the real root cause below; see Verification)
+
+**Problem:** Found live during this cycle's verification pass: `POST /api/commits` for a run-linked commit 500'd with `UndefinedColumnError: column runs.policy_outcome does not exist` against the real `aether_vault` database, even after rebuilding the engine image with #117's fix. `SELECT version_num FROM alembic_version` on the live DB showed `0004`, not `0005` — `database.py::init_db()`'s own docstring promises "Failures fail startup loudly", and indeed there was no failure: `command.upgrade(cfg, "head")` genuinely believed `0004` WAS head, because `docker exec aether-vault-engine find / -path '*/av_server/migrations*'` showed only `0001`-`0004` present inside the built image — `0005_run_policy_outcome.py` (added earlier this same session) never made it into the wheel `py-builder`'s `pip wheel . -w /wheels --no-deps` step produced. `git status` confirmed why: every other migration file was `git ls-files`-tracked; `0005_run_policy_outcome.py` was still untracked (`??`) — this project's `pyproject.toml` sets `include-package-data = true` with `setuptools-scm` as the build backend's SCM plugin, whose file-discovery is git-state-based, and `setup.py`'s own `packages=[...]` list doesn't separately declare `av_server.migrations.versions` as a package either (only `av_server.migrations` itself is listed) — so a new migration file was invisible to the packaging step from two independent angles until it was actually staged.
+
+**Fix (root cause):** `git add -A`'d every untracked file this session had created (migrations, docs, examples, new scripts, new tests — `git status --short` had shown ~15 files still marked `??` despite being real, finished, tested work) — staging (not committing) is enough for setuptools-scm's file-finder to see them. Applied migration `0005` directly against the live `aether_vault` database via `database.py::_apply_schema()` run from the host (bypassing the container entirely) to unblock the rest of this cycle's live verification without a full image rebuild.
+
+**The real root cause was different from the initial diagnosis — `git add` alone was
+NOT sufficient.** A genuinely fresh Docker rebuild eventually completed (`--no-cache-filter
+py-builder`, ~5 minutes — the earlier three attempts weren't actually all failures; two
+were killed by the OS on this RAM-constrained dev machine — confirmed via
+`benchmarks/tool_runner.py`'s new machine-profile helper, added this same cycle: this
+shell environment has only 4 logical cores / 4 GB RAM — and one was killed by hand after
+misjudging it as stuck when it was actually finishing final layer export), and the FRESH
+image **still** lacked `0005` — proving the `git add -A` fix from earlier in this entry,
+while a real and worthwhile fix in its own right, was not the actual root cause of the
+packaging gap. The real cause: `setup.py`'s `packages=[...]` list declares
+`"av_server.migrations"` but never `"av_server.migrations.versions"` — and unlike the
+SDIST (whose `include_package_data=True` + setuptools-scm MANIFEST generation is a
+genuinely different, git-state-based inclusion mechanism, which is why `python -m build
+--sdist` misleadingly showed `0005` present and looked like confirmation), the WHEEL is
+built by setuptools' `build_py` command, which only descends into a package's own
+directory for each name explicitly present in `packages=[]` — an undeclared subdirectory
+like `versions/` (alembic's own convention has no `__init__.py` there; alembic's
+`ScriptDirectory` finds `.py` files via its own directory walk, not Python imports) is
+invisible to it regardless of git tracking state. This means the wheel has likely NEVER
+reliably included every migration file, for as long as this packaging config existed —
+0001-0004 happening to be present in earlier images is most plausibly explained by an
+editable/dev install (`pip install -e .`) being used for local testing at the time
+(editable installs bypass wheel packaging entirely, symlinking the real source tree), so
+this exact gap was never exercised by a genuine non-editable wheel/Docker build.
+
+**Fix:** added `"av_server.migrations.versions"` explicitly to `setup.py`'s `packages=[...]`
+list.
+
+**Verification:** built the wheel directly on the host (`pip wheel . --no-deps
+--no-build-isolation`, no Docker needed) both BEFORE and AFTER this fix — before,
+`av_server/migrations/versions/0005_run_policy_outcome.py` was absent from the `.whl`
+(confirmed via `zipfile.ZipFile(...).namelist()`) even though it was already `git add`ed;
+after, it's present alongside 0001-0004. Also re-confirmed against the already-completed
+fresh Docker image (built before this final fix landed) that it exhibits the SAME
+"`Can't locate revision identified by '0005'`" startup crash predicted by this diagnosis —
+consistent, reproducible evidence pointing at `packages=[]`, not git-tracking state, as
+the actual root cause. A live-patched (`docker cp`) container was used throughout this
+session's remaining live verification (WP-27) as a working stand-in while this fix was
+being tracked down; the real fix now makes that workaround unnecessary for any future
+build.
+
+**Process lesson:** every new file created this session should have been `git add`ed as it landed, not batched into one `git add -A` only once a packaging bug surfaced. Noted for future long sessions with a "one commit at the very end" policy — stage incrementally regardless of when the final commit happens; a wheel/Docker build should never be the first thing to notice a file was never staged.
+
+---
+
+### 119. `av registry export` has NEVER actually exported any file content — the object-discovery loop silently found zero hashes on every real invocation
+
+**Severity:** 10/10 (a backup/disaster-recovery command that silently produces a metadata-only archive with none of the actual data — the single worst kind of bug a backup tool can have, because the failure is invisible until the moment someone actually needs the restore) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** `cmd_registry.py::export()`'s object-discovery walk (`for c in manifest["commits"]: _walk(c.get("tree") or {})`) reads each commit's `tree` field to find every file hash referenced anywhere in it. But the command's own `GET /api/commits?limit=&offset=` query never passed `include_layers=true` — and `server.py::list_commits()` only attaches a `"tree"` key to each returned commit dict when that flag is set (added for `WeightDiffPanel.tsx`'s checkpoint picker, opt-in specifically to keep the default payload light). Without it, `c.get("tree")` is always `None`, `_walk({})` finds nothing, the object hash set stays empty for the ENTIRE export regardless of how much real data the project actually has, the progress-bar loop over that empty set never executes even once, and both `manifest["objects"]` and `OUT_DIR/.state.json` end up empty/never-written. `manifest["commits"]`/`manifest["refs"]`/`manifest["runs"]` still populate correctly (those never depended on the tree field) — so an export LOOKED successful (`av registry export` reported real commit/ref/run counts, `objects_ok: 0, objects_failed: 0` reads as "nothing to do" rather than "something is wrong"), and `av registry restore` from such an archive would recreate every commit/ref/run row but ingest ZERO file objects — every checkpoint, dataset, and code blob in the "backed up" project would be unrecoverable. This is the fourth bug found in this exact command this cycle (#110-112) and by far the most severe — none of the earlier three fixes (the `NameError` that made the command crash outright, the unhandled `ConnectionError`, the always-`true` per-object `ok` flag) had ever let a real end-to-end run reach this deep into the command, so this one was never exercised until this cycle's new `tests/test_registry_export_restore_round_trip` (todo.md item 18) finally drove one.
+
+**Fix:** added `&include_layers=true` to the export command's `/api/commits` query.
+
+**Verification:** the same live round-trip test (`tests/test_server.py::test_registry_export_restore_round_trip`, strengthened alongside this fix to actually assert `export1_data["objects_ok"] >= 4` and `manifest["objects"]` non-empty — the earlier version of this test, Probleme #110-112, checked the command's ERROR HANDLING thoroughly but never asserted a nonzero object count, so this exact gap survived three prior fix-and-verify cycles on the same command) now passes end to end against the live registry.
+
+---
+
+### 120. `av registry restore`'s `--resume` misread `export`'s own bookkeeping as its own — a fresh restore into an empty registry would silently skip uploading every object
+
+**Severity:** 10/10 (the other half of #119's disaster-recovery breakage, and arguably worse: this one would make a restore into a genuinely EMPTY/different registry — the actual point of a backup — silently no-op on every object, believing them all "already done") · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** Found immediately while re-verifying #119's fix, from the SAME test: `export()` and `restore()` both read/write a `.state.json` file in `ARCHIVE_DIR` via the identical `_state_path()`/`_load_state()`/`_save_state()` helpers, with an identical `completed_objects` key — but the two commands mean opposite things by "completed": for export it means "already downloaded from the registry into this archive"; for restore it means "already uploaded from this archive into the registry". Because both commands shared one file, `restore()`'s own `--resume` (the default) on its VERY FIRST invocation against a freshly-exported archive would load export's `completed_objects` list (every object hash export had just downloaded, tracked purely for EXPORT's own resumability) and treat every one of them as already uploaded — skipping the real `POST /api/objects/{hash}` call for all of them via the `if h in done_objects: ok += 1; obj_resumed += 1; continue` fast path. In this cycle's test (restoring into the SAME registry the objects were originally pushed to) this was invisible: the data genuinely was already present, so a silently-skipped upload and a correctly-executed-then-409'd upload looked identical from the outside. Against a genuinely empty/different target registry — the actual disaster-recovery scenario — this would leave every single object un-uploaded while `av registry restore` reported success.
+
+**Fix:** gave export and restore separate, independently-tracked state files in the same archive directory — `.export-state.json` and `.restore-state.json` — via a `kind` parameter threaded through `_state_path()`/`_load_state()`/`_save_state()`. Each command's `--resume` now only ever sees its OWN prior progress, never the other direction's.
+
+**Verification:** the same live round-trip test's restore-specific assertions (previously untested-because-untestable due to this exact bug making them accidentally-true): `restore1_data["objects_duplicate"] > 0` (proves the objects were REALLY POSTed and got real 409s, not skipped), `restore1_data["objects_resumed"] == 0` (nothing was wrongly resumed on the first restore), `restore2_data["objects_resumed"] > 0` (restore's OWN resume state now works correctly on its second invocation), `restore3 --no-resume` re-attempts everything regardless. All pass.
+
+---
+
+### 121. `av benchmark` crashed on Windows the moment DVC's own temp-directory cleanup raced a still-open file handle
+
+**Severity:** 5/10 (every real measurement had already succeeded by the time this happened — it's a cleanup-time crash, not a data-quality issue, but it made a full benchmark re-run outright impossible on Windows) · **Status:** 🟢 `fixed` (2026-09-02)
+
+**Problem:** Found live while re-running `av benchmark --markdown development/BENCHMARKS.md` for this cycle's full capture: `bench_hashing_throughput.py`'s `tempfile.TemporaryDirectory(...)` context manager raised `PermissionError: [WinError 32] ... being used by another process` on `__exit__`, while trying to remove `dvc-repo` — DVC's own subprocess apparently still held a handle open on something inside it at that exact moment. Unlike POSIX, Windows refuses to delete a file/directory a process still has open, so this isn't a portability shim gap — it's Windows behaving correctly and DVC's own cleanup timing being the actual source. The exception propagated all the way up through `cmd_devtools.py`'s `benchmark()` command and aborted the ENTIRE run, discarding every benchmark's already-successful measurements along with it. `bench_commit_push_latency.py`'s mlflow helper had already discovered and worked around a version of this exact problem (manual `mkdtemp` + best-effort cleanup instead of `TemporaryDirectory`'s context manager) — but that fix was never applied to the other five `bench_*.py` files, all of which used the same vulnerable pattern.
+
+**Fix:** added `ignore_cleanup_errors=True` (stdlib-native since Python 3.10, this project's own minimum supported version — simpler than the manual-mkdtemp workaround) to every `tempfile.TemporaryDirectory(...)` call across all six affected `benchmarks/bench_*.py` files.
+
+**Verification:** `av benchmark --markdown development/BENCHMARKS.md` re-run end to end on this same Windows machine, against the live registry, completes without crashing.
+
+---
+
+### 122. Concurrent-push benchmark mislabeled a real mid-run failure as "not installed", and a real 8-way connection reset under whole-suite load
+
+**Severity:** 4/10 (a benchmark-reporting honesty bug, not a product bug — but it directly contradicts the module's own "skip and label, never fabricate" contract) · **Status:** 🟢 `fixed` (2026-09-03)
+
+**Problem:** Found on the same full `av benchmark` re-run that verified #121: the "Concurrent Multi-User Push Throughput" row rendered `av` as `not installed`, even though `av` was demonstrably installed and the registry had been up and answering requests the entire run (confirmed via `docker ps`/`docker logs` — the container never restarted). Two separate things were going on:
+1. **Real, environment-level flakiness, not a code bug:** `bench_concurrent_push.py`'s 8-way `ThreadPoolExecutor` hit a raw `ConnectionResetError(10054, ...)` mid-push. `docker logs aether-vault-engine` shows zero `POST /api/commits` entries for the whole window this benchmark ran in — the reset happened before the request ever reached uvicorn, i.e. at the Windows/Docker-Desktop network layer, not inside the server. Re-running `python -m benchmarks.bench_concurrent_push` in isolation immediately afterward (nothing else running, honoring the standing "one heavy operation at a time" rule) succeeded cleanly at 4,905.3 ms — confirming this was capture-machine contention (the full suite had just finished hammering the same 4-core/4GB box with hashing, DVC/git-lfs subprocesses, and a GC benchmark back to back), not a registry or client defect.
+2. **A real reporting bug on top of that:** `bench_concurrent_push.py`'s `run()` only ever set `ToolStatus.AVAILABLE` or `ToolStatus.NOT_INSTALLED` for `av` — there was no third state for "the server was reachable but the operation itself failed." A `ConnectionResetError` raised out of `client.push_commit()` wasn't even caught, so this state was reachable via two different paths (an uncaught exception, or `all(results)` being `False`) and both collapsed onto the same wrong label. `NOT_INSTALLED`'s value renders as literally `"not installed"` in both the console table and `development/BENCHMARKS.md` — actively misleading to a reader who'd reasonably conclude `av` wasn't on `PATH`, when the truth (a load-induced connection reset, worth re-running rather than worth "installing something") is a completely different diagnosis.
+
+**Fix:** added `ToolStatus.FAILED` (`benchmarks/tool_runner.py`) as a third state distinct from `NOT_INSTALLED`/`NOT_APPLICABLE`, with its own Legend entry in `render_doc_header()`; `format_value()` simplified to attach the optional footnote to any non-`AVAILABLE` status uniformly (previously only `NOT_APPLICABLE` got one). `bench_concurrent_push.py` now wraps the push in `try/except`, sets `FAILED` (not `NOT_INSTALLED`) with an honest note whenever the server was reachable but the operation failed, whether that surfaces as `all(results)` being `False` or as a raised exception.
+
+**Verification:** `tests/test_tool_runner.py` — 2 new tests for `format_value()` rendering `FAILED` with/without a note. `development/BENCHMARKS.md`'s concurrent-push row corrected by hand to the real isolated-run number (4,905.3 ms) rather than re-running the full suite a third time on this RAM-constrained machine purely to regenerate one already-diagnosed row.
+
+---
+
+### 123. `scripts/append_perf_history.py` captured a silently wrong project version — `importlib.metadata.version("aether-vault")` is non-deterministic on a dev machine with more than one registered install
+
+**Severity:** 6/10 (directly threatens WP-25's release gate: `check_perf_history_has_tag()` requires a perf-history row whose `version` field matches the tag being released — a wrong capture here would fail a real release for a reason that has nothing to do with release readiness) · **Status:** 🟢 `fixed` (2026-09-03)
+
+**Problem:** Found immediately after the corrected concurrent-push re-run (#122), running `python scripts/append_perf_history.py` to re-append the trend section `av benchmark`'s full-file rewrite had just discarded: the new `perf-history.json` entry captured `"version": "0.0.0"` for commit `8ef634b` — the same commit whose *first* perf-history entry (captured minutes earlier, same session) correctly recorded `"1.2.5.dev6+g8ef634b58.d20260902"`. Root cause: this session's own Docker/packaging debugging (Probleme #118) ran `pip wheel .` and `pip install -e .` more than once against this checkout, leaving **two separate registered `aether-vault` distributions** on this machine — a stale `python/aether_vault.egg-info` (from a direct `setup.py`-path build, frozen at `Version: 0.0.0`) and a stale editable dist-info under the user's Roaming site-packages (frozen at `Version: 1.0.0` from whenever that `pip install -e .` last ran). `importlib.metadata.version("aether-vault")` — the exact mechanism `_project_version()` tried FIRST — picks between same-named distributions by `sys.path` order, which differed between two same-session Python process invocations of the identical script against the identical commit, returning `"1.0.0"` interactively and `"0.0.0"` from a backgrounded run. Both are wrong; neither reflects the live git state. `python/av_server/server.py::_installed_version()` (the `/api/health` version field) and `python/av_cli/cmd_env.py`'s snapshot use the exact same `importlib.metadata` call and are equally exposed on a machine in this state — this session's own repeated build/debug cycle is what created the hazard, so a clean CI runner or a single-install dev machine won't normally hit it, but it's a real footgun for exactly the kind of long, build-heavy session this plan required.
+
+**Fix:** `_project_version()` now tries `av_cli._version.__version__` FIRST — the file setuptools-scm regenerates on every build/wheel, which is why it was already correct at the moment of capture — falling back to `importlib.metadata`/`setuptools_scm.get_version()` only for a source checkout that has never been built at all. This matches `av_cli/ui.py::_get_version()`'s pre-existing, correct ordering (the `av --version` banner never had this bug) instead of reinventing a worse one.
+
+**Verification:** `tests/test_perf_history_script.py` — new tests proving the live version file wins over stale/monkeypatched installed metadata, and that the fallback chain still degrades cleanly to metadata then `"unknown"` when the version file genuinely isn't there. The already-corrupted `development/perf-history.json` entry was hand-corrected to the real value (`1.2.5.dev6+g8ef634b58.d20260902`, matching the sibling entry from the same commit) rather than re-running the multi-minute speedcheck capture a third time purely to fix one field; `development/BENCHMARKS.md`'s trend table re-rendered from the corrected file via `update_benchmarks_md()` directly (no recapture needed — that function is pure).
+
+---
+
+### 124. `av webhooks deliveries --output json` crashed with an unhandled `ConnectionError` (empty output, exit 1) instead of a clean `unreachable_queued` envelope, when the registry was unreachable
+
+**Severity:** 6/10 (breaks the JSON-mode contract — the whole point of the anti-leakage sweep — for a documented, agent-facing command the moment its one real-world failure mode, an unreachable registry, actually happens) · **Status:** 🟢 `fixed` (2026-09-04)
+
+**Problem:** Found by `tests/test_contract_matrix.py::TestAntiLeakage`'s full-suite sweep on a machine with Docker intentionally stopped (a realistic "registry unreachable" condition, not a test artifact): `av --output json webhooks deliveries` failed with exit 1 and **completely empty** stdout, not even a truncated envelope. Every sibling command in `cmd_webhooks.py` (`add`/`list`/`remove`/`test`/`enable`/`replay`) makes its network call through the module's own `_request()` helper, which wraps `client.session.request(...)` in `try/except requests.RequestException` and calls `fail(None, "unreachable_queued", ...)` on failure — the correct, documented behavior for this exact situation (AGENTS.md non-negotiable #3: offline resilience is sacred). `deliveries()` alone bypassed `_request()` and called `client.session.get(...)` directly, with no exception handling at all — a `requests.exceptions.ConnectionError` propagated straight out of the Click command, uncaught. Click's `CliRunner` (and a real terminal invocation identically) catches an unhandled exception, sets exit code 1, but the crash happens before anything is ever echoed, so `result.output` is empty rather than containing a JSON envelope OR a human traceback — the worst of both: a scripting agent parsing `stdout` as JSON gets a `JSONDecodeError` on an empty string with no diagnostic content anywhere. `show()`'s second network call (fetching that webhook's 5 most recent deliveries) had the exact same bypass, but was masked in practice: `show()` always makes an EARLIER `_request()` call first (to resolve the webhook by id), which already raises the correct `fail()` before code ever reaches the unguarded second call — a latent, currently-unreachable version of the same bug that a future reordering of those two calls would have silently reintroduced.
+
+**Fix:** `_request()` gained a `params` parameter (routes to `client.session.request(..., params=params, ...)` — until now only `json_body` was threaded through, since no caller had needed query params before this fix); both `deliveries()`'s and `show()`'s raw `client.session.get(...)` calls now go through `_request()` like every other command in the module. No more raw `client.session.*` calls remain anywhere in `cmd_webhooks.py` outside `_request()`'s own definition.
+
+**Verification:** `tests/test_contract_matrix.py::TestAntiLeakage::test_command_emits_clean_json_or_usage_error[webhooks deliveries]` — the exact test that caught this — now passes. `tests/test_webhooks_cli.py`'s `FakeSession` fake had its `.get()` method merged into `.request()` (matching the real client shape now that nothing calls `.get()` directly) with a comment explaining why a future direct `.get()` call would now fail loudly instead of silently bypassing the fake's call tracking; full `tests/test_webhooks_cli.py` (73 tests) and `tests/test_contract_matrix.py` re-run green together. Found during the v1.3.0 wrap-up's final `pytest tests/ -v` pass with Docker deliberately stopped (owner: "I will turn it on manually, continue with your stuff without it") — the offline condition this bug needed to surface was exactly what that choice created, a good example of why AGENTS.md's manual-repro standard matters even for a command whose happy path was already well-tested.

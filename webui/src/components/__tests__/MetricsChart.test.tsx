@@ -41,4 +41,17 @@ describe("MetricsChart", () => {
     render(<MetricsChart commits={[commit]} loading={false} />);
     expect(screen.getByText("No metrics yet")).toBeInTheDocument();
   });
+
+  it("shows an error state instead of the empty state when a fetch failed", () => {
+    render(<MetricsChart commits={[]} loading={false} error="registry unreachable" />);
+    expect(screen.getByText("⚠ registry unreachable")).toBeInTheDocument();
+    expect(screen.queryByText("No metrics yet")).not.toBeInTheDocument();
+  });
+
+  it("prefers real data over an error when both are present", () => {
+    const commit = makeCommit({ metrics: { sharpe: 2.5 } });
+    render(<MetricsChart commits={[commit]} loading={false} error="stale error" />);
+    expect(screen.getByText("1 metrics")).toBeInTheDocument();
+    expect(screen.queryByText("⚠ stale error")).not.toBeInTheDocument();
+  });
 });

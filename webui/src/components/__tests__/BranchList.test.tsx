@@ -29,6 +29,12 @@ describe("BranchList", () => {
     expect(screen.getByText("No branches found")).toBeInTheDocument();
   });
 
+  it("shows an error state instead of the empty state when a fetch failed", () => {
+    render(<BranchList refs={{}} commits={[]} loading={false} error="401 Unauthorized" />);
+    expect(screen.getByText("⚠ 401 Unauthorized")).toBeInTheDocument();
+    expect(screen.queryByText("No branches found")).not.toBeInTheDocument();
+  });
+
   it("strips a single project_id/ prefix from the displayed branch name", () => {
     const commit = makeCommit();
     render(

@@ -103,18 +103,9 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
     click.echo(detail)
 
 
-def _tip_run_id(repo_root: Path, commit_hash: str | None) -> str | None:
-    """The run:<id> tag of a (local) commit, or None — used by pull's divergence message
-    to attribute the divergent tips to their runs (v1.2.2)."""
-    if not commit_hash:
-        return None
-    from . import sync as _sync
-
-    commit = _sync.load_local_commit(repo_root, commit_hash)
-    for tag in (commit or {}).get("tags", []):
-        if isinstance(tag, str) and tag.startswith("run:"):
-            return tag.split(":", 1)[1]
-    return None
+# v1.3.0: moved to core.py::tip_run_id() so _finalize_commit's ref-race path can share
+# it too — kept as a thin re-export so nothing here (or any external caller) breaks.
+from .core import tip_run_id as _tip_run_id  # noqa: F401
 
 
 @click.command()
@@ -270,8 +261,11 @@ def pull(force: bool) -> None:
               help="Create a merge commit even when a fast-forward would do.")
 @click.option("--force", "-f", is_flag=True, default=False,
               help="Bypass an armed branch policy for this merge (recorded in output).")
+@click.option("--conflict-report", "conflict_report_path", type=click.Path(), default=None,
+              help="On conflict, also write the structured conflict report to this path "
+                   "(always written to .av/last_conflict.json regardless of this flag).")
 def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bool,
-          no_ff: bool, force: bool) -> None:
+          no_ff: bool, force: bool, conflict_report_path: str | None) -> None:
     """Merge another branch or commit into the current branch.
 
     Tree-level three-way merge against the nearest common ancestor: per file, whichever
@@ -432,6 +426,28 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
                 fmt = lambda rid: f"run:{rid[:8]}…" if rid else "(no run)"
                 click.echo(f"  ours   [{ours[:7]}] belongs to {fmt(ours_run)}")
                 click.echo(f"  theirs [{theirs[:7]}] belongs to {fmt(theirs_run)}")
+
+        # v1.3.0 (todo.md item 2): structured conflict report, always written locally
+        # (never lost even if this exact stdout is never re-read) plus optionally to a
+        # caller-chosen path — same fields as error.data below, so JSON and file agree.
+        import datetime as _dt
+
+        report = {
+            "conflicts": conflicts, "conflict_count": len(conflicts),
+            "ours": ours, "theirs": theirs, "target": target, "branch": branch,
+            "ours_run_id": ours_run, "theirs_run_id": theirs_run,
+            "remediation": remediation,
+            "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }
+        default_report_path = repo_root / ".av" / "last_conflict.json"
+        atomic_write_text(default_report_path, json.dumps(report, indent=2))
+        report_paths = [str(default_report_path)]
+        if conflict_report_path:
+            Path(conflict_report_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+            report_paths.append(str(conflict_report_path))
+        if not output_is_json(ctx):
+            click.secho(f"  Conflict report written: {default_report_path}", fg="cyan")
+
         fail(ctx, "merge_conflict",
              f"Merge conflicts in {len(conflicts)} file(s) — both branches changed them "
              "differently. Nothing was modified.",
@@ -440,6 +456,7 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
                  "ours": ours, "theirs": theirs,
                  "ours_run_id": ours_run, "theirs_run_id": theirs_run,
                  "remediation": remediation,
+                 "report_paths": report_paths,
              }, quiet_text=True)
 
     policy_side = ours_tree if policy_ours else theirs_tree

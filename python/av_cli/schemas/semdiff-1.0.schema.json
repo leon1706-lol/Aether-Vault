@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/semdiff-1.0.json",
+  "title": "Aether-Vault semantic diff",
+  "description": "python/av_cli/semdiff.py::diff_trees(). Feeds `av diff --output json`, .avh v2's semantic_summary, and GET /api/runs/{id}/summary's semantic_summary. See docs/contracts.md.",
+  "type": "object",
+  "required": ["files", "models", "chunks", "datasets", "totals"],
+  "properties": {
+    "base": {"type": ["string", "null"], "description": "Only present on av diff output, not on .avh's embedded copy."},
+    "target": {"type": ["string", "null"]},
+    "summary": {"type": "string", "description": "One-line prose rendering (human_summary())."},
+    "files": {
+      "type": "object",
+      "required": ["added", "removed", "changed"],
+      "properties": {
+        "added": {"type": "array", "items": {"$ref": "#/$defs/fileEntry"}},
+        "removed": {"type": "array", "items": {"$ref": "#/$defs/fileEntry"}},
+        "changed": {"type": "array", "items": {"$ref": "#/$defs/fileEntry"}}
+      }
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "layers_changed", "layers_total", "pct", "moved", "largest_moved"],
+        "properties": {
+          "path": {"type": "string"},
+          "layers_changed": {"type": "integer"},
+          "layers_total": {"type": "integer"},
+          "pct": {"type": "number"},
+          "moved": {"type": "array", "items": {"type": "string"}},
+          "largest_moved": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "size"],
+              "properties": {"name": {"type": "string"}, "size": {"type": "integer"}}
+            }
+          },
+          "bytes_changed": {"type": "integer", "description": "v1.3.0+, additive — bytes across the layers that moved."},
+          "bytes_total": {"type": "integer", "description": "v1.3.0+, additive — total bytes across all layers."},
+          "pct_bytes": {"type": "number", "description": "v1.3.0+, additive — bytes_changed/bytes_total; can diverge a lot from pct (layer-count ratio) when layer sizes vary."}
+        }
+      }
+    },
+    "chunks": {
+      "type": "object",
+      "required": ["reused", "new", "dedup_efficiency", "status"],
+      "properties": {
+        "reused": {"type": "integer"},
+        "new": {"type": "integer"},
+        "dedup_efficiency": {
+          "type": ["number", "null"],
+          "description": "reused / (reused + new). null only when status is no_chunks — that's real information, not a zero."
+        },
+        "status": {"type": "string", "enum": ["measured", "no_chunks"]},
+        "reused_bytes": {"type": "integer", "description": "v1.3.0+, additive."},
+        "new_bytes": {"type": "integer", "description": "v1.3.0+, additive."},
+        "dedup_efficiency_bytes": {"type": ["number", "null"], "description": "v1.3.0+, additive."}
+      }
+    },
+    "datasets": {"type": "array", "items": {"type": "string"}},
+    "totals": {
+      "type": "object",
+      "required": ["bytes_before", "bytes_after"],
+      "properties": {
+        "bytes_before": {"type": "integer"},
+        "bytes_after": {"type": "integer"}
+      }
+    }
+  },
+  "$defs": {
+    "fileEntry": {
+      "type": "object",
+      "required": ["path", "kind"],
+      "properties": {
+        "path": {"type": "string"},
+        "kind": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

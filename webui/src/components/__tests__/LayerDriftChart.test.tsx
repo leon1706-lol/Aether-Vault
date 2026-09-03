@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { LayerDriftChart } from "../LayerDriftChart";
@@ -23,13 +23,17 @@ describe("LayerDriftChart", () => {
     expect(screen.getByText("Removed")).toBeInTheDocument();
   });
 
-  it("truncates and shows a notice past MAX_RENDERED_LAYERS", () => {
+  it("progressively reveals a large layer set instead of permanently hiding the tail", async () => {
+    // v1.3.0 (todo.md item 25): replaces the old hard MAX_RENDERED_LAYERS truncation.
     const layers: LayerDiff[] = Array.from({ length: 4001 }, (_, i) => ({
       name: `layer${i}`,
       status: "unchanged" as const,
       size: 1,
     }));
     render(<LayerDriftChart layers={layers} />);
-    expect(screen.getByText("Showing 4000 of 4001 layers")).toBeInTheDocument();
+    expect(screen.getByText(/Rendering \d+ of 4001 layers…/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByText(/Rendering \d+ of 4001 layers…/)).not.toBeInTheDocument();
+    });
   });
 });

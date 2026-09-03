@@ -17,6 +17,7 @@ from python.av_server.database import (
     _LEGACY_COLUMNS,
     _alembic_config,
     _heal_legacy_columns,
+    _heal_legacy_indexes,
 )
 
 _MIGRATIONS = Path(MIGRATIONS_DIR)
@@ -28,14 +29,15 @@ def test_migration_chain_resolves_to_single_head():
 
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
-    assert heads == ["0004"], f"unexpected heads: {heads}"
+    assert heads == ["0005"], f"unexpected heads: {heads}"
     # walk_revisions() yields every revision reachable from head exactly once —
     # no dangling down_revisions, no surprise second branch. The chain is strictly
     # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline),
-    # 0003 (webhook_deliveries/audit outcome/signature) descends from 0002, and
-    # 0004 (webhook health tracking/runs.avh_object_id/audit indexes) descends from 0003.
+    # 0003 (webhook_deliveries/audit outcome/signature) descends from 0002,
+    # 0004 (webhook health tracking/runs.avh_object_id/audit indexes) descends from 0003,
+    # 0005 (runs.policy_outcome) descends from 0004.
     walked = sorted(rev.revision for rev in script.walk_revisions())
-    assert walked == ["0001", "0002", "0003", "0004"]
+    assert walked == ["0001", "0002", "0003", "0004", "0005"]
 
 
 def test_env_py_is_valid_python():
@@ -130,6 +132,70 @@ def test_heal_is_idempotent(tmp_path):
     assert "extra_parents" in cols
 
 
+def test_heal_legacy_indexes_creates_only_whats_missing_on_sqlite(tmp_path):
+    """v1.3.0: the index-shaped sibling of the column-heal test above — an adopted
+    legacy volume's audit_log table (created by an earlier phase, before migration 0004
+    added ix_audit_log_username/ix_audit_log_action) must come out of healing with both
+    indexes, without touching a column-level index (ix_audit_ts) that's unrelated."""
+    from python.av_server.models import Base
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    with engine.begin() as conn:
+        # Same shape Base.metadata declares for audit_log, MINUS the two indexes this
+        # heal function is responsible for adding — i.e. exactly what an adopted volume
+        # whose create_all() predates their declaration would look like.
+        conn.exec_driver_sql(
+            "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts DATETIME NOT NULL,"
+            " username VARCHAR, action VARCHAR NOT NULL, project_id VARCHAR,"
+            " details JSON, status_code INTEGER)"
+        )
+        conn.exec_driver_sql("CREATE INDEX ix_audit_ts ON audit_log (ts)")
+
+    with engine.connect() as conn:
+        before = {ix["name"] for ix in sa.inspect(conn).get_indexes("audit_log")}
+        assert before == {"ix_audit_ts"}
+
+        _heal_legacy_indexes(conn, {"audit_log"})
+
+        after = {ix["name"] for ix in sa.inspect(conn).get_indexes("audit_log")}
+    engine.dispose()
+
+    # Confirms the fix is genuinely sourced from Base.metadata (the model), not a
+    # hardcoded name list that could itself drift from what DBAuditLog actually declares
+    # — including project_id's own `index=True` column-level index, which this healed
+    # too (not just the two explicit `Index(...)` entries in __table_args__).
+    declared = {ix.name for ix in Base.metadata.tables["audit_log"].indexes}
+    assert {"ix_audit_log_username", "ix_audit_log_action"} <= after
+    assert after == declared
+
+
+def test_heal_legacy_indexes_is_idempotent(tmp_path):
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts DATETIME NOT NULL,"
+            " username VARCHAR, action VARCHAR NOT NULL, project_id VARCHAR,"
+            " details JSON, status_code INTEGER)"
+        )
+    with engine.connect() as conn:
+        _heal_legacy_indexes(conn, {"audit_log"})
+        # Second pass over the same database must not raise (indexes already there).
+        _heal_legacy_indexes(conn, {"audit_log"})
+        after = {ix["name"] for ix in sa.inspect(conn).get_indexes("audit_log")}
+    engine.dispose()
+    assert {"ix_audit_log_username", "ix_audit_log_action"} <= after
+
+
+def test_heal_legacy_indexes_ignores_a_genuinely_missing_table(tmp_path):
+    """A table not in the passed-in `tables` set (i.e. genuinely absent from the
+    database, _create_missing_tables' job) must never be touched — no crash from trying
+    to inspect or index a table that isn't there."""
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    with engine.connect() as conn:
+        _heal_legacy_indexes(conn, set())  # nothing present at all
+    engine.dispose()  # reaching here without raising is the assertion
+
+
 # ---------------------------------------------------------------------------
 # Stack-free execution proof (v1.1.8): render the full chain to Postgres DDL offline
 # ---------------------------------------------------------------------------
@@ -179,6 +245,9 @@ def test_chain_renders_complete_postgres_ddl_offline():
     assert "CREATE INDEX ix_audit_log_username" in ddl
     assert "CREATE INDEX ix_audit_log_action" in ddl
 
+    # v1.3.0 runs.policy_outcome (0005):
+    assert "policy_outcome" in ddl, "offline DDL missing 0005 column policy_outcome"
+
     # Every table from 0001_baseline exists in the rendered schema.
     for table in ("objects", "trees", "commits", "refs"):
         assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
@@ -196,6 +265,45 @@ def test_chain_renders_complete_postgres_ddl_offline():
 
     # The refs → commits FK (the one deliberate FK in the schema) is present.
     assert "FOREIGN KEY" in ddl
+
+
+def test_chain_renders_downgrade_ddl_offline_for_every_revision():
+    """v1.3.0 (todo.md item 21): all five revisions define downgrade() — before this
+    test, NOT ONE of them was ever executed by anything (upgrade-only offline test above,
+    upgrade-only live test in test_server.py). This proves every revision's downgrade
+    renders real, revision-specific DDL, one step at a time from head back to base."""
+    import contextlib
+    import io
+
+    from alembic import command
+    from alembic.script import ScriptDirectory
+
+    cfg = _alembic_config()
+    cfg.set_main_option("sqlalchemy.url", "postgresql://av_user:av_password@localhost/aether_vault")
+    script = ScriptDirectory.from_config(cfg)
+    chain = [rev.revision for rev in script.walk_revisions()]  # head -> base order
+    assert chain == ["0005", "0004", "0003", "0002", "0001"]
+
+    # Revision-specific DDL each downgrade step must emit, in the order downgrade() drops
+    # things — proves the rendered SQL is THIS revision's downgrade, not a no-op or a
+    # copy-paste of the wrong one.
+    expected_per_step = {
+        "0005": ["policy_outcome"],
+        "0004": ["disabled_reason", "consecutive_failures", "avh_object_id"],
+        "0003": ["webhook_deliveries", "signature", "status_code"],
+        "0002": ["audit_log", "webhooks", "events", "run_commits", "runs"],
+        "0001": ["objects", "trees", "commits", "refs"],
+    }
+
+    for i, rev in enumerate(chain):
+        target = chain[i + 1] if i + 1 < len(chain) else "base"
+        buf = io.StringIO()
+        cfg.output_buffer = buf
+        with contextlib.redirect_stdout(buf):
+            command.downgrade(cfg, f"{rev}:{target}" if target != "base" else f"{rev}:base", sql=True)
+        ddl = buf.getvalue()
+        for token in expected_per_step[rev]:
+            assert token in ddl, f"downgrade {rev}->{target} DDL missing expected {token!r}:\n{ddl}"
 
 
 def test_apply_schema_runs_inside_a_committing_transaction():

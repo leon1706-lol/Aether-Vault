@@ -3,6 +3,10 @@
 Aether-Vault versions ML artifacts and runs a networked registry service — we take both
 local-data-integrity and remote-attack-surface reports seriously.
 
+See `development/threat-model.md` for the systematic threat→mitigation→residual-risk
+record this file's statements are drawn from (assets, actors, trust boundaries, an
+annual review log).
+
 ## Reporting a vulnerability
 
 **Please do not report security issues in public GitHub Issues.**

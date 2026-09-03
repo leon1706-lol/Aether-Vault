@@ -35,11 +35,21 @@
     },
     "semantic_summary": {
       "type": ["object", "null"],
+      "required": ["summary", "files", "models", "chunks", "datasets", "totals"],
       "properties": {
         "summary": {"type": "string"},
         "files": {"type": "object"},
         "models": {"type": "array"},
-        "chunks": {"type": "object"},
+        "chunks": {
+          "type": "object",
+          "required": ["reused", "new", "status"],
+          "properties": {
+            "reused": {"type": "integer"},
+            "new": {"type": "integer"},
+            "dedup_efficiency": {"type": ["number", "null"]},
+            "status": {"type": "string", "enum": ["measured", "no_chunks"]}
+          }
+        },
         "datasets": {"type": "array"},
         "totals": {"type": "object"}
       }
@@ -67,7 +77,8 @@
             "properties": {
               "ts": {"type": ["string", "null"]},
               "agent": {"type": ["string", "null"]},
-              "note": {"type": "string"}
+              "note": {"type": "string"},
+              "run_id": {"type": ["string", "null"], "description": "v1.3.0+, additive — the active run (if any) when the note was written."}
             },
             "required": ["note"]
           }

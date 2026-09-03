@@ -29,6 +29,18 @@ describe("CommitList", () => {
     expect(screen.getByText("No commits yet")).toBeInTheDocument();
   });
 
+  it("shows an error state instead of the empty state when a fetch failed", () => {
+    render(<CommitList commits={[]} loading={false} error="registry unreachable" />);
+    expect(screen.getByText("⚠ registry unreachable")).toBeInTheDocument();
+    expect(screen.queryByText("No commits yet")).not.toBeInTheDocument();
+  });
+
+  it("prefers real data over an error when both are present", () => {
+    render(<CommitList commits={[makeCommit()]} loading={false} error="stale error" />);
+    expect(screen.getByText("first commit")).toBeInTheDocument();
+    expect(screen.queryByText("⚠ stale error")).not.toBeInTheDocument();
+  });
+
   it("renders the commit message, tags, and metrics", () => {
     const commit = makeCommit({ tags: ["v1"], metrics: { sharpe: 2.5 } });
     render(<CommitList commits={[commit]} loading={false} />);

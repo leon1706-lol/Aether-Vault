@@ -60,4 +60,67 @@ describe("CheckpointPicker", () => {
 
     expect(onSlotChange).toHaveBeenCalledWith("A", null);
   });
+
+  it("omits the 'Compare by hash' form entirely when onResolveHash isn't given", () => {
+    render(<CheckpointPicker rows={[]} loading={false} slotA={null} slotB={null} onSlotChange={vi.fn()} />);
+    expect(screen.queryByLabelText("Compare by hash")).not.toBeInTheDocument();
+  });
+
+  it("submits the typed hash to onResolveHash for the next open slot, then clears the input", async () => {
+    const user = userEvent.setup();
+    const onResolveHash = vi.fn();
+    render(
+      <CheckpointPicker
+        rows={[]}
+        loading={false}
+        slotA={null}
+        slotB={null}
+        onSlotChange={vi.fn()}
+        onResolveHash={onResolveHash}
+      />
+    );
+
+    const input = screen.getByLabelText("Compare by hash");
+    await user.type(input, "deadbeef");
+    await user.click(screen.getByRole("button", { name: "Load into Slot A" }));
+
+    expect(onResolveHash).toHaveBeenCalledWith("deadbeef", "A");
+    expect(input).toHaveValue("");
+  });
+
+  it("targets Slot B once Slot A is already filled", async () => {
+    const user = userEvent.setup();
+    const onResolveHash = vi.fn();
+    const filled = row();
+    render(
+      <CheckpointPicker
+        rows={[filled]}
+        loading={false}
+        slotA={filled}
+        slotB={null}
+        onSlotChange={vi.fn()}
+        onResolveHash={onResolveHash}
+      />
+    );
+
+    await user.type(screen.getByLabelText("Compare by hash"), "cafef00d");
+    await user.click(screen.getByRole("button", { name: "Load into Slot B" }));
+
+    expect(onResolveHash).toHaveBeenCalledWith("cafef00d", "B");
+  });
+
+  it("shows a lookup error message next to the form when given", () => {
+    render(
+      <CheckpointPicker
+        rows={[]}
+        loading={false}
+        slotA={null}
+        slotB={null}
+        onSlotChange={vi.fn()}
+        onResolveHash={vi.fn()}
+        hashLookupError="Commit not found: deadbeef"
+      />
+    );
+    expect(screen.getByText("Commit not found: deadbeef")).toBeInTheDocument();
+  });
 });

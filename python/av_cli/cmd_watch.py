@@ -1,16 +1,72 @@
 """av watch — filesystem watcher for continuous training loops (v1.2.0).
 
-Pure-stdlib polling (no watchdog dependency): scans the repo on an interval, stages and
-commits any file matching --glob that appeared or changed since the last scan. Commits
-run through the SAME single code path (commit command semantics, upload deferred) so
-offline resilience and run-tagging apply unchanged.
+Pure-stdlib polling by default (no hard watchdog dependency): scans the repo on an
+interval, stages and commits any file matching --glob that appeared or changed since the
+last scan. Commits run through the SAME single code path (commit command semantics,
+upload deferred) so offline resilience and run-tagging apply unchanged.
+
+v1.3.0: when the optional `watchdog` extra (`pip install aether-vault[watch]`) is
+installed, change DETECTION switches to real filesystem events instead of a full
+os.walk() every tick — the debounce/staging/commit logic below is identical either way,
+this only changes how a tick decides which paths are even worth re-stat'ing. Falls back
+to the original polling behavior automatically when watchdog isn't importable.
 """
 
 import fnmatch
 import os
+import threading
 import time
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
+
+
+def _try_start_watchdog(repo_root, pattern: str):
+    """Returns (observer, drain_fn) when the watchdog extra is installed, else None.
+
+    `drain_fn()` returns (and clears) the set of rel_paths that received a real
+    filesystem event since the last call — a superset is fine (a path re-checked that
+    didn't actually change is just a cheap no-op stat), a false negative is not, so
+    `on_any_event` is deliberately unfiltered by event TYPE (create/modify/move/delete
+    all count) and only filtered by the --glob pattern."""
+    try:
+        from watchdog.events import FileSystemEventHandler
+        from watchdog.observers import Observer
+    except ImportError:
+        return None
+
+    touched: set[str] = set()
+    lock = threading.Lock()
+
+    def _rel(path: str) -> str | None:
+        try:
+            rel = os.path.relpath(path, repo_root).replace(os.sep, "/")
+        except ValueError:
+            return None
+        if ".av" in rel.split("/"):
+            return None
+        return rel if fnmatch.fnmatch(rel, pattern) else None
+
+    class _Handler(FileSystemEventHandler):
+        def on_any_event(self, event) -> None:
+            for raw in (getattr(event, "src_path", None), getattr(event, "dest_path", None)):
+                if not raw:
+                    continue
+                rel = _rel(raw)
+                if rel:
+                    with lock:
+                        touched.add(rel)
+
+    observer = Observer()
+    observer.schedule(_Handler(), str(repo_root), recursive=True)
+    observer.start()
+
+    def _drain() -> set[str]:
+        with lock:
+            paths = set(touched)
+            touched.clear()
+        return paths
+
+    return observer, _drain
 
 
 @click.command()
@@ -32,30 +88,68 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
     from .index import Index
 
     repo_root = ensure_repo()
-    click.secho(f"Watching '{pattern}' every {interval:.0f}s "
-                f"(debounce {debounce:.0f}s) — Ctrl+C to stop.", fg="cyan")
+    json_mode = current_output_mode() == "json"
+    # v1.3.0: watch is the one documented streaming exception to "single clean envelope
+    # per invocation" (see docs/contracts.md and the leakage-guard allowlist in
+    # tests/test_contract_matrix.py) — it runs indefinitely and reports as it goes, so JSON
+    # mode emits one newline-delimited envelope PER auto-commit (plus a final summary
+    # envelope on exit) instead of one envelope for the whole command.
+    watchdog_handle = _try_start_watchdog(repo_root, pattern)
+    using_watchdog = watchdog_handle is not None
+    if not json_mode:
+        mode_desc = "watchdog events" if using_watchdog else "polling"
+        click.secho(f"Watching '{pattern}' every {interval:.0f}s "
+                    f"(debounce {debounce:.0f}s, {mode_desc}) — Ctrl+C to stop.", fg="cyan")
 
     seen: dict[str, tuple[int, int]] = {}   # rel_path -> (mtime_ns, size)
     pending_since: dict[str, float] = {}
     commits_made = 0
+    first_tick = True
 
     try:
         while True:
             now = time.monotonic()
-            current: dict[str, tuple[int, int]] = {}
-            for dirpath, _dirnames, filenames in os.walk(repo_root):
-                if ".av" in dirpath.split(os.sep):
-                    continue
-                for fn in filenames:
-                    full = os.path.join(dirpath, fn)
-                    rel = os.path.relpath(full, repo_root).replace(os.sep, "/")
-                    if not fnmatch.fnmatch(rel, pattern):
-                        continue
+            if using_watchdog and not first_tick:
+                # Only re-stat paths a real fs event touched, or that are already mid-
+                # debounce (still need re-checking each tick until they go stable) —
+                # everything else in `seen` carries forward unchanged. A path that
+                # disappeared (deleted/renamed away) drops out of `current` exactly like
+                # a fresh os.walk() would naturally omit it.
+                _, drain = watchdog_handle
+                candidates = drain() | set(pending_since)
+                current: dict[str, tuple[int, int]] = dict(seen)
+                for rel in candidates:
                     try:
-                        st = os.stat(full)
+                        st = os.stat(repo_root / rel)
                     except OSError:
+                        current.pop(rel, None)
                         continue
                     current[rel] = (st.st_mtime_ns, st.st_size)
+            else:
+                # Polling mode every tick, OR the watchdog path's very first tick: a
+                # real fs-event watcher only sees CHANGES from the moment it starts —
+                # it would otherwise never discover files that already existed before
+                # `av watch` was invoked (a real bug this exact comment replaced: the
+                # first version of this code left `current` empty on tick one whenever
+                # nothing had changed yet, so a pre-existing matching file was invisible
+                # forever and --max-commits could never be reached).
+                if using_watchdog:
+                    watchdog_handle[1]()  # drain events queued during the scan below
+                current = {}
+                for dirpath, _dirnames, filenames in os.walk(repo_root):
+                    if ".av" in dirpath.split(os.sep):
+                        continue
+                    for fn in filenames:
+                        full = os.path.join(dirpath, fn)
+                        rel = os.path.relpath(full, repo_root).replace(os.sep, "/")
+                        if not fnmatch.fnmatch(rel, pattern):
+                            continue
+                        try:
+                            st = os.stat(full)
+                        except OSError:
+                            continue
+                        current[rel] = (st.st_mtime_ns, st.st_size)
+                first_tick = False
 
             for rel, sig in sorted(current.items()):
                 prev = seen.get(rel)
@@ -67,7 +161,8 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
                     if entry and entry.get("hash") == _hash_of(repo_root, rel):
                         pending_since.pop(rel, None)  # already committed this content
                         continue
-                    click.secho(f"[watch] new content: {rel}", fg="yellow")
+                    if not json_mode:
+                        click.secho(f"[watch] new content: {rel}", fg="yellow")
                     # Stage through the REAL staging path (hashing/pointers/CDC/attributes),
                     # then commit through THE shared path (offline-queue semantics apply).
                     from .core import commit_staged, get_file_meta_safe, hash_file_safe, stage_one_file
@@ -92,20 +187,51 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
                     # regardless of `av run start`, breaking the documented "AV_RUN_ID
                     # joins ANY process' commits" contract (Probleme.md). Same precedence
                     # as every other commit path now (resolve_run_id: env > state).
-                    _commit(repo_root, f"watch: {rel} @ {time.strftime('%H:%M:%S')}",
-                            run_id=resolve_run_id(repo_root), defer_upload=True)
+                    # v1.3.0 fix: _finalize_commit's own human echoes ("Staged [...]",
+                    # "Upload deferred — queued for `av push`", ...) are gated on
+                    # result_sink is None — cmd_history.py's `commit` command already
+                    # passes a sink in JSON mode for exactly this reason, but this call
+                    # never did, so `av --output json watch` leaked plain text ahead of
+                    # every per-commit envelope below (same regression class as
+                    # Probleme #93, just never exercised for this call site until now).
+                    sink_data: dict = {}
+                    json_sink = (lambda result: sink_data.update(result)) if json_mode else None
+                    commit_hash = _commit(repo_root, f"watch: {rel} @ {time.strftime('%H:%M:%S')}",
+                            run_id=resolve_run_id(repo_root), defer_upload=True,
+                            result_sink=json_sink, outcome_sink=sink_data.update)
                     commits_made += 1
                     pending_since.pop(rel, None)
+                    if json_mode:
+                        click.echo(json.dumps(json_envelope("watch", data={
+                            "event": "auto_commit", "path": rel, "commit_hash": commit_hash,
+                            **sink_data,
+                        })))
 
             seen = current
 
             if max_commits and commits_made >= max_commits:
-                click.secho(f"[watch] reached --max-commits={max_commits}; "
-                            f"{commits_made} auto-commit(s) this session.", fg="cyan")
+                if json_mode:
+                    click.echo(json.dumps(json_envelope("watch", data={
+                        "event": "stopped", "reason": "max_commits_reached",
+                        "commits_made": commits_made,
+                    })))
+                else:
+                    click.secho(f"[watch] reached --max-commits={max_commits}; "
+                                f"{commits_made} auto-commit(s) this session.", fg="cyan")
                 break
             time.sleep(interval)
     except KeyboardInterrupt:
-        click.secho(f"\n[watch] stopped — {commits_made} auto-commit(s) this session.", fg="cyan")
+        if json_mode:
+            click.echo(json.dumps(json_envelope("watch", data={
+                "event": "stopped", "reason": "keyboard_interrupt", "commits_made": commits_made,
+            })))
+        else:
+            click.secho(f"\n[watch] stopped — {commits_made} auto-commit(s) this session.", fg="cyan")
+    finally:
+        if using_watchdog:
+            observer, _ = watchdog_handle
+            observer.stop()
+            observer.join(timeout=5)
 
 
 def _hash_of(repo_root, rel_path: str) -> str | None:

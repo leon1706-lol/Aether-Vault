@@ -1,3 +1,16 @@
+import os
+import tempfile
+
+# Must run before ANY test module is imported: python/av_server/server.py builds
+# CASStorage(DATA_DIR) at import time (server.py:238-239), defaulting DATA_DIR to '/data'
+# when AV_DATA_DIR is unset. That's fine on CI jobs that export AV_DATA_DIR (tests.yml) but
+# nightly.yml does not, and any test module that imports python.av_server.server without
+# setting it itself (e.g. test_audit_coverage.py) dies at collection with
+# PermissionError: /data. conftest.py is always imported before test modules, so a
+# setdefault here — not inside a fixture — is the one place that reliably runs first for
+# every module, regardless of which test file happens to import server.py first.
+os.environ.setdefault("AV_DATA_DIR", tempfile.mkdtemp(prefix="av-test-data-"))
+
 import pytest
 from click.testing import CliRunner
 

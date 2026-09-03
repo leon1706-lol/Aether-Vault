@@ -9,7 +9,8 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import { MAX_RENDERED_LAYERS, type LayerDiff, type LayerStatus } from "@/lib/diffWeights";
+import { type LayerDiff, type LayerStatus } from "@/lib/diffWeights";
+import { useIncrementalReveal } from "@/hooks/useIncrementalReveal";
 
 interface Props {
   layers: LayerDiff[];
@@ -39,12 +40,16 @@ const STATUS_LABEL: Record<LayerStatus, string> = {
 const Y_AXIS_LABEL: Record<number, string> = { 0: "unchanged", 1: "changed" };
 
 export function LayerDriftChart({ layers }: Props) {
+  // v1.3.0 (todo.md item 25): same progressive reveal as WeightHeatmap — see
+  // hooks/useIncrementalReveal.ts.
+  const visibleCount = useIncrementalReveal(layers.length);
+
   if (layers.length === 0) {
     return <div className="empty-state">No per-layer data for this file.</div>;
   }
 
-  const truncated = layers.length > MAX_RENDERED_LAYERS;
-  const visible = truncated ? layers.slice(0, MAX_RENDERED_LAYERS) : layers;
+  const rendering = visibleCount < layers.length;
+  const visible = layers.slice(0, visibleCount);
 
   const data = visible.map((layer, idx) => ({
     idx,
@@ -55,9 +60,9 @@ export function LayerDriftChart({ layers }: Props) {
 
   return (
     <div>
-      {truncated && (
+      {rendering && (
         <div className="diff-truncate-notice">
-          Showing {MAX_RENDERED_LAYERS} of {layers.length} layers
+          Rendering {visibleCount} of {layers.length} layers…
         </div>
       )}
       <div className="chart-container" style={{ height: 220 }}>

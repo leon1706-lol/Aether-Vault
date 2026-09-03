@@ -562,3 +562,29 @@ def test_require_signature_policy_does_not_affect_policies_without_it(tmp_path, 
     res = CliRunner().invoke(cli, ["promote", "--into", "main"], standalone_mode=False)
     assert res.exit_code == 16, res.output
     assert "require_signature" not in res.output
+
+
+# ---------------------------------------------------------------------------
+# v1.3.0 (todo.md item 17): "not PKI / not identity binding" must appear on --help for
+# every command under av registry keys / verify / export-signature, not just the parent
+# group — keys list/fingerprint were previously silent about it (only keys' own group
+# docstring said it, and click doesn't roll a group's help into its subcommands' --help).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("args", [
+    ["registry", "keys", "--help"],
+    ["registry", "keys", "list", "--help"],
+    ["registry", "keys", "fingerprint", "--help"],
+    ["registry", "keys", "rotate", "--help"],
+    ["registry", "verify", "--help"],
+    ["registry", "export-signature", "--help"],
+    ["policy", "set", "--help"],
+])
+def test_every_signing_command_help_states_not_pki(args):
+    res = CliRunner().invoke(cli, args, standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    lowered = res.output.lower()
+    assert "not" in lowered and "pki" in lowered and "identity" in lowered, (
+        f"{' '.join(args)} --help doesn't restate the not-PKI/not-identity-binding "
+        f"disclaimer:\n{res.output}"
+    )

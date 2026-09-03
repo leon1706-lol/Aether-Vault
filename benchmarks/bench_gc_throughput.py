@@ -39,7 +39,7 @@ def _bench_av() -> float | None:
     if not server_up:
         return None
 
-    with tempfile.TemporaryDirectory(prefix="bench-gc-av-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-gc-av-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         speedcheck.run_av_cli_probes(av_path, root)  # init + add + commit a small fixture
         for i in range(GC_OBJECT_COUNT):

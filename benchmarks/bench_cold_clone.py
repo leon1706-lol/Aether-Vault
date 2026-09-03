@@ -58,7 +58,7 @@ def _bench_av() -> tuple[float | None, str | None]:
     if not _av_server_reachable():
         return None, f"registry unreachable at {_AV_REGISTRY} — start the docker compose stack"
 
-    with tempfile.TemporaryDirectory(prefix="bench-clone-av-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-clone-av-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         source = root / "source"
         source.mkdir()
@@ -87,7 +87,7 @@ def _bench_git_lfs() -> float | None:
     git_lfs = shutil.which("git-lfs")
     if git_path is None or git_lfs is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-clone-gitlfs-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-clone-gitlfs-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         remote = root / "remote.git"
         subprocess.run(["git", "init", "--bare", str(remote)])
@@ -113,7 +113,7 @@ def _bench_dvc() -> float | None:
     git_path = shutil.which("git")
     if dvc_path is None or git_path is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-clone-dvc-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-clone-dvc-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         bare = root / "remote.git"
         subprocess.run(["git", "init", "--bare", str(bare)])

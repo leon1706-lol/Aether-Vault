@@ -19,11 +19,12 @@ interface Props {
   commits: Commit[];
   refs: Ref;
   loading: boolean;
+  error?: string | null;
 }
 
 const METRIC_COLORS = ["#ff7a1a", "#ffb380", "#4fd1c5", "#ffd166", "#68d391", "#fc8181"];
 
-export function MetricsPanel({ commits, refs, loading }: Props) {
+export function MetricsPanel({ commits, refs, loading, error }: Props) {
   const allMetricKeys = useMemo(() => extractMetricKeys(commits), [commits]);
   const [visibleKeys, setVisibleKeys] = useState<Set<string> | null>(null);
   const [branchFilter, setBranchFilter] = useState<string>("__all__");
@@ -78,6 +79,14 @@ export function MetricsPanel({ commits, refs, loading }: Props) {
           <div className="spinner" />
           Loading metrics…
         </div>
+      </div>
+    );
+  }
+
+  if (error && commits.length === 0) {
+    return (
+      <div className="card">
+        <div className="empty-state">⚠ {error}</div>
       </div>
     );
   }

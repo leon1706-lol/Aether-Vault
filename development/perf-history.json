@@ -1,0 +1,39 @@
+{
+  "schema": "perf-history-1.0",
+  "entries": [
+    {
+      "date": "2026-09-02",
+      "version": "1.2.5.dev6+g8ef634b58.d20260902",
+      "os": "Windows-10-10.0.19045-SP0",
+      "python": "3.14.7",
+      "probes": {
+        "Index.save() (500 entries)": 13.22,
+        "Index.load() (500 entries)": 59.52,
+        "load_config()": 84.85,
+        "iter_working_files() (2000 files)": 111.11,
+        "Storage stats (1000 objs)": 1436.29,
+        "semdiff.diff_trees() (500 entries)": 43.84,
+        "commit_staged() (300 entries)": 224.4,
+        "compute_status() (2000 files)": 1933.35,
+        "log() (150 commits)": 12392.79
+      }
+    },
+    {
+      "date": "2026-09-02",
+      "version": "1.2.5.dev6+g8ef634b58.d20260902",
+      "os": "Windows-10-10.0.19045-SP0",
+      "python": "3.14.7",
+      "probes": {
+        "Index.save() (500 entries)": 17.5,
+        "Index.load() (500 entries)": 58.45,
+        "load_config()": 100.08,
+        "iter_working_files() (2000 files)": 97.8,
+        "Storage stats (1000 objs)": 1380.08,
+        "semdiff.diff_trees() (500 entries)": 36.78,
+        "commit_staged() (300 entries)": 173.75,
+        "compute_status() (2000 files)": 1790.04,
+        "log() (150 commits)": 9504.03
+      }
+    }
+  ]
+}

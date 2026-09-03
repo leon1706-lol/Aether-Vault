@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/webhook-payload-1.0.json",
+  "title": "Aether-Vault webhook delivery body",
+  "description": "The exact bytes signed and POSTed to a webhook URL: json.dumps(..., sort_keys=True) of this shape. See python/av_server/server.py::_event_body() and docs/contracts.md. Verify via the X-AV-Signature header: hex(hmac-sha256(secret, body)).",
+  "type": "object",
+  "required": ["id", "kind", "project_id", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {"type": "integer"},
+    "kind": {"type": "string"},
+    "project_id": {"type": ["string", "null"]},
+    "payload": {"type": "object"}
+  }
+}

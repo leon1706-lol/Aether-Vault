@@ -1,53 +1,46 @@
+# To-Do — Objectives Canvas
 
-Main Objektive V1.2.5
-- continuation of the gapfilling of V1.2 features
-1. Engine image consolidation
-    • Cleaner process supervision (signal handling, graceful drain, independent restart of webui vs server without killing the whole container) 
-    • Documented upgrade path when legacy aliases are removed 
-    • Stronger production health semantics (readiness vs liveness) 
-2. Env snapshot & replay
-    • Deeper execute path (venv/conda target, not only current interpreter pip install) 
-    • Capture more training-relevant state (CUDA toolkit version, GPU name, critical env vars list, optional conda env name) 
-    • Real validation mode that checks “can this recipe resolve?” without installing 
-    • Higher-quality Dockerfile (multi-stage, CUDA base options, non-root) 
-    • Golden fixtures proving bit-identical snapshot IDs across machines/OS 
-3. Dataset CDC generalization
-    • Broader default set (e.g. common dataset dumps / arrow-related patterns where safe) 
-    • Clearer docs + examples for .avattributes 
-    • Explicit opt-in for formats that are risky to chunk by default 
-    • semdiff always reports realized chunk-reuse / dedup efficiency in a stable machine field used by .avh 
-4. Audit log depth
-    • Richer filters (actor, outcome, route family) + stable pagination tokens 
-    • Export format for compliance (CSV/JSONL) 
-    • Guaranteed coverage matrix test: every mutating route appears in audit 
-    • Clear retention + prune UX in CLI (av audit prune or documented admin-only) 
-5. Signed commits
-    • Key management UX (list keys, show fingerprint, rotate with guidance) 
-    • Optional signature requirement policy on protected branches 
-    • Stronger canonicalization tests across clone/pull/server round-trips 
-    • Explicit “not a PKI / not identity binding” callouts in CLI help, not only SECURITY.md 
-    • Optional detached signature export for external audit 
-6. WebUI run detail
-    • Dedicated run detail view (not only expandable list row) 
-    • Show context-memory notes from .avh / handoff 
-    • Metrics history chart or table over the run’s commits 
-    • Server-side semantic summary (not only client-side from last two trees) 
-    • Deep-linkable run URL + loading/error empty states polished 
-7. Plugin migration
-    • Plugins call the same functions as av_sdk.Repo with zero remaining CLI/chdir assumptions 
-    • Perfect parity tests: plugin commit ≡ SDK commit ≡ CLI commit (hash, metrics, run linkage) 
-    • Documented extension guide for new frameworks on the SDK path only 
-8. Webhook delivery maturity
-    • Persistent dead-letter queue with inspect/replay CLI or admin API 
-    • Delivery attempt history visible per webhook 
-    • Better observability (last success/failure, consecutive failures, disable-after-N) 
-    • Poison-message isolation and max-attempt policy fully documented + tested 
-9. Perf regression gates
-    • Stable probes that don’t flake on disk-heavy paths 
-    • Separate budgets for commit / status / log / semdiff 
-    • CI fails only on real regressions, not noise 
-10. Multi-agent conflict UX
-    • Every divergence/conflict message includes run IDs when present 
-    • Exact copy-paste remediation commands in JSON + human modes 
-    • Consistent behavior on pull/merge/push races 
+This is the owner's planning space, not a generated backlog. Whatever is written below is
+the current objective(s) and any personal notes/context for it — read it before starting
+work in this repo, and treat it as the live brief for what an AI agent should do next.
+Expect this file to be rewritten or cleared out entirely as objectives change; it does not
+accumulate history (that's what `development/CHANGELOG.md` and `development/Probleme.md`
+are for — see `AGENTS.md`).
 
+---
+
+## v1.3.0 wrap-up: everything is done except the actual commit
+
+The full "Depth to 10/10" plan (WP-0 through WP-28, all 28 work packages) is implemented,
+tested, and manually verified end to end — nothing deferred. The mechanical wrap-up
+checklist is also complete: full `pytest tests/ -v` (Docker stopped per your instruction —
+815 passed, 139 skipped as expected, 1 known non-regression noted below), webui lint +
+typecheck both green, `development/CHANGELOG.md` Phase 58 entry written (ends with
+`Essential-Tasks: signed off`), Obsidian vault regenerated (`generate_code_graph.py` then
+`regenerate_vault.py`, both `--append-handoff`), `git status --short` reviewed — 146 files,
+all accounted for, nothing stray, no `.env` drift.
+
+**What's left is only step 7 of the checklist: ask before committing (AGENTS.md
+non-negotiable).** Nothing has been committed or pushed. When you're ready:
+- One commit for the whole v1.3.0 release, Sonnet 5 attribution.
+- Push, watch `tests.yml` + `nightly.yml` + the new `chaos-drills` job.
+- Tag `v1.3.0` only after the `gate` job passes (it will also need a *fresh*
+  `av benchmark` + `scripts/append_perf_history.py` run against the actual tagged commit
+  first — the perf-history entries captured so far predate the tag and won't satisfy the
+  gate's version check on their own; this is expected, not a bug).
+
+### Two things worth deciding, not urgent
+
+- **Live registry's resting auth mode is genuinely unknown.** This cycle's live
+  verification stopped/restarted the engine container repeatedly; whether Anonymous mode
+  (its state when Docker was last up) matches what it should be "at rest" was never
+  independently confirmed. Not blocking the commit — just don't assume it's settled.
+- One pre-existing, non-regression test result: `tests/test_perf_gate.py`'s `log()` probe
+  fails locally on this machine (disk I/O characteristic — reproduced in isolation,
+  confirmed unrelated to any code touched this cycle, predicted by the plan itself).
+  Expected to pass on CI's Linux runners; left as-is deliberately rather than loosening
+  the gate to chase local noise. Full reasoning in Probleme.md / the Phase 58 entry.
+
+Every bug found and fixed this cycle (#114–124, including tonight's `av webhooks
+deliveries` crash caught specifically because Docker was intentionally off) is logged in
+`development/Probleme.md` with severity, fix, and verification.

@@ -9,6 +9,7 @@ interface Props {
   commits: Commit[];
   loading: boolean;
   projectId?: string | null;
+  error?: string | null;
 }
 
 // "main" is the conventional base branch name within a project namespace (project_id/main) —
@@ -22,7 +23,7 @@ function baseRefNameFor(branchRefName: string, refs: Ref): string | null {
   return refs[candidate] !== undefined ? candidate : null;
 }
 
-export function BranchesPanel({ refs, commits, loading, projectId }: Props) {
+export function BranchesPanel({ refs, commits, loading, projectId, error }: Props) {
   const commitByHash = useMemo(() => indexByHash(commits), [commits]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [creating, setCreating] = useState<{ name: string; fromHash: string } | null>(null);
@@ -38,6 +39,14 @@ export function BranchesPanel({ refs, commits, loading, projectId }: Props) {
           <div className="spinner" />
           Loading branches…
         </div>
+      </div>
+    );
+  }
+
+  if (error && branches.length === 0) {
+    return (
+      <div className="card">
+        <div className="empty-state">⚠ {error}</div>
       </div>
     );
   }

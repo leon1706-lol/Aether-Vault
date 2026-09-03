@@ -87,7 +87,7 @@ class AetherVaultCallback(Callback):
         if not paths:
             return
         repo_root = resolve_repo_root(Path(paths[0]).parent)
-        push_pending(repo_root)  # v1.2.5: no chdir, no CLI hop (was run_av(..., ["push"]))
+        push_pending(repo_root)  # v1.2.5: no chdir, no CLI hop (run_av() itself removed at v1.3.0)
 
 
 def import_checkpoint(

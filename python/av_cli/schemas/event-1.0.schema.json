@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/event-1.0.json",
+  "title": "Aether-Vault event (GET /api/events)",
+  "description": "One row of the resumable, ordered event feed. See python/av_server/server.py::list_events() and docs/contracts.md.",
+  "type": "object",
+  "required": ["id", "ts", "kind", "project_id", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {"type": "integer", "description": "Monotonic cursor; pass as ?since= to resume."},
+    "ts": {"type": ["string", "null"]},
+    "kind": {"type": "string"},
+    "project_id": {"type": ["string", "null"]},
+    "payload": {"type": "object"}
+  }
+}

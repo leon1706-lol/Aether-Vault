@@ -38,7 +38,7 @@ _LEGACY_COLUMNS = {
         "consecutive_failures": "INTEGER DEFAULT 0",
         "disabled_reason": "TEXT",
     },
-    "runs": {"avh_object_id": "TEXT"},
+    "runs": {"avh_object_id": "TEXT", "policy_outcome": "JSON"},
 }
 
 
@@ -62,6 +62,40 @@ def _heal_legacy_columns(sync_conn, tables: set[str]) -> None:
         for col, ddl in cols.items():
             if col not in present:
                 sync_conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+
+def _heal_legacy_indexes(sync_conn, tables: set[str]) -> None:
+    """Creates any index a CURRENT table's model declares but an adopted legacy volume
+    doesn't have — the index-shaped sibling of `_heal_legacy_columns` (v1.3.0).
+
+    Real gap this closes: a volume adopted via the `needs_adoption` branch gets its
+    COLUMNS healed (`_LEGACY_COLUMNS`, matched by hand) and stamped straight to head —
+    but nothing ever diffed INDEXES the same way. A migration that only adds
+    `op.create_index(...)` with no matching column (migration 0004's
+    `ix_audit_log_username`/`ix_audit_log_action`) left an adopted volume silently
+    missing those indexes forever, even though it reports itself as being at head — found
+    via `tests/test_server.py::test_migration_chain_downgrades_and_reupgrades_cleanly`
+    hitting `UndefinedObjectError` trying to DROP an index that a REAL step-by-step
+    upgrade would have created, but this environment's adopted volume never had.
+
+    Walks every table `Base.metadata` (the models — the single source of truth an
+    adopted volume is diffed against) actually declares, comparing against what
+    `sa.inspect` reports is really on disk; creates whatever's missing via the same
+    `Index` object the model declared, so the DDL is byte-identical to what a fresh
+    `create_all()` would have produced.
+    """
+    import sqlalchemy as sa
+
+    from .models import Base
+
+    inspector = sa.inspect(sync_conn)
+    for table_name, table in Base.metadata.tables.items():
+        if table_name not in tables:
+            continue  # a genuinely missing table is _create_missing_tables' job, not this
+        present = {ix["name"] for ix in inspector.get_indexes(table_name)}
+        for index in table.indexes:
+            if index.name not in present:
+                index.create(bind=sync_conn)
 
 
 def _create_missing_tables(sync_conn, tables: set[str]) -> None:
@@ -105,6 +139,10 @@ def _ensure_schema_sync(sync_conn, cfg) -> None:
         # execute on it.
         _create_missing_tables(sync_conn, tables)
         _heal_legacy_columns(sync_conn, tables)
+        # Tables the healing above just created (via create_all) already have their
+        # indexes — re-inspect so this only ever considers indexes on tables that
+        # already existed before adoption ran (create_all already made the rest).
+        _heal_legacy_indexes(sync_conn, set(sa.inspect(sync_conn).get_table_names()))
         MigrationContext.configure(sync_conn).stamp(script, script.get_current_head())
 
     cfg.attributes["connection"] = sync_conn

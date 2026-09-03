@@ -43,6 +43,12 @@ ATTRIBUTES_TEMPLATE = """\
 #   models/frozen/** no-chunk no-layer-split
 #   experiments/*.safetensors no-layer-split
 #   datasets/exports/*.parquet chunk        # opted in: this pipeline only appends rows
+#   *.ckpt no-chunk                         # a checkpoint format you know rewrites whole
+#   raw/*.wav chunk                         # uncompressed audio, block-aligned — safe to chunk
+#   archives/*.zip                          # deliberately NOT opted in (compressed, see above)
+#   scratch/** no-chunk no-layer-split      # last line wins: everything under scratch/ stored whole
+#
+# See docs/avattributes.md for the full "risky formats are opt-in by default" rationale.
 """
 
 

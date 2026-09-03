@@ -62,11 +62,24 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
 
     if server_up:
         start = time.perf_counter()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENT_PUSHES) as pool:
-            results = list(pool.map(_push_one, range(CONCURRENT_PUSHES)))
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENT_PUSHES) as pool:
+                results = list(pool.map(_push_one, range(CONCURRENT_PUSHES)))
+            ok = all(results)
+        except Exception as exc:
+            # A real capture on a resource-constrained machine hit a raw
+            # ConnectionResetError under 8-way concurrency (see Probleme.md) — that's a
+            # server-was-up-the-whole-time failure, never "not installed". Caught here (not
+            # just a False in `results`) because a reset can raise out of push_commit()
+            # rather than return False.
+            results = []
+            ok = False
+            notes["av"] = f"server reachable but the operation failed: {exc}"
         elapsed_ms = (time.perf_counter() - start) * 1000
-        values["av"] = elapsed_ms if all(results) else None
-        statuses["av"] = ToolStatus.AVAILABLE if all(results) else ToolStatus.NOT_INSTALLED
+        values["av"] = elapsed_ms if ok else None
+        statuses["av"] = ToolStatus.AVAILABLE if ok else ToolStatus.FAILED
+        if not ok and "av" not in notes:
+            notes["av"] = "server was reachable but one or more of the concurrent pushes failed"
     else:
         values["av"] = None
         statuses["av"] = ToolStatus.NOT_INSTALLED

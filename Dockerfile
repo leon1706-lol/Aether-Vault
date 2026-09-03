@@ -43,7 +43,14 @@ ENV NEXT_TELEMETRY_DISABLED=1 \
 RUN npm run build
 
 # ── Runtime: BOTH runtimes, one image ───────────────────────────────────────
-FROM python:3.12-slim-bookworm
+# v1.3.0 fix (Probleme.md): MUST be named. Docker builds the LAST stage in the file when
+# no --target/BuildKit `target:` is given, and v1.3.0 appended the `server`/`webui`
+# targets below this one — an unnamed stage here would silently stop being the
+# untargeted-build default the moment those were added (docker-compose.yml's `build: .`
+# and both release workflows' main "Build and push engine image" step all rely on that
+# default; every one of them now pins `target: engine` explicitly instead, but naming the
+# stage itself is the belt-and-suspenders fix that survives a future reordering too).
+FROM python:3.12-slim-bookworm AS engine
 # NodeSource Node 20 on top of the python base — node-fetch-style healthchecks
 # and the standalone Next server share this interpreter-free runtime layer.
 # procps (pkill/ps/etc.) is NOT in python:3.12-slim by default — needed both for
@@ -85,4 +92,51 @@ ENV AV_DATA_DIR=/data \
     HOSTNAME=0.0.0.0 \
     NODE_ENV=production
 EXPOSE 8000 3000
+ENTRYPOINT ["/engine-entrypoint.sh"]
+
+# ============================================================================
+# v1.3.0 (todo.md item 19): slim, single-role targets alongside the "all" image
+# above — `docker build --target server` / `--target webui`. Each installs only
+# the runtime its role actually uses (no Node in the server image, no Python in
+# the webui image), reusing the exact same py-builder/web-builder artifacts and
+# the exact same engine-entrypoint.sh (its role dispatch already never touches
+# the other runtime — start_server()/start_webui() are fully independent, and
+# were already exercised this way by legacy per-service alias containers). The
+# default (untargeted) `docker build .` still produces the "all" image above,
+# unchanged — these are opt-in additional targets, not a replacement.
+# ============================================================================
+
+# ── Target: server — Python/FastAPI registry only, no Node ──────────────────
+FROM python:3.12-slim-bookworm AS server
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates procps \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=py-builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl \
+    && pip install --no-cache-dir fastapi uvicorn requests click \
+    && mkdir -p /data && chmod 777 /data
+COPY docker/engine-entrypoint.sh /engine-entrypoint.sh
+RUN chmod +x /engine-entrypoint.sh
+# Defaulted here (unlike the "all" image above, which deliberately leaves it
+# unset so legacy alias auto-detect keeps working) because this image CANNOT
+# run any other role — there's no Node runtime to fall back to, so failing
+# obviously via AV_ENGINE_ROLE=server beats a silent role-detection surprise.
+ENV AV_DATA_DIR=/data \
+    AV_ENGINE_ROLE=server
+EXPOSE 8000
+ENTRYPOINT ["/engine-entrypoint.sh"]
+
+# ── Target: webui — Next.js standalone dashboard only, no Python ────────────
+FROM node:20-bookworm-slim AS webui
+RUN apt-get update && apt-get install -y --no-install-recommends curl procps \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=web-builder /build/webui/.next/standalone /webui
+COPY --from=web-builder /build/webui/.next/static /webui/.next/static
+COPY --from=web-builder /build/webui/public /webui/public
+COPY docker/engine-entrypoint.sh /engine-entrypoint.sh
+RUN chmod +x /engine-entrypoint.sh
+ENV WEBUI_PORT=3000 \
+    HOSTNAME=0.0.0.0 \
+    NODE_ENV=production \
+    AV_ENGINE_ROLE=webui
+EXPOSE 3000
 ENTRYPOINT ["/engine-entrypoint.sh"]

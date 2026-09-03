@@ -176,12 +176,14 @@ def export_entries(action: str | None, action_prefix: str | None, project_id: st
               help="Delete entries older than this many days (default: the registry's "
                    "AV_AUDIT_RETENTION_DAYS).")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip the confirmation prompt.")
-def prune_entries(before_days: int | None, yes: bool) -> None:
-    """Prune old audit entries on the registry. Admin-only, irreversible."""
+@click.option("--dry-run", "dry_run", is_flag=True, default=False,
+              help="Report how many entries WOULD be deleted without deleting anything.")
+def prune_entries(before_days: int | None, yes: bool, dry_run: bool) -> None:
+    """Prune old audit entries on the registry. Admin-only, irreversible (unless --dry-run)."""
     repo_root = ensure_repo()
     client = _client(repo_root)
 
-    if not yes and current_output_mode() != "json":
+    if not dry_run and not yes and current_output_mode() != "json":
         label = f"older than {before_days} day(s)" if before_days is not None else "past the registry's default retention window"
         if not click.confirm(
             f"This permanently deletes audit entries {label} on {client.server_url}. Continue?",
@@ -193,6 +195,8 @@ def prune_entries(before_days: int | None, yes: bool) -> None:
     params: dict = {}
     if before_days is not None:
         params["before_days"] = before_days
+    if dry_run:
+        params["dry_run"] = "true"
     try:
         resp = client.session.delete(f"{client.server_url}/api/admin/audit", params=params)
     except Exception:
@@ -200,8 +204,14 @@ def prune_entries(before_days: int | None, yes: bool) -> None:
     if resp.status_code != 200:
         fail(None, "validation", f"Prune failed: HTTP {resp.status_code} {resp.text[:200]}")
 
-    deleted = resp.json().get("deleted", 0)
+    body = resp.json()
+    deleted = body.get("deleted", 0)
+    would_delete = body.get("would_delete")
     if current_output_mode() == "json":
-        emit_json(None, "audit prune", data={"deleted": deleted, "before_days": before_days})
+        emit_json(None, "audit prune", data={"deleted": deleted, "would_delete": would_delete,
+                                             "dry_run": dry_run, "before_days": before_days})
+        return
+    if dry_run:
+        click.secho(f"Would delete {would_delete} audit entry(ies) — nothing was changed.", fg="cyan")
         return
     click.secho(f"Pruned {deleted} audit entr{'y' if deleted == 1 else 'ies'}.", fg="green")

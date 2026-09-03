@@ -19,12 +19,12 @@ def _client(repo_root):
                        cfg.get("remote_api_token"))
 
 
-def _request(client, method: str, path: str, json_body=None):
+def _request(client, method: str, path: str, json_body=None, params=None):
     import requests
 
     try:
         return client.session.request(method, f"{client.server_url}{path}",
-                                      json=json_body, timeout=30)
+                                      json=json_body, params=params, timeout=30)
     except requests.RequestException as exc:
         fail(None, "unreachable_queued", f"Registry unreachable: {exc}")
 
@@ -143,10 +143,8 @@ def show(webhook_id: str) -> None:
     if row is None:
         fail(None, "validation", f"No such webhook: {webhook_id}")
 
-    deliveries_resp = client.session.get(
-        f"{client.server_url}/api/admin/webhook-deliveries",
-        params={"webhook_id": row["id"], "limit": 5}, timeout=30,
-    )
+    deliveries_resp = _request(client, "GET", "/api/admin/webhook-deliveries",
+                               params={"webhook_id": row["id"], "limit": 5})
     recent = deliveries_resp.json().get("deliveries", []) if deliveries_resp.status_code == 200 else []
 
     if current_output_mode() == "json":
@@ -195,8 +193,7 @@ def deliveries(webhook_id: str | None, status: str | None, event_kind: str | Non
     if cursor:
         params["cursor"] = cursor
 
-    resp = client.session.get(f"{client.server_url}/api/admin/webhook-deliveries",
-                              params=params, timeout=30)
+    resp = _request(client, "GET", "/api/admin/webhook-deliveries", params=params)
     body = resp.json() if resp.status_code == 200 else {}
     rows = body.get("deliveries", [])
     if current_output_mode() == "json":

@@ -6,6 +6,7 @@ import { shortHash, type Commit } from "@/lib/api";
 interface Props {
   commits: Commit[];
   loading: boolean;
+  error?: string | null;
 }
 
 // Colors for different branch lanes
@@ -104,7 +105,7 @@ export function buildGraph(commits: Commit[]): { nodes: GraphNode[]; edges: { x1
   return { nodes, edges };
 }
 
-export function CommitGraph({ commits, loading }: Props) {
+export function CommitGraph({ commits, loading, error }: Props) {
   const displayCommits = useMemo(() => commits.slice(0, 18), [commits]);
   const { nodes, edges } = useMemo(() => buildGraph(displayCommits), [displayCommits]);
 
@@ -121,6 +122,20 @@ export function CommitGraph({ commits, loading }: Props) {
           <div className="spinner" />
           Building graph…
         </div>
+      </div>
+    );
+  }
+
+  if (error && commits.length === 0) {
+    return (
+      <div className="card">
+        <div className="card-header">
+          <span className="card-title">
+            <GraphIcon />
+            Experiment Graph
+          </span>
+        </div>
+        <div className="empty-state">⚠ {error}</div>
       </div>
     );
   }

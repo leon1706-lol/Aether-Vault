@@ -33,12 +33,13 @@ def _reconnect_existing_repo(repo_root: Path, cfg: dict) -> None:
 
 def _handle_init_protection_choice(
     repo_root: Path, yes: bool, protected_flag: bool, join_token: str | None
-) -> None:
+) -> dict | None:
     """The Anonymous/Protected prompt `av init` shows after choosing Local mode, plus its
     "Generate a new token" vs "Enter an existing one" follow-up. Saves whatever was decided to
     this repo's config (and, for "generate," writes/applies it via `av auth set-token`'s same
     underlying helper) — never touched at all if the result is Anonymous, matching today's
-    behavior exactly.
+    behavior exactly. Returns a dict describing the outcome in JSON mode (folded into
+    `init`'s own envelope by the caller), None in text mode (behavior unchanged there).
     """
     from . import ui
     from .client import AuthenticationError, VaultClient
@@ -57,43 +58,58 @@ def _handle_init_protection_choice(
         token_source = ui.select_token_source() if choice == "protected" else None
         existing_token = ui.prompt_for_existing_token() if token_source == "existing" else None
 
+    json_mode = current_output_mode() == "json"
+
     if choice != "protected":
-        return
+        return {"protection": "anonymous"} if json_mode else None
 
     if token_source == "generate":
         token = _generate_and_apply_token(repo_root)
+        if json_mode:
+            return {"protection": "protected", "token_source": "generated", "token": token}
         click.secho(f"Token set: {token}", fg="green")
         click.secho("Save this — it won't be shown again. Share it with teammates who need access.", fg="yellow")
-        return
+        return None
 
     # "existing" — joining a registry someone else already protected. Validate before saving:
     # an unreachable server and a rejected token must not look the same to the user.
     if not existing_token:
+        if json_mode:
+            return {"protection": "anonymous", "reason": "no_token_entered"}
         click.secho("No token entered — leaving this registry Anonymous.", fg="yellow")
-        return
+        return None
 
     cfg = load_config(repo_root)
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), existing_token)
+    unreachable = False
     if not client.server_available():
-        click.secho(
-            "Could not reach the server to verify this token right now — saved anyway; "
-            "you'll find out if it's wrong on your next command (`av auth status` to check).",
-            fg="yellow",
-        )
+        unreachable = True
+        if not json_mode:
+            click.secho(
+                "Could not reach the server to verify this token right now — saved anyway; "
+                "you'll find out if it's wrong on your next command (`av auth status` to check).",
+                fg="yellow",
+            )
     else:
         try:
             client.fetch_all_refs()
         except AuthenticationError:
+            if json_mode:
+                return {"protection": "anonymous", "reason": "token_rejected"}
             click.secho(
                 "That token was rejected by the server — leaving this registry Anonymous. "
                 "Run `av auth set-token <token>` once you have the correct one.",
                 fg="red",
             )
-            return
+            return None
 
     cfg["remote_api_token"] = existing_token
     save_config(repo_root, cfg)
+    if json_mode:
+        return {"protection": "protected", "token_source": "existing",
+                "server_verified": not unreachable}
     click.secho("Token saved.", fg="green")
+    return None
 
 
 @click.command()
@@ -119,10 +135,24 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
     """Initialize a new Aether-Vault repository in the current directory."""
     from . import ui
 
+    json_mode = current_output_mode() == "json"
+    # v1.3.0: init's whole shape is an interactive wizard by design (mode picker, protection
+    # prompt, REPL handoff) — none of that is meaningful for an agent parsing an envelope, so
+    # JSON mode requires the fully-scripted invocation shape instead of silently degrading:
+    # --mode explicit, --yes to skip every prompt, and no REPL to hand off into afterward.
+    if json_mode and (mode is None or not yes or not no_repl):
+        fail(None, "validation",
+             "av init --output json requires --mode, --yes, and --no-repl — it never "
+             "prompts or opens the REPL in JSON mode.", command="init")
+
     repo_root = Path.cwd()
     av_dir = repo_root / ".av"
 
     if av_dir.exists():
+        if json_mode:
+            emit_json(None, "init", data={"initialized": False, "reason": "already_initialized",
+                                          "path": str(av_dir)})
+            return
         click.secho(f"Repository already initialized at {av_dir}", fg="yellow")
         cfg = load_config(repo_root)
         if not no_repl:
@@ -132,7 +162,8 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
             repl.run_repl(repo_root, login_mode=cfg.get("login_mode", "local"))
         return
 
-    ui.print_banner("Aether-Vault", "version control for ML models & datasets")
+    if not json_mode:
+        ui.print_banner("Aether-Vault", "version control for ML models & datasets")
 
     # Enterprise mode is intentionally not offered interactively yet (the account-login flow
     # is unbuilt; selecting it today just falls back to Local) — the choice stays reachable
@@ -144,7 +175,8 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
         login_mode = "local"
 
     _init_repo_structure(repo_root)
-    click.secho(f"Initialized empty Aether-Vault repository in {av_dir}", fg="green")
+    if not json_mode:
+        click.secho(f"Initialized empty Aether-Vault repository in {av_dir}", fg="green")
 
     if login_mode == "enterprise":
         from . import enterprise
@@ -160,8 +192,9 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
     # Anonymous-vs-Protected only applies to Local mode — Enterprise has its own (separate,
     # not-yet-built) account-based auth system; this shared-secret token is the free/OSS-tier
     # mechanism, not something to layer underneath Enterprise login too.
+    protection_result = None
     if login_mode == "local":
-        _handle_init_protection_choice(repo_root, yes, protected_flag, join_token)
+        protection_result = _handle_init_protection_choice(repo_root, yes, protected_flag, join_token)
         cfg = load_config(repo_root)  # re-load: the protection-choice handler may have saved a token
 
     if login_mode == "local" and not no_repl:
@@ -176,6 +209,15 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
                 f"[WARN] Could not start the local backend ({exc}). Run `av webui` later once Docker is ready.",
                 fg="yellow",
             )
+
+    if json_mode:
+        # --no-repl is required above, so the REPL/update-notice human-only branches below
+        # never execute in JSON mode — this is the one clean envelope for the whole command.
+        emit_json(None, "init", data={
+            "initialized": True, "path": str(av_dir), "login_mode": login_mode,
+            "protection": protection_result,
+        })
+        return
 
     from . import update_check
 
@@ -206,25 +248,50 @@ def update(check_only: bool, list_versions_flag: bool, enable_auto_update: bool,
     """Check for, and optionally install, the latest aether-vault release."""
     from . import update_check
 
+    json_mode = current_output_mode() == "json"
+    # Every confirm() below defaults to True and only prompts when NOT already answered by
+    # --yes/--check — under CliRunner (and any real non-interactive invocation) that default
+    # applies silently anyway, so requiring --yes in JSON mode isn't a behavior change, just
+    # making the "no prompt in JSON mode" guarantee explicit rather than incidental.
+    if json_mode and docker_flag and not yes:
+        fail(None, "validation",
+             "av update --docker --output json requires --yes (no interactive confirm in "
+             "JSON mode).", command="update")
+
     if docker_flag:
         from . import docker_runtime
 
         result = docker_runtime.check_for_docker_update(_root._find_source_root())
         if not result.checked:
+            if json_mode:
+                emit_json(None, "update", data={"docker_checked": False, "message": result.message})
+                return
             click.secho(result.message, fg="yellow")
             return
-        click.secho(result.message, fg="green" if not result.updated else "yellow")
+        if not json_mode:
+            click.secho(result.message, fg="green" if not result.updated else "yellow")
         if not result.updated:
+            if json_mode:
+                emit_json(None, "update", data={"docker_checked": True, "docker_updated": False,
+                                                "message": result.message})
+                return
             return
 
-        if yes or click.confirm("Restart the local backend now to apply it?", default=True):
+        if yes or (not json_mode and click.confirm("Restart the local backend now to apply it?", default=True)):
             compose_file, _ = docker_runtime.resolve_compose_file(_root._find_source_root())
             for service in docker_runtime.RELEASE_IMAGES:
                 docker_runtime.restart_service(compose_file, service)
             # Only remove the old images once the new containers are confirmed up on the new
             # ones — never leave a window where neither image is safely runnable.
             docker_runtime.remove_old_images(result.old_image_ids)
+            if json_mode:
+                emit_json(None, "update", data={"docker_checked": True, "docker_updated": True,
+                                                "restarted": True})
+                return
             click.secho("Local backend restarted and old images cleaned up.", fg="green")
+        elif json_mode:
+            emit_json(None, "update", data={"docker_checked": True, "docker_updated": True,
+                                            "restarted": False})
         return
 
     if enable_auto_update or disable_auto_update:
@@ -232,13 +299,22 @@ def update(check_only: bool, list_versions_flag: bool, enable_auto_update: bool,
         cfg["auto_update"] = bool(enable_auto_update)
         update_check.save_user_config(cfg)
         state = "enabled" if enable_auto_update else "disabled"
+        if json_mode:
+            emit_json(None, "update", data={"auto_update": bool(enable_auto_update)})
+            return
         click.secho(f"Auto-update {state}.", fg="green")
         return
 
     if list_versions_flag:
         versions = update_check.list_versions()
         if versions is None:
+            if json_mode:
+                fail(None, "unreachable_queued", "Could not reach PyPI to list versions.",
+                     command="update")
             click.secho("Could not reach PyPI to list versions.", fg="red")
+            return
+        if json_mode:
+            emit_json(None, "update", data={"versions": versions, "installed": __version__})
             return
         for v in versions:
             marker = " (installed)" if v == __version__ else ""
@@ -248,17 +324,39 @@ def update(check_only: bool, list_versions_flag: bool, enable_auto_update: bool,
 
     result = update_check.check_for_update(force=True)
     if result is None:
+        if json_mode:
+            fail(None, "unreachable_queued", "Could not reach PyPI to check for updates.",
+                 command="update")
         click.secho("Could not reach PyPI to check for updates.", fg="red")
         return
     if not result.is_outdated:
+        if json_mode:
+            emit_json(None, "update", data={"current": result.current, "is_outdated": False})
+            return
         click.secho(f"aether-vault {result.current} is up to date.", fg="green")
         return
 
-    click.secho(f"aether-vault {result.current} → {result.latest} available.", fg="yellow")
+    if not json_mode:
+        click.secho(f"aether-vault {result.current} → {result.latest} available.", fg="yellow")
     if check_only:
+        if json_mode:
+            emit_json(None, "update", data={"current": result.current, "latest": result.latest,
+                                            "is_outdated": True, "upgraded": False})
+            return
         return
 
-    if click.confirm("Upgrade now?", default=True):
+    if json_mode and not yes:
+        fail(None, "validation",
+             "av update --output json requires --yes to actually upgrade (pass --check "
+             "instead to only report).", command="update")
+
+    if yes or (not json_mode and click.confirm("Upgrade now?", default=True)):
         import subprocess
 
         subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", update_check.PACKAGE_NAME])
+        if json_mode:
+            emit_json(None, "update", data={"current": result.current, "latest": result.latest,
+                                            "is_outdated": True, "upgraded": True})
+    elif json_mode:
+        emit_json(None, "update", data={"current": result.current, "latest": result.latest,
+                                        "is_outdated": True, "upgraded": False})

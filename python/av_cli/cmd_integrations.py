@@ -16,14 +16,25 @@ def graph(update: bool) -> None:
     """Generate or update a markdown vault of code dependencies for Obsidian."""
     repo_root = ensure_repo()
     vault_dir = repo_root / "Aether-Graph"
-    
+    json_mode = current_output_mode() == "json"
+
+    generated = False
     if update or not vault_dir.exists():
-        click.echo(f"Generating graph vault at {vault_dir}...")
+        if not json_mode:
+            click.echo(f"Generating graph vault at {vault_dir}...")
         vault_dir.mkdir(exist_ok=True)
         from .graph import generate_full_graph
         generate_full_graph(repo_root, vault_dir)
-        click.secho("Graph vault updated successfully.", fg="green")
-    
+        generated = True
+        if not json_mode:
+            click.secho("Graph vault updated successfully.", fg="green")
+
+    # JSON mode never launches Obsidian (a GUI app makes no sense for an agent invocation)
+    # — it just reports the vault path so a caller can open/read it itself.
+    if json_mode:
+        emit_json(None, "graph", data={"vault_dir": str(vault_dir.resolve()), "generated": generated})
+        return
+
     if not update:
         click.secho(f"To visualize, open the following folder as a vault in Obsidian:\n  {vault_dir.resolve()}", fg="cyan")
         import webbrowser
@@ -126,6 +137,9 @@ def handoff_init() -> None:
     repo_root = ensure_repo()
     from .handoff import init_handoff_dir
     vault_dir = init_handoff_dir(repo_root)
+    if current_output_mode() == "json":
+        emit_json(None, "handoff init", data={"vault_dir": str(vault_dir.relative_to(repo_root))})
+        return
     click.secho(f"{vault_dir.relative_to(repo_root)}/ initialized.", fg="green")
 
 
@@ -133,12 +147,14 @@ def handoff_init() -> None:
 def handoff_log() -> None:
     """List all handoff snapshots in chronological order."""
     repo_root = ensure_repo()
+    json_mode = current_output_mode() == "json"
     snapshots_dir = repo_root / "Aether-Handoff" / "snapshots"
-    if not snapshots_dir.exists():
-        click.secho("No handoff snapshots yet. Run `av handoff` first.", fg="yellow")
+    entries = sorted(snapshots_dir.glob("*.md")) if snapshots_dir.exists() else []
+
+    if json_mode:
+        emit_json(None, "handoff log", data={"snapshots": [e.stem for e in entries]})
         return
 
-    entries = sorted(snapshots_dir.glob("*.md"))
     if not entries:
         click.secho("No handoff snapshots yet. Run `av handoff` first.", fg="yellow")
         return
@@ -152,13 +168,21 @@ def handoff_log() -> None:
 def handoff_show(snapshot_id: str) -> None:
     """Print a previously generated handoff Markdown note."""
     repo_root = ensure_repo()
+    json_mode = current_output_mode() == "json"
     snapshots_dir = repo_root / "Aether-Handoff" / "snapshots"
     matches = sorted(snapshots_dir.glob(f"{snapshot_id}*.md")) if snapshots_dir.exists() else []
 
     if not matches:
+        if json_mode:
+            fail(None, "validation", f"No snapshot found matching '{snapshot_id}'.",
+                 command="handoff show")
         click.secho(f"No snapshot found matching '{snapshot_id}'.", fg="red")
         return
 
+    if json_mode:
+        emit_json(None, "handoff show", data={"snapshot_id": matches[-1].stem,
+                                              "content": matches[-1].read_text(encoding="utf-8")})
+        return
     click.echo(matches[-1].read_text(encoding="utf-8"))
 
 

@@ -1,13 +1,35 @@
 import importlib.util
 import json
+import os
+from pathlib import Path
 
 import pytest
 
-from python.av_plugins._shared import build_metric_args, resolve_repo_root, run_av
+from python.av_plugins._shared import resolve_repo_root
+
+
+def _run_av(repo_root: Path, args: list[str]) -> None:
+    """Test-only CLI-invocation helper (chdir + in-process `av`).
+
+    v1.3.0: this used to be `av_plugins._shared.run_av()`, a DEPRECATED production shim
+    kept for one release's grace window (VERSIONING.md) — no plugin called it since
+    v1.2.5 (see push_pending()), and that window closed at this MINOR boundary, so it's
+    been removed from the shipped package. This test suite still wants exactly this
+    behavior as its own "drive the real CLI" helper for the seam/SDK/CLI parity tests
+    below, so it lives here now instead — test infrastructure, not a public API.
+    """
+    previous_cwd = Path.cwd()
+    os.chdir(repo_root)
+    try:
+        from av_cli.main import cli
+
+        cli.main(args=args, prog_name="av", standalone_mode=False)
+    finally:
+        os.chdir(previous_cwd)
 
 
 def _init_repo(tmp_path):
-    run_av(tmp_path, ["init", "--mode", "local", "--yes", "--no-repl"])
+    _run_av(tmp_path, ["init", "--mode", "local", "--yes", "--no-repl"])
     return tmp_path
 
 
@@ -25,18 +47,13 @@ def test_resolve_repo_root_raises_outside_repo(tmp_path):
         resolve_repo_root(tmp_path)
 
 
-def test_build_metric_args_filters_non_numeric_and_bools():
-    args = build_metric_args({"loss": 0.42, "epoch": 3, "is_best": True, "name": "run-1"})
-    assert args == ["--metric", "loss=0.42", "--metric", "epoch=3"]
-
-
 def test_run_av_add_and_commit_checkpoint(tmp_path):
     repo_root = _init_repo(tmp_path)
     ckpt = repo_root / "model.pt"
     ckpt.write_text("dummy weights")
 
-    run_av(repo_root, ["add", str(ckpt)])
-    run_av(repo_root, ["commit", "-m", "step=1", "--metric", "loss=0.5", "--tag", "auto"])
+    _run_av(repo_root, ["add", str(ckpt)])
+    _run_av(repo_root, ["commit", "-m", "step=1", "--metric", "loss=0.5", "--tag", "auto"])
 
     commits_dir = repo_root / ".av" / "commits"
     commit_files = list(commits_dir.glob("*.json"))
@@ -52,16 +69,16 @@ def test_run_av_commit_with_no_changes_raises_nothing_to_commit(tmp_path):
     repo_root = _init_repo(tmp_path)
     ckpt = repo_root / "model.pt"
     ckpt.write_text("dummy weights")
-    run_av(repo_root, ["add", str(ckpt)])
-    run_av(repo_root, ["commit", "-m", "first"])
+    _run_av(repo_root, ["add", str(ckpt)])
+    _run_av(repo_root, ["commit", "-m", "first"])
 
     # v1.2.5: nothing staged the second time around now hits fail("nothing_to_commit")
     # -> SystemExit(11) (see tests/test_exit_codes.py), matching the documented registry
     # — pre-1.2.5 this exited 0/didn't raise, which is what this test used to assert.
-    # run_av's cli.main(standalone_mode=False) doesn't catch SystemExit (unlike
+    # _run_av's cli.main(standalone_mode=False) doesn't catch SystemExit (unlike
     # CliRunner), so it propagates here exactly as it would to any real caller.
     with pytest.raises(SystemExit) as exc:
-        run_av(repo_root, ["commit", "-m", "second"])
+        _run_av(repo_root, ["commit", "-m", "second"])
     assert exc.value.code == 11
 
     commits_dir = repo_root / ".av" / "commits"
@@ -293,7 +310,7 @@ def _stage_unrelated(repo_root):
     """A file the user staged for their OWN next commit, before any import runs."""
     unrelated = repo_root / "notes.py"
     unrelated.write_text("user's in-progress work")
-    run_av(repo_root, ["add", str(unrelated)])
+    _run_av(repo_root, ["add", str(unrelated)])
     return unrelated
 
 
@@ -649,8 +666,8 @@ def test_seam_parity_plugin_vs_sdk_vs_cli(tmp_path, monkeypatch):
     cli_repo = _mkdir(tmp_path / "cli")
     _init_repo(cli_repo)
     (cli_repo / "artifact.bin").write_bytes(b"x")
-    run_av(cli_repo, ["add", "artifact.bin"])
-    run_av(cli_repo, ["commit", "-m", "via cli", "--tag", "parity",
+    _run_av(cli_repo, ["add", "artifact.bin"])
+    _run_av(cli_repo, ["commit", "-m", "via cli", "--tag", "parity",
                       "--metric", "loss=0.1"])
     cli_tree = _tree_of(next(iter((cli_repo / ".av" / "commits").glob("*.json"))))
 
@@ -703,8 +720,8 @@ def test_seam_parity_run_id_linkage(tmp_path, monkeypatch):
     cli_repo = _mkdir(tmp_path / "cli-run")
     _init_repo(cli_repo)
     (cli_repo / "artifact.bin").write_bytes(b"x")
-    run_av(cli_repo, ["add", "artifact.bin"])
-    run_av(cli_repo, ["commit", "-m", "via cli"])
+    _run_av(cli_repo, ["add", "artifact.bin"])
+    _run_av(cli_repo, ["commit", "-m", "via cli"])
     cli_run = _run_fields(next(iter((cli_repo / ".av" / "commits").glob("*.json"))))
 
     assert seam_run == sdk_run == cli_run == {
@@ -750,8 +767,8 @@ def test_seam_parity_env_snapshot_id(tmp_path):
     _init_repo(cli_repo)
     _write_snapshot(cli_repo)
     (cli_repo / "artifact.bin").write_bytes(b"x")
-    run_av(cli_repo, ["add", "artifact.bin"])
-    run_av(cli_repo, ["commit", "-m", "via cli"])
+    _run_av(cli_repo, ["add", "artifact.bin"])
+    _run_av(cli_repo, ["commit", "-m", "via cli"])
     cli_sid = _sid(next(iter((cli_repo / ".av" / "commits").glob("*.json"))))
 
     assert seam_sid == sdk_sid == cli_sid
@@ -779,8 +796,8 @@ def test_seam_parity_queued_when_server_unreachable(tmp_path):
     cli_repo = _mkdir(tmp_path / "cli-q")
     _init_repo(cli_repo)
     (cli_repo / "artifact.bin").write_bytes(b"x")
-    run_av(cli_repo, ["add", "artifact.bin"])
-    run_av(cli_repo, ["commit", "-m", "via cli"])
+    _run_av(cli_repo, ["add", "artifact.bin"])
+    _run_av(cli_repo, ["commit", "-m", "via cli"])
     assert load_pending_push(cli_repo)
 
 

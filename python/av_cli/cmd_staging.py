@@ -21,25 +21,43 @@ def config(value: int | None, remote_url: str | None, project_name: str | None) 
     """
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
+    json_mode = current_output_mode() == "json"
 
     if value is None and remote_url is None and project_name is None:
+        if json_mode:
+            emit_json(None, "config", data={
+                "lfs_threshold_mb": cfg.get("lfs_threshold_mb"),
+                "remote_url": cfg.get("remote_url"),
+                "project_name": cfg.get("project_name"),
+                "project_id": cfg.get("project_id"),
+            })
+            return
         click.echo(f"LFS threshold : {cfg.get('lfs_threshold_mb')} MB")
         click.echo(f"Remote URL    : {cfg.get('remote_url')}")
         click.echo(f"Project name  : {cfg.get('project_name')}")
         click.echo(f"Project ID    : {cfg.get('project_id')}")
         return
 
+    changed = {}
     if value is not None:
         cfg["lfs_threshold_mb"] = value
-        click.secho(f"Configured LFS threshold to {value} MB", fg="green")
+        changed["lfs_threshold_mb"] = value
+        if not json_mode:
+            click.secho(f"Configured LFS threshold to {value} MB", fg="green")
     if remote_url is not None:
         cfg["remote_url"] = remote_url
-        click.secho(f"Configured remote URL to {remote_url}", fg="green")
+        changed["remote_url"] = remote_url
+        if not json_mode:
+            click.secho(f"Configured remote URL to {remote_url}", fg="green")
     if project_name is not None:
         cfg["project_name"] = project_name
-        click.secho(f"Configured project name to {project_name}", fg="green")
+        changed["project_name"] = project_name
+        if not json_mode:
+            click.secho(f"Configured project name to {project_name}", fg="green")
 
     save_config(repo_root, cfg)
+    if json_mode:
+        emit_json(None, "config", data={"changed": changed})
 
 
 @click.command()
@@ -111,8 +129,13 @@ def file(make_avignore: bool, make_avattributes: bool) -> None:
     from .attributes import ATTRIBUTES_TEMPLATE
 
     repo_root = ensure_repo()
+    json_mode = current_output_mode() == "json"
+    result: dict = {}
 
     if not make_avignore and not make_avattributes:
+        if json_mode:
+            emit_json(None, "file", data={"generated": {}})
+            return
         click.secho(
             "Nothing to do — pass a flag, e.g. `av file --avignore` or `av file --avattributes`.",
             fg="yellow",
@@ -122,18 +145,29 @@ def file(make_avignore: bool, make_avattributes: bool) -> None:
     if make_avignore:
         avignore_path = repo_root / ".avignore"
         if avignore_path.exists():
-            click.secho(f".avignore already exists at {avignore_path} — not overwriting.", fg="yellow")
+            result["avignore"] = "already_exists"
+            if not json_mode:
+                click.secho(f".avignore already exists at {avignore_path} — not overwriting.", fg="yellow")
         else:
             avignore_path.write_text(_AVIGNORE_TEMPLATE, encoding="utf-8")
-            click.secho(f"Wrote {avignore_path}", fg="green")
+            result["avignore"] = "written"
+            if not json_mode:
+                click.secho(f"Wrote {avignore_path}", fg="green")
 
     if make_avattributes:
         attrs_path = repo_root / ".avattributes"
         if attrs_path.exists():
-            click.secho(f".avattributes already exists at {attrs_path} — not overwriting.", fg="yellow")
+            result["avattributes"] = "already_exists"
+            if not json_mode:
+                click.secho(f".avattributes already exists at {attrs_path} — not overwriting.", fg="yellow")
         else:
             attrs_path.write_text(ATTRIBUTES_TEMPLATE, encoding="utf-8")
-            click.secho(f"Wrote {attrs_path}", fg="green")
+            result["avattributes"] = "written"
+            if not json_mode:
+                click.secho(f"Wrote {attrs_path}", fg="green")
+
+    if json_mode:
+        emit_json(None, "file", data={"generated": result})
 
 
 @click.command()
@@ -147,9 +181,13 @@ def unstage(paths: tuple) -> None:
     """
     repo_root = ensure_repo()
     idx = Index(repo_root)
+    json_mode = current_output_mode() == "json"
 
     staged = idx.get_staged_entries()
     if not staged:
+        if json_mode:
+            emit_json(None, "unstage", data={"unstaged": [], "reason": "nothing_staged"})
+            return
         click.secho("Nothing staged to unstage", fg="yellow")
         return
 
@@ -163,6 +201,9 @@ def unstage(paths: tuple) -> None:
             if rel in staged:
                 rel_paths.append(rel)
         if not rel_paths:
+            if json_mode:
+                emit_json(None, "unstage", data={"unstaged": [], "reason": "none_matched"})
+                return
             click.secho("None of the given paths are staged", fg="yellow")
             return
     else:
@@ -199,6 +240,9 @@ def unstage(paths: tuple) -> None:
             del idx.entries[rel_path]
 
     idx.save()
+    if json_mode:
+        emit_json(None, "unstage", data={"unstaged": rel_paths})
+        return
     click.secho(f"Unstaged {len(rel_paths)} file(s):", fg="green")
     for rel_path in rel_paths:
         click.echo(f"  {rel_path}")

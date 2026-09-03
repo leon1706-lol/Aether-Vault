@@ -36,6 +36,12 @@ export default function DashboardPage() {
   // The run id to deep-link into (?run=<id>) — read once on mount and handed down;
   // RunsPanel owns updating this param itself as the user navigates within the tab.
   const [initialRunId, setInitialRunId] = useState<string | null>(null);
+  // v1.3.0 (todo.md item 25): same deep-link pattern for the weight-diff tab
+  // (?tab=weight-diff&a=<hash>&b=<hash>&path=<relPath>) — read once on mount, handed
+  // down; WeightDiffPanel owns updating these params itself as slots/path change.
+  const [initialWeightDiff, setInitialWeightDiff] = useState<{
+    a: string | null; b: string | null; path: string | null;
+  }>({ a: null, b: null, path: null });
   // null = no project selected, dashboard shows every project on the shared registry
   // (preserves the original pre-Projects-tab behavior). Persisted across reloads.
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -59,6 +65,7 @@ export default function DashboardPage() {
     const tab = params.get("tab");
     if (tab && tab in TAB_TITLES) setActive(tab);
     setInitialRunId(params.get("run"));
+    setInitialWeightDiff({ a: params.get("a"), b: params.get("b"), path: params.get("path") });
   }, []);
 
   function selectTab(tab: string) {
@@ -66,6 +73,11 @@ export default function DashboardPage() {
     const params = new URLSearchParams(window.location.search);
     params.set("tab", tab);
     if (tab !== "runs") params.delete("run"); // leaving the tab drops the deep link
+    if (tab !== "weight-diff") {
+      params.delete("a");
+      params.delete("b");
+      params.delete("path");
+    }
     window.history.replaceState(null, "", `?${params.toString()}`);
   }
 
@@ -82,6 +94,13 @@ export default function DashboardPage() {
     window.localStorage.removeItem(SELECTED_PROJECT_KEY);
   }
 
+  // v1.3.0 (todo.md item 25): cross-link from a run's linked commits into the weight-diff
+  // tab, both slots pre-filled — RunsPanel calls this with (olderHash, newerHash).
+  function openWeightDiff(a: string, b: string, path: string | null = null) {
+    setInitialWeightDiff({ a, b, path });
+    selectTab("weight-diff");
+  }
+
   return (
     <div className="app-shell">
       <Sidebar active={active} onSelect={selectTab} />
@@ -96,11 +115,20 @@ export default function DashboardPage() {
         />
         <div className="page-content">
           {active === "weight-diff" ? (
-            <WeightDiffPanel projectId={selectedProject?.project_id ?? null} />
+            <WeightDiffPanel
+              projectId={selectedProject?.project_id ?? null}
+              initialSlotAHash={initialWeightDiff.a}
+              initialSlotBHash={initialWeightDiff.b}
+              initialPath={initialWeightDiff.path}
+            />
           ) : active === "projects" ? (
             <ProjectsPanel selectedProjectId={selectedProject?.project_id ?? null} onOpen={openProject} />
           ) : active === "runs" ? (
-            <RunsPanel projectId={selectedProject?.project_id ?? null} initialRunId={initialRunId} />
+            <RunsPanel
+              projectId={selectedProject?.project_id ?? null}
+              initialRunId={initialRunId}
+              onCompareWeights={openWeightDiff}
+            />
           ) : active === "commits" ? (
             <CommitsPanel refs={data?.refs ?? {}} projectId={selectedProject?.project_id ?? null} />
           ) : active === "branches" ? (
@@ -109,9 +137,15 @@ export default function DashboardPage() {
               commits={data?.commits ?? []}
               loading={loading}
               projectId={selectedProject?.project_id ?? null}
+              error={data?.error ?? null}
             />
           ) : active === "metrics" ? (
-            <MetricsPanel commits={data?.commits ?? []} refs={data?.refs ?? {}} loading={loading} />
+            <MetricsPanel
+              commits={data?.commits ?? []}
+              refs={data?.refs ?? {}}
+              loading={loading}
+              error={data?.error ?? null}
+            />
           ) : active === "storage" ? (
             <StoragePanel
               stats={data?.stats ?? null}
@@ -128,14 +162,19 @@ export default function DashboardPage() {
 
               {/* Commit graph + Branches */}
               <div className="grid-2 section fade-in fade-in-2">
-                <CommitGraph commits={data?.commits ?? []} loading={loading} />
-                <BranchList refs={data?.refs ?? {}} commits={data?.commits ?? []} loading={loading} />
+                <CommitGraph commits={data?.commits ?? []} loading={loading} error={data?.error ?? null} />
+                <BranchList
+                  refs={data?.refs ?? {}}
+                  commits={data?.commits ?? []}
+                  loading={loading}
+                  error={data?.error ?? null}
+                />
               </div>
 
               {/* Metrics chart + Commit log */}
               <div className="grid-2 section fade-in fade-in-3">
-                <MetricsChart commits={data?.commits ?? []} loading={loading} />
-                <CommitList commits={data?.commits ?? []} loading={loading} />
+                <MetricsChart commits={data?.commits ?? []} loading={loading} error={data?.error ?? null} />
+                <CommitList commits={data?.commits ?? []} loading={loading} error={data?.error ?? null} />
               </div>
             </>
           ) : null}

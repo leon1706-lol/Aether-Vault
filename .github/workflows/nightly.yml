@@ -35,4 +35,30 @@ jobs:
         run: pip install -e .[dev]
 
       - name: Run full suite
+        env:
+          AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: pytest tests/ -q
+
+  # v1.3.0: no leg anywhere in CI ever ran on macOS before this — the env-snapshot and
+  # CDC-chunking golden-hash fixtures assert cross-machine determinism (todo.md items
+  # 11/1) but had only ever proven it across Windows (push CI) and Linux (nightly's
+  # `compat` job above), never a third OS. Scoped to just those tests (-k), not the
+  # whole suite — this leg exists to prove ONE property, not to duplicate `compat`.
+  golden-fixtures-macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Aether-Vault (builds the C++ core via pybind11)
+        run: pip install -e .[dev]
+
+      - name: Cross-OS golden-hash fixtures (env snapshot + CDC chunking)
+        env:
+          AV_DATA_DIR: ${{ runner.temp }}/av-data
+        run: pytest tests/test_env_snapshot.py tests/test_dataset_cdc.py tests/test_core.py -q -k "golden or cdc_boundary_stability or cdc_determinism"

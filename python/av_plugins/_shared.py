@@ -6,10 +6,12 @@ v1.2.2 migration: add/commit no longer shells through the CLI — plugins call
 v1.2.5: `push` closes the last CLI hop too — `push_pending()` calls
 `core.flush_pending_push()` directly (the exact same call `av_sdk.Repo.push()` makes),
 so plugins now have ZERO remaining chdir/CLI-invocation assumptions. `run_av` and
-`build_metric_args` are kept as thin deprecated shims for one release cycle
-(VERSIONING.md's grace-window policy) for any external caller still importing them.
+`build_metric_args` were kept as thin deprecated shims for one release cycle
+(VERSIONING.md's grace-window policy); that window closed at v1.3.0, the next MINOR
+boundary, and both are now removed. `tests/test_plugins.py` keeps its own private
+`_run_av()` helper (test infrastructure, not a public API) for the same "drive the real
+CLI" convenience its parity tests still want.
 """
-import os
 from pathlib import Path
 
 from av_cli.exceptions import AetherVaultException
@@ -30,21 +32,6 @@ def resolve_repo_root(start: Path) -> Path:
     )
 
 
-def run_av(repo_root: Path, args: list[str]) -> None:
-    """DEPRECATED (v1.2.5) — chdir + in-process CLI invocation. No longer called by any
-    plugin in this package (see push_pending() for the `push` replacement); kept only as
-    a shim for external callers still importing it, for one release's grace window.
-    """
-    previous_cwd = Path.cwd()
-    os.chdir(repo_root)
-    try:
-        from av_cli.main import cli
-
-        cli.main(args=args, prog_name="av", standalone_mode=False)
-    finally:
-        os.chdir(previous_cwd)
-
-
 def push_pending(repo_root: Path) -> dict:
     """v1.2.5: drains `.av/pending_push` via `core.flush_pending_push()` — the same call
     `av_sdk.Repo.push()` makes, no chdir, no CLI hop. Replaces `run_av(repo_root,
@@ -61,20 +48,6 @@ def push_pending(repo_root: Path) -> dict:
         return {"drained": 0, "still_queued": 0}
     still = flush_pending_push(repo_root, client)
     return {"drained": len(pending) - len(still), "still_queued": len(still)}
-
-
-def build_metric_args(metrics: dict) -> list[str]:
-    """Converts a dict of numeric metrics into repeatable `--metric k=v` flags.
-
-    Retained for backward compatibility with external callers; since the v1.2.2 seam
-    migration, plugins pass metric dicts straight to commit_scoped() instead."""
-    args = []
-    for key, value in metrics.items():
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)):
-            args.extend(["--metric", f"{key}={value}"])
-    return args
 
 
 def filter_existing_files(paths: list[str]) -> list[str]:

@@ -1,8 +1,9 @@
+import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 // buildGraph is a pure function (no hooks/DOM) — importing it from the component module
 // is safe; only the React render path needs jsdom.
-import { buildGraph } from "../CommitGraph";
+import { buildGraph, CommitGraph } from "../CommitGraph";
 import type { Commit } from "../../lib/api";
 
 const H = (seed: string) => seed.padEnd(64, "0").slice(0, 64);
@@ -100,5 +101,19 @@ describe("buildGraph — merge visualization", () => {
       commit({ hash: c }),
     ]);
     expect(edges).toHaveLength(3);
+  });
+});
+
+describe("CommitGraph — error state", () => {
+  it("shows an error state instead of the empty state when a fetch failed", () => {
+    render(<CommitGraph commits={[]} loading={false} error="registry unreachable" />);
+    expect(screen.getByText("⚠ registry unreachable")).toBeInTheDocument();
+    expect(screen.queryByText("No commits yet")).not.toBeInTheDocument();
+  });
+
+  it("prefers real data over an error when both are present", () => {
+    const c = commit({ hash: H("c1"), parents: [] });
+    render(<CommitGraph commits={[c]} loading={false} error="stale error" />);
+    expect(screen.queryByText("⚠ stale error")).not.toBeInTheDocument();
   });
 });

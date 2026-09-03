@@ -19,7 +19,7 @@ from pathlib import Path
 
 from av_cli.exceptions import AetherVaultException
 
-from .exceptions import SDKError
+from .exceptions import SDKError, error_from_code
 
 
 class Repo:
@@ -28,8 +28,8 @@ class Repo:
     def __init__(self, path: str | Path):
         self.path = Path(path).resolve()
         if not (self.path / ".av").is_dir():
-            raise SDKError("not_a_repo",
-                           f"{self.path} is not an Aether-Vault repository (no .av/).")
+            raise error_from_code("not_a_repo",
+                                  f"{self.path} is not an Aether-Vault repository (no .av/).")
 
     def __enter__(self) -> "Repo":
         return self
@@ -68,7 +68,7 @@ class Repo:
 
     @staticmethod
     def _fail(code: str, message: str):
-        raise SDKError(code, message)
+        raise error_from_code(code, message)
 
     @staticmethod
     def _wrap_validation(fn):
@@ -173,6 +173,7 @@ class Repo:
             "queued": bool(sink.get("queued")) or bool(no_upload),
             "queued_reason": sink.get("queued_reason")
                              or ("upload_deferred" if no_upload else None),
+            "ref_race": sink.get("ref_race"),
         }
 
     # -- push -----------------------------------------------------------------
@@ -183,12 +184,20 @@ class Repo:
         client = self._client()
         pending = load_pending_push(self.path)
         if not pending:
-            reachable = None
-            try:
-                reachable = bool(client.server_available())
-            except Exception:
-                reachable = None
-            return {"drained": 0, "still_queued": 0, "reachable": reachable}
+            # v1.3.0 fix (parity test caught this): matches cmd_history.py::push()'s own
+            # "nothing pending" branch exactly — reachability is genuinely UNKNOWN here
+            # (never checked, there's nothing to check it for), not False. The previous
+            # version of this method called client.server_available() anyway and reported
+            # its real boolean result, which is both an unnecessary network round trip AND
+            # a payload-shape mismatch (`None` means "not applicable", not "unreachable").
+            return {"drained": 0, "still_queued": 0, "reachable": None}
+        # v1.3.0 fix (parity test caught this): the previous version skipped this check
+        # and always reported reachable=True whenever pending work existed, even when
+        # flush_pending_push() below re-queued everything because the server genuinely
+        # could not be reached — cmd_history.py::push() checks server_available() FIRST
+        # for exactly this reason.
+        if not client.server_available():
+            return {"drained": 0, "still_queued": len(pending), "reachable": False}
         still = flush_pending_push(self.path, client)
         return {"drained": len(pending) - len(still),
                 "still_queued": len(still),
@@ -213,10 +222,14 @@ class Repo:
             c = load_commit(self.path, cur)
             if not c:
                 break
-            extras = c.get("extra_parents")
-            parents = [c["parent_hash"]] if c.get("parent_hash") else []
-            if extras:
-                parents.extend(json.loads(extras))
+            # v1.3.0 fix (full-surface SDK≡CLI parity test caught this): the real local
+            # commit JSON schema stores a single "parents" LIST (core.py's commit_staged,
+            # history.py's walk_history) — there is no "parent_hash"/"extra_parents" key
+            # in it at all (those are av_server's DB *column* names, a different schema).
+            # This method read the wrong keys since it was written, so `parents` was
+            # always [] and the walk stopped after exactly one commit for every repo,
+            # every time — log(limit=30) silently behaved like log(limit=1).
+            parents = c.get("parents") or []
             out.append({
                 "hash": cur,
                 "short": cur[:7],
@@ -226,7 +239,9 @@ class Repo:
                 "metrics": c.get("metrics") or {},
                 "parents": parents,
             })
-            cur = c.get("parent_hash")
+            # First-parent walk, same rule as history.py::walk_history() — keeps merge
+            # commits linear in this default view instead of duplicating shared ancestors.
+            cur = parents[0] if parents else None
         return out
 
     # -- diff -----------------------------------------------------------------
@@ -317,9 +332,18 @@ class Repo:
         return {"appended": True, "entry": entry}
 
     def handoff_dict(self) -> dict:
-        from av_cli.handoff import build_handoff_dict
+        from av_cli.handoff import build_handoff_dict, validate_handoff
 
-        return build_handoff_dict(self.path, None)
+        doc = build_handoff_dict(self.path, None)
+        # v1.3.0 (todo.md item 8): validate on this read path too — same guarantee as
+        # `av context export`/`av handoff`, so an SDK caller never receives a document
+        # that fails the .avh contract without knowing about it.
+        problems = validate_handoff(doc)
+        if problems:
+            self._fail("validation",
+                       "The freshly built .avh document failed validation (this is a "
+                       "bug in build_handoff_dict, not your input) — " + "; ".join(problems))
+        return doc
 
     def publish_handoff(self) -> dict:
         """v1.2.5: generates/updates handoff.avh and links it to the active run so the

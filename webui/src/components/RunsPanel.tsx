@@ -3,13 +3,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   fetchLatestEventId,
+  fetchRunMetrics,
   fetchRunSummary,
   fetchRuns,
+  type RunMetricPoint,
   type RunSummary,
   type Run,
 } from "@/lib/api";
 import { commitMetricsRows, metricColumns } from "@/lib/runDetail";
 import { MetricsChart } from "@/components/MetricsChart";
+
+const POLICY_BADGE_COLOR: Record<"allow" | "deny", string> = {
+  allow: "#68d391",
+  deny: "#fc8181",
+};
 
 interface Props {
   projectId: string | null;
@@ -18,6 +25,8 @@ interface Props {
   /** Test seam: poll intervals in ms (defaults match production cadence). */
   runsPollMs?: number;
   eventsPollMs?: number;
+  /** v1.3.0 (todo.md item 25): cross-link into the weight-diff tab — see page.tsx. */
+  onCompareWeights?: (olderHash: string, newerHash: string) => void;
 }
 
 const STATUS_COLORS: Record<Run["status"], string> = {
@@ -34,7 +43,9 @@ const STATUS_COLORS: Record<Run["status"], string> = {
 // (GET /api/runs/{id}/summary — replaces the old fetchRun()+N×fetchCommit() fan-out).
 // The selected run id is kept in the URL (?run=<id>) so the panel is shareable/
 // reloadable; the live badge in the header is fed by the event-stream cursor.
-export function RunsPanel({ projectId, initialRunId, runsPollMs = 15_000, eventsPollMs = 10_000 }: Props) {
+export function RunsPanel({
+  projectId, initialRunId, runsPollMs = 15_000, eventsPollMs = 10_000, onCompareWeights,
+}: Props) {
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [newEvents, setNewEvents] = useState(false);
@@ -181,7 +192,9 @@ export function RunsPanel({ projectId, initialRunId, runsPollMs = 15_000, events
         )}
       </div>
 
-      {selectedId && <RunDetailPanel runId={selectedId} onClose={closeDetail} />}
+      {selectedId && (
+        <RunDetailPanel runId={selectedId} onClose={closeDetail} onCompareWeights={onCompareWeights} />
+      )}
     </div>
   );
 }
@@ -189,14 +202,27 @@ export function RunsPanel({ projectId, initialRunId, runsPollMs = 15_000, events
 // v1.2.5: dedicated run-detail panel — fetches GET /api/runs/{id}/summary directly, so
 // it renders correctly even for a deep-linked run id not present in the currently
 // loaded runs page (e.g. an older run past the default limit=100 window).
-function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () => void }) {
+function RunDetailPanel({
+  runId, onClose, onCompareWeights,
+}: {
+  runId: string;
+  onClose: () => void;
+  /** v1.3.0 (todo.md item 25): cross-link into the weight-diff tab, pre-filling both
+   * slots — see page.tsx's openWeightDiff(). Older commit first, newer second. */
+  onCompareWeights?: (olderHash: string, newerHash: string) => void;
+}) {
   const [summary, setSummary] = useState<RunSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // v1.3.0 (todo.md item 7): GET /api/runs/{id}/summary's inline `commits` is capped
+  // (_RUN_SUMMARY_MAX_COMMITS) — this holds the FULL series from GET /api/runs/{id}/metrics
+  // when there's more history than the cap shows, so the chart doesn't silently lose it.
+  const [fullMetrics, setFullMetrics] = useState<RunMetricPoint[] | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setFullMetrics(null);
     try {
       setSummary(await fetchRunSummary(runId));
     } catch (e) {
@@ -210,19 +236,67 @@ function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () => void
     load();
   }, [load]);
 
-  const rows = summary ? commitMetricsRows(summary.commits) : [];
+  useEffect(() => {
+    if (!summary || summary.total_commits <= summary.commits.length) return;
+    let cancelled = false;
+    fetchRunMetrics(runId)
+      .then((points) => { if (!cancelled) setFullMetrics(points); })
+      .catch(() => { /* chart just falls back to the capped inline copy */ });
+    return () => { cancelled = true; };
+  }, [runId, summary]);
+
+  const metricSource = fullMetrics ?? summary?.commits ?? [];
+  const rows = commitMetricsRows(metricSource);
   const cols = metricColumns(rows);
   // A chart earns its place once there's real history to trend — a 2-point line is
   // barely more informative than the table and less scannable, so the table stays the
   // default until there's a genuine trend to show.
   const hasChartableMetrics =
-    summary && summary.commits.filter((c) => Object.keys(c.metrics ?? {}).length > 0).length >= 3;
+    metricSource.filter((c) => Object.keys(c.metrics ?? {}).length > 0).length >= 3;
+
+  const chronologicalCommits = fullMetrics
+    ? [...fullMetrics].sort((a, b) => {
+        const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+        const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+        return ta - tb;
+      })
+    : summary
+    ? [...summary.commits].reverse() // summary.commits is newest-first
+    : [];
+  const latestTwo =
+    chronologicalCommits.length >= 2
+      ? [chronologicalCommits[chronologicalCommits.length - 2], chronologicalCommits[chronologicalCommits.length - 1]]
+      : null;
+
+  const policyOutcome = summary?.run.policy_outcome ?? null;
 
   return (
     <div className="card">
       <div className="section-header">
-        <span className="card-title">Run detail — {runId.slice(0, 8)}…</span>
-        <button className="btn" onClick={onClose} style={{ fontSize: 12 }}>Close</button>
+        <span className="card-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          Run detail — {runId.slice(0, 8)}…
+          {policyOutcome && (
+            <span
+              className="tag-pill"
+              style={{ color: POLICY_BADGE_COLOR[policyOutcome.decision], fontSize: 11 }}
+              title={`policy ${policyOutcome.decision}${policyOutcome.rule ? ` (${policyOutcome.rule})` : ""} at ${policyOutcome.at}`}
+            >
+              policy: {policyOutcome.decision}
+            </span>
+          )}
+        </span>
+        <div style={{ display: "flex", gap: 8 }}>
+          {onCompareWeights && latestTwo && (
+            <button
+              className="btn"
+              style={{ fontSize: 12 }}
+              onClick={() => onCompareWeights(latestTwo[0].hash, latestTwo[1].hash)}
+            >
+              Compare weights (latest 2)
+            </button>
+          )}
+          <button className="btn" onClick={onClose} style={{ fontSize: 12 }}>Close</button>
+        </div>
       </div>
 
       {loading && (
@@ -286,13 +360,18 @@ function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () => void
           <div>
             <div style={{ fontWeight: 600, marginBottom: 4 }}>
               Linked commits ({summary.total_commits} total
-              {rows.length < summary.total_commits ? `, showing latest ${rows.length}` : ""})
+              {rows.length < summary.total_commits
+                ? `, showing latest ${rows.length}`
+                : fullMetrics
+                ? " — full history"
+                : ""}
+              )
             </div>
             {rows.length === 0 ? (
               <span style={{ color: "var(--text-muted)" }}>no commits linked yet</span>
             ) : hasChartableMetrics ? (
               <MetricsChart
-                commits={summary.commits.map((c) => ({
+                commits={metricSource.map((c) => ({
                   hash: c.hash, message: c.message, author: "", timestamp: c.timestamp,
                   parent_hash: null, root_tree_hash: null, tags: [], metrics: c.metrics,
                 }))}

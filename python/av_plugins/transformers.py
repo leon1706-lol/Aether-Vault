@@ -69,7 +69,7 @@ class AetherVaultTrainerCallback(TrainerCallback):
 
     def on_train_end(self, args, state, control, **kwargs) -> None:
         repo_root = resolve_repo_root(Path(args.output_dir))
-        push_pending(repo_root)  # v1.2.5: no chdir, no CLI hop (was run_av(..., ["push"]))
+        push_pending(repo_root)  # v1.2.5: no chdir, no CLI hop (run_av() itself removed at v1.3.0)
 
 
 def import_checkpoint(checkpoint_dir: str, repo_root: Path | None = None, tag: str | None = None) -> None:

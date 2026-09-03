@@ -830,7 +830,8 @@ def stage_one_file(
             f"{len(layers)} layers" if layers
             else (f"{len(chunks)} chunks" if chunks else "whole-file")
         )
-        click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {split_desc})", fg="green")
+        if current_output_mode() != "json":
+            click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {split_desc})", fg="green")
     else:
         obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
         obj_dir.mkdir(parents=True, exist_ok=True)
@@ -839,7 +840,8 @@ def stage_one_file(
             shutil.copy2(fpath, obj_path)
 
         idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None, auto_save=False)
-        click.secho(f"Staged [{file_type.upper()}] {rel_path}", fg="green")
+        if current_output_mode() != "json":
+            click.secho(f"Staged [{file_type.upper()}] {rel_path}", fg="green")
 
     return True
 
@@ -1040,9 +1042,16 @@ def _finalize_commit(
                         # ref races exactly as it does to network failures. `av pull` on
                         # the next attempt will surface the divergence with run attribution.
                         ref_ok = False
+                        # v1.3.0 (todo.md item 14): the pull-divergence and merge-conflict
+                        # paths already attribute a race to the colliding run IDs and give
+                        # identical remediation in human text and error.data — this is the
+                        # one race path (the actual concurrent-write case) that didn't.
+                        winner_run_id = tip_run_id(repo_root, race.current)
                         result["ref_race"] = {
                             "ref": race.ref_name, "current": race.current,
                             "expected": race.expected,
+                            "current_run_id": winner_run_id,
+                            "remediation": ["av pull", "av push"],
                         }
                 if ref_ok and len(_parents) == 2 and remote_ref_name:
                     # v1.2.5: this merge just landed on the ref, directly superseding
@@ -1069,8 +1078,11 @@ def _finalize_commit(
                     _queued("ref_race" if "ref_race" in result else "ref_update_failed")
                     if result_sink is None:
                         if "ref_race" in result:
+                            who = f" (run {result['ref_race']['current_run_id']})" \
+                                if result["ref_race"].get("current_run_id") else ""
                             click.secho(
-                                f"  Another agent updated '{ref_path.name if ref_path else remote_ref_name}' "
+                                f"  Another agent{who} updated "
+                                f"'{ref_path.name if ref_path else remote_ref_name}' "
                                 "first — commit queued for retry (run `av pull` then `av push`)",
                                 fg="yellow",
                             )
@@ -1230,6 +1242,26 @@ def resolve_run_id(repo_root: Path, explicit: str | None = None) -> str | None:
             return json.loads(state_path.read_text(encoding="utf-8")).get("run_id")
         except (OSError, json.JSONDecodeError):
             return None
+    return None
+
+
+def tip_run_id(repo_root: Path, commit_hash: str | None) -> str | None:
+    """The run:<id> tag of a (local) commit, or None.
+
+    v1.3.0: moved here from cmd_sync.py's private `_tip_run_id` (still re-exported there
+    for compat) so `_finalize_commit`'s own ref-race path can attribute the collision to
+    a run exactly like `av pull`'s divergence message and `av merge`'s conflict message
+    already do — todo.md item 14 ("every pull/merge/push race path includes run IDs when
+    known") was true for those two but not for this one, the actual concurrent-write case.
+    """
+    if not commit_hash:
+        return None
+    from . import sync as _sync
+
+    commit = _sync.load_local_commit(repo_root, commit_hash)
+    for tag in (commit or {}).get("tags", []):
+        if isinstance(tag, str) and tag.startswith("run:"):
+            return tag.split(":", 1)[1]
     return None
 
 
@@ -1496,6 +1528,31 @@ def json_envelope(command: str, data=None, error_code: str | None = None,
 def emit_json(ctx, command: str, data=None) -> None:
     """Prints an ok-envelope for `command` (call instead of human output in JSON mode)."""
     click.echo(json.dumps(json_envelope(command, data=data)))
+
+
+_CONTRACT_SCHEMA_NAMES = (
+    "envelope-1.0", "event-1.0", "run-1.0", "webhook-payload-1.0", "semdiff-1.0", "avh-2.0",
+)
+
+
+def load_contract_schema(name: str) -> dict:
+    """Loads and parses one of the published contracts under av_cli/schemas/<name>.schema.json.
+
+    `name` is the file's stem without the `.schema.json` suffix, e.g. "envelope-1.0" or
+    "avh-2.0" — see docs/contracts.md for the full list (`_CONTRACT_SCHEMA_NAMES`).
+    Uses importlib.resources so this works from an installed wheel, not just a checkout —
+    `setup.py`'s package_data ships `av_cli/schemas/*.schema.json` for exactly this reason.
+    Raises FileNotFoundError with the attempted filename on a typo'd/missing name.
+    """
+    import importlib.resources as resources
+
+    if name not in _CONTRACT_SCHEMA_NAMES:
+        raise FileNotFoundError(
+            f"unknown contract schema '{name}' — expected one of {_CONTRACT_SCHEMA_NAMES}"
+        )
+    ref = resources.files("av_cli").joinpath("schemas", f"{name}.schema.json")
+    with resources.as_file(ref) as path:
+        return json.loads(path.read_text(encoding="utf-8"))
 
 
 def fail(ctx, code: str, message: str, command: str | None = None, data: dict | None = None,

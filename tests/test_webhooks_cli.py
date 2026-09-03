@@ -21,12 +21,13 @@ class FakeSession:
         self.responses = list(responses)
         self.calls = []
 
-    def request(self, method, url, json=None, timeout=None):
-        self.calls.append((method, url, json))
-        return self.responses.pop(0)
-
-    def get(self, url, params=None, timeout=None):
-        self.calls.append(("GET", url, params))
+    def request(self, method, url, json=None, params=None, timeout=None):
+        # v1.3.0: cmd_webhooks.py now routes EVERY network call (including deliveries()/
+        # show()'s GETs) through the shared _request() helper — session.request(), never
+        # a raw session.get() — so this fake no longer needs a separate get() method; a
+        # future direct session.get() call in cmd_webhooks.py would now hit AttributeError
+        # here instead of silently bypassing the fake's call tracking.
+        self.calls.append((method, url, json, params))
         return self.responses.pop(0)
 
 
@@ -56,7 +57,7 @@ def test_webhook_add_posts_payload_and_prints_id(repo, monkeypatch):
     res = CliRunner().invoke(cli, ["webhooks", "add", "http://x/hook", "--secret", "s3",
                                    "--project", "p1", "--kind", "commit"])
     assert res.exit_code == 0, res.output
-    method, url, body = session.calls[0]
+    method, url, body, _params = session.calls[0]
     assert (method, url) == ("POST", "http://localhost:8000/api/webhooks")
     assert body == {"url": "http://x/hook", "secret": "s3",
                     "project_id": "p1", "kinds": ["commit"]}
@@ -134,7 +135,7 @@ def test_webhook_show_fetches_list_then_recent_deliveries(repo, monkeypatch):
     assert "last success: 2026-08-01T00:00:00" in res.output
     assert "delivered" in res.output
     # Second call is the deliveries lookup, scoped to this webhook's full id.
-    method, url, params = session.calls[1]
+    method, url, _body, params = session.calls[1]
     assert url.endswith("/api/admin/webhook-deliveries")
     assert params == {"webhook_id": "abcd1234", "limit": 5}
 
@@ -157,7 +158,7 @@ def test_webhook_deliveries_passes_filters_through(repo, monkeypatch):
         "--kind", "commit", "--limit", "5",
     ])
     assert res.exit_code == 0, res.output
-    method, url, params = session.calls[0]
+    method, url, _body, params = session.calls[0]
     assert url.endswith("/api/admin/webhook-deliveries")
     assert params == {"limit": 5, "webhook_id": "abcd1234", "status": "dead", "event_kind": "commit"}
     assert "dead" in res.output

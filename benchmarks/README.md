@@ -13,8 +13,8 @@ tool actually processes - never estimated; tools that aren't installed report as
 - `bench_safetensors_dedup.py` - #2 storage after 6 fine-tune commits.
 - `bench_commit_push_latency.py` - #3 end-to-end init/add/commit/push.
 - `bench_noop_status_speed.py` - #4 no-op `status`/`add` at scale (open finding).
-- `bench_cold_clone.py` - #5 fresh clone from a registry (`av clone`); measured row
-  capture pending - needs the Docker stack.
+- `bench_cold_clone.py` - #5 fresh clone from a registry (`av clone`); needs the Docker
+  stack up to produce a real number, otherwise reports "registry unreachable".
 - `bench_partial_checkpoint_fetch.py` - #6 single-layer fetch vs whole file.
 - `bench_storage_footprint_curve.py` - #7 cumulative storage over N versions.
 - `bench_concurrent_push.py` - #8 eight concurrent pushes against av_server.

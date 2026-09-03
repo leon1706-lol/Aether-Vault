@@ -34,29 +34,39 @@ or client stop working, it's MAJOR.*
 3. **Removal** happens only at the next MAJOR boundary, with a migration note.
 4. Pre-1.0 exceptions no longer apply: since `v1.1.1` the above is binding on maintainers.
 
-Known standing deprecation candidates (tracked, not yet scheduled):
-- **Legacy GHCR alias tags** `ghcr.io/leon1706-lol/aether-vault-server` and
-  `.../aether-vault-webui` — since v1.2.2 they are ALIASES of the consolidated
-  `aether-vault-engine` image (same digest, role auto-detected per container).
-  Announced in the v1.2.2 release notes + CHANGELOG Phase 56; the original entry named
-  "the next release" as the removal point, but v1.2.3/v1.2.4/v1.2.5 all kept publishing
-  them (owner decision, reaffirmed each cycle — grace windows only ever extend, they are
-  never shortened by a missed removal) — **earliest possible removal is v1.3.0** (the next
-  MINOR boundary; still not yet scheduled). v1.2.5 adds a runtime nudge: a container
-  started without `AV_ENGINE_ROLE` set (i.e. relying on legacy auto-detect) now prints a
-  one-line `[engine] DEPRECATED: ...` warning to its logs naming the inferred role and
-  this section.
-  - **What breaks when they go:** pulls/references to `aether-vault-server` or
-    `aether-vault-webui` (any tag) will 404 — nothing else changes, since both are today
-    just tags on the exact same image as `aether-vault-engine`.
-  - **The exact edit to make now** (safe today, not just at removal time): in your
-    compose file / pull command, replace `ghcr.io/leon1706-lol/aether-vault-server` or
-    `.../aether-vault-webui` with `ghcr.io/leon1706-lol/aether-vault-engine`, and set
-    `AV_ENGINE_ROLE` explicitly (`all` for the one-container topology both `docker-compose.yml`
-    and `python/av_cli/docker/docker-compose.release.yml` use; `server` or `webui` only if
-    you deliberately still run the two-container split) instead of relying on
-    auto-detection from `DATABASE_URL`/`NEXT_PUBLIC_API_URL`. This silences the new
-    deprecation warning and is a no-op change otherwise — same image, same digest.
+Known standing deprecation candidates (tracked, not yet scheduled): none currently.
+
+### Removed in v1.3.0: legacy GHCR alias tags
+
+`ghcr.io/leon1706-lol/aether-vault-server` and `.../aether-vault-webui` — since v1.2.2 they
+were ALIASES of the consolidated `aether-vault-engine` image (same digest, role
+auto-detected per container). Announced in the v1.2.2 release notes + CHANGELOG Phase 56;
+the original entry named "the next release" as the removal point, but v1.2.3/v1.2.4/v1.2.5
+all kept publishing them (owner decision, reaffirmed each cycle). v1.3.0 — the next MINOR
+boundary after that reaffirmed floor, and the earliest this policy ever permitted — is
+where the removal actually lands: `release.yml`/`docker-edge.yml` stopped publishing both
+alias tags as of this release.
+
+- **What broke:** pulls/references to `aether-vault-server` or `aether-vault-webui` (any
+  tag, including a fresh `:latest`/`:edge`/a future tagged release) now 404. Any image tag
+  already pulled before v1.3.0 keeps running unaffected — this only stops NEW pulls under
+  the old names.
+- **The migration, if you haven't already made it:** in your compose file / pull command,
+  replace `ghcr.io/leon1706-lol/aether-vault-server` or `.../aether-vault-webui` with
+  `ghcr.io/leon1706-lol/aether-vault-engine`, and set `AV_ENGINE_ROLE` explicitly (`all`
+  for the one-container topology both `docker-compose.yml` and
+  `python/av_cli/docker/docker-compose.release.yml` use; `server` or `webui` only if you
+  deliberately still run the two-container split — v1.3.0 also publishes real slim
+  single-role images for this, `aether-vault-engine:server-*` / `:webui-*`, built from the
+  Dockerfile's new `server`/`webui` targets) instead of relying on auto-detection from
+  `DATABASE_URL`/`NEXT_PUBLIC_API_URL`.
+- **Automated migration tool:** `av doctor --compose PATH` rewrites a pinned two-container
+  compose file into the one-container `AV_ENGINE_ROLE=all` form — dry-run by default,
+  `--write` to apply. See `docs/migrate-engine-image.md` for the full walkthrough.
+- The entrypoint's legacy auto-detect (`DATABASE_URL`/`NEXT_PUBLIC_API_URL`-based role
+  inference, with its `[engine] DEPRECATED: ...` log warning) is UNCHANGED and still
+  works for any already-pulled legacy-shaped container — only the alias TAGS themselves
+  stopped being published going forward.
 
 ## v1.2.0 additive surfaces
 
@@ -165,14 +175,36 @@ to 10/minute by default. Both pre-1.1.x behaviors remain available explicitly vi
 
 1. Merge work to `master`; CI (all `tests.yml` jobs — see `development/infrastructure.md`'s CI Job Map for the current list) must be green.
 2. Curate the release notes: collect the `CHANGELOG.md` phase entries since the previous
-   tag into a short highlights list.
-3. `git tag vX.Y.Z && git push origin vX.Y.Z`.
-4. The [`release.yml`](.github/workflows/release.yml) pipeline then automatically:
-   builds sdist + wheels (cp310–cp312, three OSes) → publishes to PyPI via trusted
-   publishing → creates a **GitHub Release for the tag** with auto-generated notes
-   (commit highlights + full changelog link) and every wheel/sdist attached → pushes
-   `:latest` + version-tagged images to GHCR.
-5. Installed users pick the update up via `av update` (opt-in silent auto-update exists).
+   tag into a short highlights list, ending that entry with the literal marker
+   `Essential-Tasks: signed off` once `Aether-vault-Obsidian-Vault/Essential-Tasks.md` has
+   actually been run end to end for this release — the `gate` job below checks for exactly
+   that marker.
+3. Re-capture perf numbers (v1.3.0, todo.md item 22), IN THIS ORDER (the first step fully
+   overwrites `BENCHMARKS.md`, so the second must come after it, not before):
+   ```bash
+   av benchmark --markdown development/BENCHMARKS.md
+   python scripts/append_perf_history.py
+   ```
+   Commit the updated `development/perf-history.json` and `development/BENCHMARKS.md`
+   alongside the release commit — the `gate` job below fails the release if
+   `perf-history.json` has no entry whose `version` matches the tag being released.
+4. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+5. The [`release.yml`](.github/workflows/release.yml) pipeline then automatically runs a
+   **`gate` job first** (v1.3.0, todo.md item 30) that every publish job depends on and
+   that blocks the release if any of the following isn't true: the stack-free suite
+   re-run passes; the tagged commit's `tests.yml` run is green (checked via `gh api`
+   check-runs); `development/perf-history.json` has a row for this tag's version (step 3
+   above); `development/CHANGELOG.md` has an entry for this tag ending with the
+   `Essential-Tasks: signed off` marker (step 2 above). The gate is **read-only toward
+   PRs** — it blocks a publish, it never merges, approves, or opens anything (see
+   `tests/test_ci_policy.py`'s standing no-bots/no-auto-merge guard, which this job must
+   never violate).
+6. Once the gate passes: builds sdist + wheels (cp310–cp312, three OSes) → publishes to
+   PyPI via trusted publishing → creates a **GitHub Release for the tag** with
+   auto-generated notes (commit highlights + full changelog link) and every wheel/sdist
+   attached → pushes `:latest` + version-tagged images (plus the slim `server-*`/`webui-*`
+   variants) to GHCR.
+7. Installed users pick the update up via `av update` (opt-in silent auto-update exists).
 
 ## Hotfix policy
 

@@ -12,6 +12,7 @@ with a clear message, if they're not reachable â€” same philosophy as test_
 import asyncio
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import socket
@@ -642,6 +643,121 @@ def test_cli_commit_pushes_to_a_live_server(tmp_path, monkeypatch):
     assert resp.json()["message"] == "live wire test"
 
 
+def test_registry_export_restore_round_trip(tmp_path, monkeypatch):
+    """v1.3.0 (todo.md item 18): the one thing this surface never had — a real
+    `av registry export` -> `av registry restore` round trip on a non-trivial fixture
+    (a plain commit, a run-linked commit, and a two-parent merge commit), against the
+    live registry. Also proves --resume actually skips completed work on a second pass.
+    """
+    if not _real_server_reachable():
+        pytest.skip(
+            "live aether-vault-engine not reachable on :8000; run "
+            "`docker compose up -d db redis aether-vault-engine`"
+        )
+
+    import json as json_mod
+
+    from click.testing import CliRunner
+
+    from python.av_cli.main import cli
+
+    repo = tmp_path / "source-repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    runner = CliRunner()
+    assert runner.invoke(cli, ["init", "--mode", "local", "--yes", "--no-repl"]).exit_code == 0
+    assert runner.invoke(cli, ["config", "--remote-url", "http://localhost:8000"]).exit_code == 0
+
+    from python.av_cli.core import load_config
+
+    project_id = load_config(repo)["project_id"]  # --project below filters by ID, not name
+
+    (repo / "a.pt").write_bytes(b"weights-a")
+    runner.invoke(cli, ["add", "a.pt"])
+    r1 = runner.invoke(cli, ["commit", "-m", "plain commit", "--metric", "acc=0.9"])
+    assert r1.exit_code == 0, r1.output
+
+    assert runner.invoke(cli, ["run", "start", "roundtrip-run"]).exit_code == 0
+    (repo / "b.pt").write_bytes(b"weights-b")
+    runner.invoke(cli, ["add", "b.pt"])
+    r2 = runner.invoke(cli, ["commit", "-m", "run-linked commit"])
+    assert r2.exit_code == 0, r2.output
+    assert runner.invoke(cli, ["run", "finish"]).exit_code == 0
+
+    # A REAL two-parent merge commit: both sides must diverge on separate files (no
+    # conflict) — main also gets a commit after branching, or `av merge` would just
+    # fast-forward (no merge commit at all, and only 3 unique commits total instead of 5).
+    assert runner.invoke(cli, ["branch", "feature"]).exit_code == 0
+    assert runner.invoke(cli, ["checkout", "feature"]).exit_code == 0
+    (repo / "c.pt").write_bytes(b"weights-c")
+    runner.invoke(cli, ["add", "c.pt"])
+    assert runner.invoke(cli, ["commit", "-m", "feature work"]).exit_code == 0
+    assert runner.invoke(cli, ["checkout", "main"]).exit_code == 0
+    (repo / "d.pt").write_bytes(b"weights-d")
+    runner.invoke(cli, ["add", "d.pt"])
+    assert runner.invoke(cli, ["commit", "-m", "main work"]).exit_code == 0
+    merge_result = runner.invoke(cli, ["merge", "feature"])
+    assert merge_result.exit_code == 0, merge_result.output
+    assert "Merged" in merge_result.output, (
+        f"expected a real (non-fast-forward) merge commit, got: {merge_result.output}"
+    )
+
+    main_tip = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    # Push everything, then export the live registry's view of this project.
+    push = runner.invoke(cli, ["push"])
+    assert push.exit_code == 0, push.output
+
+    archive_dir = tmp_path / "archive"
+    export1 = runner.invoke(cli, ["--output", "json", "registry", "export", str(archive_dir),
+                                  "--project", project_id])
+    assert export1.exit_code == 0, export1.output
+    export1_data = json_mod.loads(export1.output)["data"]
+    assert export1_data["commits"] >= 5  # plain + run-linked + feature + main-work + merge
+    # v1.3.0 (Probleme #119): the whole point of an export is the file content — this is
+    # the assertion whose absence let the object-discovery walk silently find zero hashes
+    # (missing include_layers=true on the commits query) survive three prior fix-and-
+    # verify cycles on this same command undetected. a.pt/b.pt/c.pt/d.pt = 4 distinct
+    # object hashes at minimum (the merge commit reuses its parents' unchanged files).
+    assert export1_data["objects_ok"] >= 4, (
+        f"expected real file objects to export, got: {export1_data}"
+    )
+    assert export1_data["objects_failed"] == 0
+    assert (archive_dir / "manifest.json").exists()
+    assert (archive_dir / ".export-state.json").exists()
+
+    manifest = json_mod.loads((archive_dir / "manifest.json").read_text())
+    assert any(c["hash"] == main_tip for c in manifest["commits"])
+    assert manifest["objects"], "manifest.objects must not be empty — see Probleme #119"
+    assert all(o["ok"] for o in manifest["objects"])  # the always-True bug this fixed
+
+    # First restore: everything ingests as idempotent duplicates (already on the server).
+    restore1 = runner.invoke(cli, ["--output", "json", "registry", "restore", str(archive_dir)])
+    assert restore1.exit_code == 0, restore1.output
+    restore1_data = json_mod.loads(restore1.output)["data"]
+    assert restore1_data["failed"] == 0
+    assert restore1_data["objects_duplicate"] > 0
+    assert restore1_data["commits_duplicate"] >= 5
+    assert restore1_data["objects_resumed"] == 0  # first pass — nothing skipped yet
+
+    # Second restore (--resume, the default): everything the first pass completed is
+    # now skipped via .restore-state.json instead of re-POSTed.
+    restore2 = runner.invoke(cli, ["--output", "json", "registry", "restore", str(archive_dir)])
+    assert restore2.exit_code == 0, restore2.output
+    restore2_data = json_mod.loads(restore2.output)["data"]
+    assert restore2_data["objects_resumed"] > 0
+    assert restore2_data["commits_resumed"] >= 5
+    assert restore2_data["failed"] == 0
+
+    # --no-resume forces a full re-attempt regardless of .restore-state.json.
+    restore3 = runner.invoke(cli, ["--output", "json", "registry", "restore", str(archive_dir),
+                                   "--no-resume"])
+    assert restore3.exit_code == 0, restore3.output
+    restore3_data = json_mod.loads(restore3.output)["data"]
+    assert restore3_data["objects_resumed"] == 0
+    assert restore3_data["objects_duplicate"] > 0  # re-attempted, still idempotent
+
+
 # ---------------------------------------------------------------------------
 # Merge commits: parents round-trip + live clone/pull collaboration flow
 # ---------------------------------------------------------------------------
@@ -785,7 +901,7 @@ def test_alembic_brings_schema_to_head(db):
             await conn.close()
 
     version, tables = asyncio.run(_probe())
-    assert version == "0004"  # current migration head — bump alongside new revisions
+    assert version == "0005"  # current migration head — bump alongside new revisions
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
@@ -840,7 +956,86 @@ def test_legacy_database_is_healed_and_stamped(db):
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "0004"  # stamps to CURRENT head, not a hardcoded rev
+    assert asyncio.run(_version()) == "0005"  # stamps to CURRENT head, not a hardcoded rev
+
+
+def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
+    """v1.3.0 (todo.md item 21): every revision's downgrade() had NEVER been executed by
+    anything before this — only rendered offline as SQL text (test_migrations.py) or
+    implied by the upgrade-only live path above. This walks the REAL chain down to base
+    (necessarily dropping every table — that's what "no schema" means, data loss here is
+    by design, not a bug under test) and back up to head against live Postgres, asserting
+    the schema comes back fully functional: right tables, right columns, right indexes,
+    and a brand-new commit pushes/reads back cleanly."""
+    import asyncpg
+    from alembic import command
+
+    from python.av_server.database import _alembic_config
+
+    url_sync = AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+
+    cfg = _alembic_config()
+    # A REAL (non-offline) run needs the actual async driver URL this project's env.py
+    # connects with everywhere else — unlike the offline SQL-rendering tests in
+    # test_migrations.py, which only need a dialect name and use the sync/psycopg2-style
+    # URL string purely for cosmetic rendering, never an actual connection.
+    cfg.set_main_option("sqlalchemy.url", AV_TEST_DATABASE_URL)
+
+    try:
+        command.downgrade(cfg, "base")
+
+        async def _tables():
+            conn = await asyncpg.connect(url_sync)
+            try:
+                rows = await conn.fetch(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+                return {r["tablename"] for r in rows}
+            finally:
+                await conn.close()
+
+        tables_at_base = asyncio.run(_tables())
+        # alembic_version itself is the only thing alembic ever guarantees survives a
+        # downgrade to base (it's how it knows where it is); every model table this
+        # project owns must be gone.
+        assert not ({"objects", "trees", "commits", "refs", "runs", "webhooks",
+                     "audit_log"} & tables_at_base), \
+            f"downgrade to base left tables behind: {tables_at_base}"
+
+        command.upgrade(cfg, "head")
+
+        version = asyncio.run(_version_after())
+        assert version == "0005"
+        tables_at_head = asyncio.run(_tables())
+        assert {"objects", "trees", "commits", "refs", "runs", "webhooks",
+                "audit_log", "webhook_deliveries", "events"} <= tables_at_head
+        assert {"policy_outcome"} <= _pg_columns("runs")
+        assert {"signature", "env_snapshot_id"} <= _pg_columns("commits")
+    finally:
+        # However far the assertions above got, always leave the schema back at head —
+        # every OTHER test in this session-scoped file assumes head. A failure partway
+        # through this test must not corrupt the rest of the suite's fixture state.
+        command.upgrade(cfg, "head")
+
+    # A downgrade all the way to `base` necessarily DROPS every table (that's what "no
+    # schema at all" means) — the commit made before the round trip is gone by design,
+    # not a bug. What the round trip actually promises is that the schema comes back
+    # fully FUNCTIONAL: a brand-new commit pushes and reads back cleanly afterward.
+    after_roundtrip = _make_commit("after-migration-roundtrip")
+    pushed = db.post("/api/commits", json=after_roundtrip)
+    assert pushed.status_code == 201, pushed.text
+    still_there = db.get(f"/api/commits/{after_roundtrip['hash']}")
+    assert still_there.status_code == 200
+
+
+async def _version_after() -> str | None:
+    import asyncpg
+
+    url_sync = AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+    conn = await asyncpg.connect(url_sync)
+    try:
+        return await conn.fetchval("SELECT version_num FROM alembic_version")
+    finally:
+        await conn.close()
 
 
 
@@ -908,6 +1103,40 @@ def test_events_cursor_orders_and_resumes(db):
     assert all(e["project_id"] in (None, "proj-nope") for e in scoped["events"])
 
 
+def test_events_run_id_filter_and_gap_detection(db):
+    # v1.3.0 (todo.md item 9): run_id joins project/kind in one stable query model, and
+    # a stale cursor is reported honestly instead of looking identical to "nothing new".
+    import uuid
+
+    run_a, run_b = str(uuid.uuid4()), str(uuid.uuid4())
+    c1 = _make_commit("evt-run-a", project_id="proj-evt-run")
+    c1["run_id"] = run_a
+    c2 = _make_commit("evt-run-b", project_id="proj-evt-run")
+    c2["run_id"] = run_b
+    db.post("/api/commits", json=c1)
+    db.post("/api/commits", json=c2)
+
+    only_a = db.get(f"/api/events?project_id=proj-evt-run&run_id={run_a}").json()
+    assert only_a["events"], "run_id filter matched nothing"
+    assert all(e["payload"].get("run_id") == run_a for e in only_a["events"])
+    assert not any(e["payload"].get("run_id") == run_b for e in only_a["events"])
+
+    # A fresh cursor at 0 is never a gap (every consumer starts there legitimately).
+    fresh = db.get("/api/events?project_id=proj-evt-run").json()
+    assert fresh["gap"] is False
+
+    # A `since` that predates this project's oldest retained event is a real gap.
+    oldest = min(e["id"] for e in fresh["events"])
+    stale = db.get(f"/api/events?project_id=proj-evt-run&since={max(oldest - 100, 1)}").json()
+    if oldest > 1:  # only meaningful once there's genuinely something before `oldest`
+        assert stale["gap"] is True
+        assert stale["oldest_id"] == oldest
+
+    # A `since` right at the resumable boundary (one before the oldest row) is NOT a gap.
+    not_gap = db.get(f"/api/events?project_id=proj-evt-run&since={oldest - 1}").json()
+    assert not_gap["gap"] is False
+
+
 def test_runs_crud_and_commit_linkage_with_lazy_create(db):
     import uuid
 
@@ -938,6 +1167,78 @@ def test_runs_crud_and_commit_linkage_with_lazy_create(db):
     assert db.post("/api/commits", json=c2).status_code == 201
     lazy = db.get(f"/api/runs/{ghost}").json()
     assert lazy["status"] == "created"  # never failed the push
+
+
+# ---------------------------------------------------------------------------
+# v1.3.0 contract freeze (todo.md item 27): validates LIVE run/event/webhook-payload
+# bodies against python/av_cli/schemas/*.schema.json — the envelope/semdiff/avh schemas
+# are proven stack-free in tests/test_contracts.py; these three need a live server, so
+# they live here alongside every other reachability-gated assertion in this file.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(importlib.util.find_spec("jsonschema") is None,
+                    reason="jsonschema not installed (dev extra)")
+def test_run_payload_matches_schema(db):
+    import jsonschema
+    from python.av_cli.core import load_contract_schema
+
+    run_id = _hex_hash("schema-run")
+    db.post("/api/runs", json={"id": run_id, "project_id": "proj-schema", "name": "schema-run"})
+    commit = _make_commit("schema-run-commit", project_id="proj-schema")
+    commit["run_id"] = run_id
+    db.post("/api/commits", json=commit)
+
+    schema = load_contract_schema("run-1.0")
+    jsonschema.validate(db.get(f"/api/runs/{run_id}").json(), schema)
+    for row in db.get("/api/runs?project_id=proj-schema").json()["runs"]:
+        jsonschema.validate(row, schema)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("jsonschema") is None,
+                    reason="jsonschema not installed (dev extra)")
+def test_event_payload_matches_schema(db):
+    import jsonschema
+    from python.av_cli.core import load_contract_schema
+
+    commit = _make_commit("schema-event")
+    db.post("/api/commits", json=commit)
+    db.put("/api/refs/proj-schema-evt/main", json={"commit_hash": commit["hash"]})
+
+    schema = load_contract_schema("event-1.0")
+    events = db.get("/api/events?limit=10").json()["events"]
+    assert events
+    for e in events:
+        jsonschema.validate(e, schema)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("jsonschema") is None,
+                    reason="jsonschema not installed (dev extra)")
+def test_webhook_delivery_body_matches_schema(db, monkeypatch):
+    import jsonschema
+    from python.av_cli.core import load_contract_schema
+
+    delivered = []
+
+    class FakeResp:
+        status_code = 200
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        delivered.append(data)
+        return FakeResp()
+
+    import requests as requests_mod
+    monkeypatch.setattr(requests_mod, "post", fake_post)
+
+    db.post("/api/webhooks", json={"url": "http://example.invalid/hook", "secret": "s3cr3t"})
+    commit = _make_commit("schema-webhook")
+    db.post("/api/commits", json=commit)
+    for _ in range(40):  # fire-and-forget delivery task — same poll pattern as the test
+        if delivered:      # just above (test_webhook_delivery_is_signed_and_filtered)
+            break
+        time.sleep(0.05)
+
+    assert delivered, "webhook delivery never fired"
+    jsonschema.validate(json.loads(delivered[0]), load_contract_schema("webhook-payload-1.0"))
 
 
 def test_webhook_delivery_is_signed_and_filtered(db, monkeypatch):
@@ -999,6 +1300,30 @@ def test_audit_log_records_mutations(db):
     assert "commit.push" in actions
     assert "ref.update" in actions
     assert rows[0]["ts"] >= rows[-1]["ts"]  # ordered
+
+
+def test_audit_prune_dry_run_deletes_nothing(db):
+    # v1.3.0 (todo.md item 16): dry_run=true reports would_delete honestly and leaves
+    # every row untouched.
+    commit = _make_commit("prune-dry-run")
+    db.post("/api/commits", json=commit)
+    before = db.get("/api/admin/audit?limit=100").json()["entries"]
+    assert before, "the commit above must have produced at least one audit row"
+
+    dry = db.delete("/api/admin/audit", params={"before_days": 0, "dry_run": "true"})
+    assert dry.status_code == 200
+    body = dry.json()
+    assert body["deleted"] == 0
+    assert body["would_delete"] >= len(before)
+    assert body["dry_run"] is True
+
+    after = db.get("/api/admin/audit?limit=100").json()["entries"]
+    assert len(after) == len(before), "dry_run must not delete anything"
+
+    # A real (non-dry) prune with the same cutoff actually removes them.
+    real = db.delete("/api/admin/audit", params={"before_days": 0})
+    assert real.json()["dry_run"] is False
+    assert real.json()["deleted"] >= len(before)
 
 
 def test_multi_agent_same_run_interleaved_pushes(db):
@@ -1522,6 +1847,74 @@ def test_poison_webhook_does_not_block_a_healthy_sibling(db, monkeypatch):
     assert h_rows_final[0]["attempt"] == 1, "the healthy delivery was never re-attempted"
 
 
+def test_webhook_backlog_delivers_all_in_order_without_starving_healthy_hook(db, monkeypatch):
+    """v1.3.0 (todo.md item 10): a real BACKLOG — many pending deliveries at once across
+    a healthy and a poison endpoint — not just one commit each. Every healthy delivery
+    must still land, in cursor order, and `deliveries`/`replay` must report the ledger
+    truthfully throughout (not just at the end)."""
+    class FakeResp:
+        def __init__(self, code):
+            self.status_code = code
+
+    def _post(url, data=None, headers=None, timeout=None):
+        return FakeResp(500 if "poison" in url else 200)
+
+    import requests as requests_mod
+    monkeypatch.setattr(requests_mod, "post", _post)
+    monkeypatch.setattr(server_module, "WEBHOOK_RETRY_INTERVAL_SECS", 0)
+    monkeypatch.setattr(server_module, "WEBHOOK_MAX_ATTEMPTS", 2)
+
+    proj = "proj-backlog"
+    poison_id = db.post("/api/webhooks", json={
+        "url": "http://poison.test/hook", "secret": "sp", "project_id": proj, "kinds": ["commit"],
+    }).json()["id"]
+    healthy_id = db.post("/api/webhooks", json={
+        "url": "http://healthy.test/hook", "secret": "sh", "project_id": proj, "kinds": ["commit"],
+    }).json()["id"]
+
+    N = 20
+    for i in range(N):
+        db.post("/api/commits", json=_make_commit(f"backlog-{i}", project_id=proj))
+
+    for _ in range(80):
+        rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={healthy_id}&limit={N + 5}").json()["deliveries"]
+        if sum(1 for r in rows if r["status"] == "delivered") == N:
+            break
+        time.sleep(0.05)
+    delivered = [r for r in rows if r["status"] == "delivered"]
+    assert len(delivered) == N, f"only {len(delivered)}/{N} healthy deliveries landed"
+    # /api/admin/webhook-deliveries orders newest-first (DBWebhookDelivery.id.desc()) —
+    # matches /api/admin/audit's own convention. Every id must be distinct and every one
+    # of the N commits' deliveries must be present — no duplicate row, none skipped —
+    # rather than asserting a specific direction this endpoint never promised.
+    ids = [r["id"] for r in delivered]
+    assert len(set(ids)) == N, "duplicate or missing delivery ids in the backlog"
+    assert ids == sorted(ids, reverse=True), \
+        "deliveries must come back newest-first, matching /api/admin/audit's convention"
+
+    # The parallel poison backlog must eventually fully dead-letter, on its own schedule,
+    # without ever affecting the healthy count/order asserted above.
+    for _ in range(20):
+        p_rows = db.get(f"/api/admin/webhook-deliveries?webhook_id={poison_id}&limit={N + 5}").json()["deliveries"]
+        if all(r["status"] == "dead" for r in p_rows) and len(p_rows) == N:
+            break
+        fut = db.portal.start_task_soon(server_module.process_due_webhook_deliveries)
+        fut.result(timeout=30)
+    assert len(p_rows) == N and all(r["status"] == "dead" for r in p_rows)
+
+    # `deliveries` (paginated) and `replay` see this same backlog truthfully.
+    page1 = db.get(f"/api/admin/webhook-deliveries?webhook_id={poison_id}&limit=5").json()
+    assert len(page1["deliveries"]) == 5
+    assert page1.get("next_cursor")
+
+    replay_target = p_rows[0]["id"]
+    replay_resp = db.post(f"/api/admin/webhook-deliveries/{replay_target}/replay")
+    assert replay_resp.status_code == 200
+    requeued = db.get(f"/api/admin/webhook-deliveries?webhook_id={poison_id}").json()["deliveries"]
+    replayed_row = next(r for r in requeued if r["id"] == replay_target)
+    assert replayed_row["status"] == "pending"
+
+
 def test_commit_signature_round_trips_over_the_wire(db):
     sig_blob = {"algo": "ed25519", "public_key": "ab" * 32,
                 "sig": base64.b64encode(b"\x01" * 64).decode(), "signed_at": "now"}
@@ -1571,9 +1964,16 @@ def test_run_summary_aggregates_lineage_commits_and_semantic_diff(db):
     assert [n["id"] for n in body["lineage"]] == [child_run, parent_run]
     assert body["total_commits"] == 2
     assert {c["hash"] for c in body["commits"]} == {c1["hash"], c2["hash"]}
-    assert body["semantic_summary"]["files"]["added"] == ["b.txt"]
+    # v1.3.0: files.added/removed/changed carry {path, kind} objects (matching
+    # av_cli.semdiff's own schema), not bare path strings.
+    assert body["semantic_summary"]["files"]["added"] == [{"path": "b.txt", "kind": "code"}]
     assert body["semantic_summary"]["files"]["changed"] == []
     assert body["semantic_summary"]["totals"]["bytes_after"] == 30
+    # v1.3.0: full schema parity — models/chunks/datasets now ride the server-side
+    # summary too, not just files/totals.
+    assert body["semantic_summary"]["chunks"]["status"] == "no_chunks"
+    assert body["semantic_summary"]["models"] == []
+    assert body["semantic_summary"]["datasets"] == []
 
 
 def test_run_summary_no_semantic_diff_with_fewer_than_two_commits(db):
@@ -1587,8 +1987,192 @@ def test_run_summary_no_semantic_diff_with_fewer_than_two_commits(db):
     assert body["total_commits"] == 1
 
 
+def test_server_side_summary_matches_client_side_semdiff_on_the_same_trees():
+    """v1.3.0 (todo.md item 3): server.py::_summarize_tree_diff() is a deliberate,
+    independent re-implementation (the server package never imports av_cli) of exactly
+    what av_cli.semdiff.diff_trees() computes — this is the shared-golden-fixture proof
+    that the two can never silently drift apart the way the files-only version already
+    had (it used to omit models/chunks/datasets entirely). Stack-free: pure functions,
+    no live server needed, but lives here (not test_semdiff.py) since it's inherently a
+    cross-package comparison."""
+    from python.av_cli.semdiff import diff_trees
+    from python.av_server.server import _summarize_tree_diff
+
+    old_tree = {
+        "a.txt": {"hash": "a" * 64, "size": 10, "type": "code"},
+        "model.safetensors": {
+            "hash": "m1" * 32, "size": 0, "type": "artifact",
+            "layers": [{"name": "L0", "hash": "l0" * 32, "size": 100},
+                      {"name": "L1", "hash": "l1" * 32, "size": 200}],
+        },
+        "data/train.parquet": {"hash": "d1" * 32, "size": 5000, "type": "artifact"},
+        "ckpt.pt": {
+            "hash": "c1" * 32, "size": 0, "type": "artifact",
+            "chunks": [{"hash": "ch0" * 21 + "0", "size": 1000, "offset": 0},
+                      {"hash": "ch1" * 21 + "0", "size": 2000, "offset": 1000}],
+        },
+    }
+    new_tree = {
+        "a.txt": {"hash": "a" * 64, "size": 10, "type": "code"},  # unchanged
+        "b.txt": {"hash": "b" * 64, "size": 20, "type": "code"},  # added
+        "model.safetensors": {
+            "hash": "m2" * 32, "size": 0, "type": "artifact",
+            "layers": [{"name": "L0", "hash": "l0" * 32, "size": 100},  # unchanged
+                      {"name": "L1", "hash": "l1new" * 13 + "0", "size": 200}],  # moved
+        },
+        "data/train.parquet": {"hash": "d2" * 32, "size": 5500, "type": "artifact"},  # changed
+        "ckpt.pt": {
+            "hash": "c2" * 32, "size": 0, "type": "artifact",
+            "chunks": [{"hash": "ch0" * 21 + "0", "size": 1000, "offset": 0},  # reused
+                      {"hash": "ch2" * 21 + "0", "size": 3000, "offset": 1000}],  # new
+        },
+        # a.txt removed intentionally handled below by using a third comparison
+    }
+
+    client_side = diff_trees(old_tree, new_tree)
+    server_side = _summarize_tree_diff(old_tree, new_tree)
+
+    # base/target/summary(prose) are CLI-only additions the run-summary endpoint doesn't
+    # carry the same way — compare everything else field-by-field.
+    for key in ("files", "models", "chunks", "datasets", "totals"):
+        assert client_side[key] == server_side[key], (
+            f"server/client semdiff drift on {key!r}:\n"
+            f"  client: {client_side[key]}\n  server: {server_side[key]}"
+        )
+
+
 def test_run_summary_404_for_unknown_run(db):
     assert db.get("/api/runs/does-not-exist/summary").status_code == 404
+
+
+def test_run_metrics_endpoint_pages_the_full_series_oldest_first(db):
+    """v1.3.0 (todo.md item 7): /summary caps at _RUN_SUMMARY_MAX_COMMITS and returns
+    newest-first; /metrics is the uncapped, oldest-first, cursor-paginated complement."""
+    proj = "proj-run-metrics"
+    run_id = db.post("/api/runs", json={"project_id": proj}).json()["id"]
+    hashes = []
+    prev = None
+    for i in range(3):
+        extra = {"parents": [prev]} if prev else {}
+        c = _make_commit(f"metrics-{i}", project_id=proj, run_id=run_id,
+                         metrics={"step": i}, **extra)
+        assert db.post("/api/commits", json=c).status_code == 201
+        hashes.append(c["hash"])
+        prev = c["hash"]
+
+    page1 = db.get(f"/api/runs/{run_id}/metrics", params={"limit": 2}).json()
+    assert [p["hash"] for p in page1["points"]] == hashes[:2]
+    assert page1["points"][0]["metrics"] == {"step": 0}
+    assert page1["next_cursor"] is not None
+
+    page2 = db.get(f"/api/runs/{run_id}/metrics",
+                   params={"limit": 2, "cursor": page1["next_cursor"]}).json()
+    assert [p["hash"] for p in page2["points"]] == hashes[2:]
+    assert page2["next_cursor"] is None
+
+
+def test_run_metrics_endpoint_404s_for_unknown_run(db):
+    assert db.get("/api/runs/does-not-exist/metrics").status_code == 404
+
+
+def test_run_metrics_endpoint_rejects_a_garbage_cursor(db):
+    proj = "proj-run-metrics-bad-cursor"
+    run_id = db.post("/api/runs", json={"project_id": proj}).json()["id"]
+    resp = db.get(f"/api/runs/{run_id}/metrics", params={"cursor": "not-a-real-cursor!!"})
+    assert resp.status_code == 422
+
+
+def test_run_lineage_endpoint_pages_past_the_summary_cap(db):
+    """v1.3.0: builds a chain longer than one page (depth=2) and proves the cursor resumes
+    exactly where the previous page left off, ending with next_cursor: null at the root."""
+    proj = "proj-run-lineage"
+    root_id = db.post("/api/runs", json={"project_id": proj, "name": "root"}).json()["id"]
+    mid_id = db.post("/api/runs", json={
+        "project_id": proj, "name": "mid", "parent_run_id": root_id,
+    }).json()["id"]
+    leaf_id = db.post("/api/runs", json={
+        "project_id": proj, "name": "leaf", "parent_run_id": mid_id,
+    }).json()["id"]
+
+    page1 = db.get(f"/api/runs/{leaf_id}/lineage", params={"depth": 2}).json()
+    assert [n["id"] for n in page1["lineage"]] == [leaf_id, mid_id]
+    assert page1["next_cursor"] == root_id
+
+    page2 = db.get(f"/api/runs/{leaf_id}/lineage",
+                   params={"depth": 2, "cursor": page1["next_cursor"]}).json()
+    assert [n["id"] for n in page2["lineage"]] == [root_id]
+    assert page2["next_cursor"] is None
+
+
+def test_run_lineage_endpoint_404s_for_unknown_run(db):
+    assert db.get("/api/runs/does-not-exist/lineage").status_code == 404
+
+
+def test_run_lineage_endpoint_422s_for_an_unknown_cursor(db):
+    proj = "proj-run-lineage-bad-cursor"
+    run_id = db.post("/api/runs", json={"project_id": proj}).json()["id"]
+    resp = db.get(f"/api/runs/{run_id}/lineage", params={"cursor": "does-not-exist"})
+    assert resp.status_code == 422
+
+
+def test_run_policy_outcome_is_recorded_and_surfaced_on_the_run(db):
+    proj = "proj-policy-outcome"
+    run_id = db.post("/api/runs", json={"project_id": proj}).json()["id"]
+
+    resp = db.post(f"/api/runs/{run_id}/policy-outcome",
+                   json={"decision": "deny", "rule": "metric:loss<"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["policy_outcome"]["decision"] == "deny"
+    assert body["policy_outcome"]["rule"] == "metric:loss<"
+    assert body["policy_outcome"]["at"]  # ISO timestamp present
+
+    # Surfaced from both GET /api/runs/{id} and the /summary aggregate.
+    assert db.get(f"/api/runs/{run_id}").json()["policy_outcome"]["decision"] == "deny"
+    assert db.get(f"/api/runs/{run_id}/summary").json()["run"]["policy_outcome"]["decision"] == "deny"
+
+
+def test_run_policy_outcome_rejects_an_invalid_decision(db):
+    proj = "proj-policy-outcome-bad"
+    run_id = db.post("/api/runs", json={"project_id": proj}).json()["id"]
+    resp = db.post(f"/api/runs/{run_id}/policy-outcome", json={"decision": "maybe"})
+    assert resp.status_code == 422
+
+
+def test_run_policy_outcome_404s_for_unknown_run(db):
+    resp = db.post("/api/runs/does-not-exist/policy-outcome", json={"decision": "allow"})
+    assert resp.status_code == 404
+
+
+def test_commit_diff_endpoint_returns_full_semdiff_shape(db):
+    proj = "proj-commit-diff"
+    tree_v1 = {"a.txt": {"hash": "a" * 64, "size": 10, "type": "code"}}
+    tree_v2 = {"a.txt": {"hash": "a" * 64, "size": 10, "type": "code"},
+               "b.txt": {"hash": "b" * 64, "size": 20, "type": "code"}}
+    c1 = _make_commit("diff-ep-1", project_id=proj, tree=tree_v1)
+    c2 = _make_commit("diff-ep-2", project_id=proj, tree=tree_v2, parents=[c1["hash"]])
+    assert db.post("/api/commits", json=c1).status_code == 201
+    assert db.post("/api/commits", json=c2).status_code == 201
+
+    resp = db.get(f"/api/commits/{c1['hash']}/diff/{c2['hash']}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["base"] == c1["hash"] and body["target"] == c2["hash"]
+    assert body["files"]["added"] == [{"path": "b.txt", "kind": "code"}]
+    for key in ("models", "chunks", "datasets", "totals", "summary"):
+        assert key in body
+
+
+def test_commit_diff_endpoint_404s_for_unknown_commit(db):
+    known = _make_commit("diff-ep-known")
+    db.post("/api/commits", json=known)
+    resp = db.get(f"/api/commits/{known['hash']}/diff/{'f' * 64}")
+    assert resp.status_code == 404
+
+
+def test_commit_diff_endpoint_rejects_malformed_hash(db):
+    resp = db.get("/api/commits/not-a-hash/diff/" + "a" * 64)
+    assert resp.status_code == 400
 
 
 def test_run_avh_link_requires_uploaded_object_first(db):

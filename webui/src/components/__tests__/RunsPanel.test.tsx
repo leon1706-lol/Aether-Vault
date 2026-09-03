@@ -8,6 +8,7 @@ vi.mock("../../lib/api", () => ({
   fetchRuns: vi.fn(),
   fetchLatestEventId: vi.fn(),
   fetchRunSummary: vi.fn(),
+  fetchRunMetrics: vi.fn(),
   // MetricsChart.tsx (rendered internally once there's enough run history) imports
   // shortHash directly from this module — a pure function, safe to reimplement here
   // rather than importOriginal-ing the whole module just for one helper.
@@ -19,6 +20,9 @@ const mocked = vi.mocked(api);
 beforeEach(() => {
   // v1.2.5 deep linking touches window.history — keep each test's URL state isolated.
   window.history.replaceState(null, "", "/");
+  // v1.3.0: call-count assertions (e.g. "never calls fetchRunMetrics") need a clean
+  // slate — mockResolvedValue alone doesn't clear .mock.calls from earlier tests.
+  mocked.fetchRunMetrics.mockReset();
 });
 
 function baseRun(overrides: Partial<api.Run> = {}): api.Run {
@@ -233,5 +237,70 @@ describe("RunsPanel detail", () => {
     render(<RunsPanel projectId="p" initialRunId={childRun.id} />);
     await waitFor(() => expect(screen.getByText(/Linked commits/)).toBeInTheDocument());
     expect(mocked.fetchRunSummary).toHaveBeenCalledWith(childRun.id);
+  });
+
+  it("shows a policy-outcome badge when the run has one", async () => {
+    mockDetailApi({
+      run: { ...childRun, policy_outcome: { decision: "deny", rule: "metric:loss<", at: "2026-08-25T02:00:00" } },
+    });
+    await open();
+    expect(screen.getByText("policy: deny")).toBeInTheDocument();
+  });
+
+  it("shows no policy-outcome badge when the run has never had a decision recorded", async () => {
+    mockDetailApi(); // childRun has no policy_outcome
+    await open();
+    expect(screen.queryByText(/^policy: /)).not.toBeInTheDocument();
+  });
+
+  it('offers "Compare weights" once at least two commits are linked, ordering older before newer', async () => {
+    const onCompareWeights = vi.fn();
+    mockDetailApi(); // two commits: newest-first in the payload (c0 @ 02:00, c1 @ 01:00)
+    render(<RunsPanel projectId="p" onCompareWeights={onCompareWeights} />);
+    await waitFor(() => expect(screen.getByText("fine-tune")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId(`run-row-${childRun.id.slice(0, 8)}`));
+    await waitFor(() => expect(screen.getByText(/Linked commits/)).toBeInTheDocument());
+
+    const button = screen.getByRole("button", { name: /Compare weights/ });
+    fireEvent.click(button);
+    expect(onCompareWeights).toHaveBeenCalledWith("c" + "1".repeat(63), "c" + "0".repeat(63));
+  });
+
+  it('omits "Compare weights" with fewer than two linked commits', async () => {
+    mockDetailApi({
+      commits: [{ hash: "c" + "0".repeat(63), message: "only one", metrics: {}, timestamp: null }],
+      total_commits: 1,
+      semantic_summary: null,
+    });
+    await open();
+    expect(screen.queryByRole("button", { name: /Compare weights/ })).not.toBeInTheDocument();
+  });
+
+  it("omits \"Compare weights\" entirely when the caller doesn't pass onCompareWeights", async () => {
+    mockDetailApi();
+    await open(); // uses the default render(<RunsPanel projectId="p" />) with no callback
+    expect(screen.queryByRole("button", { name: /Compare weights/ })).not.toBeInTheDocument();
+  });
+
+  it("fetches the full metrics series when there's more history than the capped summary shows", async () => {
+    mockDetailApi({ total_commits: 5 }); // only 2 commits in the payload, 5 total
+    mocked.fetchRunMetrics.mockResolvedValue([
+      { hash: "c" + "0".repeat(63), message: "c0", metrics: { loss: 0.9 }, timestamp: "2026-08-25T01:00:00", linked_at: null },
+      { hash: "c" + "1".repeat(63), message: "c1", metrics: { loss: 0.7 }, timestamp: "2026-08-25T02:00:00", linked_at: null },
+      { hash: "c" + "2".repeat(63), message: "c2", metrics: { loss: 0.5 }, timestamp: "2026-08-25T03:00:00", linked_at: null },
+      { hash: "c" + "3".repeat(63), message: "c3", metrics: { loss: 0.3 }, timestamp: "2026-08-25T04:00:00", linked_at: null },
+      { hash: "c" + "4".repeat(63), message: "c4", metrics: { loss: 0.1 }, timestamp: "2026-08-25T05:00:00", linked_at: null },
+    ]);
+    await open();
+    await waitFor(() => expect(mocked.fetchRunMetrics).toHaveBeenCalledWith(childRun.id));
+    // 5 real points is enough to cross the chart threshold and replace the 2-row table.
+    await waitFor(() => expect(screen.getByText("ML Metrics Over Time")).toBeInTheDocument());
+    expect(screen.getByText(/full history/)).toBeInTheDocument();
+  });
+
+  it("never calls fetchRunMetrics when the capped summary already has everything", async () => {
+    mockDetailApi(); // total_commits: 2, commits.length: 2 — nothing more to fetch
+    await open();
+    expect(mocked.fetchRunMetrics).not.toHaveBeenCalled();
   });
 });

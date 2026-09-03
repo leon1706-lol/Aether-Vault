@@ -63,4 +63,19 @@ describe("BranchesPanel", () => {
     render(<BranchesPanel refs={{ main: tip.hash }} commits={[tip]} loading={false} />);
     expect(screen.getByText(/Branch delete isn't available yet/)).toBeInTheDocument();
   });
+
+  it("shows an error state instead of the empty state when a fetch failed", () => {
+    render(<BranchesPanel refs={{}} commits={[]} loading={false} error="401 Unauthorized" />);
+    expect(screen.getByText("⚠ 401 Unauthorized")).toBeInTheDocument();
+    expect(screen.queryByText("No branches found")).not.toBeInTheDocument();
+  });
+
+  it("prefers real data over an error when both are present", () => {
+    const tip = makeCommit();
+    render(
+      <BranchesPanel refs={{ main: tip.hash }} commits={[tip]} loading={false} error="stale error" />
+    );
+    expect(screen.getByText("main")).toBeInTheDocument();
+    expect(screen.queryByText("⚠ stale error")).not.toBeInTheDocument();
+  });
 });

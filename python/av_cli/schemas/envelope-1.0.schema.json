@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/envelope-1.0.json",
+  "title": "Aether-Vault JSON envelope (--output json)",
+  "description": "The one response shape every `av --output json <command>` invocation returns, built by python/av_cli/core.py::json_envelope(). See docs/contracts.md.",
+  "type": "object",
+  "required": ["ok", "data", "error", "meta"],
+  "additionalProperties": false,
+  "properties": {
+    "ok": {"type": "boolean"},
+    "data": {"type": "object"},
+    "error": {
+      "type": ["object", "null"],
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": ["not_a_repo", "nothing_to_commit", "auth_failed", "unreachable_queued",
+                   "merge_conflict", "validation", "policy_denied"]
+        },
+        "message": {"type": "string"},
+        "data": {
+          "type": "object",
+          "description": "Optional machine-readable failure context (v1.2.5+): conflict paths, racing run/commit ids, remediation command lines. Present only for the failure modes that carry it."
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "required": ["command", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "command": {"type": "string"},
+        "version": {"type": "string"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"ok": {"const": true}}},
+      "then": {"properties": {"error": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"ok": {"const": false}}},
+      "then": {"properties": {"error": {"type": "object"}}}
+    }
+  ]
+}

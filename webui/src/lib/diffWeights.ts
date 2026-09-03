@@ -32,10 +32,6 @@ export interface FileDiff {
 // actual model artifacts, not datasets or code files.
 export const MODEL_EXTS = new Set([".pt", ".pth", ".safetensors", ".onnx", ".ckpt"]);
 
-// Cap applied by the UI when rendering layers (heatmap / drift chart), not by the diff math
-// itself — a checkpoint with tens of thousands of tensors must not freeze the page.
-export const MAX_RENDERED_LAYERS = 4000;
-
 type Tree = Commit["tree"];
 
 function extOf(relPath: string): string {

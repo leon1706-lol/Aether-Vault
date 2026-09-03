@@ -1,6 +1,6 @@
 # tests
 
-Owns Aether-Vault's pytest suite: ~590 tests across 25+ files covering the CLI, the
+Owns Aether-Vault's pytest suite: ~950 tests across 40+ files covering the CLI, the
 C++ bindings, the live registry server, the plugins, and the webui logic. Run with
 `pytest tests/ -q` (or `av test`); the skip-summary hook prints WHY anything skipped.
 
@@ -17,7 +17,9 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
   conflict paths.
 - `test_server.py` - live Postgres+Redis suite (lazy TCP reachability skip): wire
   round-trips, audit outcome capture, webhook delivery ledger + dead-letter,
-  signature persistence, two-repo E2E.
+  signature persistence, two-repo E2E, `av registry export`/`restore` full round trip
+  (layers, CDC chunks, a merge commit, a signed commit), run metrics/lineage/policy-
+  outcome endpoints.
 - `test_core.py` / `test_dataset_cdc.py` - binding contract; CDC boundary stability +
   `.avattributes` matrix across EVERY chunkable extension.
 - `test_signing.py` - ed25519 keygen/auto-sign/verify: roundtrip, tamper on every
@@ -28,6 +30,22 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
 - `test_perf_gate.py`, `test_speedcheck.py`, `test_migrations.py`,
   `test_docker_runtime.py`, `test_auth_users.py`, `test_rate_limit.py`, ... -
   focused units for their named surfaces.
+- `test_contracts.py` / `test_contract_matrix.py` - drives the real CLI/server and
+  validates live output against every published JSON Schema; table-driven exit-code +
+  `error.code` matrix across every command x mode x code, plus the generic anti-leakage
+  sweep (parametrized over `cli.commands`).
+- `test_tool_runner.py`, `test_perf_history_script.py` - `benchmarks/` shared infra
+  (tool detection, verdict rating, table/markdown rendering) and
+  `scripts/append_perf_history.py`'s pure merge/render logic.
+- `test_release_gate.py`, `test_ci_policy.py` - `scripts/release_gate.py`'s checks
+  (perf-history tag, CHANGELOG sign-off, benchmarks-sha ancestry) and the permanent
+  no-dependency-bots/no-auto-merge guard over `.github/`.
+- `test_docs_commands.py` - parses every fenced `av ...` command out of `docs/*.md` and
+  resolves it against the live Click tree, so documentation rot is a test failure.
+- `test_benchmark_docs_freshness.py` - guards README.md's/benchmarks/README.md's
+  hand-authored benchmark tables against drifting out of sync with the real
+  `benchmarks/bench_*.py` count, and against an unfilled "capture pending"-style
+  placeholder surviving past the run that should have replaced it.
 
 ## Conventions
 

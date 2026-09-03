@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/run-1.0.json",
+  "title": "Aether-Vault run (GET /api/runs/{id})",
+  "description": "python/av_server/server.py::_run_to_dict(). See docs/contracts.md.",
+  "type": "object",
+  "required": ["id", "project_id", "name", "status", "parent_run_id", "created_by",
+               "code_pointer", "env_snapshot_id", "avh_object_id", "metrics_summary",
+               "created_at", "completed_at"],
+  "properties": {
+    "id": {"type": "string"},
+    "project_id": {"type": ["string", "null"]},
+    "name": {"type": ["string", "null"]},
+    "status": {"type": "string"},
+    "parent_run_id": {"type": ["string", "null"]},
+    "created_by": {"type": ["string", "null"]},
+    "code_pointer": {"type": ["object", "null"]},
+    "env_snapshot_id": {"type": ["string", "null"]},
+    "avh_object_id": {"type": ["string", "null"]},
+    "policy_outcome": {
+      "type": ["object", "null"],
+      "description": "v1.3.0+, additive. {decision, rule, at} — absent/null on runs from before this field existed or that never hit a policy gate.",
+      "properties": {
+        "decision": {"type": "string", "enum": ["allow", "deny"]},
+        "rule": {"type": ["string", "null"]},
+        "at": {"type": ["string", "null"]}
+      }
+    },
+    "metrics_summary": {"type": "object"},
+    "created_at": {"type": ["string", "null"]},
+    "completed_at": {"type": ["string", "null"]},
+    "commit_hashes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Present only on the single-run GET, not on list rows."
+    }
+  }
+}

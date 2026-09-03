@@ -1,25 +1,31 @@
 "use client";
 
 import { formatBytes } from "@/lib/api";
-import { MAX_RENDERED_LAYERS, type LayerDiff } from "@/lib/diffWeights";
+import { type LayerDiff } from "@/lib/diffWeights";
+import { useIncrementalReveal } from "@/hooks/useIncrementalReveal";
 
 interface Props {
   layers: LayerDiff[];
 }
 
 export function WeightHeatmap({ layers }: Props) {
+  // v1.3.0 (todo.md item 25): progressive reveal replaces the old hard MAX_RENDERED_LAYERS
+  // cutoff — every layer eventually renders, just over a few frames instead of one giant
+  // synchronous paint. See hooks/useIncrementalReveal.ts.
+  const visibleCount = useIncrementalReveal(layers.length);
+
   if (layers.length === 0) {
     return <div className="empty-state">No per-layer data for this file.</div>;
   }
 
-  const truncated = layers.length > MAX_RENDERED_LAYERS;
-  const visible = truncated ? layers.slice(0, MAX_RENDERED_LAYERS) : layers;
+  const rendering = visibleCount < layers.length;
+  const visible = layers.slice(0, visibleCount);
 
   return (
     <div>
-      {truncated && (
+      {rendering && (
         <div className="diff-truncate-notice">
-          Showing {MAX_RENDERED_LAYERS} of {layers.length} layers
+          Rendering {visibleCount} of {layers.length} layers…
         </div>
       )}
       <div className="weight-heatmap-grid">

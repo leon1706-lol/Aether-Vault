@@ -1,0 +1,7 @@
+{
+  "main": {
+    "metric": "val_loss",
+    "op": "<",
+    "baseline_ref": "main~1"
+  }
+}

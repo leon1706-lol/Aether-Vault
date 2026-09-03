@@ -209,7 +209,82 @@ AV_TEST_DATABASE_URL=postgresql+asyncpg://... AV_TEST_REDIS_URL=redis://... \
 E2E_PSQL_URL=postgresql://... bash scripts/e2e_scenario.sh
 ```
 
-Phase map: A clone→diverge→conflicting merge→`--theirs`→two-parent push · B offline queue drain across a real restart · C pre-Alembic volume heal + stamp on a real boot · D protected mode with per-user tokens (join/attribution/wrong-token/revocation) · E zero-grace GC sweep. Notes for local runs: on Windows use Git Bash (the script converts its temp paths via cygpath), keep psql on PATH, and pass options before the connection URI if calling psql yourself — MSYS-style getopt ignores `-c` after a positional URI.
+Phase map: A clone→diverge→conflicting merge→`--theirs`→two-parent push · B offline queue drain across a real restart · C pre-Alembic volume heal + stamp on a real boot · D protected mode with per-user tokens (join/attribution/wrong-token/revocation) · E zero-grace GC sweep · F SDK-driven run/commit lifecycle · G event stream cursor/kind filter · H promotion policy · J signed commits (ed25519 roundtrip, tamper detection, unsigned-ok) · K audit trail filters. Notes for local runs: on Windows use Git Bash (the script converts its temp paths via cygpath), keep psql on PATH, and pass options before the connection URI if calling psql yourself — MSYS-style getopt ignores `-c` after a positional URI.
+
+**Chaos drills (v1.3.0, todo.md item 28), Phases L/M/N:** gated behind `AV_E2E_CHAOS=1`
+(default off — the phases above run unaffected without it) so they're opt-in for a local
+run and isolated into their own `chaos-drills` CI job rather than folded into `e2e-suite`:
+```bash
+AV_E2E_CHAOS=1 AV_TEST_DATABASE_URL=postgresql+asyncpg://... AV_TEST_REDIS_URL=redis://... \
+E2E_PSQL_URL=postgresql://... bash scripts/e2e_scenario.sh
+```
+L a real (not simulated) Redis outage: `/api/ready` correctly 503s while `/api/health`
+and the write path both keep working (redis_cache.py degrades its dedup-shortcut
+optimization gracefully rather than failing the push — see that module's own docstring),
+then recovers cleanly once Redis is reachable again · M an unwritable `AV_DATA_DIR`
+(the portable, CI-safe equivalent of a full disk — same observable failure: the storage
+layer's write call fails): the upload fails honestly, nothing partial lands, the commit
+queues locally, and it drains once storage is writable again (skips itself with a clear
+message on a filesystem/user that doesn't honor `chmod 555` as unwritable) · N the server
+process is `SIGKILL`ed mid-push (no graceful shutdown): `.av/pending_push` survives
+intact (proving the atomic temp-file+fsync+`os.replace` write pattern under a real crash,
+not just a clean stop — Phase B already covers the clean-stop case) and a later `av push`
+fully drains it.
+
+## Orchestrator readiness & liveness (v1.3.0, todo.md item 19)
+
+The engine exposes two distinct health routes — conflating them (using one for both
+probes) is the single most common orchestrator misconfiguration for this kind of
+two-dependency service:
+
+- **`GET /api/health`** — liveness. Answers "is the process alive and able to serve HTTP
+  at all" with zero external dependencies (no DB/Redis check) — auth-exempt even in
+  Protected mode, so it never deadlocks behind a token gate. A liveness probe should use
+  this: if it fails, the process itself is wedged and the orchestrator's correct move is
+  to kill and restart the container. It must NOT fail just because Postgres or Redis is
+  temporarily down — that's a readiness concern, not a liveness one, and flapping restarts
+  of a perfectly-alive process that's waiting on a dependency makes an outage worse, not
+  better.
+- **`GET /api/ready`** — readiness. Checks DB connectivity, Redis connectivity, and
+  `AV_DATA_DIR` writability; returns 503 if any fail. A readiness probe should use this:
+  when it fails, the orchestrator's correct move is to stop routing traffic to this pod
+  (take it out of the Service's endpoint list) WITHOUT killing it — the process may well
+  recover on its own once the dependency comes back, and killing it achieves nothing but
+  a pointless restart. Also auth-exempt.
+
+Both routes exist on every target this Dockerfile produces (`all`, `server`) — the `webui`
+target has neither (a Node-only container has no DB/Redis to check); point its probes at
+the Next.js standalone server's own root path instead, or omit readiness for it entirely
+(a webui-only container is either serving requests or it's dead — there's no partial
+"waiting on a dependency" state for it the way there is for the registry).
+
+Concrete Kubernetes probe stanzas for the `all`/`server` targets:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /api/health
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /api/ready
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 2
+```
+
+Drain on rolling update / scale-down: send `SIGTERM` and wait for the container to exit
+on its own before `SIGKILL` — set `terminationGracePeriodSeconds` to at least
+`AV_ENGINE_STOP_GRACE_SECS` (default 25) plus a small margin, matching this project's own
+compose files (`stop_grace_period: 30s`). `engine-entrypoint.sh` forwards `SIGTERM` to
+every child and waits up to that grace window for in-flight requests to finish before
+force-killing — a shorter `terminationGracePeriodSeconds` than the grace window defeats
+that drain and can truncate an in-flight upload. See "Drain under load" in the CI job map
+below for the automated proof of this.
 
 ## CI Job Map
 
@@ -222,7 +297,8 @@ Every product surface and the workflow that guards it (Tests workflow unless not
 | Server live stack (Postgres+Redis): TestClient + real-wire | `server-tests` |
 | Same, native Windows services | `server-tests-windows` |
 | Product flows via real CLI: merge collaboration, offline drain, legacy upgrade, per-user auth, GC | `e2e-suite` (`scripts/e2e_scenario.sh`) |
-| Engine image smoke (Phase I): role dispatch + dual healthchecks from ONE container; v1.2.5: `/api/ready` degrading independently of `/api/health`, killing one subservice restarts only it | `e2e-engine-smoke` |
+| Chaos drills: real Redis outage, unwritable storage, server killed mid-push | `chaos-drills` (`scripts/e2e_scenario.sh`, `AV_E2E_CHAOS=1`) |
+| Engine image smoke (Phase I): role dispatch + dual healthchecks from ONE container; v1.2.5: `/api/ready` degrading independently of `/api/health`, killing one subservice restarts only it; v1.3.0: a real SIGTERM drain under concurrent load (20 in-flight uploads) all complete cleanly | `e2e-engine-smoke` |
 | Plugins incl. real Lightning training loop + signed-commit gate (`[sign]` extra) | `plugin-tests` |
 | WebUI lint/typecheck/Vitest | `webui-tests` |
 | WebUI browser E2E: dashboard, weight-diff, token gate | `webui-e2e` |
@@ -327,6 +403,26 @@ av update --docker        # pull latest image + restart the local backend
 **Verified directly:** all pinned actions are the Node-24 majors (`checkout@v5`, `setup-python@v6`, `setup-node@v6`, `upload-artifact@v7`, `download-artifact@v7`) — bumped deliberately off Node-20 deprecation warnings; do not downgrade pins.
 
 **Caution:** anyone adding a new uvicorn-starting CI job must export a writable `AV_DATA_DIR` explicitly — the `/data` default is volume-backed in containers only. The webui-e2e incident in [CHANGELOG.md](CHANGELOG.md) is the reference failure. Versioning semantics for what deserves MAJOR vs MINOR live in [`../VERSIONING.md`](../VERSIONING.md).
+
+## CUDA Base Matrix (`av env replay --dockerfile --cuda TAG`)
+
+`--cuda TAG` switches the generated Dockerfile's builder base from `python:slim` to
+`nvidia/cuda:<TAG>-runtime-ubuntu22.04`. These are the tags this project has actually
+built and smoke-tested a resulting image from (`av_cli/cmd_env.py::_VALIDATED_CUDA_TAGS`)
+— a tag outside this set still generates a Dockerfile (nvidia/cuda publishes far more
+tags than any one project validates; this is a warning, never a hard failure), just with
+no guarantee the combination builds cleanly:
+
+| Tag | CUDA runtime | Notes |
+|---|---|---|
+| `12.1.0` | CUDA 12.1.0 | oldest validated — PyTorch 2.1–2.3 era |
+| `12.1.1` | CUDA 12.1.1 | patch bump of the above |
+| `12.4.1` | CUDA 12.4.1 | PyTorch 2.3–2.5 era |
+| `12.6.2` | CUDA 12.6.2 | PyTorch 2.5+ era |
+| `12.8.0` | CUDA 12.8.0 | current, Blackwell-generation driver baseline |
+
+Update `_VALIDATED_CUDA_TAGS` (and this table) after actually building and smoke-testing
+a new tag — this list is a validation record, not an aspirational target.
 
 ## Local Development Without Docker
 

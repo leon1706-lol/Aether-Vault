@@ -11,6 +11,9 @@
 #   C. legacy-volume upgrade: pre-Alembic shape heals + stamps on real boot
 #   D. protected mode with per-user tokens: join, attribution, revocation, 401 queueing
 #   E. GC drill with a zeroed grace period: orphan swept, live objects survive
+#   F-K. SDK run lifecycle, event stream, promotion policy, signed commits, audit trail
+#   L-N. chaos drills (v1.3.0) — gated behind AV_E2E_CHAOS=1, see their own section below:
+#        real redis outage, unwritable storage, server SIGKILLed mid-push
 #
 # Every phase prints PASS/FAIL lines; any failure aborts with a nonzero exit.
 # The compose-restart plumbing of `av auth add-user` (writes .env, restarts a
@@ -202,7 +205,7 @@ start_server legacy-C     # boot must detect the pre-Alembic shape, heal, stamp
 
 [[ "$(psqlq "SELECT count(*) FROM information_schema.columns WHERE table_name='commits' AND column_name='extra_parents'")" == "1" ]] \
   || die "legacy boot did not restore commits.extra_parents"
-[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0004" ]] || die "legacy boot did not stamp chain head (0004)"
+[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0005" ]] || die "legacy boot did not stamp chain head (0005)"
 [[ "$(psqlq "SELECT count(*) FROM commits")" == "$COMMITS_BEFORE" ]] || die "heal lost commit rows!"
 pass "Phase C: pre-Alembic volume healed + stamped zero-touch, data intact"
 
@@ -410,3 +413,129 @@ AV_AUDIT_OUT="$(cd "$WORK/repoC" && command av audit list --action commit.push -
   || true
 grep -q "commit.push" <<<"$AV_AUDIT_OUT" || die "av audit list failed: $AV_AUDIT_OUT"
 pass "Phase K: audit outcome capture + filters live (server + CLI)"
+
+# ============================================================================
+# Phases L/M/N — chaos drills (v1.3.0, todo.md item 28). Gated behind AV_E2E_CHAOS=1
+# (default off) so the plain `e2e-suite` CI job / a local run is unaffected; the
+# dedicated `chaos-drills` CI job sets it. Runnable locally the same way:
+#   AV_E2E_CHAOS=1 AV_TEST_DATABASE_URL=... AV_TEST_REDIS_URL=... bash scripts/e2e_scenario.sh
+# ============================================================================
+if [[ "${AV_E2E_CHAOS:-0}" == "1" ]]; then
+
+stop_server
+
+# ----------------------------------------------------------------------------
+log "Phase L — Redis unreachable: readiness degrades, pushes still succeed, restart recovers"
+# NOT "the client queues" (todo.md's shorthand doesn't match this codebase's actual
+# design): redis_cache.py's check_hash_exists()/add_hash() deliberately catch their own
+# connection errors and degrade to DB-only checks (see that module's own docstring) — a
+# commit push is NOT redis-dependent at all, only the dedup-shortcut optimization is. The
+# real, verified contract this phase proves instead: /api/ready correctly reports the
+# outage (used by orchestrators to stop routing traffic) while /api/health and the write
+# path both keep working — exactly the liveness/readiness split
+# development/infrastructure.md documents, under a REAL unreachable Redis rather than a
+# hypothetical one.
+start_server chaos-L-noredis REDIS_URL="redis://this-host-is-intentionally-absent:6379/0"
+
+READY_CODE="$(api_status "$API/api/ready")"
+[[ "$READY_CODE" == "503" ]] || die "Phase L: expected /api/ready 503 with redis unreachable, got $READY_CODE"
+# NOT curl -f: -f discards the response body on any non-2xx status, and /api/ready's
+# whole point here is a 503 body we need to actually read (found live: -f made this line
+# fail every time, on a correctly-behaving server, since /api/ready correctly 503s).
+curl -s "$API/api/ready" | grep -q '"redis": *false' || die "Phase L: /api/ready did not report the redis check as failing"
+curl -sf "$API/api/health" >/dev/null 2>&1 || die "Phase L: /api/health must stay up regardless of readiness"
+
+mkdir -p "$WORK/repoL" && cd "$WORK/repoL"
+av . init --mode local --yes --no-repl >/dev/null
+echo "pushed with redis down" > redis-down.txt
+av . add redis-down.txt >/dev/null
+av . commit -m "commit while redis unreachable" >/dev/null
+[[ "$(pending_count "$WORK/repoL")" -eq 0 ]] \
+  || die "Phase L: commit should have pushed successfully (redis outage is non-fatal to the write path), but it queued"
+LREF="$(cat .av/refs/heads/main)"
+[[ "$(api_status "$API/api/commits/$LREF")" == "200" ]] || die "Phase L: commit made during the redis outage never reached the server"
+
+stop_server
+start_server chaos-L-recovered   # real REDIS_URL restored (start_server's own default)
+READY_CODE2="$(api_status "$API/api/ready")"
+[[ "$READY_CODE2" == "200" ]] || die "Phase L: /api/ready should recover once redis is reachable again, got $READY_CODE2"
+pass "Phase L: /api/ready degraded independently of /api/health under a real redis outage; writes kept working; recovered cleanly"
+
+# ----------------------------------------------------------------------------
+log "Phase M — storage write failure: upload fails honestly, nothing partial lands, client queues"
+# A genuinely FULL disk isn't reliably producible/safe in CI — a read-only AV_DATA_DIR
+# produces the identical observable failure (the storage layer's write call fails), which
+# is what this phase actually needs to prove: the failure surfaces honestly (no silent
+# data loss, no partially-written object) and the client's offline-queue path takes over,
+# exactly as it does for any other unreachable-server case (Phase B).
+stop_server
+READONLY_DATA="$WORK/data-readonly"
+mkdir -p "$READONLY_DATA"
+chmod 555 "$READONLY_DATA"
+if ! ( : > "$READONLY_DATA/write-probe" ) 2>/dev/null; then
+  start_server chaos-M-readonly AV_DATA_DIR="$READONLY_DATA"
+
+  mkdir -p "$WORK/repoM" && cd "$WORK/repoM"
+  av . init --mode local --yes --no-repl >/dev/null
+  echo "should fail to land" > readonly-target.txt
+  av . add readonly-target.txt >/dev/null
+  set +e
+  M_COMMIT_OUT="$(av . commit -m "commit against a read-only data dir" 2>&1)"
+  set -e
+  [[ "$(pending_count "$WORK/repoM")" -ge 1 ]] \
+    || die "Phase M: commit against an unwritable AV_DATA_DIR must queue locally, not silently succeed. Output: $M_COMMIT_OUT"
+  MOBJ_COUNT="$(find "$READONLY_DATA" -type f ! -name write-probe 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "$MOBJ_COUNT" == "0" ]] || die "Phase M: a partial object landed in the unwritable data dir ($MOBJ_COUNT file(s)) — should be zero"
+
+  stop_server
+  chmod 755 "$READONLY_DATA"
+  start_server chaos-M-recovered
+  av . push >/dev/null
+  [[ "$(pending_count "$WORK/repoM")" -eq 0 ]] || die "Phase M: queued commit did not drain once storage was writable again"
+  pass "Phase M: write failure against an unwritable AV_DATA_DIR queued honestly; nothing partial landed; recovered cleanly"
+else
+  rm -f "$READONLY_DATA/write-probe"
+  log "Phase M SKIPPED — this environment does not honor chmod 555 as unwritable (root, or a filesystem that ignores POSIX perms)"
+fi
+chmod 755 "$READONLY_DATA" 2>/dev/null || true
+
+# ----------------------------------------------------------------------------
+log "Phase N — server killed mid-push (SIGKILL, not graceful): pending_push survives intact, later push drains cleanly"
+
+stop_server 2>/dev/null || true
+start_server chaos-N-before
+
+mkdir -p "$WORK/repoN" && cd "$WORK/repoN"
+av . init --mode local --yes --no-repl >/dev/null
+for i in 1 2 3 4 5; do
+  echo "chaos payload $i" > "n-file-$i.txt"
+  av . add "n-file-$i.txt" >/dev/null
+  av . commit -m "chaos commit $i" --no-upload >/dev/null   # guaranteed queued, regardless of kill timing
+done
+[[ "$(pending_count "$WORK/repoN")" -ge 1 ]] || die "Phase N: setup commits should be queued before the push even starts"
+
+# Push in the background, then SIGKILL the server almost immediately — no graceful
+# shutdown, no drain window, proving atomic local writes (core.py's temp-file+fsync+
+# os.replace pattern) rather than a clean-stop path this suite already covers (Phase B).
+( av . push >/dev/null 2>&1 || true ) &
+PUSH_PID=$!
+sleep 0.05
+kill -9 "$SERVER_PID" 2>/dev/null || true
+wait "$PUSH_PID" 2>/dev/null || true
+SERVER_PID=""
+
+# pending_push must be well-formed JSON no matter how much of the push landed before the
+# kill — a torn/partial write here would be the real bug this phase exists to catch.
+if [[ -s "$WORK/repoN/.av/pending_push" ]]; then
+  "$PY" -c "import json; json.load(open('$WORK/repoN/.av/pending_push'))" \
+    || die "Phase N: .av/pending_push is corrupted after the server was killed mid-push"
+fi
+
+start_server chaos-N-after
+av "$WORK/repoN" push >/dev/null
+[[ "$(pending_count "$WORK/repoN")" -eq 0 ]] || die "Phase N: pending_push did not fully drain after the server came back"
+N_COUNT="$(curl -sf "$API/api/commits?limit=100&project_id=$(project_of "$WORK/repoN")" | jsonget "d['total']")"
+[[ "$N_COUNT" -ge 5 ]] || die "Phase N: not all 5 chaos commits reached the server after recovery (total=$N_COUNT)"
+pass "Phase N: pending_push survived a SIGKILL mid-push intact; full drain on the next push"
+
+fi  # AV_E2E_CHAOS

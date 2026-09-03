@@ -5,9 +5,10 @@ import { shortHash, type Commit } from "@/lib/api";
 interface Props {
   commits: Commit[];
   loading: boolean;
+  error?: string | null;
 }
 
-export function CommitList({ commits, loading }: Props) {
+export function CommitList({ commits, loading, error }: Props) {
   if (loading && commits.length === 0) {
     return (
       <div className="card">
@@ -21,6 +22,20 @@ export function CommitList({ commits, loading }: Props) {
           <div className="spinner" />
           Loading commits…
         </div>
+      </div>
+    );
+  }
+
+  if (error && commits.length === 0) {
+    return (
+      <div className="card">
+        <div className="card-header">
+          <span className="card-title">
+            <CommitIcon />
+            Commit Log
+          </span>
+        </div>
+        <div className="empty-state">⚠ {error}</div>
       </div>
     );
   }

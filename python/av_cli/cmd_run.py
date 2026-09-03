@@ -137,11 +137,28 @@ def finish(metrics_raw: tuple, as_failed: bool) -> None:
         except Exception:
             delivered = False
 
+    # v1.3.0 (todo.md item 8): guarantee lineage/metrics-tail/semantic-summary are
+    # present locally after every run finish — regenerated HERE, before the run state
+    # file is removed below, since build_handoff_dict() reads the active run_id from
+    # exactly that file. Best-effort and never fails the finish itself: the run
+    # completing (or failing) in the registry is the operation that matters here; a
+    # local write hiccup building the handoff is a bonus guarantee, not grounds to lose
+    # track of the run the way a network failure would be if it blocked queuing.
+    handoff_written = False
+    try:
+        from .handoff import generate_handoff
+
+        generate_handoff(repo_root, update=True)
+        handoff_written = True
+    except Exception:
+        handoff_written = False
+
     path.unlink(missing_ok=True)
     if current_output_mode() == "json":
         emit_json(None, "run finish", data={"run_id": run_id, "status": status,
                                             "metrics_summary": summary,
-                                            "delivered_to_registry": delivered})
+                                            "delivered_to_registry": delivered,
+                                            "handoff_written": handoff_written})
         return
     click.secho(f"Run {run_id} → {status}{' (registry updated)' if delivered else ' (local only)'}",
                 fg="green" if not as_failed else "yellow")

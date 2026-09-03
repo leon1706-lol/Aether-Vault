@@ -15,7 +15,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Respo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -132,9 +132,16 @@ def _installed_version() -> str:
         return "unknown"
 
 
-def _parse_auth_users(raw: str | None) -> dict[str, str]:
+def _parse_auth_users(raw: str | None) -> dict[str, dict]:
     """Parses the AV_AUTH_USERS JSON map. Invalid payloads fail startup loudly — a
-    silently ignored auth map would look exactly like Anonymous mode."""
+    silently ignored auth map would look exactly like Anonymous mode.
+
+    v1.3.0: each value is either a bare token string (unchanged, never expires — the
+    original and still-default shape) or an object {"token": "...", "expires_at":
+    "<ISO-8601>"} for an optional expiry (`av auth add-user NAME TOKEN --expires-in-days
+    N`). Returns {username: {"token": str, "expires_at": str|None}} either way, so every
+    downstream reader has one shape to handle.
+    """
     if not raw or not raw.strip():
         return {}
     try:
@@ -143,28 +150,54 @@ def _parse_auth_users(raw: str | None) -> dict[str, str]:
         raise RuntimeError(f"AV_AUTH_USERS is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise RuntimeError("AV_AUTH_USERS must be a JSON object of {username: token}.")
-    users: dict[str, str] = {}
-    for name, tok in parsed.items():
-        name, tok = str(name).strip(), str(tok).strip()
+    users: dict[str, dict] = {}
+    for name, val in parsed.items():
+        name = str(name).strip()
+        if isinstance(val, dict):
+            tok = str(val.get("token", "")).strip()
+            expires_at = val.get("expires_at")
+            expires_at = str(expires_at).strip() if expires_at else None
+        else:
+            tok = str(val).strip()
+            expires_at = None
         if not name or not tok:
             raise RuntimeError("AV_AUTH_USERS entries need non-empty username and token.")
-        users[name] = tok
+        users[name] = {"token": tok, "expires_at": expires_at}
     return users
 
 
 _AUTH_USERS = _parse_auth_users(os.environ.get("AV_AUTH_USERS"))
 
 
-def _resolve_identity(supplied_token: str) -> str | None:
-    """Bearer token → username ("owner" for the shared secret), or None when unknown.
+def _is_expired(expires_at: str | None) -> bool:
+    if not expires_at:
+        return False
+    try:
+        # _parse_iso_dt normalizes to naive UTC (this schema's storage convention) —
+        # datetime.utcnow() matches that shape; comparing against an aware now() here
+        # would raise (naive vs aware) and get silently swallowed below, making expiry
+        # never actually take effect.
+        return _parse_iso_dt(expires_at, "expires_at") < datetime.now(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return False  # an unparseable expiry fails open on parsing, not on auth
 
-    compare_digest on every candidate — timing-safe even though the map is small.
+
+def _resolve_identity(supplied_token: str) -> str | None:
+    """Bearer token → username ("owner" for the shared secret), or None when unknown OR
+    expired. compare_digest on every candidate — timing-safe even though the map is small.
+
+    Each `_AUTH_USERS` value is normally already normalized to {"token", "expires_at"} by
+    `_parse_auth_users()` — but tolerates a bare token string too (both this module's own
+    tests and any external code that pokes `_AUTH_USERS` directly, pre-v1.3.0 style, set
+    it that way), so this doesn't assume the dict shape unconditionally.
     """
     if AV_API_TOKEN and secrets.compare_digest(supplied_token, AV_API_TOKEN):
-        return "owner"
-    for name, tok in _AUTH_USERS.items():
-        if secrets.compare_digest(supplied_token, tok):
-            return name
+        return "owner"  # the shared secret has no expiry concept
+    for name, entry in _AUTH_USERS.items():
+        token = entry["token"] if isinstance(entry, dict) else entry
+        expires_at = entry.get("expires_at") if isinstance(entry, dict) else None
+        if secrets.compare_digest(supplied_token, token):
+            return None if _is_expired(expires_at) else name
     return None
 
 
@@ -755,6 +788,35 @@ async def get_commit(
         "signature": _signature_out(commit.signature),
         "env_snapshot_id": commit.env_snapshot_id,
     }
+
+
+@app.get("/api/commits/{base_hash}/diff/{target_hash}")
+async def get_commit_diff(
+    base_hash: str, target_hash: str, db: AsyncSession = Depends(get_session)
+) -> dict:
+    """v1.3.0 (todo.md item 3): the semantic diff between any two commits, server-side —
+    previously the only server-side semantic diff lived inside GET /api/runs/{id}/summary
+    (bounded to a run's own linked commits). Feeds the WebUI's arbitrary two-commit
+    weight-diff compare. Full semdiff-1.0 schema shape via the same
+    _summarize_tree_diff() the run-summary endpoint uses — one implementation, two
+    call sites."""
+    for h in (base_hash, target_hash):
+        if not re.match(r"^[a-f0-9]{64}$", h):
+            raise HTTPException(status_code=400, detail="Invalid hash format")
+
+    async def _tree_of(h: str) -> dict:
+        result = await db.execute(select(DBCommit).where(DBCommit.hash == h))
+        commit = result.scalar_one_or_none()
+        if not commit:
+            raise HTTPException(status_code=404, detail=f"Commit not found: {h}")
+        return await resolve_tree(db, commit.root_tree_hash) if commit.root_tree_hash else {}
+
+    old_tree = await _tree_of(base_hash)
+    new_tree = await _tree_of(target_hash)
+    summary = _summarize_tree_diff(old_tree, new_tree)
+    summary["base"] = base_hash
+    summary["target"] = target_hash
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1470,11 +1532,21 @@ async def list_events(
     since: int = 0,
     project_id: Optional[str] = None,
     kinds: Optional[str] = None,
+    run_id: Optional[str] = None,
     limit: int = Query(100, ge=1, le=1000),
     wait: int = 0,
     db: AsyncSession = Depends(get_session),
 ):
-    """Resumable ordered event feed. wait=<secs> long-polls for at least one new row."""
+    """Resumable ordered event feed. wait=<secs> long-polls for at least one new row.
+
+    v1.3.0: `run_id` joins `project_id`/`kinds` as one stable query model (todo.md item
+    9) — matches events whose payload carries that run id (currently `commit` and `run`
+    kind events; a kind with no run_id in its payload simply never matches). Response
+    also gains `gap` (todo.md item 9's backlog-honesty half): true when `since` predates
+    this project's oldest retained event id (AV_EVENT_RETENTION_DAYS already swept it) —
+    a resuming consumer can tell "I missed events" apart from "there are simply no new
+    ones yet", which a stale cursor used to make silently indistinguishable.
+    """
     kind_list = [k.strip() for k in kinds.split(",")] if kinds else None
     waited = 0.0
 
@@ -1484,6 +1556,8 @@ async def list_events(
             stmt = stmt.where((DBEvent.project_id == project_id) | (DBEvent.project_id.is_(None)))
         if kind_list:
             stmt = stmt.where(DBEvent.kind.in_(kind_list))
+        if run_id:
+            stmt = stmt.where(DBEvent.payload["run_id"].as_string() == run_id)
         rows = (await db.execute(stmt.order_by(DBEvent.id.asc()).limit(limit))).scalars().all()
         return [
             {"id": e.id, "ts": e.ts.isoformat() if e.ts else None,
@@ -1498,7 +1572,18 @@ async def list_events(
         events = await _fetch()
 
     next_cursor = events[-1]["id"] if events else since
-    return {"events": events, "next_cursor": next_cursor}
+
+    gap = False
+    if since > 0:
+        oldest_stmt = select(func.min(DBEvent.id))
+        if project_id:
+            oldest_stmt = oldest_stmt.where(
+                (DBEvent.project_id == project_id) | (DBEvent.project_id.is_(None)))
+        oldest_id = (await db.execute(oldest_stmt)).scalar_one_or_none()
+        gap = oldest_id is not None and since < oldest_id - 1
+        return {"events": events, "next_cursor": next_cursor, "gap": gap,
+                "oldest_id": oldest_id}
+    return {"events": events, "next_cursor": next_cursor, "gap": False, "oldest_id": None}
 
 
 QUERY_BEFORE_DAYS_DEFAULT = EVENT_RETENTION_DAYS
@@ -1566,6 +1651,7 @@ def _run_to_dict(r: DBRun) -> dict:
         "parent_run_id": r.parent_run_id, "created_by": r.created_by,
         "code_pointer": r.code_pointer, "env_snapshot_id": r.env_snapshot_id,
         "avh_object_id": r.avh_object_id,
+        "policy_outcome": r.policy_outcome,
         "metrics_summary": r.metrics_summary or {},
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
@@ -1585,13 +1671,24 @@ async def get_run(run_id: str, db: AsyncSession = Depends(get_session)):
     return d
 
 
+_DATASET_EXTS = {".parquet", ".csv", ".h5", ".hdf5", ".npz", ".npy", ".arrow",
+                 ".jsonl", ".tfrecord", ".wav", ".flac"}
+
+
 def _summarize_tree_diff(old_tree: dict, new_tree: dict) -> dict:
-    """v1.2.5: a small, server-OWNED semantic summary for the run-detail endpoint —
-    deliberately NOT importing python/av_cli/semdiff.py (the server package has never
-    depended on av_cli; it ships and deploys standalone, see docker/engine-entrypoint.sh
-    and the Plugin/Release contracts) — this is the added/removed/changed + byte-total
-    subset that matters for a run summary, not semdiff's full layer-movement/chunk-dedup
-    analysis (that stays a client-side/CLI-side concern via `av diff`/`.avh`).
+    """v1.2.5, full-schema parity v1.3.0: a server-OWNED semantic summary for the
+    run-detail endpoint — deliberately NOT importing python/av_cli/semdiff.py (the
+    server package has never depended on av_cli; it ships and deploys standalone, see
+    docker/engine-entrypoint.sh and the Plugin/Release contracts).
+
+    v1.3.0 (todo.md item 3): this used to return only files/totals — a strict SUBSET of
+    `av_cli.semdiff.diff_trees()`'s schema, silently missing models/chunks/datasets for
+    any WebUI consumer that wanted them. Now produces the FULL semdiff-1.0 schema shape,
+    independently re-implemented (same "no av_cli dependency" rule as before) but
+    algorithmically identical — proven identical on identical input by
+    tests/test_server.py::test_server_side_summary_matches_client_side_semdiff_on_the_same_trees
+    (a shared golden fixture both implementations are run against), so the two can never
+    silently drift apart again the way the files-only version already had.
     """
     old_tree = old_tree or {}
     new_tree = new_tree or {}
@@ -1602,10 +1699,86 @@ def _summarize_tree_diff(old_tree: dict, new_tree: dict) -> dict:
         p for p in (old_keys & new_keys)
         if (old_tree.get(p) or {}).get("hash") != (new_tree.get(p) or {}).get("hash")
     )
+
+    def _layer_map(entry: dict) -> dict:
+        return {l["name"]: l["hash"] for l in (entry.get("layers") or [])}
+
+    def _chunk_hashes(entry: dict) -> set:
+        return {c["hash"] for c in (entry.get("chunks") or [])}
+
+    models = []
+    for path in sorted(old_keys | new_keys):
+        entry = new_tree.get(path) or {}
+        if not entry.get("layers"):
+            continue
+        parent_entry = old_tree.get(path) or {}
+        pmap, nmap = _layer_map(parent_entry), _layer_map(entry)
+        moved = [name for name, h in nmap.items() if pmap.get(name) != h]
+        total = len(nmap) or 1
+        size_by_name = {l["name"]: l.get("size", 0) for l in (entry.get("layers") or [])}
+        largest = sorted(
+            ({"name": m, "size": size_by_name.get(m, 0)} for m in moved),
+            key=lambda d: d["size"], reverse=True,
+        )[:5]
+        total_bytes = sum(size_by_name.values()) or 0
+        moved_bytes = sum(size_by_name.get(m, 0) for m in moved)
+        models.append({
+            "path": path, "layers_changed": len(moved), "layers_total": len(nmap),
+            "pct": round(len(moved) / total, 4), "moved": moved[:20],
+            "largest_moved": largest, "bytes_changed": moved_bytes,
+            "bytes_total": total_bytes,
+            "pct_bytes": round(moved_bytes / total_bytes, 4) if total_bytes else 0.0,
+        })
+
+    chunks_reused = chunks_new = chunks_reused_bytes = chunks_new_bytes = 0
+    for path in new_keys:
+        entry = new_tree[path]
+        chs = _chunk_hashes(entry)
+        if not chs:
+            continue
+        parent_chs = _chunk_hashes(old_tree.get(path) or {})
+        new_hashes = chs - parent_chs
+        reused_hashes = chs & parent_chs
+        chunks_new += len(new_hashes)
+        chunks_reused += len(reused_hashes)
+        size_by_hash = {c["hash"]: c.get("size", 0) for c in (entry.get("chunks") or [])}
+        chunks_new_bytes += sum(size_by_hash.get(h, 0) for h in new_hashes)
+        chunks_reused_bytes += sum(size_by_hash.get(h, 0) for h in reused_hashes)
+    chunk_total = chunks_reused + chunks_new
+    dedup_efficiency = round(chunks_reused / chunk_total, 4) if chunk_total else None
+    chunk_total_bytes = chunks_reused_bytes + chunks_new_bytes
+    dedup_efficiency_bytes = (
+        round(chunks_reused_bytes / chunk_total_bytes, 4) if chunk_total_bytes else None
+    )
+
+    def _is_dataset(path: str) -> bool:
+        low = path.lower()
+        return any(low.endswith(e) for e in _DATASET_EXTS) or "dataset" in low
+
+    datasets = sorted(
+        p for p in (old_keys | new_keys)
+        if _is_dataset(p)
+        and (old_tree.get(p) or {}).get("hash") != (new_tree.get(p) or {}).get("hash")
+        and p not in added
+    )
+
     bytes_before = sum((e or {}).get("size") or 0 for e in old_tree.values())
     bytes_after = sum((e or {}).get("size") or 0 for e in new_tree.values())
+
     return {
-        "files": {"added": added, "removed": removed, "changed": changed},
+        "files": {
+            "added": [{"path": p, "kind": (new_tree.get(p) or {}).get("type")} for p in added],
+            "removed": [{"path": p, "kind": (old_tree.get(p) or {}).get("type")} for p in removed],
+            "changed": [{"path": p, "kind": (new_tree.get(p) or {}).get("type")
+                        or (old_tree.get(p) or {}).get("type")} for p in changed],
+        },
+        "models": models,
+        "chunks": {"reused": chunks_reused, "new": chunks_new,
+                   "dedup_efficiency": dedup_efficiency,
+                   "status": "measured" if chunk_total else "no_chunks",
+                   "reused_bytes": chunks_reused_bytes, "new_bytes": chunks_new_bytes,
+                   "dedup_efficiency_bytes": dedup_efficiency_bytes},
+        "datasets": datasets,
         "totals": {"bytes_before": bytes_before, "bytes_after": bytes_after},
         "summary": f"+{len(added)} -{len(removed)} ~{len(changed)} file(s)",
     }
@@ -1686,6 +1859,141 @@ async def get_run_summary(run_id: str, db: AsyncSession = Depends(get_session)):
         "env_snapshot_id": r.env_snapshot_id,
         "avh_object_id": r.avh_object_id,
     }
+
+
+async def _fetch_run(db: AsyncSession, run_id: str) -> Optional[DBRun]:
+    return (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+
+
+# v1.3.0 (todo.md item 7): full per-commit metric series and full lineage chain, both
+# cursor-paginated — `/summary` keeps its capped inline copy (bounded response size for
+# the common case), these two exist for a WebUI/agent that wants to page past the cap.
+_RUN_METRICS_DEFAULT_LIMIT = 50
+_RUN_METRICS_MAX_LIMIT = 500
+_RUN_LINEAGE_DEFAULT_DEPTH = 50
+_RUN_LINEAGE_MAX_DEPTH = 500
+
+
+def _encode_run_commit_cursor(created_at: datetime, commit_hash: str) -> str:
+    import base64
+
+    raw = f"{created_at.isoformat()}|{commit_hash}"
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _decode_run_commit_cursor(cursor: str) -> tuple[datetime, str]:
+    import base64
+
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode()).decode()
+        ts_str, chash = raw.split("|", 1)
+        return datetime.fromisoformat(ts_str), chash
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Invalid cursor: {cursor!r}")
+
+
+@app.get("/api/runs/{run_id}/metrics")
+async def get_run_metrics(run_id: str, limit: int = _RUN_METRICS_DEFAULT_LIMIT,
+                          cursor: Optional[str] = None,
+                          db: AsyncSession = Depends(get_session)):
+    """v1.3.0: the full per-commit metric series for a run, oldest-linked-first (chart
+    order), cursor-paginated on (run_commits.created_at, commit_hash) — `/summary`'s
+    inline `commits` copy is capped at `_RUN_SUMMARY_MAX_COMMITS` and newest-first; this
+    is the uncapped complement for a WebUI chart or an agent that wants every point."""
+    r = await _fetch_run(db, run_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    limit = max(1, min(limit, _RUN_METRICS_MAX_LIMIT))
+
+    stmt = (
+        select(DBRunCommit.created_at, DBCommit)
+        .join(DBCommit, DBCommit.hash == DBRunCommit.commit_hash)
+        .where(DBRunCommit.run_id == run_id)
+        .order_by(DBRunCommit.created_at.asc(), DBRunCommit.commit_hash.asc())
+    )
+    if cursor:
+        cur_ts, cur_hash = _decode_run_commit_cursor(cursor)
+        stmt = stmt.where(
+            or_(DBRunCommit.created_at > cur_ts,
+                and_(DBRunCommit.created_at == cur_ts, DBRunCommit.commit_hash > cur_hash))
+        )
+    rows = (await db.execute(stmt.limit(limit))).all()
+
+    points = [
+        {"hash": c.hash, "message": c.message, "metrics": c.metrics or {},
+         "timestamp": c.timestamp.isoformat() if c.timestamp else None,
+         "linked_at": linked_at.isoformat() if linked_at else None}
+        for linked_at, c in rows
+    ]
+    next_cursor = (
+        _encode_run_commit_cursor(rows[-1][0], rows[-1][1].hash) if len(rows) == limit else None
+    )
+    return {"run_id": run_id, "points": points, "limit": limit, "next_cursor": next_cursor}
+
+
+@app.get("/api/runs/{run_id}/lineage")
+async def get_run_lineage(run_id: str, depth: int = _RUN_LINEAGE_DEFAULT_DEPTH,
+                          cursor: Optional[str] = None,
+                          db: AsyncSession = Depends(get_session)):
+    """v1.3.0: the full parent_run_id chain, depth- and cursor-bounded per page —
+    `/summary`'s inline `lineage` copy is capped at `_RUN_SUMMARY_MAX_LINEAGE_DEPTH`; this
+    is the uncapped complement. `cursor` (opaque: a run id) resumes the walk from that run
+    inclusive, so a caller pages by re-issuing with `next_cursor` until it comes back null."""
+    r = await _fetch_run(db, run_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if depth < 1 or depth > _RUN_LINEAGE_MAX_DEPTH:
+        raise HTTPException(status_code=422,
+                            detail=f"depth must be between 1 and {_RUN_LINEAGE_MAX_DEPTH}")
+
+    node = r if not cursor else await _fetch_run(db, cursor)
+    if cursor and node is None:
+        raise HTTPException(status_code=422, detail=f"Invalid cursor: unknown run {cursor!r}")
+
+    chain: list = []
+    seen: set = set()
+    while len(chain) < depth:
+        if node is None or node.id in seen:
+            node = None
+            break
+        seen.add(node.id)
+        chain.append({"id": node.id, "name": node.name, "status": node.status,
+                      "project_id": node.project_id, "parent_run_id": node.parent_run_id})
+        if not node.parent_run_id:
+            node = None
+            break
+        node = await _fetch_run(db, node.parent_run_id)
+
+    # `node` still points at the next unconsumed run only when the loop stopped because
+    # the depth cap was hit — root/missing-parent/cycle all leave it None above, meaning
+    # this page is the end of the chain.
+    next_cursor = node.id if (len(chain) == depth and node is not None) else None
+    return {"run_id": run_id, "lineage": chain, "next_cursor": next_cursor}
+
+
+@app.post("/api/runs/{run_id}/policy-outcome")
+async def set_run_policy_outcome(run_id: str, request: Request,
+                                 body: Dict[str, Any] = Body(...),
+                                 db: AsyncSession = Depends(get_session)):
+    """v1.3.0 (todo.md item 7): records the most recent `av promote`/`enforce_policy`
+    decision for this run's active commit — best-effort telemetry the CLI calls right
+    after deciding, never a gate itself (see cmd_policy.py::_report_policy_outcome, which
+    swallows every failure from this call rather than let a reporting failure block a
+    promotion)."""
+    decision = body.get("decision")
+    if decision not in ("allow", "deny"):
+        raise HTTPException(status_code=422, detail="decision must be 'allow' or 'deny'")
+    r = await _fetch_run(db, run_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    outcome = {"decision": decision, "rule": body.get("rule"), "at": utcnow_naive().isoformat()}
+    r.policy_outcome = outcome
+    r.updated_at = utcnow_naive()
+    _audit(db, _identity(request), "run.policy_outcome", r.project_id,
+          {"run_id": run_id, **outcome}, status_code=200)
+    await db.commit()
+    return {"status": "recorded", "run_id": run_id, "policy_outcome": outcome}
 
 
 @app.post("/api/runs/{run_id}/avh")
@@ -1921,15 +2229,26 @@ async def export_audit_log(
 
 @app.delete("/api/admin/audit")
 async def prune_audit_log(request: Request, before_days: int = Query(AUDIT_RETENTION_DAYS, ge=0),
+                          dry_run: bool = Query(False),
                           db: AsyncSession = Depends(get_session)):
-    """Manual audit-trail pruning; the same window is swept automatically during GC."""
+    """Manual audit-trail pruning; the same window is swept automatically during GC.
+
+    v1.3.0: dry_run=true reports the count that WOULD be deleted (a plain SELECT count)
+    without touching anything — no audit row is written for a dry run either, since
+    nothing actually happened.
+    """
     cutoff = utcnow_naive() - timedelta(days=max(before_days, 0))
+    if dry_run:
+        count = (await db.execute(
+            select(func.count()).select_from(DBAuditLog).where(DBAuditLog.ts < cutoff)
+        )).scalar_one()
+        return {"deleted": 0, "would_delete": count, "dry_run": True}
     result = await db.execute(delete(DBAuditLog).where(DBAuditLog.ts < cutoff))
     await db.commit()
     _audit(db, _identity(request), "audit.prune", None,
            {"deleted": result.rowcount, "before_days": before_days}, status_code=200)
     await db.commit()
-    return {"deleted": result.rowcount}
+    return {"deleted": result.rowcount, "dry_run": False}
 
 
 # --- webhook management ------------------------------------------------------

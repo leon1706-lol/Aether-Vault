@@ -22,9 +22,8 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 
 ## Known Limitations
 
-- **Benchmark #5 (cold clone)** — `av clone` shipped in v1.1.1 but the measured row in the comparison table is still "capture pending". Lands on the next `av benchmark --markdown` run against a live registry.
 - **Perf #4 (no-op status/add)** — ~15x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
-- **Legacy image aliases** — the historical `aether-vault-server`/`-webui` images are published as aliases of the engine image; earliest possible removal is v1.3.0, not yet scheduled (see `VERSIONING.md`'s deprecation policy). Switch pulls/composes to `ghcr.io/leon1706-lol/aether-vault-engine` with an explicit `AV_ENGINE_ROLE` now to silence the runtime deprecation warning.
+- **Legacy image aliases — removed in v1.3.0.** The historical `aether-vault-server`/`-webui` image tags stopped publishing as of this release (see `VERSIONING.md`'s "Removed in v1.3.0" entry). If you're still pinned to them, see `docs/migrate-engine-image.md` (or run `av doctor --compose PATH` for an automated rewrite) — already-pulled legacy images keep working via the entrypoint's auto-detect, only new pulls under the old names 404.
 
 ## Table of Contents
 
@@ -209,8 +208,10 @@ and how it's wired in, this table is the index.
 |---|---|
 | [`architecture.md`](development/architecture.md) | What the system **is**: one contract section per subsystem, system/tech-stack diagrams, testing map |
 | [`infrastructure.md`](development/infrastructure.md) | How to **run** it: Docker compose stack, env vars, Protected mode, migrations, releases, SQL |
+| [`threat-model.md`](development/threat-model.md) | Assets, actors, trust boundaries, threat→mitigation→residual-risk table |
 | [`CHANGELOG.md`](development/CHANGELOG.md) | Full build-phase history: what was built, when, and why |
 | [`Probleme.md`](development/Probleme.md) | Audit log of correctness, performance and security findings with severity ratings |
+| [`todo.md`](todo.md) | **Owner's planning canvas** — the current objective(s) and personal notes for the next AI agent to pick up; not a generated backlog, expect it to be rewritten as priorities change |
 | [`VERSIONING.md`](VERSIONING.md) | SemVer per compatibility surface, deprecation policy, release runbook |
 | [`SECURITY.md`](SECURITY.md) | Threat model, signing trust chain, reporting process |
 
@@ -269,7 +270,7 @@ av import-mlflow <run_id> --tag backfill   # requires: pip install aether-vault[
 | 2 | Safetensors Layer-Dedup | **63% smaller** | 47 MB vs. 126 MB after 6 fine-tune commits |
 | 3 | Commit + Push Latency | push ~70% faster · commit ~6x slower *(by design, vs. DVC)* | av uploads during commit; DVC defers to a separate push |
 | 4 | No-Op `status`/`add` | ~15x slower than Git LFS | open finding — interpreter/import startup cost |
-| 5 | Cold Clone / First Pull | shipped — capture pending | `av clone` exists as of v1.1.1; measured row lands next run |
+| 5 | Cold Clone / First Pull | ~1.5x faster than Git LFS, ~2x faster than DVC | fresh checkout of a project someone else already pushed |
 | 6 | Partial-Checkpoint Fetch | unique capability | only tool that can fetch a single layer instead of the whole file |
 | 7 | Storage Footprint Curve | **63% smaller**, gap widens every commit | same dedup advantage as #2, sustained over time |
 | 8 | Concurrent Push Throughput | Aether-only | no competitor has a comparable concurrent-server primitive |
@@ -313,6 +314,14 @@ Aether-Vault is built so autonomous agents are first-class operators. Four stabl
 
 Full details, examples, and the guardrails you should arm: [AGENTS.md](AGENTS.md).
 
+The full narrative walkthrough (init → train under a run → env snapshot → commit → promote
+past a policy gate → publish a handoff → the next agent picks it up) lives at
+[`docs/tutorial.md`](docs/tutorial.md); the minimal agent recipe + error/exit-code registry
+at [`docs/for-agents.md`](docs/for-agents.md); every published JSON Schema contract at
+[`docs/contracts.md`](docs/contracts.md). See [`docs/README.md`](docs/README.md) for the
+full index — every command on those pages is tested against the live CLI
+(`tests/test_docs_commands.py`), so they can't silently drift from what `av` actually does.
+
 ---
 
 ## CLI Reference
@@ -346,6 +355,9 @@ av auth add-user <name>        # grant NAME its own token (generated + printed o
 av auth add-user <name> <tok>  # ...or with a specific token
 av auth list-users             # masked list of per-user tokens
 av auth remove-user <name>     # revoke NAME's personal token
+av auth rotate                 # (v1.3.0) mint a fresh owner token, invalidating the old one immediately
+av auth rotate --user <name>   # (v1.3.0) rotate one user's personal token instead
+av auth doctor                 # (v1.3.0) diagnose Protected-mode onboarding: token configured? server reachable? token actually authenticates?
 ```
 
 Per-user flow: run `av auth add-user alice`, share Alice her token over a trusted channel; she puts it in her own repo via `av auth set-token <her-token>` and pushes as usual — her commits show up attributed to `alice` without any shared secret leaving your machine. Per-user tokens work everywhere the shared secret does, including the webui's token prompt.
@@ -562,7 +574,9 @@ Agent context memory. Notes are append-only and durable; `export` renders the fu
 av context note "baseline established; next agent should tune LR"
 av context note "dataset v3 fixed the NaN rows" --agent alice
 av context show
-av context validate              # structural check against the .avh v2 contract
+av context validate              # structural check against the .avh v2 contract (jsonschema when installed, structural fallback otherwise)
+av context search "LR schedule"                  # (v1.3.0) substring search over every note left so far
+av context search "LR" --run <run-id> --since 2026-08-01  # (v1.3.0) scope to one run and/or a time window
 av context export --format md --out CONTEXT.md   # also: avh | json
 ```
 
@@ -577,6 +591,7 @@ av policy set main --require-signature                          # (v1.2.5) signa
 av policy set release val_loss "<" --threshold 0.35 --require-signature   # (v1.2.5) both gates
 av policy list / av policy remove main
 av promote <candidate> --into main      # evaluate → checkout main → merge (two-parent)
+av promote <candidate> --into main --dry-run   # (v1.3.0) preview the decision + deciding rule, touch nothing — exits 0 either way
 av promote <candidate> --force          # conscious bypass, recorded in the merge message
 av merge <target> --force               # same bypass at merge level (exit code 16 on deny)
 ```
@@ -596,22 +611,31 @@ av env replay --dockerfile --cuda 12.1.0   # nvidia/cuda base instead of python:
 av env replay --out FILE     # write the recipe/Dockerfile to a file instead of stdout (v1.2.5)
 av env replay <target>       # TARGET = run id, commit hash, or snapshot id
 av env replay --validate     # resolve every pin against PyPI WITHOUT installing (v1.2.5)
-av env replay --execute      # install the pins after showing them (-y skips ask); uses
-                             # sys.executable -m pip — the correct interpreter, always
-av env replay --execute --target-venv PATH   # create (if absent) + install into this venv
-av env replay --execute --conda-env NAME     # install via `conda run -n NAME`
+av env replay --execute      # installs into a clean .av/replay-venv/<snapshot>/ by default
+                             # (v1.3.0) — never the interpreter running `av` itself
+av env replay --execute --target-venv PATH   # create (if absent) + install into this venv instead
+av env replay --execute --conda-env NAME     # install via `conda run -n NAME` instead
+av env replay --execute --into-current       # explicit opt-out: install into the running
+                                             # interpreter (sys.executable -m pip)
 ```
 
 `av replay` works as a top-level alias; on another machine resolve by run id or the id in `.avh.replay`. Which env vars ride the hashed identity is configurable via `AV_ENV_CAPTURE_VARS` (comma-separated; default `CUDA_VISIBLE_DEVICES,PYTORCH_CUDA_ALLOC_CONF,OMP_NUM_THREADS,TOKENIZERS_PARALLELISM,HF_HOME,TORCH_HOME`).
 
 #### `av watch`
 
-Filesystem watcher for continuous training loops without framework plugins: stages + commits new/changed artifacts matching a pattern as soon as they stabilize (upload deferred; offline queue applies). Pure stdlib polling — no extra dependency.
+Filesystem watcher for continuous training loops without framework plugins: stages + commits new/changed artifacts matching a pattern as soon as they stabilize (upload deferred; offline queue applies). Pure stdlib polling by default — no hard dependency; switches to real filesystem events when the optional `watchdog` extra is installed (`pip install aether-vault[watch]`), falling back to polling automatically otherwise.
 
 ```bash
 av watch --glob "runs/*.ckpt" --interval 10 --debounce 5
 av watch --max-commits 20    # exit after N auto-commits (CI-friendly)
 ```
+
+**Failure modes:**
+- **Editor atomic-save renames** (write-to-temp-then-rename, common in many training frameworks' checkpoint writers): the debounce window exists specifically for this — a file's `(mtime, size)` must be stable for `--debounce` seconds before it's staged, so a rename-in-progress doesn't get committed half-written.
+- **Network drives / high-latency filesystems**: `--debounce` may need to be higher than the default 5s if stat() itself has meaningful latency, to avoid false "stable" reads mid-write.
+- **Permission errors**: an unreadable path is skipped silently on that tick (matches Lightning's own "checkpoint not written yet" tolerance in `av_plugins`) — it's picked up on the next tick once readable, not reported as a hard failure.
+- **The `--debounce` window is per-file wall-clock, not event-driven**, even under `watchdog` — a burst of writes to the same file keeps re-arming the timer; only a stretch of true stability commits it.
+- **`watchdog` extra not installed**: falls back to the original interval-based `os.walk()` polling — same debounce/commit semantics, just discovers changes on a fixed cadence instead of immediately. Text-mode output states which mode is active.
 
 #### `av registry`
 
@@ -668,6 +692,7 @@ av audit list --action-prefix commit.  --cursor <next_cursor>   # (v1.2.5) route
 
 av audit export --format jsonl --out audit.jsonl   # (v1.2.5) filtered export for compliance (jsonl or csv)
 av audit prune --before-days 90                    # (v1.2.5) admin-only, irreversible; prompts unless --yes
+av audit prune --before-days 90 --dry-run          # (v1.3.0) report what WOULD be deleted, delete nothing, no prompt
 ```
 
 #### `av stash`
@@ -757,6 +782,8 @@ av doctor                    # diagnose only
 av doctor --fix              # repair what's safely recoverable
 av doctor --fix --dry-run    # preview what --fix would do, without changing anything
 av doctor --speed            # also print a read-only timing snapshot of this repo's hot paths
+av doctor --compose docker-compose.yml            # (v1.3.0) preview migrating a legacy two-container compose file to the consolidated engine image
+av doctor --compose docker-compose.yml --write    # (v1.3.0) apply that rewrite in place — see docs/migrate-engine-image.md
 ```
 
 `--fix` re-links orphaned/stale `.av-pointer` files back to their objects (downloading from the remote if needed), clears `*.tmp.*` leftovers, and clears pending-push entries whose commit no longer exists locally while retrying the rest. Anything it can't safely recover is left as `[WARN]` rather than fabricated or silently dropped. `--speed` times `Index.load()`, `load_config()`, a working-tree scan, and local object-store stats — a quick way to spot where a specific user's repo is actually slow, as opposed to `av test --speed`'s synthetic, cross-machine-comparable numbers.

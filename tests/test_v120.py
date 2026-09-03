@@ -3,6 +3,7 @@
 Stack-free by design (CliRunner + fakes); live-path coverage for events/runs/webhooks
 lives in tests/test_server.py behind the reachability skip.
 """
+import importlib.util
 import json
 import os
 import pathlib
@@ -156,6 +157,117 @@ def test_context_memory_note_survives_handoff_and_export_md(repo):
 
     val = jinv("--output", "json", "context", "validate")["data"]
     assert val["valid"] is True and val["problems"] == []
+
+
+# ---------------------------------------------------------------------------
+# v1.3.0 (todo.md item 8): .avh validation on every write/read, run finish guarantees
+# the handoff exists, context search, notes stamp their active run.
+# ---------------------------------------------------------------------------
+
+def test_context_note_stamps_the_active_run_id(repo):
+    inv("context", "note", "no run yet")
+    inv("run", "start", "search-run")
+    inv("context", "note", "written under a run")
+    inv("run", "finish")
+
+    notes = jinv("context", "show")["data"]["notes"]
+    assert notes[0]["run_id"] is None
+    assert notes[1]["run_id"] is not None
+
+
+def test_context_search_filters_by_substring_run_and_since(repo):
+    inv("context", "note", "LR 3e-4 diverged at step 9k")
+    inv("run", "start", "tuning-run")
+    inv("context", "note", "LR schedule looks stable now")
+    inv("run", "finish")
+    run_id = None
+
+    notes = jinv("context", "show")["data"]["notes"]
+    run_id = notes[1]["run_id"]
+
+    all_lr = jinv("context", "search", "LR")["data"]
+    assert all_lr["count"] == 2
+
+    scoped = jinv("context", "search", "LR", "--run", run_id)["data"]
+    assert scoped["count"] == 1
+    assert "stable" in scoped["matches"][0]["note"]
+
+    none_match = jinv("context", "search", "definitely-not-present")["data"]
+    assert none_match["count"] == 0
+
+    text_result = inv("context", "search", "diverged")
+    assert "diverged" in text_result.output
+
+
+def test_context_search_is_case_insensitive_by_default(repo):
+    inv("context", "note", "Loss Function tuning note")
+    hit = jinv("context", "search", "loss function")["data"]
+    assert hit["count"] == 1
+    miss = jinv("context", "search", "loss function", "--case-sensitive")["data"]
+    assert miss["count"] == 0
+
+
+def test_run_finish_regenerates_handoff_with_guaranteed_fields(repo):
+    """v1.3.0: av run finish must guarantee lineage/metrics-tail/semantic-summary are
+    present locally afterward, without needing a separate `av handoff` call."""
+    (repo / "m.pt").write_bytes(b"weights")
+    inv("run", "start", "handoff-guarantee-run")
+    inv("add", "m.pt")
+    inv("commit", "-m", "in run", "--metric", "val_loss=0.2")
+    result = jinv("run", "finish")
+    assert result["data"]["handoff_written"] is True
+
+    doc = json.loads((repo / "handoff.avh").read_text(encoding="utf-8"))
+    assert doc["lineage"]["run_id"] is not None
+    assert doc["semantic_summary"] is not None
+    assert doc["context_memory"]["metrics_history_tail"]
+
+
+def test_run_finish_handoff_failure_never_blocks_the_finish(repo, monkeypatch):
+    """Best-effort: a broken handoff generation must not prevent the run from finishing
+    (the run itself completing is what matters — the handoff guarantee is a bonus, not
+    a hard dependency, matching the "never lose the run" spirit non-negotiable #3 sets
+    for network failures)."""
+    import python.av_cli.handoff as handoff_module
+
+    inv("run", "start", "resilient-run")
+
+    def _boom(*a, **k):
+        raise RuntimeError("disk full, or whatever")
+
+    # finish() does `from .handoff import generate_handoff` fresh inside its own try
+    # block, so patching the name on the `handoff` module itself (not cmd_run's
+    # namespace, which never holds a reference to it) is what actually intercepts it.
+    monkeypatch.setattr(handoff_module, "generate_handoff", _boom)
+
+    result = inv("--output", "json", "run", "finish")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)["data"]
+    assert data["handoff_written"] is False
+    assert data["status"] == "completed"  # the run itself still finished
+
+
+def test_avh_validate_catches_a_schema_violation_via_jsonschema():
+    """Proves validate_handoff() actually uses real jsonschema.validate() when
+    available, not just the hand-rolled structural check — a violation only jsonschema
+    would catch (wrong TYPE for an existing, present field) must surface."""
+    import importlib.util
+
+    if importlib.util.find_spec("jsonschema") is None:
+        pytest.skip("jsonschema not installed (dev extra)")
+
+    from python.av_cli.handoff import validate_handoff
+
+    doc = {
+        "$schema": "https://aether-vault.dev/schemas/avh-2.0.json",
+        "avh_version": "2.0",
+        "generated_at": "2026-01-01T00:00:00Z",
+        "current_branch": "main",
+        "lineage": {"run_id": None, "parent_run_ids": "not-a-list", "code_pointer": None},
+        "context_memory": {"notes": [], "metrics_history_tail": []},
+    }
+    problems = validate_handoff(doc)
+    assert problems, "a wrong-typed lineage.parent_run_ids should have been caught"
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +469,140 @@ def test_evaluate_operator_matrix():
     assert ok is False and "unknown operator" in reason
 
 
+def test_example_policies_load_and_evaluate():
+    """v1.3.0 (todo.md item 12): examples/policies/*.json are real, loaded, exercised
+    fixtures, not just illustrative prose — this fails the moment one of them stops
+    matching the shape av_cli.cmd_policy actually understands."""
+    import json
+    from pathlib import Path
+
+    from python.av_cli.cmd_policy import evaluate
+
+    examples_dir = Path(__file__).resolve().parents[1] / "examples" / "policies"
+    assert examples_dir.is_dir(), "examples/policies/ is missing"
+
+    metric_gate = json.loads((examples_dir / "metric-gate.json").read_text())["main"]
+    assert metric_gate["baseline_ref"] == "main~1"
+    ok, reason = evaluate(metric_gate, {"val_loss": 0.3}, {"val_loss": 0.5})
+    assert ok is True and "PASS" in reason
+    ok, reason = evaluate(metric_gate, {"val_loss": 0.7}, {"val_loss": 0.5})
+    assert ok is False and "DENY" in reason
+
+    sig_gate = json.loads((examples_dir / "signature-gate.json").read_text())["main"]
+    assert sig_gate == {"require_signature": True}
+    # A signature-only policy has no metric — evaluate() correctly refuses to be used
+    # for it (promote()/enforce_policy() both branch around evaluate() entirely when
+    # "metric" is absent, checking require_signature separately — see cmd_policy.py).
+    ok, reason = evaluate(sig_gate, {}, None)
+    assert ok is False and "no metric" in reason
+
+    combined = json.loads((examples_dir / "combined-gate.json").read_text())["main"]
+    assert combined["require_signature"] is True
+    ok, reason = evaluate(combined, {"val_loss": 0.4}, None)
+    assert ok is True and "PASS" in reason
+    ok, reason = evaluate(combined, {"val_loss": 0.6}, None)
+    assert ok is False and "DENY" in reason
+
+
+def test_example_policies_apply_via_the_real_cli(repo):
+    """The combined-gate example, applied to a real repo exactly as a user would copy
+    it in, then exercised through av promote --dry-run end to end."""
+    import json
+    import shutil
+    from pathlib import Path
+
+    examples_dir = Path(__file__).resolve().parents[1] / "examples" / "policies"
+    shutil.copy(examples_dir / "combined-gate.json", repo / ".av" / "policies.json")
+
+    (repo / "m.txt").write_text("v1")
+    inv("add", "m.txt")
+    inv("commit", "-m", "unsigned, good metric", "--metric", "val_loss=0.3")
+
+    result = jinv("promote", "--into", "main", "--dry-run")
+    assert result["data"]["decision"] == "deny"  # unsigned — the combined gate's other half
+    assert "require_signature" in result["data"]["rule"]
+
+
+def test_promote_reports_policy_outcome_for_the_active_run(repo, monkeypatch):
+    """v1.3.0 (todo.md item 7): a real (non-dry-run) promote decision is reported against
+    whatever run is active via VaultClient.report_run_policy_outcome — best-effort
+    telemetry, not a gate."""
+    from python.av_cli import client as client_module
+
+    calls = []
+    monkeypatch.setattr(
+        client_module.VaultClient, "report_run_policy_outcome",
+        lambda self, run_id, decision, rule: calls.append((run_id, decision, rule)),
+    )
+
+    run_id = jinv("run", "start", "training-run")["data"]["run_id"]
+    tip = _two_runs_with_metrics(repo, better_second=True)
+    jinv("policy", "set", "main", "val_loss", "<", "--threshold", "0.45")
+
+    result = jinv("promote", "--into", "main")
+    assert result["data"]["allowed"] is True
+    assert calls == [(run_id, "allow", "metric:val_loss<")]
+
+
+def test_promote_dry_run_never_reports_policy_outcome(repo, monkeypatch):
+    """The documented dry-run contract is 'touches nothing either way' — that includes
+    not writing a policy-outcome pointer for the active run."""
+    from python.av_cli import client as client_module
+
+    calls = []
+    monkeypatch.setattr(
+        client_module.VaultClient, "report_run_policy_outcome",
+        lambda self, run_id, decision, rule: calls.append((run_id, decision, rule)),
+    )
+
+    jinv("run", "start", "training-run")
+    _two_runs_with_metrics(repo, better_second=False)
+    jinv("policy", "set", "main", "val_loss", "<", "--threshold", "0.45")
+
+    jinv("promote", "--into", "main", "--dry-run")
+    assert calls == []
+
+
+def test_promote_reporting_failure_never_blocks_the_promotion(repo, monkeypatch):
+    """Offline resilience is sacred: an unreachable/erroring registry must never turn a
+    telemetry write into a failed promotion."""
+    from python.av_cli import client as client_module
+
+    def _boom(self, run_id, decision, rule):
+        raise ConnectionError("registry unreachable")
+
+    monkeypatch.setattr(client_module.VaultClient, "report_run_policy_outcome", _boom)
+
+    jinv("run", "start", "training-run")
+    _two_runs_with_metrics(repo, better_second=True)
+    jinv("policy", "set", "main", "val_loss", "<", "--threshold", "0.45")
+
+    result = jinv("promote", "--into", "main")
+    assert result["data"]["allowed"] is True
+
+
+def test_enforce_policy_reports_outcome_directly(repo, monkeypatch):
+    """Unit-level check of the shared helper both promote() and merge()'s policy hook
+    (enforce_policy) call — covers the require_signature-denial reporting path, which
+    promote() takes a different code branch to reach than the metric path above does."""
+    from python.av_cli import client as client_module
+    from python.av_cli.cmd_policy import enforce_policy, save_policies
+
+    calls = []
+    monkeypatch.setattr(
+        client_module.VaultClient, "report_run_policy_outcome",
+        lambda self, run_id, decision, rule: calls.append((run_id, decision, rule)),
+    )
+
+    run_id = jinv("run", "start", "training-run")["data"]["run_id"]
+    save_policies(repo, {"main": {"require_signature": True}})
+
+    with pytest.raises(SystemExit):
+        enforce_policy(repo, "main", None, lambda ref: None, candidate_ref=None)
+
+    assert calls == [(run_id, "deny", "require_signature")]
+
+
 # ---------------------------------------------------------------------------
 # watch — single-scan behavior via max_commits
 # ---------------------------------------------------------------------------
@@ -370,6 +616,51 @@ def test_watch_commits_new_matching_file_then_exits(repo):
                  "--debounce", "0.1", "--max-commits", "1")
     assert result.exit_code == 0, result.output
     assert "[watch]" in result.output and "1 auto-commit" in result.output
+
+    log = inv("log").output
+    assert "watch:" in log
+
+
+def test_watch_polling_fallback_when_watchdog_unavailable(repo, monkeypatch):
+    """v1.3.0: forces the pure-stdlib os.walk() polling path even on a machine that DOES
+    have watchdog installed — the optional extra must degrade cleanly, not become a hard
+    dependency of the command actually working."""
+    import python.av_cli.cmd_watch as cmd_watch_module
+
+    monkeypatch.setattr(cmd_watch_module, "_try_start_watchdog", lambda repo_root, pattern: None)
+
+    ckpt_dir = repo / "runs"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "auto.ckpt").write_bytes(b"checkpoint-bytes")
+
+    result = inv("watch", "--glob", "runs/*.ckpt", "--interval", "0.1",
+                 "--debounce", "0.1", "--max-commits", "1")
+    assert result.exit_code == 0, result.output
+    assert "polling" in result.output
+    assert "1 auto-commit" in result.output
+
+
+@pytest.mark.skipif(importlib.util.find_spec("watchdog") is None, reason="watchdog extra not installed")
+def test_watch_uses_real_watchdog_events_when_installed(repo):
+    """The real path, with the real watchdog package — not mocked. A file created AFTER
+    watch starts must still get picked up and committed via real fs events."""
+    ckpt_dir = repo / "runs"
+    ckpt_dir.mkdir()
+
+    import threading
+    import time as _time
+
+    def _write_after_a_beat():
+        _time.sleep(0.3)
+        (ckpt_dir / "auto.ckpt").write_bytes(b"checkpoint-bytes")
+
+    threading.Thread(target=_write_after_a_beat, daemon=True).start()
+
+    result = inv("watch", "--glob", "runs/*.ckpt", "--interval", "0.2",
+                 "--debounce", "0.2", "--max-commits", "1")
+    assert result.exit_code == 0, result.output
+    assert "watchdog events" in result.output
+    assert "1 auto-commit" in result.output
 
     log = inv("log").output
     assert "watch:" in log

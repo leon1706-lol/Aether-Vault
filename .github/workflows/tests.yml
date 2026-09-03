@@ -31,10 +31,30 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
-        run: pip install -e .[dev]
+        # v1.3.0: [watch] added so tests/test_v120.py's real-watchdog `av watch` test
+        # exercises the actual event-driven path here (not just its polling fallback,
+        # which runs regardless of whether the extra is installed).
+        run: pip install -e .[dev,watch]
 
       - name: Run test suite
         run: pytest --cov=python --cov-report=term-missing tests/
+
+      # v1.3.0 (todo.md item 22): captures this run's perf numbers as a workflow artifact —
+      # trends survive artifact expiry via `scripts/append_perf_history.py`'s SEPARATE,
+      # maintainer-run-locally step (never from CI — this project's CI never commits
+      # anything back to the repo, see tests/test_ci_policy.py) that appends a row to the
+      # committed development/perf-history.json from a downloaded copy of this artifact.
+      - name: Capture speedcheck JSON
+        if: matrix.python-version == '3.14'
+        run: python scripts/append_perf_history.py --dry-run --save-speedcheck-json speedcheck-${{ matrix.python-version }}.json
+
+      - name: Upload speedcheck JSON artifact
+        if: matrix.python-version == '3.14'
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedcheck-windows-py${{ matrix.python-version }}
+          path: speedcheck-${{ matrix.python-version }}.json
+          retention-days: 90
 
   plugin-tests:
     runs-on: ubuntu-latest
@@ -245,6 +265,67 @@ jobs:
           path: /tmp/server-e2e.log
           if-no-files-found: ignore
 
+  # v1.3.0 (todo.md item 28): chaos drills — Phases L/M/N in the same
+  # scripts/e2e_scenario.sh (gated behind AV_E2E_CHAOS=1, off by default so this doesn't
+  # change e2e-suite's own behavior above). A separate job, not folded into e2e-suite,
+  # because these phases kill the server process and make its storage briefly unwritable
+  # — deliberately more disruptive than the rest of the suite, worth isolating so a chaos
+  # regression's failure signal doesn't get lost among Phases A-K's unrelated assertions.
+  chaos-drills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: av_user
+          POSTGRES_PASSWORD: av_password
+          POSTGRES_DB: aether_vault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis/redis-stack-server:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      AV_TEST_DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test
+      AV_TEST_REDIS_URL: redis://localhost:6379/0
+      E2E_PSQL_URL: postgresql://av_user:av_password@localhost:5432/aether_vault_test
+      AV_E2E_CHAOS: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install Aether-Vault (builds the C++ core via pybind11)
+        run: pip install -e .[dev]
+
+      - name: Run end-to-end scenario suite with chaos drills (Phases A-N)
+        shell: bash
+        run: bash scripts/e2e_scenario.sh
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chaos-drills-server-log
+          path: /tmp/server-e2e.log
+          if-no-files-found: ignore
+
   # Phase I of the e2e layer (v1.2.2): the ENGINE IMAGE itself is a product surface now.
   # Builds the consolidated image and proves all three dispatch modes from it:
   # role=all (both subservices healthy in ONE container), role=server, role=webui —
@@ -258,7 +339,8 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Build the engine image
-        run: docker build -t aether-vault-engine:smoke .
+        # v1.3.0 (Probleme.md): explicit target — see release.yml's identical comment.
+        run: docker build --target engine -t aether-vault-engine:smoke .
 
       - name: Role=all — one container, both subservices healthy
         run: |
@@ -341,6 +423,56 @@ jobs:
             echo "::error::server leg went down during a webui-only restart"; exit 1; }
           echo "::notice::role=all: killing webui restarted just that subservice (container RestartCount unchanged: $before)"
 
+      # v1.3.0 (todo.md item 19): the only kill test above (subservice restart) kills an
+      # IDLE process — nothing anywhere proved an in-flight request actually survives a
+      # real drain. Fresh container so we can set a short, CI-fast --stop-timeout/grace
+      # pair (AV_ENGINE_STOP_GRACE_SECS=8, docker --stop-timeout 20 comfortably above it —
+      # see infrastructure.md's orchestrator readiness/liveness section for why the two
+      # must stay in that order for a real deployment).
+      - name: Drain under load — in-flight uploads survive a real SIGTERM
+        run: |
+          docker run -d --name engine-drain --network avnet -p 8020:8000 \
+            -e AV_ENGINE_ROLE=all -e AV_ENGINE_STOP_GRACE_SECS=8 --stop-timeout 20 \
+            -e DATABASE_URL=postgresql+asyncpg://av_user:av_password@pg:5432/aether_vault \
+            -e REDIS_URL=redis://this-host-is-intentionally-absent:6379/0 \
+            aether-vault-engine:smoke >/dev/null
+          ok=0
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8020/api/health >/dev/null 2>&1 && { ok=1; break; }
+            sleep 2
+          done
+          [[ "$ok" == 1 ]] || { docker logs engine-drain >&2 || true; exit 1; }
+
+          # 20 concurrent object uploads, fired in the background; SIGTERM lands on the
+          # container while at least some of these are genuinely still in flight. Each
+          # writes its own curl exit code + HTTP status so none can be silently dropped.
+          RESULTS=$(mktemp -d)
+          for i in $(seq 1 20); do
+            (
+              body=$(mktemp); head -c $((256 * 1024)) /dev/urandom > "$body"
+              hash=$(sha256sum "$body" | cut -d' ' -f1)
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 \
+                     -X POST --data-binary "@$body" "http://localhost:8020/api/objects/$hash")
+              echo "$code" > "$RESULTS/$i"
+              rm -f "$body"
+            ) &
+          done
+          sleep 0.3   # let the batch actually start connecting before we pull the rug
+          docker stop --time 20 engine-drain >/dev/null
+          wait   # every backgrounded curl must finish (successfully or not) before we score it
+
+          failed=0
+          for i in $(seq 1 20); do
+            code=$(cat "$RESULTS/$i" 2>/dev/null || echo "MISSING")
+            if [[ "$code" != "201" && "$code" != "200" ]]; then
+              echo "::error::upload $i did not complete cleanly during drain (got: $code)"
+              failed=1
+            fi
+          done
+          [[ "$failed" == 0 ]] || { docker logs engine-drain >&2 || true; exit 1; }
+          echo "::notice::all 20 in-flight uploads completed cleanly across a real SIGTERM drain"
+          docker rm -f engine-drain >/dev/null 2>&1 || true
+
       - name: Role=server + legacy auto-detect dispatch
         run: |
           docker stop engine-all >/dev/null
@@ -393,7 +525,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f engine-all engine-srv engine-legacy engine-webui pg >/dev/null 2>&1 || true
+          docker rm -f engine-all engine-drain engine-srv engine-legacy engine-webui pg >/dev/null 2>&1 || true
           docker network rm avnet >/dev/null 2>&1 || true
 
   # First time release artifacts are ever INSTALLED rather than just built: a wheel goes
@@ -460,6 +592,20 @@ jobs:
           "$AV" add f.txt
           "$AV" commit -m "wheel-smoke"
           "$AV" log | grep "wheel-smoke"
+          # v1.3.0 contract freeze (todo.md #27): pyproject.toml's own
+          # [tool.setuptools.package-data] only lists "docker/*.yml" for av_cli — it can
+          # silently shadow setup.py's package_data (which DOES list
+          # "schemas/*.schema.json"). This is the one place that proves the schemas
+          # actually landed in the wheel installed into a clean venv, not just in the
+          # checkout.
+          "$PYBIN" -c "
+          import importlib.resources as r
+          names = {'envelope-1.0','event-1.0','run-1.0','webhook-payload-1.0','semdiff-1.0','avh-2.0'}
+          for name in names:
+              ref = r.files('av_cli').joinpath('schemas', f'{name}.schema.json')
+              assert ref.is_file(), f'{name}.schema.json missing from installed wheel'
+          print('all contract schemas present in wheel')
+          "
 
   smoke-sdist-windows:
     needs: package-build

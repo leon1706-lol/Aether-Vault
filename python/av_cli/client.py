@@ -219,6 +219,20 @@ class VaultClient:
         except requests.exceptions.RequestException:
             return False
 
+    def report_run_policy_outcome(self, run_id: str, decision: str, rule: str | None) -> bool:
+        """Best-effort telemetry (v1.3.0): records a promote()/enforce_policy() decision
+        against the active run so the WebUI's run-detail view can show a policy-outcome
+        badge. Never raises and callers must treat a False return as a no-op — a
+        promotion/merge must never be blocked or fail just because this pointer write
+        couldn't reach the server (offline resilience is sacred; this is reporting, not a
+        gate)."""
+        url = f"{self.server_url}/api/runs/{run_id}/policy-outcome"
+        try:
+            resp = self.session.post(url, json={"decision": decision, "rule": rule})
+            return resp.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+
     def run_gc(self) -> dict | None:
         """Trigger garbage collection on the remote server."""
         url = f"{self.server_url}/api/admin/gc"

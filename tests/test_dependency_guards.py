@@ -10,6 +10,7 @@ uninstalling anything), then force-reimporting the guarded module fresh.
 
 import importlib
 import sys
+import tempfile
 
 import click
 import pytest
@@ -75,3 +76,21 @@ def test_update_check_raises_clear_error_when_packaging_missing():
             "python.av_cli.update_check", ["packaging", "packaging.version"]
         )
     assert "packaging" in str(exc_info.value)
+
+
+def test_server_module_imports_cleanly_under_a_clean_env(monkeypatch):
+    """Regression for the nightly-only collection failure this fixed (2026-09-02).
+
+    python.av_server.server builds CASStorage(DATA_DIR) at import time, defaulting to
+    '/data' when AV_DATA_DIR is unset — unwritable on a real CI runner (PermissionError)
+    rather than the ModuleNotFoundError this file's other guards target, but the same
+    "clean environment" hazard class. conftest.py's module-level os.environ.setdefault is
+    what actually fixes this for every test module in this suite; this test proves the
+    fix holds even for a process that (unlike pytest collection) never ran conftest.py —
+    i.e. it doesn't rely on conftest's setdefault having already fired, only on
+    AV_DATA_DIR being set to *something* writable before import, which any real launcher
+    (CLI, docker entrypoint, this test) must do.
+    """
+    monkeypatch.setenv("AV_DATA_DIR", tempfile.mkdtemp(prefix="av-server-import-test-"))
+    module = _simulate_missing_and_reload("python.av_server.server", [])
+    assert hasattr(module, "app")

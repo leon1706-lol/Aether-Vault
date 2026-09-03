@@ -59,6 +59,11 @@ def diff_trees(old_tree: Tree | None, new_tree: Tree | None) -> dict:
             ({"name": m, "size": size_by_name.get(m, 0)} for m in moved),
             key=lambda d: d["size"], reverse=True,
         )[:5]
+        # v1.3.0 (todo.md item 1): "realized dedup" as a byte-weighted claim, not just a
+        # layer COUNT ratio — a model with 900 tiny layers and 1 huge one that moved
+        # reports 1/901 by count (looks negligible) but could be 95% of the bytes.
+        total_bytes = sum(size_by_name.values()) or 0
+        moved_bytes = sum(size_by_name.get(m, 0) for m in moved)
         models.append({
             "path": path,
             "layers_changed": len(moved),
@@ -66,21 +71,37 @@ def diff_trees(old_tree: Tree | None, new_tree: Tree | None) -> dict:
             "pct": round(len(moved) / total, 4),
             "moved": moved[:20],
             "largest_moved": largest,
+            "bytes_changed": moved_bytes,
+            "bytes_total": total_bytes,
+            "pct_bytes": round(moved_bytes / total_bytes, 4) if total_bytes else 0.0,
         })
 
+    chunks_reused_bytes = chunks_new_bytes = 0
     for path in set(new_tree):
         entry = new_tree[path]
         chs = _chunk_hashes(entry)
         if not chs:
             continue
         parent_chs = _chunk_hashes(old_tree.get(path) or {})
-        chunks_new += len(chs - parent_chs)
-        chunks_reused += len(chs & parent_chs)
+        new_hashes = chs - parent_chs
+        reused_hashes = chs & parent_chs
+        chunks_new += len(new_hashes)
+        chunks_reused += len(reused_hashes)
+        # v1.3.0 (todo.md item 1): the count ratio says "6 of 8 chunks reused" but not
+        # how many BYTES that saved re-storing — chunk sizes vary a lot in practice
+        # (content-defined boundaries), so a byte-weighted figure is the real storage claim.
+        size_by_hash = {c["hash"]: c.get("size", 0) for c in (entry.get("chunks") or [])}
+        chunks_new_bytes += sum(size_by_hash.get(h, 0) for h in new_hashes)
+        chunks_reused_bytes += sum(size_by_hash.get(h, 0) for h in reused_hashes)
 
     # v1.2.2 dataset-CDC visibility: how much of the new chunk population was reused
     # rather than re-stored. None when no chunked files exist (no signal ≠ zero).
     chunk_total = chunks_reused + chunks_new
     dedup_efficiency = round(chunks_reused / chunk_total, 4) if chunk_total else None
+    chunk_total_bytes = chunks_reused_bytes + chunks_new_bytes
+    dedup_efficiency_bytes = (
+        round(chunks_reused_bytes / chunk_total_bytes, 4) if chunk_total_bytes else None
+    )
 
     DATASET_EXTS = {".parquet", ".csv", ".h5", ".hdf5", ".npz", ".npy", ".arrow",
                     ".jsonl", ".tfrecord", ".wav", ".flac"}
@@ -113,7 +134,12 @@ def diff_trees(old_tree: Tree | None, new_tree: Tree | None) -> dict:
                    # real information — "no chunked files changed" isn't "0% reuse"), but
                    # `status` is ALWAYS one of these two strings, so .avh/agent consumers
                    # get a stable field to branch on without a null-check on the float.
-                   "status": "measured" if chunk_total else "no_chunks"},
+                   "status": "measured" if chunk_total else "no_chunks",
+                   # v1.3.0: the byte-weighted siblings of the count-based fields above —
+                   # "6 of 8 chunks reused" and "60% of the BYTES were reused" can tell
+                   # very different stories when chunk sizes vary.
+                   "reused_bytes": chunks_reused_bytes, "new_bytes": chunks_new_bytes,
+                   "dedup_efficiency_bytes": dedup_efficiency_bytes},
         "datasets": datasets,
         "totals": {
             "bytes_before": _bytes(old_tree),

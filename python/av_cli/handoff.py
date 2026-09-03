@@ -249,8 +249,10 @@ def upgrade_handoff(doc: dict) -> dict:
     return upgraded
 
 
-def validate_handoff(doc: dict) -> list[str]:
-    """Structural validation without a jsonschema dependency. Returns problem list."""
+def _validate_handoff_structural(doc: dict) -> list[str]:
+    """The original hand-rolled check — no jsonschema dependency. Runtime always has
+    this available (dependency-free); used as-is when jsonschema isn't importable, and
+    as a defense-in-depth second opinion even when it is (see validate_handoff)."""
     problems: list[str] = []
     version = str(doc.get("avh_version", ""))
     if not version:
@@ -269,6 +271,32 @@ def validate_handoff(doc: dict) -> list[str]:
         if key not in lin:
             problems.append(f"lineage missing: {key}")
     return problems
+
+
+def validate_handoff(doc: dict) -> list[str]:
+    """Validates a `.avh` v2 document. Returns a problem list (empty = valid).
+
+    v1.3.0: uses real jsonschema.validate() against the published
+    av_cli/schemas/avh-2.0.schema.json when jsonschema is importable (the `dev` extra —
+    always true in CI since WP-1's contract freeze), falling back to the original
+    hand-rolled structural check when it isn't (the shipped runtime stays
+    dependency-free either way — jsonschema is never a hard requirement to USE av).
+    The structural check also always runs as a second opinion: it catches a couple of
+    shape problems (semantic_summary being neither null nor an object) a schema alone
+    states more permissively than this project actually wants enforced.
+    """
+    try:
+        import jsonschema
+
+        from .core import load_contract_schema
+
+        schema = load_contract_schema("avh-2.0")
+        validator = jsonschema.Draft202012Validator(schema)
+        problems = [f"{'.'.join(str(p) for p in err.path) or '(root)'}: {err.message}"
+                   for err in sorted(validator.iter_errors(doc), key=str)]
+    except ImportError:
+        problems = []
+    return problems + [p for p in _validate_handoff_structural(doc) if p not in problems]
 
 
 def diff_model_weights(repo_root: Path, current_tree: list[dict], parent_commit_hash: str | None) -> list[dict]:
@@ -419,6 +447,17 @@ def generate_handoff(
     if not with_memory:
         # Privacy/size trim for agents that only want the state snapshot.
         handoff_data["context_memory"] = {"notes": [], "metrics_history_tail": []}
+
+    # v1.3.0 (todo.md item 8): validate on every write, not just when `av context
+    # validate` is invoked by hand — a schema violation here means build_handoff_dict()
+    # itself produced a malformed document, a real bug worth failing loudly on rather
+    # than silently persisting a broken .avh for the next agent to trip over.
+    problems = validate_handoff(handoff_data)
+    if problems:
+        raise ValidationError(
+            "Generated .avh document failed validation (this is a bug in "
+            "build_handoff_dict, not your input) — " + "; ".join(problems)
+        )
 
     with open(avh_path, "w") as f:
         json.dump(handoff_data, f, indent=2, sort_keys=True)

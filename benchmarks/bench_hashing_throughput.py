@@ -61,7 +61,15 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
     tool_order = tool_order or ["av", "git-lfs", "dvc", "mlflow"]
     rows: list[Row] = []
 
-    with tempfile.TemporaryDirectory(prefix="bench-hashing-") as tmp:
+    # ignore_cleanup_errors=True (v1.3.0, Probleme.md): DVC can still hold a file handle
+    # open inside its own repo directory on Windows right as this `with` block exits —
+    # without this, cleanup itself raises PermissionError and crashes the whole
+    # `av benchmark` run, even though every real measurement already succeeded. Same fix
+    # applied uniformly across every bench_*.py that uses TemporaryDirectory (some already
+    # worked around a narrower version of this via manual mkdtemp — see bench_commit_push_
+    # latency.py's mlflow helper — this is the simpler stdlib-native equivalent, available
+    # since Python 3.10, this project's own floor).
+    with tempfile.TemporaryDirectory(prefix="bench-hashing-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         git_lfs_repo = root / "git-lfs-repo"
         dvc_repo = root / "dvc-repo"

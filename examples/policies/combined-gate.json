@@ -1,0 +1,8 @@
+{
+  "main": {
+    "metric": "val_loss",
+    "op": "<",
+    "threshold": 0.5,
+    "require_signature": true
+  }
+}

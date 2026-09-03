@@ -190,21 +190,71 @@ def test_validate_passes_when_all_pins_resolve(repo, monkeypatch):
     assert result.exit_code == 0, result.output
 
 
+def _pypi_reachable() -> bool:
+    import socket
+
+    try:
+        with socket.create_connection(("pypi.org", 443), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def test_validate_pins_real_pypi_resolution_not_monkeypatched():
+    """v1.3.0: every OTHER --validate test above monkeypatches cmd_env._validate_pins
+    itself away — this is the one test that drives the REAL `pip install --dry-run`
+    subprocess path against real PyPI, both for a pin that genuinely exists and one that
+    cannot possibly. Skips (not fails) with no network — this is real-resolution
+    coverage, not a hard CI requirement every environment can satisfy."""
+    if not _pypi_reachable():
+        pytest.skip("pypi.org:443 not reachable from this environment")
+
+    from python.av_cli.cmd_env import _validate_pins
+
+    results = _validate_pins(["packaging==23.2", "definitely-not-a-real-package-xyz-999==0.0.0"])
+    by_pin = {r["pin"]: r for r in results}
+    assert by_pin["packaging==23.2"]["status"] == "resolvable"
+    assert by_pin["definitely-not-a-real-package-xyz-999==0.0.0"]["status"] == "version-not-found"
+
+
 # ---------------------------------------------------------------------------
 # --execute: sys.executable -m pip, --target-venv, --conda-env
 # ---------------------------------------------------------------------------
 
-def test_execute_uses_sys_executable_not_bare_pip(repo, monkeypatch):
-    """The actual bug fix: pre-1.2.5 shelled a bare 'pip' string, which can silently
-    resolve to the WRONG interpreter's pip on a machine with more than one Python."""
+def test_execute_defaults_to_a_clean_venv_not_the_running_interpreter(repo, monkeypatch):
+    """v1.3.0: clean-venv is now the DEFAULT --execute target — installing an arbitrary
+    snapshot's pins into the interpreter running `av` itself was surprising, occasionally
+    destructive default behavior. venv.create is mocked (creating a real venv is slow and
+    not what this test is checking)."""
     jinvoke("env", "snapshot")
     calls = []
+    created = []
 
     class _FakeCompleted:
         returncode = 0
 
     monkeypatch.setattr("subprocess.call", lambda argv, **kw: calls.append(argv) or 0)
+    monkeypatch.setattr("venv.create", lambda path, **kw: created.append(path))
     result = invoke("env", "replay", "--execute", "--yes")
+    assert result.exit_code == 0, result.output
+    assert calls, "pip install was never invoked"
+    assert created, "the default clean venv was never created"
+    for argv in calls:
+        assert argv[0] != sys.executable, "must not default into the running interpreter"
+        assert ".av" in argv[0] and "replay-venv" in argv[0]
+        assert argv[1:3] == ["-m", "pip"]
+
+
+def test_execute_into_current_uses_sys_executable_not_bare_pip(repo, monkeypatch):
+    """The pre-1.2.5 bug fix this pins: a bare 'pip' string can silently resolve to the
+    WRONG interpreter's pip on a machine with more than one Python. --into-current
+    (v1.3.0's explicit opt-out of the new clean-venv default) is what now exercises this
+    exact path."""
+    jinvoke("env", "snapshot")
+    calls = []
+
+    monkeypatch.setattr("subprocess.call", lambda argv, **kw: calls.append(argv) or 0)
+    result = invoke("env", "replay", "--execute", "--yes", "--into-current")
     assert result.exit_code == 0, result.output
     assert calls, "pip install was never invoked"
     for argv in calls:

@@ -11,6 +11,8 @@ candidate's own embedded signature — tamper evidence, not a PKI; this does not
 to an identity.
 """
 
+import contextlib
+import io
 import json
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
@@ -197,6 +199,25 @@ def candidate_is_signed(repo_root, candidate_ref) -> tuple[bool, str]:
     return ok, reason
 
 
+def _report_policy_outcome(repo_root, decision: str, rule: str | None) -> None:
+    """v1.3.0 (todo.md item 7): best-effort telemetry pointer from the active run to the
+    policy decision that was just made — never raises and never blocks the caller.
+    Silently a no-op with no active run (resolve_run_id() returns None outside `av run`)
+    or no reachable server (offline resilience is sacred; this is reporting, not a gate)."""
+    try:
+        from .client import VaultClient
+
+        run_id = resolve_run_id(repo_root)
+        if not run_id:
+            return
+        cfg = load_config(repo_root)
+        client = VaultClient(cfg.get("remote_url", "http://localhost:8000"),
+                             cfg.get("remote_api_token"))
+        client.report_run_policy_outcome(run_id, decision, rule)
+    except Exception:
+        pass  # telemetry only — a reporting failure must never affect the promotion itself
+
+
 def enforce_policy(repo_root, target_branch: str, candidate_metrics: dict | None,
                    baseline_metrics_fn, candidate_ref=None) -> None:
     """Raises PolicyDenied (via fail) when TARGET_BRANCH is protected and policy fails.
@@ -210,6 +231,7 @@ def enforce_policy(repo_root, target_branch: str, candidate_metrics: dict | None
     if pol.get("require_signature"):
         signed, sig_reason = candidate_is_signed(repo_root, candidate_ref)
         if not signed:
+            _report_policy_outcome(repo_root, "deny", "require_signature")
             fail(None, "policy_denied",
                  f"promotion to '{target_branch}' denied: require_signature is armed and "
                  f"the candidate is not validly signed ({sig_reason}). "
@@ -218,10 +240,13 @@ def enforce_policy(repo_root, target_branch: str, candidate_metrics: dict | None
     # v1.2.5: require_signature is usable standalone — a policy with no "metric" key is a
     # signature-only gate, not an incomplete metric policy (matches promote()'s handling).
     if not pol.get("metric"):
+        _report_policy_outcome(repo_root, "allow",
+                               "require_signature" if pol.get("require_signature") else None)
         return
     base_ref = pol.get("baseline_ref")
     baseline = baseline_metrics_fn(base_ref) if base_ref else None
     ok, reason = evaluate(pol, candidate_metrics, baseline)
+    _report_policy_outcome(repo_root, "allow" if ok else "deny", f"metric:{pol['metric']}{pol.get('op', '')}")
     if not ok:
         fail(None, "policy_denied",
              f"promotion to '{target_branch}' denied: {reason}. "
@@ -232,8 +257,11 @@ def enforce_policy(repo_root, target_branch: str, candidate_metrics: dict | None
 @click.argument("candidate", required=False, default=None)
 @click.option("--into", "into_branch", default="main", show_default=True)
 @click.option("--force", is_flag=True, default=False, help="Bypass the armed policy explicitly.")
+@click.option("--dry-run", "dry_run", is_flag=True, default=False,
+              help="Evaluate the policy decision and which rule would decide it, "
+                   "without landing anything — touches nothing either way.")
 @click.pass_context
-def promote(ctx, candidate: str | None, into_branch: str, force: bool) -> None:
+def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: bool) -> None:
     """Evaluate INTO_BRANCH's armed policy against CANDIDATE's latest metrics, then land it."""
     repo_root = ensure_repo()
     pol_entry = load_policies(repo_root).get(into_branch)
@@ -246,17 +274,17 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool) -> None:
         fail(None, "validation", f"Unknown candidate: {candidate}")
     cand_metrics = cand_commit.get("metrics")
 
-    allowed, reason = True, "no policy armed"
+    allowed, reason, deciding_rule = True, "no policy armed", None
     if pol_entry and not force:
         # v1.2.5: require_signature is checked FIRST — a denial here should say "unsigned",
         # not a misleading metric-comparison message when the metrics happen to also fail.
         if pol_entry.get("require_signature"):
             signed, sig_reason = candidate_is_signed(repo_root, cand_ref)
             if not signed:
-                allowed, reason = False, (
+                allowed, reason, deciding_rule = False, (
                     f"require_signature is armed and the candidate is not validly signed "
                     f"({sig_reason})"
-                )
+                ), "require_signature"
         # v1.2.5: require_signature is usable standalone — a policy with no "metric" key
         # is a signature-only gate, not an incomplete metric policy. evaluate() runs only
         # when a metric IS configured (existing metric-only policies are unaffected).
@@ -264,18 +292,45 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool) -> None:
             base_ref = pol_entry.get("baseline_ref")
             baseline = _latest_metrics_for_ref(repo_root, base_ref) if base_ref else None
             allowed, reason = evaluate(pol_entry, cand_metrics, baseline)
+            deciding_rule = f"metric:{pol_entry['metric']}{pol_entry.get('op', '')}"
         elif allowed and pol_entry.get("require_signature"):
             reason = "require_signature: candidate is validly signed"
+            deciding_rule = "require_signature"
     elif force and pol_entry:
         reason = f"policy BYPASSED via --force on '{into_branch}'"
+        deciding_rule = "force"
 
-    if current_output_mode() == "json":
-        emit_json(None, "promote", data={"allowed": allowed, "forced": bool(force and pol_entry),
-                                         "reason": reason})
+    if dry_run:
+        # v1.2.5's --force already previews a DENY (it stops before landing); this is the
+        # missing half — previewing an ALLOW without landing anything either. Exits 0 for
+        # BOTH decisions (a script branches on data.decision, not the exit code) — dry-run
+        # never fails just because the real promotion would have.
+        decision = "allow" if allowed else "deny"
+        if current_output_mode() == "json":
+            emit_json(None, "promote", data={"dry_run": True, "decision": decision,
+                                             "rule": deciding_rule, "reason": reason})
+            return
+        color = "green" if allowed else "red"
+        click.secho(f"[DRY RUN] {decision.upper()}: {reason}"
+                    + (f" (rule: {deciding_rule})" if deciding_rule else ""), fg=color)
+        return
+
+    # v1.3.0: report the real decision for the active run — dry runs above are deliberately
+    # excluded ("touches nothing either way" is the documented dry-run contract).
+    if pol_entry:
+        _report_policy_outcome(repo_root, "allow" if allowed else "deny", deciding_rule)
+
     if not allowed:
+        if current_output_mode() == "json":
+            emit_json(None, "promote", data={"allowed": False,
+                                             "forced": bool(force and pol_entry),
+                                             "reason": reason, "rule": deciding_rule})
         click.secho(f"DENIED: {reason}", fg="red", err=True)
         ctx_exit(EXIT_POLICY_DENIED)
-    if pol_entry:
+    # v1.3.0 fix (Probleme.md): this used to secho unconditionally, leaking human text
+    # ahead of the JSON envelope emitted below for the landing case — the same bug class
+    # as Probleme #105-107, just never exercised by a full non-dry-run JSON promote before.
+    if pol_entry and current_output_mode() != "json":
         click.secho(f"Policy PASS: {reason}", fg="green")
 
     # Land it: switch to the target branch and merge the candidate (real single path).
@@ -287,11 +342,42 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool) -> None:
 
     if resolve_head(repo_root)[0] != into_branch:
         ctx.invoke(checkout, name=into_branch)
-    ctx.invoke(merge_cmd, target=cand_ref,
-               message=f"Promote {str(cand_ref)[:7]} into {into_branch}"
-                       + (" [policy bypassed]" if force and pol_entry else ""),
-               policy_ours=False, policy_theirs=False, no_ff=True,
-               force=bool(pol_entry))  # enforcement already happened above
+
+    merge_kwargs = dict(
+        target=cand_ref,
+        message=f"Promote {str(cand_ref)[:7]} into {into_branch}"
+                + (" [policy bypassed]" if force and pol_entry else ""),
+        policy_ours=False, policy_theirs=False, no_ff=True,
+        force=bool(pol_entry),  # enforcement already happened above
+    )
+
+    if current_output_mode() != "json":
+        ctx.invoke(merge_cmd, **merge_kwargs)
+        return
+
+    # v1.3.0 fix (Probleme.md): merge_cmd emits its OWN top-level JSON envelope in JSON
+    # mode — invoking it here unguarded printed a SECOND JSON object for one `av promote`
+    # call (envelope-1.0 is one object per command; a strict consumer's json.loads() over
+    # the whole invocation's output fails outright, exactly like this fix's own regression
+    # test). Capture merge's output instead of letting it reach real stdout, and fold the
+    # parsed envelope into promote's own single combined envelope. On a merge failure
+    # (conflict, validation, ...) merge has already echoed its OWN failure envelope with
+    # the correct error code into the buffer before raising SystemExit — forward that
+    # captured envelope verbatim as the (single, correct) output and re-raise so the
+    # caller still sees the real exit code.
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            ctx.invoke(merge_cmd, **merge_kwargs)
+    except SystemExit:
+        click.echo(buf.getvalue(), nl=False)
+        raise
+
+    merge_line = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else "{}"
+    merge_data = json.loads(merge_line).get("data")
+    emit_json(None, "promote", data={"allowed": True, "forced": bool(force and pol_entry),
+                                     "reason": reason, "rule": deciding_rule,
+                                     "merge": merge_data})
 
 
 def ctx_exit(code):

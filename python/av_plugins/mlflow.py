@@ -21,7 +21,7 @@ except ImportError as exc:
 
 def import_run(
     run_id: str,
-    repo_root: Path | None = None,
+    repo_root: Path | str,
     tracking_uri: str | None = None,
     tag: str | None = None,
 ) -> None:
@@ -33,8 +33,16 @@ def import_run(
     Artifacts are downloaded into `<repo_root>/mlflow_imports/<run_id>/` rather than a system
     temp directory — `av add` requires every staged path to live under the repo root, and
     MLflow's own artifact store (e.g. `~/mlruns/...`) is typically outside it.
+
+    `repo_root` is REQUIRED (v1.3.0) — unlike `import_checkpoint()` in the other plugin
+    modules, an MLflow run has no artifact path of its own to resolve a root from before
+    any files are downloaded, so this used to fall back to `resolve_repo_root(Path.cwd())`
+    — the one `Path.cwd()` use left anywhere in this package, and a direct violation of
+    this package's own contract ("never Path.cwd()", see the module README). Callers
+    (the `av import-mlflow` CLI command, or your own script) must resolve and pass it
+    explicitly, exactly like every other plugin entry point already does.
     """
-    resolved_root = repo_root if repo_root is not None else resolve_repo_root(Path.cwd())
+    resolved_root = resolve_repo_root(Path(repo_root))
 
     client = MlflowClient(tracking_uri=tracking_uri)
     run = client.get_run(run_id)

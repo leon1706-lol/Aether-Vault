@@ -335,3 +335,32 @@ def test_audit_prune_json_mode_skips_prompt(monkeypatch, tmp_path):
     envelope = json.loads(res.output)
     assert envelope["data"]["deleted"] == 0
     assert fake.delete_calls  # ran without any interactive prompt
+
+
+def test_audit_prune_dry_run_deletes_nothing_and_skips_the_prompt(monkeypatch, tmp_path):
+    # v1.3.0: --dry-run reports would_delete without a confirm prompt (nothing to
+    # confirm — it can't destroy anything) and without deleting anything server-side.
+    fake = _FakeClient(delete_responder=lambda url, params: _FakeResponse(
+        {"deleted": 0, "would_delete": 7, "dry_run": True}))
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, ["audit", "prune", "--before-days", "30", "--dry-run"],
+                             standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    assert "Would delete 7" in res.output
+    _, params = fake.delete_calls[-1]
+    assert params == {"before_days": 30, "dry_run": "true"}
+
+
+def test_audit_prune_dry_run_json_mode(monkeypatch, tmp_path):
+    fake = _FakeClient(delete_responder=lambda url, params: _FakeResponse(
+        {"deleted": 0, "would_delete": 12, "dry_run": True}))
+    monkeypatch.setattr(cmd_audit, "_client", lambda repo_root: fake)
+    _init_repo(tmp_path, monkeypatch)
+
+    res = CliRunner().invoke(cli, ["--output", "json", "audit", "prune", "--dry-run"],
+                             standalone_mode=False)
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)["data"]
+    assert data == {"deleted": 0, "would_delete": 12, "dry_run": True, "before_days": None}

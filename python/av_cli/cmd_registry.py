@@ -14,6 +14,10 @@ casual tampering. Asymmetric signing is tracked for the enterprise tier.
 import hashlib
 import hmac as hmac_mod
 import json
+import pathlib  # NOT re-exported by `from .core import *` (core.py imports only the
+                # `Path` class, never the module) — every pathlib.Path(...) call below
+                # was a NameError on every real invocation until this import existed;
+                # av registry export/restore had literally never worked (Probleme.md).
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from .core import current_output_mode, emit_json
@@ -27,6 +31,20 @@ def _client(repo_root):
                        cfg.get("remote_api_token"))
 
 
+class _NullProgressBar:
+    """Drop-in stand-in for click.progressbar() that just iterates — used in JSON mode
+    so export/restore's item loop doesn't need two separate code paths."""
+
+    def __init__(self, iterable):
+        self._iterable = iterable
+
+    def __enter__(self):
+        return iter(self._iterable)
+
+    def __exit__(self, *exc):
+        return False
+
+
 def ctx_exit(code):
     """Module-local exit helper (restore's failure path used to reference this name
     without defining it anywhere — a latent NameError on every failed restore)."""
@@ -38,17 +56,58 @@ def registry() -> None:
     """Registry-level operations: backup export/restore and commit attestation keys."""
 
 
+def _state_path(out_path, kind: str) -> "pathlib.Path":
+    # v1.3.0 fix (Probleme.md): export and restore each need their OWN "what's already
+    # done" bookkeeping, even though both operate on the same ARCHIVE_DIR — export's
+    # completed_objects means "already downloaded from the registry into this archive";
+    # restore's means "already uploaded from this archive into the registry". A single
+    # shared file used to let restore's own default --resume=True misread export's
+    # bookkeeping as its own: the FIRST restore of a freshly-exported archive would see
+    # every object already marked "completed" (by export, for a completely different
+    # direction) and skip uploading all of them — silently a no-op restore into an empty
+    # registry, exactly the disaster-recovery scenario this whole feature exists for.
+    return out_path / f".{kind}-state.json"
+
+
+def _load_state(out_path, kind: str) -> dict:
+    p = _state_path(out_path, kind)
+    if not p.exists():
+        return {"completed_objects": [], "completed_commits": [], "completed_refs": []}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"completed_objects": [], "completed_commits": [], "completed_refs": []}
+
+
+def _save_state(out_path, kind: str, state: dict) -> None:
+    atomic_write_json(_state_path(out_path, kind), state)
+
+
 @registry.command()
 @click.argument("out_dir")
 @click.option("--project", "project_id", default=None, help="Scope to one project.")
-def export(out_dir: str, project_id: str | None) -> None:
+@click.option("--resume/--no-resume", default=True, show_default=True,
+              help="Skip network I/O for objects/commits/refs a previous run into the "
+                   "same OUT_DIR already completed (tracked in OUT_DIR/.export-state.json). "
+                   "--no-resume forces a full pass regardless of prior state.")
+def export(out_dir: str, project_id: str | None, resume: bool) -> None:
     """Export commits+refs+runs+objects from the configured registry into OUT_DIR."""
     repo_root = ensure_repo()
     client = _client(repo_root)
+    json_mode = current_output_mode() == "json"
+
+    # v1.3.0: was an unhandled requests.exceptions.ConnectionError traceback on every
+    # unreachable-server export — no other command in this codebase lets a raw
+    # connection error escape uncaught.
+    if not client.server_available():
+        fail(None, "unreachable_queued", f"Registry unreachable at {client.server_url}.",
+             command="registry export")
 
     out_path = pathlib.Path(out_dir)
     (out_path / "objects").mkdir(parents=True, exist_ok=True)
     manifest: dict = {"format": 1, "commits": [], "refs": [], "runs": [], "objects": []}
+    state = _load_state(out_path, "export") if resume else {"completed_objects": [], "completed_commits": [], "completed_refs": []}
+    done_objects = set(state["completed_objects"])
 
     def _get_json(path: str):
         import requests
@@ -57,10 +116,14 @@ def export(out_dir: str, project_id: str | None) -> None:
         resp.raise_for_status()
         return resp.json()
 
-    # commits (paged)
+    # commits (paged) — v1.3.0 fix (Probleme.md): include_layers=true is REQUIRED here.
+    # Without it, GET /api/commits omits the "tree" key entirely (server.py::list_commits
+    # only attaches it under that flag), so the object-discovery walk below silently found
+    # zero hashes to export on every single real invocation this command has ever had —
+    # a backup archive with commits/refs metadata but NO file content whatsoever.
     offset, limit = 0, 200
     while True:
-        q = f"/api/commits?limit={limit}&offset={offset}"
+        q = f"/api/commits?limit={limit}&offset={offset}&include_layers=true"
         if project_id:
             q += f"&project_id={project_id}"
         page = _get_json(q)
@@ -95,34 +158,51 @@ def export(out_dir: str, project_id: str | None) -> None:
     for c in manifest["commits"]:
         _walk(c.get("tree") or {})
 
-    import requests as requests_mod
-
-    ok = failed = 0
-    for h in sorted(hashes):
-        dest = out_path / "objects" / h[:2] / h[2:]
-        if dest.exists():
-            ok += 1
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            resp = client.session.get(f"{client.server_url}/api/objects/{h}", timeout=120)
-            resp.raise_for_status()
-            data = resp.content
-            if hashlib.sha256(data).hexdigest() != h:
-                raise ValueError("hash mismatch during download")
-            dest.write_bytes(data)
-            ok += 1
-        except Exception as exc:
-            failed += 1
-            click.secho(f"  object {h[:12]}… failed: {exc}", fg="yellow")
-        manifest["objects"].append({"hash": h, "ok": ok and not failed or True})
+    ok = failed = skipped = 0
+    sorted_hashes = sorted(hashes)
+    # v1.3.0: a real progress bar over objects — the expensive part of an export.
+    # Suppressed in JSON mode (an agent wants one clean envelope, not a progress bar
+    # mixed into it) — same is_json check every other command in this codebase uses;
+    # --silent has no ctx.obj flag to read here (it only gates logging setup today).
+    with (click.progressbar(sorted_hashes, label="Downloading objects") if not json_mode
+          else _NullProgressBar(sorted_hashes)) as bar:
+        for h in bar:
+            dest = out_path / "objects" / h[:2] / h[2:]
+            this_ok = False
+            if h in done_objects and dest.exists():
+                ok += 1
+                skipped += 1
+                this_ok = True
+            elif dest.exists():
+                ok += 1
+                this_ok = True
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    resp = client.session.get(f"{client.server_url}/api/objects/{h}", timeout=120)
+                    resp.raise_for_status()
+                    data = resp.content
+                    if hashlib.sha256(data).hexdigest() != h:
+                        raise ValueError("hash mismatch during download")
+                    dest.write_bytes(data)
+                    ok += 1
+                    this_ok = True
+                except Exception as exc:
+                    failed += 1
+                    if not json_mode:
+                        click.secho(f"  object {h[:12]}… failed: {exc}", fg="yellow")
+            manifest["objects"].append({"hash": h, "ok": this_ok})
+            if this_ok:
+                done_objects.add(h)
+                state["completed_objects"] = sorted(done_objects)
+                _save_state(out_path, "export", state)  # incremental — a killed export can resume
 
     (out_path / "manifest.json").write_text(
         json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
 
     summary = {"dir": str(out_path), "commits": len(manifest["commits"]),
                "refs": len(manifest["refs"]), "runs": len(manifest["runs"]),
-               "objects_ok": ok, "objects_failed": failed}
+               "objects_ok": ok, "objects_failed": failed, "objects_resumed": skipped}
     if current_output_mode() == "json":
         emit_json(None, "registry export", data=summary)
         return
@@ -134,7 +214,13 @@ def export(out_dir: str, project_id: str | None) -> None:
 
 @registry.command()
 @click.argument("archive_dir")
-def restore(archive_dir: str) -> None:
+@click.option("--resume/--no-resume", default=True, show_default=True,
+              help="Skip network I/O for objects/commits/refs a previous run against "
+                   "this ARCHIVE_DIR already completed successfully (tracked in "
+                   "ARCHIVE_DIR/.restore-state.json). --no-resume re-attempts everything — safe "
+                   "either way since every write here is already idempotent (409/200 on "
+                   "duplicate), just not free.")
+def restore(archive_dir: str, resume: bool) -> None:
     """Re-ingest an `av registry export` archive into the configured registry.
 
     Ordering mirrors the push path (objects → commits → refs) and every object shard is
@@ -145,6 +231,10 @@ def restore(archive_dir: str) -> None:
     """
     repo_root = ensure_repo()
     client = _client(repo_root)
+    json_mode = current_output_mode() == "json"
+    if not client.server_available():
+        fail(None, "unreachable_queued", f"Registry unreachable at {client.server_url}.",
+             command="registry restore")
     src = pathlib.Path(archive_dir)
     manifest_path = src / "manifest.json"
     if not manifest_path.exists():
@@ -152,54 +242,89 @@ def restore(archive_dir: str) -> None:
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     failed = 0
+    state = _load_state(src, "restore") if resume else {"completed_objects": [], "completed_commits": [], "completed_refs": []}
+    done_objects = set(state["completed_objects"])
+    done_commits = set(state["completed_commits"])
+    done_refs = set(state["completed_refs"])
 
-    ok = dup = 0
-    for entry in manifest.get("objects", []):
-        h = entry["hash"]
-        fpath = src / "objects" / h[:2] / h[2:]
-        if not fpath.exists():
-            failed += 1
-            click.secho(f"  missing shard {h[:12]}… skipped", fg="yellow")
-            continue
-        data = fpath.read_bytes()
-        if hashlib.sha256(data).hexdigest() != h:
-            failed += 1
-            click.secho(f"  CORRUPT archive shard {h[:12]}… skipped", fg="red")
-            continue
-        resp = client.session.post(f"{client.server_url}/api/objects/{h}", data=data,
-                                   timeout=120)
-        if resp.status_code in (201, 409):
-            ok += 1
-            if resp.status_code == 409:
-                dup += 1
-        else:
-            failed += 1
+    objects = manifest.get("objects", [])
+    ok = dup = obj_resumed = 0
+    with (click.progressbar(objects, label="Uploading objects") if not json_mode
+          else _NullProgressBar(objects)) as bar:
+        for entry in bar:
+            h = entry["hash"]
+            if h in done_objects:
+                ok += 1
+                obj_resumed += 1
+                continue
+            fpath = src / "objects" / h[:2] / h[2:]
+            if not fpath.exists():
+                failed += 1
+                if not json_mode:
+                    click.secho(f"  missing shard {h[:12]}… skipped", fg="yellow")
+                continue
+            data = fpath.read_bytes()
+            if hashlib.sha256(data).hexdigest() != h:
+                failed += 1
+                if not json_mode:
+                    click.secho(f"  CORRUPT archive shard {h[:12]}… skipped", fg="red")
+                continue
+            resp = client.session.post(f"{client.server_url}/api/objects/{h}", data=data,
+                                       timeout=120)
+            if resp.status_code in (201, 409):
+                ok += 1
+                if resp.status_code == 409:
+                    dup += 1
+                done_objects.add(h)
+                state["completed_objects"] = sorted(done_objects)
+                _save_state(src, "restore", state)
+            else:
+                failed += 1
 
-    c_ok = c_dup = 0
-    for commit in manifest.get("commits", []):
-        payload = dict(commit)
-        payload.pop("timestamp", None)  # server re-stamps from message payload if absent
-        resp = client.session.post(f"{client.server_url}/api/commits", json=payload,
-                                   timeout=60)
-        if resp.status_code in (201, 409):
-            c_ok += 1
-            if resp.status_code == 409:
-                c_dup += 1
-        else:
-            failed += 1
+    commits = manifest.get("commits", [])
+    c_ok = c_dup = commit_resumed = 0
+    with (click.progressbar(commits, label="Uploading commits  ") if not json_mode
+          else _NullProgressBar(commits)) as bar:
+        for commit in bar:
+            h = commit.get("hash")
+            if h and h in done_commits:
+                c_ok += 1
+                commit_resumed += 1
+                continue
+            payload = dict(commit)
+            payload.pop("timestamp", None)  # server re-stamps from message payload if absent
+            resp = client.session.post(f"{client.server_url}/api/commits", json=payload,
+                                       timeout=60)
+            if resp.status_code in (201, 409):
+                c_ok += 1
+                if resp.status_code == 409:
+                    c_dup += 1
+                if h:
+                    done_commits.add(h)
+                    state["completed_commits"] = sorted(done_commits)
+                    _save_state(src, "restore", state)
+            else:
+                failed += 1
 
     r_ok = 0
     refs = manifest.get("refs") or {}
     for name, ref_hash in refs.items():
+        if name in done_refs:
+            r_ok += 1
+            continue
         resp = client.session.put(f"{client.server_url}/api/refs/{name}",
                                   json={"commit_hash": ref_hash}, timeout=60)
         if resp.status_code == 200:
             r_ok += 1
+            done_refs.add(name)
+            state["completed_refs"] = sorted(done_refs)
+            _save_state(src, "restore", state)
         else:
             failed += 1
 
-    summary = {"objects_uploaded": ok, "objects_duplicate": dup, "commits": c_ok,
-               "commits_duplicate": c_dup, "refs": r_ok, "failed": failed}
+    summary = {"objects_uploaded": ok, "objects_duplicate": dup, "objects_resumed": obj_resumed,
+               "commits": c_ok, "commits_duplicate": c_dup, "commits_resumed": commit_resumed,
+               "refs": r_ok, "failed": failed}
     if current_output_mode() == "json":
         emit_json(None, "registry restore", data=summary)
         return
@@ -251,7 +376,9 @@ def keys_group() -> None:
 
 @keys_group.command("list")
 def keys_list() -> None:
-    """List every signing key this repo knows about (active + archived from past rotations)."""
+    """List every signing key this repo knows about (active + archived from past rotations).
+
+    Tamper evidence, not PKI / identity binding — see `av registry keys --help`."""
     from .signing import list_keys
 
     repo_root = ensure_repo()
@@ -269,7 +396,9 @@ def keys_list() -> None:
 
 @keys_group.command("fingerprint")
 def keys_fingerprint() -> None:
-    """Print just this repo's active-key fingerprint (scriptable)."""
+    """Print just this repo's active-key fingerprint (scriptable).
+
+    Tamper evidence, not PKI / identity binding — see `av registry keys --help`."""
     from .signing import fingerprint, public_key_path
 
     repo_root = ensure_repo()
@@ -288,9 +417,9 @@ def keys_fingerprint() -> None:
 def keys_rotate(yes: bool) -> None:
     """Archive the current signing key and generate a fresh one.
 
-    Tamper evidence, not a PKI: old commits keep verifying (their signature carries the
-    OLD public key embedded), new commits sign with the new key. The archived private
-    key is never deleted."""
+    Tamper evidence, not PKI / identity binding: old commits keep verifying (their
+    signature carries the OLD public key embedded), new commits sign with the new key.
+    The archived private key is never deleted."""
     from .signing import fingerprint, public_key_path, rotate_keypair
 
     repo_root = ensure_repo()
@@ -328,8 +457,8 @@ def export_signature(commit_hash: str, out_path: str | None) -> None:
     — verify it elsewhere with `av registry verify <hash> --signature FILE`, without that
     verifier needing this repo's config or registry access.
 
-    Tamper evidence, not a PKI: this proves the exported record matches what the signer
-    produced, not who the signer is."""
+    Tamper evidence, not PKI / identity binding: this proves the exported record matches
+    what the signer produced, not who the signer is."""
     from .handoff import load_commit
     from .signing import export_signature_blob
 
@@ -407,8 +536,8 @@ def verify(commit_hash: str, signature_file: str | None) -> None:
     """Verify COMMIT_HASH: an ed25519 commit signature when present, else a legacy
     HMAC attestation tag.
 
-    Tamper evidence, not a PKI — this proves the payload wasn't modified after
-    signing, not who the signer is (see SECURITY.md).
+    Tamper evidence, not PKI / identity binding — this proves the payload wasn't
+    modified after signing, not who the signer is (see SECURITY.md).
 
     v1.2.2 verification order:
     1. `signature` blob on the commit → validate the ed25519 signature over the

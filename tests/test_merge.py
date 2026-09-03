@@ -298,6 +298,49 @@ def test_merge_conflict_aborts_without_touching_anything(forked_repo):
     )
 
 
+def test_merge_conflict_writes_structured_report(forked_repo, tmp_path):
+    # v1.3.0 (todo.md item 2): a conflict always writes .av/last_conflict.json, and
+    # optionally a caller-chosen path too — both carrying the same fields as error.data.
+    repo = forked_repo["repo"]
+    assert invoke("checkout", "feature").exit_code == 0
+    _commit_file(repo, "shared.txt", "feature's version")
+    assert invoke("commit", "-m", "feature edits shared").exit_code == 0
+
+    assert invoke("checkout", "main").exit_code == 0
+    _commit_file(repo, "shared.txt", "main's version")
+    assert invoke("commit", "-m", "main edits shared").exit_code == 0
+
+    extra_path = tmp_path / "conflict-out.json"
+    result = invoke("merge", "feature", "--conflict-report", str(extra_path))
+    assert result.exit_code == 14, result.output
+
+    default_report = json.loads((repo / ".av" / "last_conflict.json").read_text())
+    assert default_report["conflicts"] == ["shared.txt"]
+    assert default_report["remediation"]
+    assert default_report["ours"] and default_report["theirs"]
+
+    extra_report = json.loads(extra_path.read_text())
+    assert extra_report == default_report
+
+
+def test_merge_conflict_json_envelope_includes_report_paths(forked_repo):
+    repo = forked_repo["repo"]
+    assert invoke("checkout", "feature").exit_code == 0
+    _commit_file(repo, "shared.txt", "feature's version")
+    assert invoke("commit", "-m", "feature edits shared").exit_code == 0
+
+    assert invoke("checkout", "main").exit_code == 0
+    _commit_file(repo, "shared.txt", "main's version")
+    assert invoke("commit", "-m", "main edits shared").exit_code == 0
+
+    result = invoke("--output", "json", "merge", "feature")
+    assert result.exit_code == 14, result.output
+    env = json.loads(result.output)
+    report_paths = env["error"]["data"]["report_paths"]
+    assert len(report_paths) == 1  # no --conflict-report given
+    assert Path(report_paths[0]).exists()
+
+
 def test_merge_conflict_resolved_with_theirs_flag(forked_repo):
     repo = forked_repo["repo"]
     assert invoke("checkout", "feature").exit_code == 0

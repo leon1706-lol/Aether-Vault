@@ -114,6 +114,40 @@ def test_run_synthetic_probes_sampled_rejects_zero_samples(tmp_path):
         speedcheck.run_synthetic_probes_sampled(load_config, iter_working_files, tmp_path, samples=0)
 
 
+def test_run_synthetic_probes_sampled_runs_an_uncounted_warm_pass(tmp_path):
+    # v1.3.0: a full warm-pass battery runs into its own "warm" subdirectory before any
+    # counted sample — proves it happened (and didn't silently consume a numbered slot).
+    speedcheck.run_synthetic_probes_sampled(load_config, iter_working_files, tmp_path, samples=1)
+    assert (tmp_path / "warm").is_dir()
+    assert (tmp_path / "sample_0").is_dir()
+    assert not (tmp_path / "sample_1").exists()  # samples=1 -> exactly one counted dir
+
+
+def test_run_synthetic_probes_sampled_honors_av_perf_samples_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("AV_PERF_SAMPLES", "2")
+    results = speedcheck.run_synthetic_probes_sampled(load_config, iter_working_files, tmp_path)
+    # samples=2 requested via env, 1 discarded as warm-up -> 1 kept.
+    for _, samples, *_ in results:
+        assert len(samples) == 1
+
+
+def test_run_synthetic_probes_sampled_explicit_samples_wins_over_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("AV_PERF_SAMPLES", "5")
+    results = speedcheck.run_synthetic_probes_sampled(
+        load_config, iter_working_files, tmp_path, samples=1,
+    )
+    for _, samples, *_ in results:
+        assert len(samples) == 1  # explicit samples=1, not the env's 5
+
+
+def test_run_synthetic_probes_sampled_ignores_a_malformed_av_perf_samples(tmp_path, monkeypatch):
+    monkeypatch.setenv("AV_PERF_SAMPLES", "not-a-number")
+    results = speedcheck.run_synthetic_probes_sampled(load_config, iter_working_files, tmp_path)
+    # Falls back to PROBE_SAMPLES (5) rather than crashing the gate.
+    for _, samples, *_ in results:
+        assert len(samples) == speedcheck.PROBE_SAMPLES - 1
+
+
 def test_run_synthetic_probes_is_repeatable_across_calls_in_fresh_dirs(tmp_path):
     # Fixture sizes are fixed constants (SYNTHETIC_ENTRY_COUNT etc.) — two independent runs
     # against two fresh tmp_roots should produce the same number/shape of probes every time.

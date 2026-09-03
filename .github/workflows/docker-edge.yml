@@ -5,11 +5,11 @@ name: Docker Edge Build
 # (Was `main` — this repo's default branch has always been `master`, so the trigger never
 # fired; caught in the v1.1.8 doc/config sweep.)
 #
-# v1.2.2 engine consolidation: ONE image (aether-vault-engine) is built and pushed;
-# the historical aether-vault-server/-webui names ride along as ALIASES of the same
-# image for one transition cycle so existing installs' pulls keep working
-# (auto-detected role per legacy container — see docker/engine-entrypoint.sh).
-# Aliases are removed in the next release.
+# v1.2.2 engine consolidation: ONE image (aether-vault-engine) is built and pushed.
+# The historical aether-vault-server/-webui alias tags were removed at v1.3.0 (the
+# earliest-possible MINOR boundary VERSIONING.md named for this) — see
+# docs/migrate-engine-image.md. Already-pulled legacy images still auto-detect their
+# role from DATABASE_URL/NEXT_PUBLIC_API_URL (docker/engine-entrypoint.sh).
 
 on:
   push:
@@ -42,13 +42,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # One build, one push step — every tag below receives THE SAME image.
-      - name: Build and push engine image (+ legacy aliases)
+      - name: Build and push engine image
         uses: docker/build-push-action@v6
         with:
           context: .
+          # v1.3.0 (Probleme.md): explicit — see release.yml's identical comment.
+          target: engine
           push: true
-          tags: |
-            ghcr.io/leon1706-lol/aether-vault-engine:edge
-            ghcr.io/leon1706-lol/aether-vault-server:edge
-            ghcr.io/leon1706-lol/aether-vault-webui:edge
+          tags: ghcr.io/leon1706-lol/aether-vault-engine:edge
+
+      # v1.3.0 (todo.md item 19): slim, single-role images alongside :edge.
+      - name: Build and push slim server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: server
+          push: true
+          tags: ghcr.io/leon1706-lol/aether-vault-engine:server-edge
+
+      - name: Build and push slim webui image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: webui
+          push: true
+          tags: ghcr.io/leon1706-lol/aether-vault-engine:webui-edge

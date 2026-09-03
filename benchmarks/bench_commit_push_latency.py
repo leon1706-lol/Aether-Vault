@@ -34,7 +34,7 @@ def _bench_av() -> dict[str, float | None] | None:
     av_path = shutil.which("av")
     if av_path is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-push-av-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-push-av-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         probes = speedcheck.run_av_cli_probes(av_path, root)
         result = {"init": probes[0][1], "add": probes[1][1], "commit": probes[2][1]}
@@ -48,7 +48,7 @@ def _bench_git_lfs() -> dict[str, float | None] | None:
     git_lfs = shutil.which("git-lfs")
     if git_path is None or git_lfs is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-push-gitlfs-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-push-gitlfs-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         remote = root.parent / f"{root.name}-remote.git"
         subprocess.run(["git", "init", "--bare", str(remote)])
@@ -73,7 +73,7 @@ def _bench_dvc() -> dict[str, float | None] | None:
     git_path = shutil.which("git")
     if dvc_path is None or git_path is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-push-dvc-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-push-dvc-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         remote = root / "dvc-remote"
         remote.mkdir()

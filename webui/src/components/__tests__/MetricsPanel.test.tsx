@@ -67,4 +67,17 @@ describe("MetricsPanel", () => {
     await user.selectOptions(screen.getByLabelText("Branch"), "main");
     expect(screen.getByText("1 commits")).toBeInTheDocument();
   });
+
+  it("shows an error state instead of the empty state when a fetch failed", () => {
+    render(<MetricsPanel commits={[]} refs={{}} loading={false} error="registry unreachable" />);
+    expect(screen.getByText("⚠ registry unreachable")).toBeInTheDocument();
+    expect(screen.queryByText("No metrics yet")).not.toBeInTheDocument();
+  });
+
+  it("prefers real data over an error when both are present", () => {
+    const commits = [makeCommit({ metrics: { sharpe: 2.5 } })];
+    render(<MetricsPanel commits={commits} refs={{}} loading={false} error="stale error" />);
+    expect(screen.getByText("Metrics Table")).toBeInTheDocument();
+    expect(screen.queryByText("⚠ stale error")).not.toBeInTheDocument();
+  });
 });

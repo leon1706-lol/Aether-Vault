@@ -51,7 +51,23 @@ transformers = ["transformers>=4.30.0"]
 mlflow = ["mlflow>=2.0.0"]
 # v1.2.2 signed commits: ed25519 keygen/auto-sign/verify (av registry keygen, av verify).
 sign = ["cryptography>=42.0.0"]
-dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0", "httpx>=0.24.0"]
+# v1.3.0: `av watch` uses real filesystem event notifications when this is installed,
+# falling back to its original pure-stdlib polling loop otherwise (never a hard
+# dependency — see cmd_watch.py).
+watch = ["watchdog>=4.0.0"]
+# v1.3.0: `av doctor --compose PATH` (docs/migrate-engine-image.md) parses/rewrites a
+# docker-compose YAML file — the ONLY place PyYAML is used; every other `av` command
+# stays dependency-free without it, failing cleanly with an install hint when it's
+# absent (no structural fallback — a compose rewrite is exactly the kind of thing that
+# shouldn't be attempted with a hand-rolled partial parser). Also listed in `dev` below
+# so the main test job actually exercises the real PyYAML path, not just the ImportError
+# one.
+docker = ["PyYAML>=6.0"]
+# v1.3.0 contract freeze: real jsonschema.validate() against python/av_cli/schemas/*
+# (envelope/event/run/webhook-payload/semdiff/.avh) instead of the hand-rolled structural
+# checks — runtime code still falls back to those when jsonschema isn't importable, so the
+# installed package stays dependency-free; CI (this extra) always exercises the strict path.
+dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0", "httpx>=0.24.0", "jsonschema>=4.0", "PyYAML>=6.0"]
 benchmarks = ["dvc>=3.55,<4", "mlflow>=2.16"]
 
 [project.scripts]

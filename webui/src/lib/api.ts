@@ -153,6 +153,10 @@ export interface Run {
   // v1.2.5: opt-in pointer to a published .avh context-memory object (`av handoff
   // --publish`) — null unless the repo owner explicitly published one.
   avh_object_id?: string | null;
+  // v1.3.0 (todo.md item 7): the most recent `av promote`/merge policy decision made for
+  // this run's active commit (POST /api/runs/{id}/policy-outcome) — null until the first
+  // decision for this run.
+  policy_outcome?: { decision: "allow" | "deny"; rule: string | null; at: string } | null;
 }
 
 // v1.2.5: server-computed semantic summary shape returned by GET /api/runs/{id}/summary
@@ -192,6 +196,39 @@ export interface RunSummary {
 // as the fallback/test surface and are still exercised by RunsPanel's own tests.
 export async function fetchRunSummary(runId: string): Promise<RunSummary> {
   return fetchJSON<RunSummary>(`/api/runs/${encodeURIComponent(runId)}/summary`);
+}
+
+export interface RunMetricPoint {
+  hash: string;
+  message: string;
+  metrics: Record<string, number | string>;
+  timestamp: string | null;
+  linked_at: string | null;
+}
+
+// v1.3.0 (todo.md item 7): the FULL per-commit metric series for a run, oldest-linked-
+// first — GET /api/runs/{id}/summary's inline `commits` is capped at 20 and newest-first
+// (bounded response size for the common case); this pages through the uncapped
+// GET /api/runs/{id}/metrics endpoint fully, for a run-detail chart that shouldn't lose
+// history past the cap. `maxPoints` bounds how much this will ever fetch/hold in memory
+// for one run (a runaway run with tens of thousands of linked commits must not hang the
+// tab) — matches this file's other defensive caps (e.g. CHECKPOINT_FETCH_LIMIT's sibling).
+export async function fetchRunMetrics(
+  runId: string,
+  { pageLimit = 200, maxPoints = 5000 }: { pageLimit?: number; maxPoints?: number } = {}
+): Promise<RunMetricPoint[]> {
+  const points: RunMetricPoint[] = [];
+  let cursor: string | null = null;
+  do {
+    const params = new URLSearchParams({ limit: String(pageLimit) });
+    if (cursor) params.set("cursor", cursor);
+    const page: { points: RunMetricPoint[]; next_cursor: string | null } = await fetchJSON(
+      `/api/runs/${encodeURIComponent(runId)}/metrics?${params.toString()}`
+    );
+    points.push(...page.points);
+    cursor = page.next_cursor;
+  } while (cursor && points.length < maxPoints);
+  return points;
 }
 
 export async function fetchRuns(
@@ -286,15 +323,42 @@ export async function fetchCommitsPage(
 // was added. Stats stay unscoped: they describe the shared object store, which is
 // deliberately deduplicated *across* projects (see development/Probleme.md).
 export async function fetchDashboardData(projectId?: string | null): Promise<DashboardData> {
+  // v1.3.0: each sub-fetch already caught its own rejection (a safe empty fallback, so
+  // one flaky endpoint doesn't blank the whole dashboard) — but that meant NOTHING ever
+  // reached the outer try/catch below, so `error` stayed null even on a real 401/500/
+  // network failure. A genuinely empty registry and an unreachable one were then
+  // indistinguishable to every panel reading this data. Each fetch below now records
+  // its own failure reason instead of silently discarding it, and `error` is set
+  // whenever at least one sub-fetch actually failed.
+  const failures: string[] = [];
+  const describe = (label: string) => (err: unknown) => {
+    failures.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+  };
+
   try {
     const [health, refs, stats, commits] = await Promise.all([
-      fetchHealth().catch(() => null),
-      fetchRefs(projectId).catch(() => ({})),
-      fetchStats().catch(() => null),
-      fetchCommits(40, projectId).catch(() => []),
+      fetchHealth().catch((err) => {
+        describe("health")(err);
+        return null;
+      }),
+      fetchRefs(projectId).catch((err) => {
+        describe("refs")(err);
+        return {};
+      }),
+      fetchStats().catch((err) => {
+        describe("stats")(err);
+        return null;
+      }),
+      fetchCommits(40, projectId).catch((err) => {
+        describe("commits")(err);
+        return [];
+      }),
     ]);
 
-    return { health, refs, commits, stats, error: null };
+    return {
+      health, refs, commits, stats,
+      error: failures.length ? failures.join("; ") : null,
+    };
   } catch (err) {
     return {
       health: null,

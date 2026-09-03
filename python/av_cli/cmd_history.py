@@ -107,6 +107,9 @@ def commit(
             "run_id": run_id,
             "queued": sink_data.get("queued", False),
             "queued_reason": sink_data.get("queued_reason"),
+            # v1.3.0: present only when queued_reason == "ref_race" — the colliding run
+            # (when known) + copy-paste remediation, matching pull/merge's own race data.
+            "ref_race": sink_data.get("ref_race"),
         })
     # Exit 0 even when queued (matches `av push`'s established behavior, cmd_history.py
     # above: "reachable": False still returns/exits cleanly) — queued is a SAFE, complete
@@ -122,6 +125,7 @@ def branch(name: str | None) -> None:
     """List existing branches, or create a new one."""
     repo_root = ensure_repo()
     heads_dir = repo_root / ".av" / "refs" / "heads"
+    json_mode = current_output_mode() == "json"
 
     if not name:
         head_path = repo_root / ".av" / "HEAD"
@@ -131,6 +135,12 @@ def branch(name: str | None) -> None:
             if head_content.startswith("ref: refs/heads/"):
                 current = head_content.split("/")[-1]
 
+        if json_mode:
+            emit_json(None, "branch", data={
+                "branches": [{"name": br.name, "current": br.name == current}
+                            for br in sorted(heads_dir.iterdir(), key=lambda p: p.name)],
+            })
+            return
         for br in heads_dir.iterdir():
             if br.name == current:
                 click.secho(f"* {br.name}", fg="green")
@@ -150,6 +160,9 @@ def branch(name: str | None) -> None:
 
         with open(heads_dir / name, "w") as f:
             f.write(commit_hash)
+        if json_mode:
+            emit_json(None, "branch", data={"created": name, "at": commit_hash or None})
+            return
         click.secho(f"Created branch '{name}'", fg="green")
 
 
@@ -164,6 +177,7 @@ def checkout(target: str, force: bool) -> None:
     repo_root = ensure_repo()
     cfg = load_config(repo_root)
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
+    json_mode = current_output_mode() == "json"
 
     heads_dir = repo_root / ".av" / "refs" / "heads"
     commit_hash = target
@@ -177,6 +191,8 @@ def checkout(target: str, force: bool) -> None:
     try:
         commit_file = find_commit_file(repo_root, commit_hash)
     except AmbiguousCommitHash as exc:
+        if json_mode:
+            fail(None, "validation", exc.message, command="checkout")
         click.secho(f"Error: {exc.message}", fg="red")
         return
     except FileNotFoundError:
@@ -195,6 +211,8 @@ def checkout(target: str, force: bool) -> None:
                 json.dump(commit_data, f)
 
     if not commit_data:
+        if json_mode:
+            fail(None, "validation", f"Commit '{target}' not found.", command="checkout")
         click.secho(f"Error: Commit '{target}' not found.", fg="red")
         return
 
@@ -206,6 +224,11 @@ def checkout(target: str, force: bool) -> None:
     if not force:
         dirty = _collect_dirty_paths(repo_root, idx)
         if dirty:
+            if json_mode:
+                fail(None, "validation",
+                     "You have uncommitted changes that would be overwritten by checkout.",
+                     command="checkout", data={"dirty_paths": dirty[:20],
+                                               "dirty_count": len(dirty)})
             click.secho(
                 "Error: You have uncommitted changes that would be overwritten by checkout:",
                 fg="red",
@@ -226,6 +249,10 @@ def checkout(target: str, force: bool) -> None:
         else:
             f.write(f"{commit_hash}\n")
 
+    if json_mode:
+        emit_json(None, "checkout", data={"target": target, "commit_hash": commit_hash,
+                                          "branch": ref_name})
+        return
     click.secho(f"Checked out '{target}'", fg="green")
 
 
@@ -244,10 +271,14 @@ def log(limit: int, branch: str | None, show_all: bool) -> None:
     from . import history
 
     repo_root = ensure_repo()
+    json_mode = current_output_mode() == "json"
 
     if show_all:
         commits = history.collect_all_commits(repo_root, limit)
         if not commits:
+            if json_mode:
+                emit_json(None, "log", data={"commits": []})
+                return
             click.secho("No commits yet.", fg="yellow")
             return
         decorations = history.collect_branch_decorations(repo_root)
@@ -255,14 +286,32 @@ def log(limit: int, branch: str | None, show_all: bool) -> None:
     else:
         start, err = history.resolve_start_hash(repo_root, branch)
         if err:
+            if json_mode:
+                fail(None, "validation", err, command="log")
             click.secho(f"Error: {err}", fg="red")
             return
         if start is None:
+            if json_mode:
+                emit_json(None, "log", data={"commits": []})
+                return
             click.secho("No commits yet.", fg="yellow")
             return
         commits = history.walk_history(repo_root, start, limit)
         decorations = history.collect_branch_decorations(repo_root)
         head_hash = start
+
+    if json_mode:
+        # `tree` omitted (can be large — layers/chunks per file); every other field of the
+        # raw commit record rides through as-is. `short` is synthesized (matches the
+        # `commit`/`checkout` envelopes' own "short" field convention, and av_sdk.Repo.log()).
+        emit_json(None, "log", data={"commits": [
+            {**{k: v for k, v in commit.items() if k != "tree"},
+             "short": commit["hash"][:7],
+             "decorations": decorations.get(commit["hash"], []),
+             "is_head": bool(head_hash) and commit["hash"] == head_hash}
+            for commit in commits
+        ]})
+        return
 
     for commit in commits:
         h = commit["hash"]
@@ -306,9 +355,10 @@ def _stash_push(message: str | None) -> None:
     cfg = load_config(repo_root)
     client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
     threshold_bytes = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
+    json_mode = current_output_mode() == "json"
 
     staged, modified, deleted, _untracked = compute_status(repo_root, idx)
-    if deleted:
+    if deleted and not json_mode:
         click.secho(
             f"Skipping {len(deleted)} deleted file(s) — not yet supported by `av stash`.",
             fg="yellow",
@@ -316,6 +366,10 @@ def _stash_push(message: str | None) -> None:
 
     dirty_paths = staged + modified  # compute_status's branches are mutually exclusive
     if not dirty_paths:
+        if json_mode:
+            emit_json(None, "stash", data={"stashed": False, "reason": "nothing_to_stash",
+                                           "skipped_deleted": deleted})
+            return
         click.secho("No local changes to stash", fg="yellow")
         return
 
@@ -398,6 +452,11 @@ def _stash_push(message: str | None) -> None:
         "entries": stash_entries,
     })
 
+    if json_mode:
+        emit_json(None, "stash", data={"stashed": True, "id": stash_id,
+                                       "file_count": len(stash_entries),
+                                       "skipped_deleted": deleted})
+        return
     label = f": {message}" if message else ""
     click.secho(f"Saved working directory state: stash@{{0}}{label}", fg="green")
 
@@ -407,8 +466,13 @@ def _stash_apply_or_pop(stash_id: str | None, delete_after: bool) -> None:
 
     repo_root = ensure_repo()
     stash_file = _resolve_stash_file(repo_root, stash_id)
+    json_mode = current_output_mode() == "json"
     if stash_file is None:
         msg = f"No stash found matching '{stash_id}'" if stash_id else "No stashes to apply"
+        if json_mode:
+            emit_json(None, "stash pop" if delete_after else "stash apply",
+                      data={"applied": False, "reason": "not_found"})
+            return
         click.secho(msg, fg="yellow")
         return
 
@@ -458,6 +522,12 @@ def _stash_apply_or_pop(stash_id: str | None, delete_after: bool) -> None:
     if delete_after:
         stash_file.unlink()
 
+    if json_mode:
+        emit_json(None, "stash pop" if delete_after else "stash apply", data={
+            "applied": True, "id": stash_file.stem, "restored_count": len(record["entries"]),
+            "deleted": delete_after,
+        })
+        return
     verb = "Popped" if delete_after else "Applied"
     click.secho(f"{verb} stash {stash_file.stem} ({len(record['entries'])} file(s) restored)", fg="green")
 
@@ -488,8 +558,22 @@ def stash_list_cmd() -> None:
     """List stashes, newest first."""
     repo_root = ensure_repo()
     files = _list_stash_files(repo_root)
+    json_mode = current_output_mode() == "json"
     if not files:
+        if json_mode:
+            emit_json(None, "stash list", data={"stashes": []})
+            return
         click.secho("No stashes", fg="yellow")
+        return
+    if json_mode:
+        stashes = []
+        for f in files:
+            with open(f, "r") as fh:
+                record = json.load(fh)
+            stashes.append({"id": f.stem, "created_at": record["created_at"],
+                            "branch": record.get("branch"), "message": record.get("message"),
+                            "file_count": len(record["entries"])})
+        emit_json(None, "stash list", data={"stashes": stashes})
         return
     for i, f in enumerate(files):
         with open(f, "r") as fh:
@@ -518,12 +602,20 @@ def stash_drop_cmd(stash_id: str | None) -> None:
     """Delete a stash without applying it."""
     repo_root = ensure_repo()
     stash_file = _resolve_stash_file(repo_root, stash_id)
+    json_mode = current_output_mode() == "json"
     if stash_file is None:
+        if json_mode:
+            emit_json(None, "stash drop", data={"dropped": False, "reason": "not_found"})
+            return
         msg = f"No stash found matching '{stash_id}'" if stash_id else "No stashes to drop"
         click.secho(msg, fg="yellow")
         return
+    stem = stash_file.stem
     stash_file.unlink()
-    click.secho(f"Dropped stash {stash_file.stem}", fg="green")
+    if json_mode:
+        emit_json(None, "stash drop", data={"dropped": True, "id": stem})
+        return
+    click.secho(f"Dropped stash {stem}", fg="green")
 
 
 @click.command("list-meta")
@@ -531,6 +623,12 @@ def list_meta() -> None:
     """Display all registered tag labels and metric keys for this repository."""
     repo_root = ensure_repo()
     reg = load_registry(repo_root)
+
+    if current_output_mode() == "json":
+        emit_json(None, "list-meta", data={
+            "tags": sorted(reg["tags"]), "metrics": sorted(reg["metrics"]),
+        })
+        return
 
     click.secho("\n─── Registered Metadata ───", bold=True)
 

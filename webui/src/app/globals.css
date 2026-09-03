@@ -802,6 +802,26 @@ code, pre, .mono {
 
 .diff-slot-clear:hover { color: var(--accent-red); }
 
+/* Arbitrary-hash checkpoint lookup (v1.3.0) */
+.checkpoint-hash-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.checkpoint-hash-form input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
 /* Checkpoint list */
 .checkpoint-list {
   display: flex;

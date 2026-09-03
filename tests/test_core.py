@@ -138,3 +138,65 @@ def test_chunk_and_hash_file_rejects_bad_params(tmp_path):
         aether_core.chunk_and_hash_file(str(p), min_chunk=0)
     with pytest.raises(RuntimeError):
         aether_core.chunk_and_hash_file(str(p), min_chunk=4 * 1024 * 1024, avg_chunk=1024)
+
+
+# ---------------------------------------------------------------------------
+# v1.3.0 (todo.md item 1/17): cross-OS golden fixture. Every other CDC test in this
+# suite proves determinism WITHIN one process/machine (same-run reuse, boundary
+# stability under a local edit) — none of them ever pinned an actual expected hash that
+# a genuinely different OS/architecture could be compared against. The gear table is
+# generated from a fixed splitmix64 seed (src/core.cpp) specifically so chunk boundaries
+# (and therefore shard hashes) are architecture-independent — this is the test that
+# actually proves it, by hardcoding the exact expected output and running it on every
+# CI leg: Windows (`test` job), Linux (`nightly`'s `compat` job), and macOS
+# (`nightly`'s dedicated `golden-fixtures-macos` job, -k "golden").
+#
+# Input is `random.Random(42).getrandbits(8)` — CPython's Mersenne Twister stream for a
+# fixed seed is a long-stable, documented property (not OS/architecture-dependent), so
+# this is exactly reproducible input without needing a checked-in binary fixture file.
+# ---------------------------------------------------------------------------
+
+def _golden_cdc_input(size_bytes: int) -> bytes:
+    import random
+
+    rng = random.Random(42)
+    return bytes(rng.getrandbits(8) for _ in range(size_bytes))
+
+
+def test_golden_cdc_input_bytes_are_stable():
+    """Pins the INPUT itself first — if this ever fails, Python's random module changed
+    its stream generation (which would also silently invalidate the boundary/hash golden
+    fixture below without this catching it first, more legibly)."""
+    data = _golden_cdc_input(4 * 1024 * 1024)
+    assert len(data) == 4 * 1024 * 1024
+    assert hashlib.sha256(data).hexdigest() == (
+        "5ac5ccdde350c54d2ebf9e39f33cdd29721cefa16955c5c214ec59427c107ed1"
+    )
+
+
+def test_golden_cdc_chunk_boundaries_and_hashes(tmp_path):
+    """The actual cross-OS golden fixture: exact expected (offset, size, hash) triples
+    for a fixed 4 MiB input under fixed chunk-size parameters. ANY change to the gear
+    table, the cut-point rule, or the hashing itself changes these numbers — that's
+    precisely what this test exists to catch, on every OS in CI."""
+    p = tmp_path / "golden.bin"
+    p.write_bytes(_golden_cdc_input(4 * 1024 * 1024))
+
+    chunks = aether_core.chunk_and_hash_file(
+        str(p), min_chunk=256 * 1024, avg_chunk=512 * 1024, max_chunk=1024 * 1024)
+
+    expected = [
+        (0, 599408, "23a7c1a2341c899d837a7908127078691bf156f40e4e8d208a845a3bcc1035b9"),
+        (599408, 1003226, "eef07a0842594a6fe379cca0d8a016ab53e9652546cc5353cb4800d19b3a68b5"),
+        (1602634, 385964, "d20c45241b20aed8767b6eceff93f9a906f9a877911fbd273f50f271f73afc1d"),
+        (1988598, 936099, "2c6eafc606b73772252d8d87fc8a1379019dee49a24c60cf842b45f638f81a43"),
+        (2924697, 862770, "cc14a21631f5a66edafbdf17d8129dc371c6fa79dc71cc404688d50ca5f060b4"),
+        (3787467, 406837, "45faba08f727218cfdb33f06d9a410bf9236bc1a7dee8dd7b286c222bbf34734"),
+    ]
+    actual = [(c["offset"], c["size"], c["hash"]) for c in chunks]
+    assert actual == expected, (
+        "CDC chunk boundaries/hashes drifted from the pinned golden fixture — if this "
+        "is an intentional algorithm change, dedup silently breaks for every existing "
+        "chunked object in every deployed repo (see src/core.cpp's gear-table comment); "
+        "update this fixture only alongside a deliberate, documented breaking change."
+    )

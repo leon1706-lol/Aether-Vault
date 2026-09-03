@@ -26,3 +26,23 @@ test("dashboard loads and shows the seeded commits", async ({ page }) => {
   const statsGrid = page.locator(".stats-grid").first();
   await expect(statsGrid.getByText("—")).toHaveCount(0);
 });
+
+// v1.3.0 (todo.md item 24): a real backend failure must render as a visible error, not
+// silently look identical to "no data yet" — see lib/api.ts::fetchDashboardData() and
+// every panel's `error` prop. Fails the whole registry API server-side (not just one
+// route) so this is a true end-to-end proof of the wiring page.tsx -> useDashboard ->
+// fetchDashboardData -> every panel, not just a single component's unit test.
+test("dashboard shows a real error state instead of an empty state when the registry API fails", async ({ page }) => {
+  await page.route("**/api/commits**", (route) => route.fulfill({ status: 500, body: "boom" }));
+  await page.route("**/api/refs**", (route) => route.fulfill({ status: 500, body: "boom" }));
+  await page.route("**/api/stats**", (route) => route.fulfill({ status: 500, body: "boom" }));
+
+  await page.goto("/");
+
+  // The app shell still mounts (health/refs/stats/commits failures don't crash the page) —
+  // but the commit graph and commit list panels show a real error, not their empty states.
+  await expect(page.getByText("ML Registry Dashboard")).toBeVisible();
+  await expect(page.getByText(/⚠.*HTTP 500/).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("No commits to graph")).not.toBeVisible();
+  await expect(page.getByText("No commits yet")).not.toBeVisible();
+});

@@ -7,6 +7,33 @@ on:
   workflow_dispatch:
 
 jobs:
+  # v1.3.0 (todo.md item 30): every publish job below depends on this passing — a red
+  # commit (or a release whose bookkeeping is stale/incomplete) can no longer reach PyPI
+  # or GHCR. Read-only toward PRs by construction: see scripts/release_gate.py's own
+  # module docstring — it only ever reads state and exits non-zero, never merges/
+  # approves/opens/pushes anything (tests/test_ci_policy.py enforces that standing rule
+  # for every workflow in this repo, this one included).
+  gate:
+    name: Release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # full history — release_gate.py needs `git merge-base --is-ancestor`
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Aether-Vault (builds the C++ core via pybind11)
+        run: pip install -e .[dev]
+
+      - name: Run the release gate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/release_gate.py --tag "${{ github.ref_name }}"
+
   build-wheels:
     name: Build wheels (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -51,7 +78,7 @@ jobs:
 
   publish-pypi:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    needs: [gate, build-wheels, build-sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -72,7 +99,7 @@ jobs:
 
   github-release:
     name: Create GitHub Release with changelog
-    needs: [build-wheels, build-sdist]
+    needs: [gate, build-wheels, build-sdist]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -106,6 +133,7 @@ jobs:
 
   build-and-push-docker:
     name: Build and push Docker engine image (GHCR)
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
@@ -121,18 +149,45 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # v1.2.2 consolidation: ONE multi-stage build produces the engine image
-      # (registry + webui in one container). The historical server/webui names are
-      # pushed as ALIASES of the same image for one transition cycle — existing
-      # installs' pinned pulls keep working; removed in the next release.
-      - name: Build and push engine image (+ legacy aliases)
+      # (registry + webui in one container). The historical aether-vault-server /
+      # aether-vault-webui image ALIASES (published as one transition cycle's worth of
+      # tags of this exact image) are REMOVED as of v1.3.0 — the earliest-possible MINOR
+      # boundary VERSIONING.md named for this removal. engine-entrypoint.sh's legacy
+      # role auto-detect (DATABASE_URL/NEXT_PUBLIC_API_URL-based) keeps working for
+      # already-pulled legacy images; see docs/migrate-engine-image.md for pinned-compose
+      # migration and `av doctor --compose PATH` for an automated rewrite.
+      - name: Build and push engine image
         uses: docker/build-push-action@v6
         with:
           context: .
+          # v1.3.0 (Probleme.md): explicit — the Dockerfile's unnamed-default stage
+          # stopped being "engine" the moment the server/webui targets were appended
+          # after it; omitting this built the wrong (webui-only, no Python at all) image
+          # under the aether-vault-engine tag.
+          target: engine
           push: true
           tags: |
             ghcr.io/leon1706-lol/aether-vault-engine:latest
             ghcr.io/leon1706-lol/aether-vault-engine:${{ github.ref_name }}
-            ghcr.io/leon1706-lol/aether-vault-server:latest
-            ghcr.io/leon1706-lol/aether-vault-server:${{ github.ref_name }}
-            ghcr.io/leon1706-lol/aether-vault-webui:latest
-            ghcr.io/leon1706-lol/aether-vault-webui:${{ github.ref_name }}
+
+      # v1.3.0 (todo.md item 19): slim, single-role images alongside the "all" engine
+      # image above — for operators who don't want both runtimes in one container.
+      - name: Build and push slim server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: server
+          push: true
+          tags: |
+            ghcr.io/leon1706-lol/aether-vault-engine:server-latest
+            ghcr.io/leon1706-lol/aether-vault-engine:server-${{ github.ref_name }}
+
+      - name: Build and push slim webui image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: webui
+          push: true
+          tags: |
+            ghcr.io/leon1706-lol/aether-vault-engine:webui-latest
+            ghcr.io/leon1706-lol/aether-vault-engine:webui-${{ github.ref_name }}

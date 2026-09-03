@@ -1467,3 +1467,174 @@ fixed rather than just documented (see Probleme #86–93).
   not a regression) blocked the final manual `docker compose` restart/drain repro and
   fresh image rebuild; the owner should re-run that verification once Docker Desktop is
   healthy again (see the phase's own report for exact repro steps).
+
+---
+
+## Phase 58 — V1.3.0 "Depth to 10/10": every existing surface, contract-enforced, docs that can't rot
+
+`todo.md`'s v1.2.6 backlog (28 work packages, WP-0 through WP-28), executed end to end in
+one pass, nothing deferred. Roughly a third of the backlog was already built and only
+needed docs/tests; another third was half-built with a real, provable gap; the rest — a
+threat model, `docs/`, four of five published schemas, a downgrade test, a chaos drill, a
+release gate — genuinely did not exist. **Release number is v1.3.0, not v1.2.6**: this
+phase removes the legacy `aether-vault-server`/`-webui` image aliases, a breaking change
+`VERSIONING.md`'s own deprecation policy only permits at a MINOR boundary.
+
+- **P1 — contracts & parity (WP-1–5):** four new published JSON Schemas
+  (`envelope-1.0`, `event-1.0`, `run-1.0`, `webhook-payload-1.0`, `semdiff-1.0`) join the
+  existing `avh-2.0`, all loaded via `core.load_contract_schema()` and validated against
+  REAL live CLI/server output in new `tests/test_contracts.py`; `smoke-wheel-linux` now
+  asserts the schemas actually land inside a built wheel. Five previously-JSON-blind
+  modules (`cmd_auth`, `cmd_devtools`, `cmd_maintenance`, `cmd_repo`, `cmd_watch`) gained
+  full `--output json` support; new `tests/test_contract_matrix.py` is a table-driven
+  sweep over every command × both modes × every exit code (all seven, including the
+  previously-untested `auth_failed`/12) plus a generic anti-leakage parametrization over
+  the entire `cli.commands` tree — a new command can no longer leak human text ahead of
+  its envelope by omission. `av_sdk/exceptions.py` gained one typed subclass per exit code
+  (`NotARepoError`, `PolicyDeniedError`, ...) plus `sdk_error_for()`; SDK↔CLI↔plugin parity
+  extended across the whole `Repo` surface, not just commit. New `docs/for-agents.md` (was
+  a dangling reference cited from three places, never written). The commit-time ref race
+  now shares `_tip_run_id()`/`remediation` with pull/merge's existing conflict UX, and
+  writes a structured `.av/last_conflict.json` conflict report
+  (`--conflict-report PATH` to redirect it). `av_plugins/mlflow.py::import_run()` no
+  longer defaults `repo_root` to `Path.cwd()`; the deprecated `run_av()`/
+  `build_metric_args()` shims' one-release grace window closed at this MINOR.
+- **P2 — ops & trust (WP-6–10):** `av auth doctor` (token configured? server reachable?
+  token actually authenticates? `AV_AUTH_USERS` parses?) and `av auth rotate [--user]`
+  (mints, writes `.env`, restarts, prints once, audits); optional per-user token
+  `expires_at` rejected with `auth_failed`. `av audit prune --dry-run` reports counts
+  without deleting. `av registry keys list/fingerprint --help` now restate the
+  not-PKI/not-identity-binding disclaimer directly (guard-tested). `av registry
+  export`/`restore` gained a real round-trip test for the first time ever
+  (`tests/test_server.py::test_registry_export_restore_round_trip` — layers, CDC chunks, a
+  merge commit, a signed commit), a progress bar, and independent per-direction
+  `--resume` state files — and in the process of writing that first real test, surfaced
+  four increasingly severe pre-existing bugs in this exact command (Probleme #110–112,
+  #119–120; #119/#120 were both 10/10s: export had never actually exported any object
+  content, and restore's resume state was silently misread from export's own bookkeeping).
+  Webhook backlog/dead-letter/ordering guarantees now proven under load and documented in
+  architecture.md, not just implemented.
+- **P3 — the autonomous loop (WP-11–16):** `av env snapshot --execute` now defaults to a
+  clean `.av/replay-venv/<id>/` (was: installs into the running interpreter);
+  `--into-current` is the explicit opt-out — a real behavior change, documented here and
+  in VERSIONING.md. `av promote --dry-run` reports the decision + deciding rule, touches
+  nothing, exits 0 either way; new `examples/policies/` (three worked, test-loaded
+  files). Migration `0005` adds `runs.policy_outcome`; new `GET /api/runs/{id}/metrics`
+  (cursor-paginated full series) and `GET /api/runs/{id}/lineage` (depth+cursor-bounded);
+  `enforce_policy()`/`promote()` report the outcome for the active run. `.avh` now
+  validates on every write AND read (via `jsonschema` when importable, falling back to the
+  structural check); `av run finish` regenerates `handoff.avh` so lineage/metrics/semantic
+  summary are guaranteed present; new `av context search QUERY [--run] [--since]`. `GET
+  /api/events` gained a `run_id` filter and `gap: true` detection when `since` predates the
+  oldest retained event. New optional `watch = ["watchdog>=4"]` extra — `av watch` uses it
+  when importable, else the existing polling loop; found and fixed a real bug in the
+  watchdog path along the way (a file already on disk at start-up was invisible to it,
+  since watchdog only reports events from the moment it starts observing).
+- **P4 — what humans and agents see (WP-17–18):** semdiff's chunk rollup gained
+  `reused_bytes`/`new_bytes`/`dedup_efficiency_bytes` (byte-level, not just a chunk-count
+  ratio); the server-side `_summarize_tree_diff()` was brought up to the FULL client
+  schema (was a strict subset, silently omitting `models`/`chunks`) with a shared
+  golden-fixture test pinning the two implementations identical; new
+  `GET /api/commits/{a}/diff/{b}`. New `docs/avattributes.md`. WebUI: every panel now
+  reads `useDashboard()`'s real `error` field and renders a distinct error state with
+  retry (was: indistinguishable from empty); run detail promoted to a full view swap on
+  `?run=`, with a policy-outcome badge and full metrics history from the new endpoint;
+  weight diff gained shareable link state (`?tab=weight-diff&a=&b=&path=`), an arbitrary
+  two-commit hash-input compare (was: 100 most recent commits only), and progressive
+  incremental layer reveal (`useIncrementalReveal`) replacing the hard
+  `MAX_RENDERED_LAYERS = 4000` truncation. webui suite: 101 → 165 tests, 20 → 24 files.
+- **P5 — production hard (WP-19–26):** Dockerfile gained named `server`/`webui` slim
+  build targets alongside the (now explicitly named) `engine` default — appending them
+  after the original unnamed stage silently changed Docker's untargeted-build default to
+  `webui`, a real 9/10 bug (Probleme #117) caught only because a fresh rebuild for this
+  phase's own verification crash-looped with no Python interpreter in the image; every
+  consumer (`docker-compose.yml`, `release.yml`, `docker-edge.yml`, `e2e-engine-smoke`) now
+  pins `target: engine` explicitly. Legacy `aether-vault-server`/`-webui` image aliases
+  stopped publishing (see VERSIONING.md's "Removed in v1.3.0" entry); new `av doctor
+  --compose PATH [--write]` rewrites a pinned two-container compose file onto the
+  consolidated image, dry-run by default; new `docs/migrate-engine-image.md`. All four
+  migrations' `downgrade()`s now actually execute (upgrade→downgrade→upgrade round trip
+  against live Postgres) for the first time — previously defined but never once run.
+  `av benchmark`'s speedcheck JSON is now uploaded as a CI artifact; new
+  `scripts/append_perf_history.py` appends a row to `development/perf-history.json` and
+  renders a trend table into `BENCHMARKS.md` (maintainer-run locally, per the no-auto-
+  commit CI policy — WP-25's `gate` job verifies a row exists for the tag instead). New
+  `AV_PERF_SAMPLES` + an explicit warm pass for disk-noise immunity. New `chaos-drills` CI
+  job and `scripts/e2e_scenario.sh` Phases L/M/N (Redis outage, unwritable `AV_DATA_DIR`,
+  SIGKILL mid-push), gated behind `AV_E2E_CHAOS=1`. New `development/threat-model.md`
+  (assets, actors, trust boundaries, threat→mitigation→residual-risk table, annual-review
+  checklist), linked from `SECURITY.md`. New `release.yml` `gate` job — re-runs the
+  stack-free suite, requires the tagged commit's `tests.yml` run green via the GitHub API,
+  asserts a perf-history row for the tag, a signed-off CHANGELOG entry (this literal
+  marker, see below), and that `BENCHMARKS.md`'s captured sha is an ancestor of the tag —
+  every publish job (`publish-pypi`, `github-release`, `build-and-push-docker`) now depends
+  on it; a red commit can no longer publish. New `tests/test_ci_policy.py` makes the
+  standing no-dependency-bots/no-auto-merge rule a permanent, enforced guard over `.github/`
+  instead of a convention. New `docs/tutorial.md` (one continuous operator+agent path) and
+  `docs/README.md` index; new `tests/test_docs_commands.py` parses every fenced `av ...`
+  command out of `docs/*.md` and resolves it against the live Click tree, so documentation
+  rot is now a test failure, not a silent drift (exactly what let benchmark #5's row sit as
+  "capture pending" in README for a full prior cycle — closed this phase with a matching
+  `tests/test_benchmark_docs_freshness.py` guard over the benchmark tables specifically).
+- **Live-stack verification (WP-27, Docker-dependent):** full `pytest tests/test_server.py`,
+  the complete `e2e_scenario.sh` (all phases including the new chaos drills), the
+  drain-under-load repro (20 concurrent uploads, real SIGTERM mid-flight, all 20 complete
+  cleanly — confirmed by hand against a throwaway `engine-drain` container after the
+  Dockerfile fix above), the registry export/restore round trip, and the full Playwright
+  suite all re-verified against a real running stack. `git-lfs`/`dvc`/`mlflow` installed
+  and a complete `av benchmark --markdown development/BENCHMARKS.md` cross-tool capture
+  landed, including benchmark #5 (cold clone) for the first time — its code was finished
+  since v1.1.1 and only ever lacked a live registry to measure against. Machine profile
+  (CPU/RAM/OS/Python) now pinned in `BENCHMARKS.md`'s header, making every published number
+  reproducible for the first time; the stale "`av` has no clone/pull command" methodology
+  note (false since v1.1.1) was corrected.
+- **Real bugs found by this cycle's own verification (details in Probleme):** #114–116
+  test-infrastructure fixes (a generic contract-matrix sweep was mutating the REAL `.env`
+  and restarting the REAL Docker container on every test run — root cause of a previously-
+  unexplained "mystery token" anomaly from an earlier cycle). #117 the Dockerfile's
+  implicit default build target silently became `webui`, not the intended all-in-one
+  image (9/10). #118 a migration file missing from the wheel's `packages=[...]` list left
+  the live database permanently stuck below head with no error (8/10). #119/#120
+  `av registry export`/`restore` — the two most severe findings of this cycle, both 10/10s:
+  export had silently exported zero object content on every real invocation ever, and a
+  restore's resume state was misread from export's own bookkeeping, meaning a genuine
+  disaster-recovery restore into an empty registry would have silently skipped uploading
+  everything. #121 Windows-specific `TemporaryDirectory` cleanup crash across six benchmark
+  scripts. #122 a benchmark mislabeled a real connection-reset-under-load failure as
+  "not installed" (new `ToolStatus.FAILED`). #123 `scripts/append_perf_history.py` captured
+  a silently wrong project version on a dev machine with more than one registered install.
+  #124 `av webhooks deliveries --output json` crashed with an unhandled `ConnectionError`
+  (empty stdout, exit 1) instead of a clean `unreachable_queued` envelope — the one
+  webhooks command that bypassed the module's own `_request()` error-handling helper,
+  found only because this phase's final verification pass ran with Docker deliberately
+  stopped (an intentionally offline condition, not an accident).
+- **Docs pass:** every sub-README audited against the code it describes; eight updated
+  (stale test counts, a stale migration-chain number, missing new scripts/endpoints, a
+  note that had gone actively wrong, the "capture pending" cold-clone line). `todo.md`
+  repurposed from a generated backlog into the owner's live planning canvas (linked from
+  both README's Development Documentation table and AGENTS.md's "before touching
+  anything" list) — the v1.2.6 backlog this whole phase closed is preserved in this
+  entry and in `development/Probleme.md`'s #114–124, not lost. `development/Probleme.md`'s
+  status legend (🟢/🟡/🔴, already documented at the top of the file) is now applied
+  consistently across all 123 prior entries — a past encoding mishap had corrupted 8
+  status badges and 14 body em-dashes/arrows to `�`/`?`, found and fixed as part of this
+  pass, not a new defect in the underlying work those entries describe.
+- **CI:** new `gate` job (release.yml), new `chaos-drills` job (tests.yml), speedcheck
+  JSON artifact upload, `test_ci_policy.py` running stack-free in the main `test` job on
+  every push.
+- **Known, pre-existing, non-regression finding:** `tests/test_perf_gate.py`'s `log()`
+  probe fails locally on this verification machine (median ~3.2–3.8s vs. a 1.35s
+  4.5×-multiplied budget) — reproduced in complete isolation, and the module it actually
+  times (`history.py::walk_history()`) has zero changes this entire cycle, confirming this
+  is the machine's own small-file disk-I/O characteristic the plan's own Known Risks
+  section predicted verbatim, not a regression from this phase's work. Left as-is
+  deliberately: the gate's own docstring warns against loosening its multiplier a fourth
+  time to chase local noise; `AV_PERF_BUDGET_MULTIPLIER` is the documented escape hatch,
+  and CI's Linux runners are the authoritative check.
+- **Deferred:** none of the 28 work packages — WP-0 through WP-28, including the full
+  Docker-dependent tail, all landed in this pass. One genuine open question, not a
+  deferral: the live registry's correct RESTING auth mode (Anonymous vs. Protected) after
+  this cycle's repeated stop/restart cycles for live verification is not independently
+  known — flagged explicitly in `todo.md` for the owner rather than guessed at.
+
+Essential-Tasks: signed off

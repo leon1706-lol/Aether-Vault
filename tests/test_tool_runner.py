@@ -70,6 +70,19 @@ def test_format_value_renders_not_installed():
     assert format_value(None, ToolStatus.NOT_INSTALLED, "ms") == "not installed"
 
 
+def test_format_value_renders_failed_with_note():
+    # v1.3.0 (Probleme.md): a reachable tool/server whose operation itself failed must say
+    # "failed", never "not installed" — those mean different things to a reader deciding
+    # whether to re-run the capture or go looking for a missing binary.
+    out = format_value(None, ToolStatus.FAILED, "ms", note="connection reset", with_note=True)
+    assert out == "failed (connection reset)"
+
+
+def test_format_value_renders_failed_without_note_when_with_note_false():
+    out = format_value(None, ToolStatus.FAILED, "ms", note="connection reset", with_note=False)
+    assert out == "failed"
+
+
 def _make_result(name="bench_x", op="op1", av_value=100.0, competitor_value=50.0):
     return BenchmarkResult(
         name=name,

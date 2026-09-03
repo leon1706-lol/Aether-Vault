@@ -307,6 +307,16 @@ def resolve_replay_target(repo_root: Path, target: str | None):
     return None, None
 
 
+# v1.3.0: the CUDA base tags this project's own CI/Docker images actually build against
+# (see development/infrastructure.md's "CUDA base matrix" section) — --cuda TAG outside
+# this set still generates a Dockerfile (never a hard failure; nvidia/cuda publishes many
+# tags this project simply hasn't validated), just with a warning that combination is
+# unverified.
+_VALIDATED_CUDA_TAGS = {
+    "12.1.0", "12.1.1", "12.4.1", "12.6.2", "12.8.0",
+}
+
+
 def render_recipe(snap: dict, dockerfile: bool, cuda_tag: str | None = None) -> str:
     """Pure renderer shared by all replay paths (and the golden fixture test).
 
@@ -390,13 +400,24 @@ def snapshot(full: bool) -> None:
                 + ("  · linked to the active run" if linked else ""), fg="cyan")
 
 
-def _resolve_pip_invocation(target_venv: str | None, conda_env: str | None):
-    """v1.2.5: where --execute actually installs. Returns (argv_prefix, description).
+def _resolve_pip_invocation(repo_root: Path, snapshot_id: str | None, target_venv: str | None,
+                            conda_env: str | None, into_current: bool):
+    """Where --execute actually installs. Returns (argv_prefix, description).
 
-    Default (neither flag) now correctly uses `sys.executable -m pip` — the pre-1.2.5
-    code shelled a bare `pip`, which can silently resolve to a DIFFERENT interpreter's
-    pip than the one running this command (Probleme.md: a real interpreter-mismatch
-    risk, not hypothetical, on any machine with more than one Python on PATH)."""
+    v1.3.0: clean-venv is now the DEFAULT happy path — --execute with none of
+    --target-venv/--conda-env/--into-current creates (or reuses)
+    `.av/replay-venv/<snapshot_id>/` instead of installing into the interpreter running
+    `av` itself. Reproducing an experiment's environment into the CURRENT interpreter's
+    site-packages is exactly the kind of silent cross-contamination replay exists to
+    avoid — installing pins from an arbitrary snapshot into your daily-driver Python
+    was surprising, occasionally destructive default behavior. --into-current is the
+    explicit, named opt-out for whoever actually wants that.
+
+    v1.2.5: `sys.executable -m pip` (never a bare `pip`, which can silently resolve to a
+    DIFFERENT interpreter's pip than the one running this command — a real
+    interpreter-mismatch risk on any machine with more than one Python on PATH) is what
+    --into-current now uses.
+    """
     import shutil
 
     if conda_env:
@@ -416,7 +437,20 @@ def _resolve_pip_invocation(target_venv: str | None, conda_env: str | None):
         activate = (venv_path / "Scripts" / "activate") if os.name == "nt" else \
             (venv_path / "bin" / "activate")
         return [str(py), "-m", "pip"], f"venv at {venv_path} (activate: {activate})"
-    return [sys.executable, "-m", "pip"], f"the running interpreter ({sys.executable})"
+    if into_current:
+        return [sys.executable, "-m", "pip"], f"the running interpreter ({sys.executable})"
+    # Default: a clean venv scoped to this snapshot, reused on a re-run instead of
+    # rebuilt every time.
+    default_venv = repo_root / ".av" / "replay-venv" / (snapshot_id or "default")
+    if not default_venv.exists():
+        import venv as _venv_mod
+
+        click.secho(f"Creating venv at {default_venv}...", fg="cyan")
+        _venv_mod.create(default_venv, with_pip=True)
+    py = default_venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    activate = (default_venv / "Scripts" / "activate") if os.name == "nt" else \
+        (default_venv / "bin" / "activate")
+    return [str(py), "-m", "pip"], f"venv at {default_venv} (activate: {activate})"
 
 
 def _validate_pins(pins: list[str]) -> list[dict]:
@@ -462,13 +496,18 @@ def _validate_pins(pins: list[str]) -> list[dict]:
 @click.option("--execute", "execute_mode", is_flag=True, default=False,
               help="Install the recipe's pins after showing it (asks first unless -y).")
 @click.option("--target-venv", "target_venv", default=None, metavar="PATH",
-              help="With --execute: create (if absent) and install into this venv, not the running interpreter.")
+              help="With --execute: create (if absent) and install into this venv instead "
+                   "of the default .av/replay-venv/<snapshot>/.")
 @click.option("--conda-env", "conda_env", default=None, metavar="NAME",
               help="With --execute: install into this conda environment via `conda run -n NAME`.")
+@click.option("--into-current", "into_current", is_flag=True, default=False,
+              help="With --execute: install into the interpreter running `av` itself, "
+                   "instead of the default clean .av/replay-venv/<snapshot>/. Explicit "
+                   "opt-out of the default isolation — mutates your current environment.")
 @click.option("-y", "--yes", is_flag=True, default=False, help="Skip the execute confirmation.")
 def replay(target: str | None, dockerfile: bool, cuda_tag: str | None, out_path: str | None,
           validate_mode: bool, execute_mode: bool, target_venv: str | None,
-          conda_env: str | None, yes: bool) -> None:
+          conda_env: str | None, into_current: bool, yes: bool) -> None:
     """Print (or execute) the reproduction recipe for TARGET (a run id, commit hash, or
     snapshot id) — or the latest local snapshot when omitted.
 
@@ -481,8 +520,18 @@ def replay(target: str | None, dockerfile: bool, cuda_tag: str | None, out_path:
     """
     if cuda_tag and not dockerfile:
         fail(None, "validation", "--cuda only applies together with --dockerfile.")
-    if target_venv and conda_env:
-        fail(None, "validation", "--target-venv and --conda-env are mutually exclusive.")
+    if cuda_tag and cuda_tag not in _VALIDATED_CUDA_TAGS and current_output_mode() != "json":
+        click.secho(
+            f"[WARN] '{cuda_tag}' is not one of the validated CUDA base tags "
+            f"({', '.join(sorted(_VALIDATED_CUDA_TAGS))}) — the Dockerfile will still be "
+            "generated, but this combination hasn't been built/tested (see "
+            "development/infrastructure.md).",
+            fg="yellow",
+        )
+    isolation_flags = [f for f, v in (("--target-venv", target_venv), ("--conda-env", conda_env),
+                                      ("--into-current", into_current)) if v]
+    if len(isolation_flags) > 1:
+        fail(None, "validation", f"{' and '.join(isolation_flags)} are mutually exclusive.")
 
     repo_root = ensure_repo()
     snap, source = resolve_replay_target(repo_root, target)
@@ -523,7 +572,8 @@ def replay(target: str | None, dockerfile: bool, cuda_tag: str | None, out_path:
     if execute_mode:
         if not pins:
             fail(None, "validation", "Nothing to install — snapshot has no pins.")
-        pip_prefix, exec_target_desc = _resolve_pip_invocation(target_venv, conda_env)
+        pip_prefix, exec_target_desc = _resolve_pip_invocation(
+            repo_root, env_snapshot_id(snap), target_venv, conda_env, into_current)
         if not yes and not json_mode:
             click.secho(f"About to run {len(pins)} pip install command(s) into "
                         f"{exec_target_desc}. Continue? [y/N]", fg="yellow", nl=False)

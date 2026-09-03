@@ -6,9 +6,10 @@ interface Props {
   refs: Ref;
   commits: Commit[];
   loading: boolean;
+  error?: string | null;
 }
 
-export function BranchList({ refs, commits, loading }: Props) {
+export function BranchList({ refs, commits, loading, error }: Props) {
   const commitByHash: Record<string, Commit> = {};
   for (const c of commits) {
     commitByHash[c.hash] = c;
@@ -29,6 +30,22 @@ export function BranchList({ refs, commits, loading }: Props) {
           <div className="spinner" />
           Loading branches…
         </div>
+      </div>
+    );
+  }
+
+  // v1.3.0: distinguishes "the registry is unreachable/errored" from "genuinely no
+  // branches yet" — these used to render identically (see development/Probleme.md).
+  if (error && branches.length === 0) {
+    return (
+      <div className="card">
+        <div className="card-header">
+          <span className="card-title">
+            <BranchIcon />
+            Branches
+          </span>
+        </div>
+        <div className="empty-state">⚠ {error}</div>
       </div>
     );
   }

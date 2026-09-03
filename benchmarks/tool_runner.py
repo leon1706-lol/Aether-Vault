@@ -9,6 +9,7 @@ never inferred), instead of guessing at a number for either case.
 """
 
 import datetime
+import os
 import platform
 import shutil
 import subprocess
@@ -26,6 +27,12 @@ class ToolStatus(Enum):
     AVAILABLE = "available"
     NOT_INSTALLED = "not installed"
     NOT_APPLICABLE = "N/A"
+    # v1.3.0 (Probleme.md): distinct from NOT_INSTALLED. A benchmark that reached a real,
+    # reachable tool/server but had the operation itself fail (e.g. a connection reset under
+    # concurrent load) must say so honestly rather than claim the tool "wasn't installed" —
+    # that was actively misleading on a real capture where av was installed and the server
+    # was up the whole time.
+    FAILED = "failed"
 
 
 @dataclass
@@ -107,9 +114,8 @@ def rate(av_value: float | None, competitor_values: dict[str, float | None]) -> 
 def format_value(value: float | None, status: ToolStatus, unit: str, note: str | None = None, with_note: bool = False) -> str:
     if value is not None:
         return f"{value:,.1f} {unit}"
-    if status == ToolStatus.NOT_APPLICABLE:
-        return "N/A" + (f" ({note})" if with_note and note else "")
-    return status.value
+    label = "N/A" if status == ToolStatus.NOT_APPLICABLE else status.value
+    return label + (f" ({note})" if with_note and note else "")
 
 
 def _verdict_for_row(row: Row, tool_order: list[str]) -> str:
@@ -176,11 +182,12 @@ METHODOLOGY_NOTES = """## Methodology notes (resolved open questions)
 - **GC throughput, competitor columns:** same reasoning as concurrent push — `av gc` is a
   remote-CAS-server operation with no equivalent in Git LFS/DVC/MLflow's storage models, so
   all three competitor columns are N/A rather than approximated.
-- **Cold clone, `av` column:** a real product gap found while building this benchmark, not a
-  benchmark artifact — `av` has no `clone`/`pull` command at all today. Sync is currently
-  push-only from a single working repo; there's no flow for a second machine to materialize a
-  fresh copy of a project someone else pushed. Tracked as a roadmap item (see README), not a
-  bug — nothing is broken, the feature doesn't exist yet.
+- **Cold clone, `av` column:** `av clone <project>` has existed since v1.1.1 — this note
+  used to say the command didn't exist at all; that was true when this benchmark suite was
+  first built and is stale now. The measured number here is a real, live `av clone` against
+  a running registry (`benchmarks/bench_cold_clone.py`), timing exactly what Git LFS's
+  `git clone` + `git lfs pull` and DVC's `git clone` + `dvc pull` measure for their own
+  columns — a second machine materializing a fresh copy of a project someone else pushed.
 - **Partial-checkpoint fetch, "fetch whole checkpoint" row:** MLflow's number here is a
   local-filesystem artifact store, not a network round trip like av/Git LFS's real HTTP
   fetch or DVC's local-dir remote pull — faster for that reason, not because MLflow's actual
@@ -242,6 +249,61 @@ def _git_short_sha(repo_root: Path) -> str:
         return "unknown"
 
 
+def _total_ram_gb() -> str:
+    """Best-effort, dependency-free (no psutil) total RAM — a real reference-machine fact
+    every published number here should be read against, since these are single-machine
+    timings (see the Caveat line). "unknown" rather than a wrong guess when the platform-
+    specific path isn't available."""
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+
+            class _MEMSTATUS(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MEMSTATUS()
+            status.dwLength = ctypes.sizeof(_MEMSTATUS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+            return f"{status.ullTotalPhys / (1024 ** 3):.0f} GB"
+        # Linux/macOS: /proc/meminfo exists on Linux; macOS has no equivalent without a
+        # subprocess (sysctl) — try both, fall back to unknown rather than guess.
+        meminfo = Path("/proc/meminfo")
+        if meminfo.exists():
+            for line in meminfo.read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return f"{kb / (1024 ** 2):.0f} GB"
+        result = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return f"{int(result.stdout.strip()) / (1024 ** 3):.0f} GB"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def render_machine_profile() -> str:
+    """v1.3.0 (todo.md item 4): none of the numbers in this doc were reproducible before
+    this existed — CPU model, core count, RAM, and OS are exactly the variables that make
+    a "hash 10MB file" timing mean something different on two different machines."""
+    cpu = platform.processor() or platform.machine() or "unknown"
+    return f"""## Reference machine
+
+| | |
+|---|---|
+| CPU | {cpu} ({os.cpu_count() or "?"} logical cores) |
+| RAM | {_total_ram_gb()} |
+| OS | {platform.system()} {platform.release()} ({platform.machine()}) |
+| Python | {platform.python_version()} |
+
+"""
+
+
 def render_doc_header(repo_root: Path, tool_versions: dict[str, str] | None = None) -> str:
     """Generates the whole BENCHMARKS.md preamble (title, intro, Captured line, Caveat,
     Legend) so `--markdown` can write a complete, ready-to-commit file in one shot instead
@@ -268,13 +330,16 @@ guessed at.
 is real. Re-run before relying on any single number for a decision. Use `av benchmark --baseline`
 to track regressions across captures rather than eyeballing two snapshots of this file by hand.
 
-## Legend
+{render_machine_profile()}## Legend
 
 - **GOOD** — Aether is at least 1.5x better than the best real competitor number.
 - **OK** — within 1.5x either way, or no competitor produced a real number to compare against.
 - **BAD** — Aether is more than 1.5x worse than the best real competitor number.
 - **N/A** — the benchmark's primitive doesn't apply to that tool at all (footnoted why).
 - **not installed** — the tool wasn't found on `PATH` in the capturing environment.
+- **failed** — the tool/server was reachable but the operation itself failed on this capture
+  (footnoted why); re-run before treating a "failed" cell as a real regression, since it
+  usually means capture-machine contention rather than a code defect.
 
 """
 

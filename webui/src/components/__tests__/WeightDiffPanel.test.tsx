@@ -1,17 +1,25 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WeightDiffPanel } from "../WeightDiffPanel";
 import type { Commit } from "@/lib/api";
 
-const { fetchCommitsWithLayers } = vi.hoisted(() => ({
+const { fetchCommitsWithLayers, fetchCommit } = vi.hoisted(() => ({
   fetchCommitsWithLayers: vi.fn(),
+  fetchCommit: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
-  return { ...actual, fetchCommitsWithLayers };
+  return { ...actual, fetchCommitsWithLayers, fetchCommit };
+});
+
+beforeEach(() => {
+  // v1.3.0 shareable weight-diff link touches window.history — keep each test's URL
+  // state isolated (same convention as RunsPanel.test.tsx's ?run= deep-link tests).
+  window.history.replaceState(null, "", "/");
+  fetchCommit.mockReset();
 });
 
 function makeCommit(overrides: Partial<Commit> = {}): Commit {
@@ -125,5 +133,83 @@ describe("WeightDiffPanel", () => {
     await waitFor(() =>
       expect(screen.getByText(/Comparing different files/)).toBeInTheDocument()
     );
+  });
+
+  it("syncs the selection into the URL as slots are filled and cleared", async () => {
+    const user = userEvent.setup();
+    fetchCommitsWithLayers.mockResolvedValueOnce([commitV1, commitV2]);
+    render(<WeightDiffPanel />);
+
+    await waitFor(() => expect(screen.getByText("v1")).toBeInTheDocument());
+    await user.click(screen.getByText("v1"));
+    expect(new URLSearchParams(window.location.search).get("a")).toBe(commitV1.hash);
+
+    await user.click(screen.getByText("v2"));
+    expect(new URLSearchParams(window.location.search).get("b")).toBe(commitV2.hash);
+    expect(new URLSearchParams(window.location.search).get("path")).toBe("model.safetensors");
+  });
+
+  it('resolves an older commit by hash via "Compare by hash" and fills the next open slot', async () => {
+    const user = userEvent.setup();
+    const older = makeCommit({
+      hash: "e".repeat(64),
+      timestamp: "2026-06-01T00:00:00Z",
+      tree: {
+        "old.safetensors": {
+          hash: "t-old",
+          size: 50,
+          type: "artifact",
+          layers: [{ name: "layer0", hash: "OLD0", size: 50 }],
+        },
+      },
+    });
+    fetchCommitsWithLayers.mockResolvedValueOnce([commitV1]);
+    fetchCommit.mockResolvedValueOnce(older);
+
+    render(<WeightDiffPanel />);
+    await waitFor(() => expect(screen.getByText("v1")).toBeInTheDocument());
+
+    await user.type(screen.getByLabelText("Compare by hash"), older.hash);
+    await user.click(screen.getByRole("button", { name: /Load into Slot A/ }));
+
+    await waitFor(() => expect(fetchCommit).toHaveBeenCalledWith(older.hash));
+    await waitFor(() =>
+      expect(new URLSearchParams(window.location.search).get("a")).toBe(older.hash)
+    );
+    // Appears twice: once in the filled Slot A card, once in the checkpoint list below it.
+    expect(screen.getAllByText("old.safetensors").length).toBeGreaterThan(0);
+  });
+
+  it("shows a lookup error for an unknown hash instead of crashing", async () => {
+    const user = userEvent.setup();
+    fetchCommitsWithLayers.mockResolvedValueOnce([commitV1]);
+    fetchCommit.mockRejectedValueOnce(new Error("404: commit not found"));
+
+    render(<WeightDiffPanel />);
+    await waitFor(() => expect(screen.getByText("v1")).toBeInTheDocument());
+
+    await user.type(screen.getByLabelText("Compare by hash"), "f".repeat(64));
+    await user.click(screen.getByRole("button", { name: /Load into Slot A/ }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/commit not found/)).toBeInTheDocument()
+    );
+  });
+
+  it("applies a ?a=&b=&path= deep link on mount, resolving hashes not in the initial page", async () => {
+    fetchCommitsWithLayers.mockResolvedValueOnce([commitV1]);
+    fetchCommit.mockResolvedValueOnce(commitV2); // "b" isn't in the initial fetched page
+
+    render(
+      <WeightDiffPanel
+        initialSlotAHash={commitV1.hash}
+        initialSlotBHash={commitV2.hash}
+        initialPath="model.safetensors"
+      />
+    );
+
+    await waitFor(() => expect(screen.getByText("Total Layers")).toBeInTheDocument());
+    const totalLayersCard = screen.getByText("Total Layers").closest(".stat-card")!;
+    expect(within(totalLayersCard).getByText("2")).toBeInTheDocument();
   });
 });

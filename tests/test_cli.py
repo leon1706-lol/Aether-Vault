@@ -510,6 +510,51 @@ def test_commit_queues_for_retry_instead_of_losing_it_when_token_is_rejected(rep
     assert any(p["commit_hash"] == commit_hash for p in pending)
 
 
+def test_commit_ref_race_attributes_the_winning_run_and_gives_remediation(repo, monkeypatch):
+    # v1.3.0 (todo.md item 14): the commit-time ref race is the actual concurrent-write
+    # collision — before this, av pull/av merge's own race paths attributed the collision
+    # to a run id with copy-paste remediation, but THIS path (a losing compare-and-swap on
+    # av commit's own push) gave a generic "another agent updated X first" with neither.
+    from python.av_cli.client import RefRaceError, VaultClient
+
+    # A prior commit tagged with a run — this is the "winner" the race will report.
+    (repo / "winner.txt").write_text("w")
+    invoke("add", "winner.txt")
+    import os
+    os.environ["AV_RUN_ID"] = "winning-run-42"
+    try:
+        invoke("commit", "-m", "winner commit")
+    finally:
+        del os.environ["AV_RUN_ID"]
+    winner_hash = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
+    monkeypatch.setattr(VaultClient, "batch_check_objects", lambda self, hashes: set())
+    monkeypatch.setattr(VaultClient, "upload_object", lambda self, *a, **k: True)
+    monkeypatch.setattr(VaultClient, "push_commit", lambda self, data: True)
+
+    def _raise_race(self, ref_name, commit_hash, expected_hash=None):
+        raise RefRaceError(ref_name, winner_hash, expected_hash)
+
+    monkeypatch.setattr(VaultClient, "update_ref", _raise_race)
+
+    (repo / "loser.txt").write_text("l")
+    invoke("add", "loser.txt")
+    result = invoke("--output", "json", "commit", "-m", "loser commit")
+    assert result.exit_code == 0, result.output  # queued is safe, not a failure
+    env = json.loads(result.output)
+    assert env["data"]["queued_reason"] == "ref_race"
+    race = env["data"]["ref_race"]
+    assert race["current"] == winner_hash
+    assert race["current_run_id"] == "winning-run-42"
+    assert race["remediation"] == ["av pull", "av push"]
+
+    (repo / "loser2.txt").write_text("l2")
+    invoke("add", "loser2.txt")
+    text_result = invoke("commit", "-m", "another loser")
+    assert "winning-run-42" in text_result.output
+
+
 def test_flush_pending_push_preserves_queue_on_auth_failure(repo, monkeypatch):
     # Companion regression test: flush_pending_push() must not lose *other* already-queued
     # commits either when a bad/stale token is hit partway through retrying them.
@@ -815,6 +860,117 @@ def test_doctor_dry_run_without_fix_is_a_noop(repo):
     result_dry = invoke("doctor", "--dry-run")
     assert result_plain.exit_code == result_dry.exit_code == 0
     assert result_plain.output == result_dry.output
+
+
+# ---------------------------------------------------------------------------
+# av doctor --compose (v1.3.0, todo.md item 20): legacy two-container compose ->
+# consolidated one-container AV_ENGINE_ROLE=all migration tool. Doesn't need a repo
+# (ensure_repo() is never called on this branch) — a bare tmp_path compose file is enough.
+# ---------------------------------------------------------------------------
+
+_LEGACY_COMPOSE = """\
+services:
+  db:
+    image: postgres:15-alpine
+  aether-vault-server:
+    image: ghcr.io/leon1706-lol/aether-vault-server:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://av_user:av_password@db:5432/aether_vault
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - db
+    volumes:
+      - av-data:/data
+    restart: unless-stopped
+  aether-vault-webui:
+    image: ghcr.io/leon1706-lol/aether-vault-webui:latest
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+volumes:
+  av-data:
+"""
+
+
+def _write_legacy_compose(tmp_path):
+    p = tmp_path / "docker-compose.yml"
+    p.write_text(_LEGACY_COMPOSE, encoding="utf-8")
+    return p
+
+
+def test_doctor_compose_dry_run_previews_without_touching_the_file(tmp_path):
+    import yaml
+
+    path = _write_legacy_compose(tmp_path)
+    before = path.read_bytes()
+
+    result = invoke("doctor", "--compose", str(path))
+    assert result.exit_code == 0, result.output
+    assert "[DRY RUN]" in result.output
+    assert "Pass --write to apply" in result.output
+    assert path.read_bytes() == before  # untouched
+
+    rendered = yaml.safe_load(result.output.split(":\n", 1)[1].rsplit("\n\nPass", 1)[0])
+    services = rendered["services"]
+    assert "aether-vault-server" not in services and "aether-vault-webui" not in services
+    engine = services["aether-vault-engine"]
+    assert engine["environment"]["AV_ENGINE_ROLE"] == "all"
+    assert engine["environment"]["DATABASE_URL"].startswith("postgresql+asyncpg://")
+    assert engine["environment"]["NEXT_PUBLIC_API_URL"] == "http://localhost:8000"
+    assert sorted(engine["ports"]) == ["3000:3000", "8000:8000"]
+    assert engine["depends_on"] == ["db"]
+    assert engine["volumes"] == ["av-data:/data"]
+    assert engine["stop_grace_period"] == "30s"  # v1.2.5 default, carried forward
+    assert services["db"]["image"] == "postgres:15-alpine"  # untouched sibling service
+
+
+def test_doctor_compose_write_applies_the_rewrite_in_place(tmp_path):
+    import yaml
+
+    path = _write_legacy_compose(tmp_path)
+    result = invoke("doctor", "--compose", str(path), "--write")
+    assert result.exit_code == 0, result.output
+    assert "Rewriting" in result.output
+
+    rewritten = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert set(rewritten["services"]) == {"db", "aether-vault-engine"}
+
+
+def test_doctor_compose_json_mode_reports_the_rewrite(tmp_path):
+    path = _write_legacy_compose(tmp_path)
+    result = invoke("--output", "json", "doctor", "--compose", str(path))
+    assert result.exit_code == 0, result.output
+    env = json.loads(result.output)
+    assert env["ok"] is True
+    assert env["data"]["mode"] == "compose_migrate"
+    assert env["data"]["applied"] is False
+    assert set(env["data"]["removed_services"]) == {"aether-vault-server", "aether-vault-webui"}
+    assert env["data"]["added_service"] == "aether-vault-engine"
+    assert "AV_ENGINE_ROLE: all" in env["data"]["rendered"]
+    # JSON dry-run must not touch the file either.
+    assert "aether-vault-server" in path.read_text(encoding="utf-8")
+
+
+def test_doctor_compose_fails_cleanly_on_an_unrelated_compose_file(tmp_path):
+    path = tmp_path / "docker-compose.yml"
+    path.write_text("services:\n  redis:\n    image: redis:7\n", encoding="utf-8")
+    before = path.read_bytes()
+
+    result = invoke("doctor", "--compose", str(path))
+    assert result.exit_code == 15  # validation
+    assert "could not find both a legacy server AND webui service" in result.output
+    assert path.read_bytes() == before
+
+
+def test_doctor_compose_rejects_invalid_yaml(tmp_path):
+    path = tmp_path / "docker-compose.yml"
+    path.write_text("services: [this is not: valid: yaml", encoding="utf-8")
+    result = invoke("doctor", "--compose", str(path))
+    assert result.exit_code == 15
+    assert "not valid YAML" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -1565,6 +1721,91 @@ def test_auth_remove_unknown_user_warns(repo, monkeypatch):
     result = invoke("auth", "remove-user", "nobody")
     assert result.exit_code == 0, result.output
     assert "No such user 'nobody'" in result.output
+
+
+def test_auth_add_user_with_expiry_shows_in_list(repo, monkeypatch):
+    import json as json_mod
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    import python.av_cli.docker_runtime as docker_runtime_module
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    result = invoke("auth", "add-user", "temp", "temp-tok", "--expires-in-days", "7")
+    assert result.exit_code == 0, result.output
+    assert "Expires:" in result.output
+
+    env_text = (repo / ".env").read_text(encoding="utf-8")
+    assert "temp-tok" in env_text and "expires_at" in env_text
+
+    listing = invoke("--output", "json", "auth", "list-users")
+    users = json_mod.loads(listing.output)["data"]["users"]
+    temp_user = next(u for u in users if u["name"] == "temp")
+    assert temp_user["expires_at"] is not None
+
+
+def test_auth_rotate_preserves_expiry_and_invalidates_old_token(repo, monkeypatch):
+    import json as json_mod
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    import python.av_cli.docker_runtime as docker_runtime_module
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+
+    invoke("auth", "add-user", "temp", "old-tok", "--expires-in-days", "30")
+    result = invoke("--output", "json", "auth", "rotate", "--user", "temp")
+    assert result.exit_code == 0, result.output
+    env = json_mod.loads(result.output)
+    new_token = env["data"]["token"]
+    assert new_token != "old-tok"
+
+    listing = json_mod.loads(invoke("--output", "json", "auth", "list-users").output)
+    temp_user = next(u for u in listing["data"]["users"] if u["name"] == "temp")
+    assert temp_user["expires_at"] is not None  # preserved across rotation
+
+
+def test_auth_rotate_unknown_user_fails_validation(repo, monkeypatch):
+    _sandbox_compose_dir(repo, monkeypatch)
+    result = invoke("--output", "json", "auth", "rotate", "--user", "ghost")
+    assert result.exit_code == 15, result.output
+
+
+def test_auth_doctor_reports_anonymous_repo(repo, monkeypatch):
+    import python.av_cli.client as client_module
+
+    monkeypatch.setattr(client_module.VaultClient, "server_available", lambda self: False)
+    result = invoke("--output", "json", "auth", "doctor")
+    assert result.exit_code == 0, result.output
+    import json as json_mod
+    env = json_mod.loads(result.output)
+    checks = {c["name"]: c for c in env["data"]["checks"]}
+    assert checks["token_configured"]["ok"] is False
+    assert checks["token_configured"]["fix"] == "av auth set-token <token>"
+
+
+def test_auth_doctor_flags_rejected_token(repo, monkeypatch):
+    import python.av_cli.client as client_module
+    from python.av_cli.client import AuthenticationError
+
+    _sandbox_compose_dir(repo, monkeypatch)
+    import python.av_cli.docker_runtime as docker_runtime_module
+    monkeypatch.setattr(docker_runtime_module, "check_docker_running", lambda: docker_runtime_module.DockerCheckResult.RUNNING)
+    monkeypatch.setattr(docker_runtime_module, "restart_service", lambda *a, **k: True)
+    invoke("auth", "set-token", "stale-token")
+
+    monkeypatch.setattr(client_module.VaultClient, "server_available", lambda self: True)
+
+    def _raise(self):
+        raise AuthenticationError("nope")
+
+    monkeypatch.setattr(client_module.VaultClient, "fetch_all_refs", _raise)
+
+    result = invoke("--output", "json", "auth", "doctor")
+    import json as json_mod
+    env = json_mod.loads(result.output)
+    checks = {c["name"]: c for c in env["data"]["checks"]}
+    assert checks["token_authenticates"]["ok"] is False
+    assert env["data"]["healthy"] is False
 
 
 # ---------------------------------------------------------------------------

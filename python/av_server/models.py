@@ -144,6 +144,11 @@ class DBRun(Base):
     # private reasoning, so this is never set implicitly by a normal commit/push.
     avh_object_id = Column(Text, nullable=True)
     env_snapshot_id = Column(String, nullable=True)
+    # v1.3.0 (todo.md item 7): the most recent av promote/merge policy decision made for
+    # THIS run's active commit, reported by the CLI via POST /api/runs/{id}/policy-outcome
+    # right after enforce_policy()/promote() decides — {"decision": "allow"|"deny",
+    # "rule": str|None, "at": ISO-8601}. Null until the first decision for this run.
+    policy_outcome = Column(JSON, nullable=True)
     # Latest value per metric name: {"val_loss": 0.31, "steps": 12000} — refreshed on
     # every linked commit push. Query-friendly without walking commit trees.
     metrics_summary = Column(JSON, nullable=True)
@@ -222,7 +227,16 @@ class DBAuditLog(Base):
     # duplicate, ...) so the trail answers "did it actually land?", not just "was it tried".
     status_code = Column(Integer, nullable=True)
 
-    __table_args__ = (Index("ix_audit_ts", "ts"),)
+    # v1.2.5 (migration 0004): username/action indexes support the richer audit filters
+    # added that same phase. Declared here too (not just in the migration) so this model
+    # stays the single source of truth `_heal_legacy_indexes` diffs an adopted volume
+    # against — see Probleme.md: an adopted legacy volume's stamp-to-head skipped these
+    # entirely (only _LEGACY_COLUMNS was healed, never index-only migration additions).
+    __table_args__ = (
+        Index("ix_audit_ts", "ts"),
+        Index("ix_audit_log_username", "username"),
+        Index("ix_audit_log_action", "action"),
+    )
 
 
 class DBWebhookDelivery(Base):

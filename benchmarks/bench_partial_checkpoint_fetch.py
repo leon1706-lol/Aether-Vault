@@ -46,7 +46,7 @@ def _bench_av() -> dict[str, float | None]:
     if av_path is None:
         return {"layer": None, "whole": None}
 
-    with tempfile.TemporaryDirectory(prefix="bench-fetch-av-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-fetch-av-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         subprocess.run([av_path, "init", "--mode", "local", "--yes", "--no-repl"], cwd=root)
         subprocess.run([av_path, "config", "1"], cwd=root)
@@ -91,7 +91,7 @@ def _bench_git_lfs() -> float | None:
     git_lfs = shutil.which("git-lfs")
     if git_path is None or git_lfs is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-fetch-gitlfs-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-fetch-gitlfs-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         remote = root / "remote.git"
         subprocess.run(["git", "init", "--bare", str(remote)])
@@ -120,7 +120,7 @@ def _bench_dvc() -> float | None:
     git_path = shutil.which("git")
     if dvc_path is None or git_path is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-fetch-dvc-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-fetch-dvc-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         bare = root / "remote.git"
         subprocess.run(["git", "init", "--bare", str(bare)])

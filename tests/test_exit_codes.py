@@ -64,6 +64,50 @@ def test_nothing_to_commit_exits_11_json(repo):
 
 
 # ---------------------------------------------------------------------------
+# 12 — auth_failed. _AuthRetryGroup (core.py) catches AuthenticationError from ANY
+# subcommand in one place; under CliRunner, ui.is_interactive() is always False (no real
+# tty), so the non-interactive branch (fail(ctx, "auth_failed", ...)) fires regardless of
+# --output json — proving the same code path both modes actually share, rather than
+# needing two different simulations.
+# ---------------------------------------------------------------------------
+
+def _make_push_401(monkeypatch, repo):
+    from python.av_cli.client import AuthenticationError, VaultClient
+
+    (repo / "f.txt").write_text("v1")
+    invoke("add", "f.txt")
+    # No server ever runs for this repo, so this queues (same shape as the
+    # unreachable_queued test above) — gives `push` a pending commit to retry.
+    invoke("commit", "-m", "queued for auth-failed repro")
+    monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
+
+    def _raise(*args, **kwargs):
+        raise AuthenticationError("Server rejected the request (401)")
+
+    # cmd_history.py does `from .core import *` at import time, so `flush_pending_push`
+    # is a name bound in cmd_history's own module namespace by now — patching
+    # core.flush_pending_push itself would not affect the already-resolved reference
+    # push() actually calls.
+    monkeypatch.setattr("python.av_cli.cmd_history.flush_pending_push", _raise)
+
+
+def test_auth_failed_exits_12_text(repo, monkeypatch):
+    _make_push_401(monkeypatch, repo)
+    result = invoke("push")
+    assert result.exit_code == 12, result.output
+    assert "protected" in result.output.lower()
+
+
+def test_auth_failed_exits_12_json(repo, monkeypatch):
+    _make_push_401(monkeypatch, repo)
+    result = invoke_json("push")
+    assert result.exit_code == 12, result.output
+    env = json.loads(result.output)
+    assert env["ok"] is False
+    assert env["error"]["code"] == "auth_failed"
+
+
+# ---------------------------------------------------------------------------
 # 13 — unreachable_queued: `commit`/`push` deliberately exit 0 when queued (queued is a
 # SAFE, complete local outcome by design — AGENTS.md non-negotiable #3, and `av push`
 # already behaves this way for "reachable": False). What WAS broken: `av --output json
@@ -166,3 +210,55 @@ def test_policy_denied_exits_16(repo):
 
     result = invoke("promote", "--into", "main")
     assert result.exit_code == 16, result.output
+
+
+# ---------------------------------------------------------------------------
+# promote --dry-run (v1.3.0, todo.md item 12): exits 0 for BOTH decisions, touches
+# nothing either way — a script branches on data.decision, not the exit code.
+# ---------------------------------------------------------------------------
+
+def _armed_repo_with_regressed_tip(repo):
+    (repo / "m.txt").write_text("v1")
+    invoke("add", "m.txt")
+    invoke("commit", "-m", "baseline", "--metric", "val_loss=1.0")
+    baseline = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+    invoke("policy", "set", "main", "val_loss", "<", "--baseline-ref", baseline)
+    (repo / "m.txt").write_text("v2")
+    invoke("add", "m.txt")
+    invoke("commit", "-m", "regressed", "--metric", "val_loss=2.0")
+    return baseline
+
+
+def test_promote_dry_run_deny_exits_0_and_lands_nothing(repo):
+    _armed_repo_with_regressed_tip(repo)
+    head_before = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    result = invoke_json("promote", "--into", "main", "--dry-run")
+    assert result.exit_code == 0, result.output
+    env = json.loads(result.output)
+    assert env["data"]["dry_run"] is True
+    assert env["data"]["decision"] == "deny"
+    assert env["data"]["rule"].startswith("metric:val_loss")
+
+    assert (repo / ".av" / "refs" / "heads" / "main").read_text().strip() == head_before, \
+        "dry-run must not land anything even on what would be a DENY"
+
+
+def test_promote_dry_run_allow_exits_0_and_lands_nothing(repo):
+    (repo / "m.txt").write_text("v1")
+    invoke("add", "m.txt")
+    invoke("commit", "-m", "baseline", "--metric", "val_loss=1.0")
+    baseline = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+    invoke("policy", "set", "main", "val_loss", "<", "--baseline-ref", baseline)
+    (repo / "m.txt").write_text("v2")
+    invoke("add", "m.txt")
+    invoke("commit", "-m", "improved", "--metric", "val_loss=0.5")
+    head_before = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    result = invoke_json("promote", "--into", "main", "--dry-run")
+    assert result.exit_code == 0, result.output
+    env = json.loads(result.output)
+    assert env["data"]["decision"] == "allow"
+
+    assert (repo / ".av" / "refs" / "heads" / "main").read_text().strip() == head_before, \
+        "dry-run must not land anything even on what would be an ALLOW"

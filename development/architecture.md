@@ -153,6 +153,8 @@ Push ordering is a hard rule enforced inside `_finalize_commit()`: `python/av_cl
 
 Unreachability never loses a commit. When the registry is unreachable, the commit stays local and enters the `.av/pending_push` queue (`python/av_cli/core.py::queue_pending_push()`); `av push` and every subsequent commit retry it via `flush_pending_push()`.
 
+Every ref push carries compare-and-swap (`expected_hash`, the pre-commit tip) — this is unconditional, not opt-in or scoped to "protected" branches: any ref race (two agents' commits landing concurrently) is detected server-side (409) rather than silently overwritten, and a losing race queues via the same `.av/pending_push` path as unreachability (v1.2.5). Since v1.3.0 that race also attributes the winning commit to its run (when known, via `core.py::tip_run_id()`) and carries the same `remediation` (`av pull` then `av push`) in both `error.data.ref_race` and the human-text output — matching what `av pull`'s divergence message and `av merge`'s conflict message already did.
+
 Server-side, `push_commit()` defends itself against hostile or oversized payloads with early request-size guards in `python/av_server/server.py` — caps on tree entries (100,000), metrics (1,000), tags (200), message length (20,000), and tag length (200) — and ref names pass a strict regex (`validate_ref_name()`) because refs become filesystem paths in the storage fallback; traversal attempts like `..` components are rejected at the door.
 
 | Commit-time outcome | Result |
@@ -213,6 +215,8 @@ Tree merging is `three_way_tree_merge()` over the flat trees, per path:
 | otherwise | Both changed differently — CONFLICT |
 
 Entries compare by FULL dict equality, so a layer re-split that leaves content identical still reads as unchanged. Absence counts as deletion on that side. Conflicts belong to the caller: `av merge` aborts before touching anything unless `--ours` or `--theirs` resolves it. Content-level line merging is intentionally out of scope — versioned payloads are binary artifacts, and an honest abort beats a corrupt merge.
+
+A conflict attributes both tips to their runs (when known) and always writes a structured report to `.av/last_conflict.json` (`--conflict-report PATH` for an additional copy) — same fields (`conflicts`, `ours`/`theirs`, `*_run_id`, `remediation`) in the file, the human-text output, and `error.data` under `--output json`, so no surface has to re-derive what another already computed (v1.3.0).
 
 A successful non-fast-forward merge creates a real two-parent commit through the same `_finalize_commit()` path as ordinary commits; `--no-ff` forces that shape even when a fast-forward would do. The wire format is asymmetric by schema evolution, not by design taste: the server stores `parents[0]` in `parent_hash` and the remainder in `extra_parents` as JSON (`python/av_server/models.py::DBCommit.extra_parents`), and read endpoints reconstruct the full parents array via `python/av_server/server.py::_full_parents()` — so clients always see a complete `parents` list.
 
@@ -333,8 +337,12 @@ AV_RUN_ID flow via `core.resolve_run_id()` (v1.2.5: explicit > `AV_RUN_ID` env >
 this, three call sites silently disagreed, and `av watch`'s auto-commits weren't tagged
 under the active run at all). Training-end flush is `_shared.push_pending()` (v1.2.5,
 delegates to `core.flush_pending_push()` directly) — as of v1.2.5 no plugin has any
-remaining chdir or in-process CLI invocation; `run_av()`/`build_metric_args()` are
-deprecated shims kept one release for external callers.
+remaining chdir or in-process CLI invocation. `run_av()`/`build_metric_args()` were
+deprecated shims kept for external callers through one release's grace window
+(VERSIONING.md); that window closed at v1.3.0 and both are removed from the package
+entirely — `mlflow.py::import_run()`'s `repo_root` argument became required in the same
+release (its `resolve_repo_root(Path.cwd())` fallback was this package's one remaining
+`Path.cwd()` use, and every other plugin entry point already required an explicit root).
 
 **Scoped commits (v1.1.9, seam v1.2.2):** every plugin add+commit pair (callbacks AND import backfills) runs through the scoping seam, which isolates one commit without destroying the change-detection baseline: staging runs against the untouched index, the scope is computed as exactly what that staging touched (new keys, changed content, staged transitions), committed through the real single code path, and everything else merges back with its staged flag untouched — an import or checkpoint commit therefore never sweeps unrelated human-staged files into its tree (Probleme.md #38), and unchanged re-imports stay "Nothing to commit" no-ops (Probleme.md #71). Plain `av commit` keeps full-snapshot semantics; only machine-driven plugin events are scoped.
 
@@ -369,16 +377,42 @@ pushes referencing an UNKNOWN run lazily create it in `created` state — orderi
 agents never fails a push. `metrics_summary` keeps the latest value per metric, refreshed
 on every linked commit. Client surface: `av run start/finish/list/show`, `AV_RUN_ID`,
 SDK `repo.runs`. Commits auto-tag `run:<id>` (tags remain part of the hashed payload).
+Published schema: `av_cli/schemas/run-1.0.schema.json` — see `docs/contracts.md`.
+
+**Uncapped history (v1.3.0, migration `0005`):** `GET /api/runs/{id}/summary` bounds its
+inline `commits`/`lineage` copies (`_RUN_SUMMARY_MAX_COMMITS`/`_MAX_LINEAGE_DEPTH`) —
+bounded response size for the common case, never a silent drop (it reports
+`total_commits` vs. what it actually returned). `GET /api/runs/{id}/metrics` (cursor on
+`(run_commits.created_at, commit_hash)`, oldest-linked-first) and
+`GET /api/runs/{id}/lineage` (cursor on a resume-from run id, depth-bounded per page) are
+the uncapped complements for a WebUI chart or an agent that wants everything.
+`runs.policy_outcome` (JSON: `{decision, rule, at}`) records the most recent
+`av promote`/merge policy decision for the run's active commit —
+`POST /api/runs/{id}/policy-outcome`, called by `cmd_policy.py::_report_policy_outcome()`
+as best-effort telemetry right after `enforce_policy()`/`promote()` decide (never a gate
+itself; a reporting failure never blocks the promotion). Surfaced on `_run_to_dict()`
+(so both `GET /api/runs/{id}` and `/summary`'s `run` field carry it) and as a badge in the
+WebUI's run-detail panel.
 
 ## Events & Webhooks Contract (v1.2.0, delivery ledger v1.2.2)
 
 `events` is append-only; the autoincrement id IS the resumable cursor
-(`GET /api/events?since=<id>&project_id=&kinds=&wait=<secs>`, ascending, bounded limit).
-Kinds today: commit · ref · run · gc · webhook_test. Webhooks POST the raw JSON body with
+(`GET /api/events?since=<id>&project_id=&kinds=&run_id=&wait=<secs>`, ascending, bounded
+limit). `run_id` (v1.3.0) matches events whose payload carries that run — `commit` and
+`run` kind events today; a kind with no run_id in its payload never matches, same as an
+unknown project/kind narrows to nothing rather than erroring. The response also carries
+`gap`/`oldest_id` (v1.3.0): `gap: true` when `since` predates this project's oldest
+retained event id (swept by `AV_EVENT_RETENTION_DAYS`) — a resuming consumer can tell
+"I fell behind and missed events" apart from "there's simply nothing new yet", which a
+stale cursor used to make silently indistinguishable. Kinds today: commit · ref · run ·
+gc · webhook_test. Webhooks POST the raw JSON body with
 `X-AV-Event-Id/-Kind/X-AV-Signature: hex(hmac-sha256(secret, body))`; secrets live in the
 registry (signing requirement) and are never returned (masked listings only). Zero active hooks ⇒
 zero background work. Retention: `AV_EVENT_RETENTION_DAYS` (default 30) swept during GC,
-plus manual `DELETE /api/events?before_days=N`.
+plus manual `DELETE /api/events?before_days=N`. Published schemas:
+`av_cli/schemas/event-1.0.schema.json` (one row of `data.events`) and
+`av_cli/schemas/webhook-payload-1.0.schema.json` (the signed delivery body) — see
+`docs/contracts.md`.
 
 **Webhook delivery ledger (v1.2.2, migration `0003`):** every fan-out attempt persists a
 `webhook_deliveries` row BEFORE its POST (`pending`) and updates it after
@@ -388,6 +422,35 @@ startup+interval retry worker until `AV_WEBHOOK_MAX_ATTEMPTS` (default 5) exhaus
 byte-identical signed body even after the source event is retention-swept; rows ride the
 mutation's own transaction so rolled-back mutations leave no phantom records.
 Observability: `GET /api/admin/webhook-deliveries?status&webhook_id&limit&offset`.
+
+**Delivery guarantees (v1.3.0, proven under a real multi-endpoint backlog by
+`tests/test_server.py::test_webhook_backlog_delivers_all_in_order_without_starving_healthy_hook`):**
+at-least-once per hook — a delivery is `delivered`, retried on schedule, or eventually
+`dead`-lettered, never silently dropped. Delivery order per hook matches event creation
+order (ledger ids are monotonic). One endpoint stuck failing (`poison`) dead-letters on
+its own exponential-backoff schedule without delaying or skipping deliveries to any
+other webhook subscribed to the same events — proven at backlog scale (20 concurrent
+commits fan out to two hooks), not just a single event. `av webhooks show/deliveries`
+and `POST /api/admin/webhook-deliveries/{id}/replay` reflect the ledger's real state at
+any point during an in-flight backlog, not only once it drains.
+
+## Registry Export/Restore Contract (v1.2.0, resume + real round-trip proof v1.3.0)
+
+`av registry export OUT_DIR [--project]` walks the registry's public API (commits paged,
+refs, runs, then every object hash referenced in any exported tree's files/layers/chunks)
+into a portable archive; every object is hash-re-verified during download.
+`av registry restore ARCHIVE_DIR` re-ingests in push order (objects → commits → refs);
+duplicate hashes land as idempotent 409s, so restoring into an already-populated registry
+is safe. Both commands show a progress bar over their item loop (suppressed under
+`--output json`) and track completed items in `ARCHIVE_DIR/.state.json`, so a killed
+export/restore resumes instead of re-downloading/re-uploading everything (`--resume` is
+the default; `--no-resume` forces a full pass — always safe either way, since every
+write is already idempotent). **v1.3.0 fixes:** a missing `import pathlib` meant every
+real invocation of both commands raised `NameError` immediately — no test had ever driven
+either through the real CLI until `tests/test_server.py::test_registry_export_restore_round_trip`
+(live-registry-gated) closed that gap; both also now call `client.server_available()`
+first instead of letting an unreachable server surface as an unhandled
+`requests.exceptions.ConnectionError` traceback.
 
 ## Signed Commits Contract (v1.2.2)
 
@@ -445,18 +508,34 @@ attempt. Read surface: `GET /api/admin/audit?action&project_id&since&until&limit
 (invalid timestamps → 422), CLI `av audit list`. Retention: `AV_AUDIT_RETENTION_DAYS`
 (default 90) swept during GC plus manual prune endpoint.
 
-## Semantic Diff Contract (v1.2.0, dedup_efficiency v1.2.2, chunks.status v1.2.5)
+## Semantic Diff Contract (v1.2.0, dedup_efficiency v1.2.2, chunks.status v1.2.5, byte-level fields + server parity v1.3.0)
 
 `python/av_cli/semdiff.py::diff_trees(old_tree, new_tree)` is pure: added/removed/changed,
-per-model layer movement (count/pct/largest movers), chunk reuse ratio across CDC-chunked
+per-model layer movement (count/pct/largest movers, plus v1.3.0's `bytes_changed`/
+`bytes_total`/`pct_bytes` — a byte-weighted view that deliberately diverges from the
+count-based `pct` when layer sizes vary, so "half the layers changed" and "half the
+storage changed" stay answerable independently), chunk reuse ratio across CDC-chunked
 files (+ `chunks.dedup_efficiency` = reused/(reused+new), None when no chunks — flows into
 `.avh.semantic_summary`; `chunks.status` (v1.2.5) is a sibling field ALWAYS present as
 `"measured"`/`"no_chunks"`, so consumers get a stable field to branch on without a
-null-check on the float — `None` stays meaningful as "no signal", not "0%"), dataset
-classification (extension+name heuristics), byte totals, and a one-sentence human
+null-check on the float — `None` stays meaningful as "no signal", not "0%"; v1.3.0 adds
+the byte-weighted siblings `chunks.reused_bytes`/`new_bytes`/`dedup_efficiency_bytes`),
+dataset classification (extension+name heuristics), byte totals, and a one-sentence human
 summary. Consumers: `av diff`, `.avh.semantic_summary`, WebUI expanded commits and the
 v1.2.2 run-detail panel (client-side re-composition in `webui/src/lib/runDetail.ts`). The
-dict shape is additive-only by policy.
+dict shape is additive-only by policy. Published schema (v1.3.0):
+`av_cli/schemas/semdiff-1.0.schema.json` — see `docs/contracts.md`.
+
+**Server-side parity (v1.3.0):** `server.py::_summarize_tree_diff()` independently
+re-implements the FULL schema above (models/chunks/datasets, not just files/totals like
+before) — it deliberately never imports `av_cli` (the server package ships and deploys
+standalone), so the two implementations are proven identical on identical input by a
+shared golden-fixture test
+(`tests/test_server.py::test_server_side_summary_matches_client_side_semdiff_on_the_same_trees`)
+rather than by sharing code. Feeds both `GET /api/runs/{id}/summary`'s
+`semantic_summary` and the new `GET /api/commits/{base}/diff/{target}` (arbitrary
+two-commit compare, not just a run's two most recent linked commits — feeds the WebUI's
+weight-diff arbitrary-hash compare).
 
 ## .avh v2 — Agent Context Memory Contract (v1.2.0)
 
@@ -466,8 +545,9 @@ and: `lineage{run_id,parent_run_ids,code_pointer{git_remote,git_sha,dirty}}`,
 `context_memory{notes[],metrics_history_tail[]}` — notes are APPEND-ONLY in
 `.av/context/memory.jsonl` (`av context note`) and survive every regeneration.
 Readers must tolerate unknown sections; writers must run `validate_handoff()` in CI paths.
+Published schema: `av_cli/schemas/avh-2.0.schema.json` — see `docs/contracts.md`.
 
-## Promotion Policy Contract (v1.2.0, `require_signature` v1.2.5)
+## Promotion Policy Contract (v1.2.0, `require_signature` v1.2.5, `--dry-run` + outcome reporting v1.3.0)
 
 Policies live in `.av/policies.json`: `{branch: {metric, op∈{<,<=,>,>=},
 baseline_ref|threshold, require_signature}}` — `require_signature` (v1.2.5, additive) is
@@ -476,7 +556,18 @@ metric comparison so a denial reports "unsigned", not a misleading metric mismat
 Enforcement points: `av merge` (current branch armed → deny, exit 16, unless --force) and
 `av promote CANDIDATE --into BRANCH` (authoritative eval — merge-side check intentionally
 bypassed there to avoid comparing the baseline against itself). Enforcement is
-CLIENT-SIDE v1; server-side authz is enterprise-tier.
+CLIENT-SIDE v1; server-side authz is enterprise-tier. Worked examples (metric gate,
+signature gate, combined): `examples/policies/`, loaded by tests so they can't rot.
+
+`av promote --dry-run` (v1.3.0) evaluates and reports `data.decision`
+(`allow`/`deny`) plus the deciding rule, touching nothing — exits 0 for BOTH decisions
+(a script branches on `data`, not the exit code). Every REAL (non-dry-run) decision also
+reports to `POST /api/runs/{id}/policy-outcome` for the active run (best-effort,
+never blocks the promotion — see the Runs Contract section above). `promote`'s own JSON
+envelope for a landing (allowed, non-dry-run) promotion is emitted AFTER the merge lands,
+folding in the merge result under `data.merge` — the nested `merge` invocation's own
+stdout is captured, not let through directly, specifically so one `av promote` call never
+prints two top-level JSON objects (Probleme #114/#115).
 
 ## Testing And Verification Map
 

@@ -16,6 +16,7 @@ import { type Commit, shortHash } from "@/lib/api";
 interface Props {
   commits: Commit[];
   loading: boolean;
+  error?: string | null;
 }
 
 const METRIC_COLORS: Record<number, string> = {
@@ -39,7 +40,7 @@ export function extractMetricKeys(commits: Commit[]): string[] {
   ].slice(0, 6);
 }
 
-export function MetricsChart({ commits, loading }: Props) {
+export function MetricsChart({ commits, loading, error }: Props) {
   const metricKeys = useMemo(() => extractMetricKeys(commits), [commits]);
 
   if (loading && commits.length === 0) {
@@ -55,6 +56,20 @@ export function MetricsChart({ commits, loading }: Props) {
           <div className="spinner" />
           Loading metrics…
         </div>
+      </div>
+    );
+  }
+
+  if (error && commits.length === 0) {
+    return (
+      <div className="card">
+        <div className="card-header">
+          <span className="card-title">
+            <ChartIcon />
+            ML Metrics Over Time
+          </span>
+        </div>
+        <div className="empty-state">⚠ {error}</div>
       </div>
     );
   }

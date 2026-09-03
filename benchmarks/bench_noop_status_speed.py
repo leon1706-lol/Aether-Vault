@@ -35,7 +35,7 @@ def _bench_av() -> float | None:
     av_path = shutil.which("av")
     if av_path is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-noop-av-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-noop-av-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         _populate_fixture(root)
         time_subprocess([av_path, "init", "--mode", "local", "--yes", "--no-repl"], root)
@@ -49,7 +49,7 @@ def _bench_git_lfs() -> float | None:
     git_lfs = shutil.which("git-lfs")
     if git_path is None or git_lfs is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-noop-gitlfs-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-noop-gitlfs-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         _populate_fixture(root)
         time_subprocess(["git", "init"], root)
@@ -68,7 +68,7 @@ def _bench_dvc() -> float | None:
     git_path = shutil.which("git")
     if dvc_path is None or git_path is None:
         return None
-    with tempfile.TemporaryDirectory(prefix="bench-noop-dvc-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="bench-noop-dvc-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         _populate_fixture(root)
         time_subprocess(["git", "init"], root)

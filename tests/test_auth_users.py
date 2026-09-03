@@ -41,10 +41,17 @@ from python.av_server.server import _parse_auth_users, _resolve_identity  # noqa
 # ---------------------------------------------------------------------------
 
 def test_parse_accepts_a_valid_map():
+    # v1.3.0: every value normalizes to {"token", "expires_at"} — a bare string (the
+    # original, still-default shape) means "never expires".
     assert _parse_auth_users('{"alice": "tok-a", "bob": "tok-b"}') == {
-        "alice": "tok-a",
-        "bob": "tok-b",
+        "alice": {"token": "tok-a", "expires_at": None},
+        "bob": {"token": "tok-b", "expires_at": None},
     }
+
+
+def test_parse_accepts_an_object_value_with_expiry():
+    parsed = _parse_auth_users('{"alice": {"token": "tok-a", "expires_at": "2020-01-01T00:00:00+00:00"}}')
+    assert parsed == {"alice": {"token": "tok-a", "expires_at": "2020-01-01T00:00:00+00:00"}}
 
 
 def test_parse_empty_and_unset_are_anonymous():
@@ -78,7 +85,43 @@ def test_parse_empty_username_or_token_rejected(payload):
 def test_parse_strips_and_coerces_to_str():
     # Values arrive from an env var as text, but a hand-written JSON map could use numbers
     # — compare_digest(str, int) raises TypeError, so everything normalizes to str.
-    assert _parse_auth_users('{" alice ": 12345}') == {"alice": "12345"}
+    assert _parse_auth_users('{" alice ": 12345}') == {"alice": {"token": "12345", "expires_at": None}}
+
+
+# ---------------------------------------------------------------------------
+# Token expiry (v1.3.0)
+# ---------------------------------------------------------------------------
+
+def test_expired_user_token_is_rejected(monkeypatch):
+    monkeypatch.setattr(server_module, "AV_API_TOKEN", "")
+    monkeypatch.setattr(server_module, "_AUTH_USERS", {
+        "alice": {"token": "tok-a", "expires_at": "2020-01-01T00:00:00+00:00"},
+    })
+    assert _resolve_identity("tok-a") is None
+
+
+def test_future_expiry_still_authenticates(monkeypatch):
+    monkeypatch.setattr(server_module, "AV_API_TOKEN", "")
+    monkeypatch.setattr(server_module, "_AUTH_USERS", {
+        "alice": {"token": "tok-a", "expires_at": "2099-01-01T00:00:00+00:00"},
+    })
+    assert _resolve_identity("tok-a") == "alice"
+
+
+def test_no_expiry_never_expires(monkeypatch):
+    monkeypatch.setattr(server_module, "AV_API_TOKEN", "")
+    monkeypatch.setattr(server_module, "_AUTH_USERS", {
+        "alice": {"token": "tok-a", "expires_at": None},
+    })
+    assert _resolve_identity("tok-a") == "alice"
+
+
+def test_bare_string_value_still_resolves(monkeypatch):
+    # Backward compat: _AUTH_USERS set directly with the pre-v1.3.0 bare-string shape
+    # (as the rest of this file's fixtures do) must keep working, not just parsed output.
+    monkeypatch.setattr(server_module, "AV_API_TOKEN", "")
+    monkeypatch.setattr(server_module, "_AUTH_USERS", {"alice": "tok-a"})
+    assert _resolve_identity("tok-a") == "alice"
 
 
 # ---------------------------------------------------------------------------

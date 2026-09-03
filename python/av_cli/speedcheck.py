@@ -340,7 +340,7 @@ def run_synthetic_probes_sampled(
     load_config: Callable[[Path], dict],
     iter_working_files: Callable[[Path], object],
     tmp_root: Path,
-    samples: int = PROBE_SAMPLES,
+    samples: int | None = None,
 ) -> list[SampledProbe]:
     """Median-of-N view of run_synthetic_probes(), for the perf gate (test_perf_gate.py).
 
@@ -352,9 +352,26 @@ def run_synthetic_probes_sampled(
     rather than this module baking one policy in, so `av test --speed`'s single-shot
     printed table (run_synthetic_probes(), unchanged) and the gate's stricter view can
     each want different things without duplicating the probe bodies themselves.
+
+    `samples` defaults to `PROBE_SAMPLES`, overridable via `AV_PERF_SAMPLES` (env var takes
+    effect only when `samples` isn't passed explicitly — an explicit argument always wins)
+    for a genuinely noisy machine that needs a larger N than the default to get a stable
+    median, without editing source. v1.3.0 also adds an explicit WARM PASS below: a full
+    battery run before any counted sample, discarded entirely (not even the "first sample"
+    slot) — disk-noise immunity on top of the existing discard-first-sample behavior.
     """
+    if samples is None:
+        env_override = os.environ.get("AV_PERF_SAMPLES")
+        try:
+            samples = int(env_override) if env_override else PROBE_SAMPLES
+        except ValueError:
+            samples = PROBE_SAMPLES  # malformed override — fall back rather than crash the gate
     if samples < 1:
         raise ValueError("samples must be >= 1")
+
+    warm_dir = tmp_root / "warm"
+    warm_dir.mkdir()
+    run_synthetic_probes(load_config, iter_working_files, warm_dir)
 
     per_run: list[list[tuple[str, float, float | None]]] = []
     for i in range(samples):

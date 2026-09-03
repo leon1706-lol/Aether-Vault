@@ -7,6 +7,11 @@ file defers to — treat it as part of this contract, not optional extra credit.
 
 ## Before touching anything
 
+- **`todo.md`** (repo root) — the owner's live planning canvas: current objective(s) and
+  personal notes, in plain language. Check it first — it's the closest thing to a standing
+  work order in this repo. It is not a generated or permanent backlog; it gets rewritten or
+  cleared as objectives change, so don't treat its absence of content as "nothing to do" —
+  ask, or fall back to `development/CHANGELOG.md`'s most recent phase for context.
 - **Sub-readmes** — every folder has a short one; read the one for whatever you're touching.
 - **`development/*.md`** — read all of them; they hold the structure/plan context.
 - **`Aether-vault-Obsidian-Vault/`** — a generated dependency/function graph for orientation.
@@ -70,9 +75,15 @@ auth_failed, unreachable_queued, merge_conflict, validation, policy_denied}` and
 codes `10–16` respectively (`0` ok, `2` usage). `unreachable_queued` means the work is
 SAFE — persisted locally and queued for `av push`.
 
-Supported commands (v1.2): status · add · commit · push · diff · run start/finish/list/
-show · context note/show/validate/export · env snapshot/replay · policy set/list/remove ·
-registry export/keygen/attest/verify.
+Supported commands (v1.3): every CLI command supports `--output json` except `watch`
+(streams one envelope per auto-commit — NDJSON, not one envelope per invocation) and the
+dev-only `test`/`benchmark`/`webui` (see `docs/contracts.md`'s leakage-exemption list for
+why). Originally-agent-facing core: status · add · commit · push · diff · run
+start/finish/list/show · context note/show/validate/export/search · env snapshot/replay ·
+policy set/list/remove/promote --dry-run · registry export/keygen/attest/verify · auth
+doctor/rotate · audit list/export/prune --dry-run. A generic anti-leakage test
+(`tests/test_contract_matrix.py`) walks every command and asserts `--output json` never
+mixes human text with the envelope — see that file before adding a new command.
 
 ### Python SDK — `from av_sdk import Repo`
 

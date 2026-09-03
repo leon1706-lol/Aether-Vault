@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { shortHash } from "@/lib/api";
 
 export interface CheckpointRow {
@@ -19,15 +20,33 @@ interface Props {
   slotA: CheckpointRow | null;
   slotB: CheckpointRow | null;
   onSlotChange: (slot: "A" | "B", row: CheckpointRow | null) => void;
+  // v1.3.0 (todo.md item 25): arbitrary two-commit compare — the list above only ever
+  // shows the most recent CHECKPOINT_FETCH_LIMIT commits (see WeightDiffPanel.tsx); this
+  // lets a caller resolve and select an older commit by hash directly. `onResolveHash`
+  // resolves (fetching if necessary) and fills the given slot; `hashLookupError` surfaces
+  // a failed lookup (unknown hash, or a commit with no model checkpoints) next to the form.
+  onResolveHash?: (hash: string, slot: "A" | "B") => void;
+  hashLookupError?: string | null;
 }
 
 const DRAG_MIME = "application/x-aether-checkpoint";
 
-export function CheckpointPicker({ rows, loading, slotA, slotB, onSlotChange }: Props) {
+export function CheckpointPicker({
+  rows, loading, slotA, slotB, onSlotChange, onResolveHash, hashLookupError,
+}: Props) {
+  const [hashInput, setHashInput] = useState("");
+
   function handleRowClick(row: CheckpointRow) {
     if (!slotA) onSlotChange("A", row);
     else if (!slotB) onSlotChange("B", row);
     else onSlotChange("A", row);
+  }
+
+  function handleResolveSubmit(e: React.FormEvent, slot: "A" | "B") {
+    e.preventDefault();
+    if (!onResolveHash || !hashInput.trim()) return;
+    onResolveHash(hashInput.trim(), slot);
+    setHashInput("");
   }
 
   function handleDrop(slot: "A" | "B", e: React.DragEvent) {
@@ -65,6 +84,28 @@ export function CheckpointPicker({ rows, loading, slotA, slotB, onSlotChange }: 
           onClear={() => onSlotChange("B", null)}
         />
       </div>
+
+      {onResolveHash && (
+        <form
+          className="checkpoint-hash-form"
+          onSubmit={(e) => handleResolveSubmit(e, !slotA ? "A" : "B")}
+        >
+          <label htmlFor="checkpoint-hash-input" className="diff-toolbar-label">
+            Compare by hash
+          </label>
+          <input
+            id="checkpoint-hash-input"
+            type="text"
+            placeholder="commit hash (older than the list below)"
+            value={hashInput}
+            onChange={(e) => setHashInput(e.target.value)}
+          />
+          <button type="submit" className="btn btn-ghost" disabled={!hashInput.trim()}>
+            Load into {!slotA ? "Slot A" : "Slot B"}
+          </button>
+        </form>
+      )}
+      {hashLookupError && <div className="diff-warning">{hashLookupError}</div>}
 
       {loading && rows.length === 0 ? (
         <div className="loading-overlay">

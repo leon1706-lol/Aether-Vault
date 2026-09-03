@@ -10,7 +10,12 @@
 # ============================================================================
 services:
   aether-vault-engine:
-    build: .
+    build:
+      context: .
+      # v1.3.0 (Probleme.md): explicit — Dockerfile now has server/webui targets too,
+      # appended after this one, so relying on "the last stage in the file" as the
+      # implicit default is no longer safe.
+      target: engine
     container_name: aether-vault-engine
     ports:
       - '8000:8000'
