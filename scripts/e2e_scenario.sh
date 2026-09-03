@@ -66,13 +66,26 @@ start_server() { # start_server <name> [ENV=VAL ...]
   #
   # The subshell EXPORTS then EXECs python: the backgrounded PID becomes python itself,
   # not a wrapper — otherwise stop_server kills the wrapper and orphans the server.
+  #
+  # `cd "$REPO_ROOT"` below is NOT itself inside that subshell (uvicorn's own module
+  # resolution needs it to happen in a real `cd`, not a subshell's, on this project's
+  # setup) — which means it silently changes the CALLING shell's cwd too, since this is
+  # a plain function, not a subshell. Every phase that calls `start_server` mid-phase
+  # already has to know this and route around it with an explicit `av "$WORK/repoX" ...`
+  # instead of the shorter `av . ...` (see Phase A/B/D's own calls) — save/restore the
+  # caller's original cwd here instead, so `av .` stays correct after ANY start_server
+  # call, in this phase or any future one, without every caller needing to remember this
+  # (found live: Phase M's recovery step didn't, and `av . push` ran from $REPO_ROOT
+  # instead of the actual repo — see development/Probleme.md).
   local name="$1"; shift
+  local _caller_cwd; _caller_cwd="$PWD"
   cd "$REPO_ROOT"
   (
     export DATABASE_URL="$DB_URL_ASYNC" REDIS_URL="$REDIS_URL" AV_DATA_DIR="$WORK/data" "$@"
     exec "$PY" -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000
   ) >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
+  cd "$_caller_cwd"
   wait_health "server($name)"
 }
 
