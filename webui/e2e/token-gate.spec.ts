@@ -51,7 +51,16 @@ test("second visit without the param stays unlocked via localStorage", async ({ 
 test("unknown browser shows the entry prompt instead of registry data", async ({ page }) => {
   await page.goto("/");
   // First fetches fire without a token → 401 → setUnauthorizedHandler shows the prompt.
-  await expect(page.getByText("This registry is protected")).toBeVisible({ timeout: 15_000 });
+  // { exact: true } (v1.3.0, Probleme #127): WP-18's per-panel error states now render the
+  // SAME UnauthorizedError message verbatim ("This registry is protected — a valid access
+  // token is required.") in every panel that 401s, alongside TokenGate's own shorter title
+  // ("This registry is protected", no trailing text) — a real, live dashboard genuinely
+  // shows both simultaneously (the panels underneath the gate keep fetching and 401ing).
+  // A substring locator now matches all of them; only an exact match on TokenGate's own
+  // title text is still unambiguous.
+  await expect(
+    page.getByText("This registry is protected", { exact: true })
+  ).toBeVisible({ timeout: 15_000 });
 
   // Manual path: enter the token → reload → same unlocked state as the handoff flow.
   await page.locator('input[type="password"]').fill(OWNER_TOKEN);

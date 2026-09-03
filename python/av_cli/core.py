@@ -372,7 +372,7 @@ def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) 
     save_pending_push(repo_root, pending)
 
 
-def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) -> None:
+def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) -> bool:
     """Upload every tracked file's object/layer shards referenced by a commit tree.
 
     Covers every type (`code` and `artifact` alike), not just artifacts — `add()` now writes
@@ -380,10 +380,18 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
     code's bytes uploaded too, or `av checkout` against the remote would restore artifacts but
     silently leave code files at whatever the puller's working tree already had.
 
-    Must run BEFORE push_commit(): the server stores each tree entry's object hash as a
-    foreign key into its objects table (see DBTree.object_hash in av_server/models.py), so
-    pushing the commit first makes that insert violate the FK — the commit silently never
-    lands in the database even though the server used to (incorrectly) report success.
+    Must run BEFORE push_commit() — but NOT because the server enforces this at the DB
+    level: `DBTree.object_hash` (av_server/models.py) is deliberately NOT a real foreign
+    key (a layer-split/CDC-chunked artifact's whole-file hash never gets its own object
+    row, only its shards do — enforcing the FK there broke every such commit). That means
+    the server accepts a commit's tree unconditionally, even one referencing an object that
+    was never actually stored — so THIS function's own return value is the only signal
+    that an object genuinely failed to land. v1.3.0 (Probleme #126): it used to be silently
+    discarded (`future.result()`'s bool return went nowhere), so a write failure here (a
+    full/unwritable registry disk, mid-upload) let the caller push commit METADATA
+    referencing bytes that were never stored — a "successful" push whose artifact content
+    is unrecoverable. Returns True only when every upload genuinely succeeded (or there
+    was nothing to upload); callers MUST queue rather than call push_commit() on False.
 
     Uploads are batch-checked then sent in parallel (small thread pool — these are
     network-bound HTTP calls, not CPU work) rather than one HEAD+POST round trip per
@@ -429,20 +437,27 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
             pass  # a corrupt snapshot never blocks a push
 
     if not candidates:
-        return
+        return True
 
     found = client.batch_check_objects(list(candidates.keys()))
     missing = {h: p for h, p in candidates.items() if h not in found}
     if not missing:
-        return
+        return True
 
     with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
         futures = [
             pool.submit(client.upload_object, path, h, known_missing=True)
             for h, path in missing.items()
         ]
-        for future in futures:
-            future.result()
+        # v1.3.0 (Probleme #126): a False return from upload_object() (a clean HTTP
+        # failure — e.g. the server's storage write itself failed) used to be discarded
+        # here entirely, so a caller could never tell "every object genuinely landed"
+        # from "nothing raised". `.result()` for every future first (not a short-
+        # circuiting `all()` over the generator) — an unexpected exception from a LATER
+        # future must still surface, not get silently skipped because an earlier one
+        # already turned out False.
+        results = [future.result() for future in futures]
+        return all(results)
 
 
 def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
@@ -471,8 +486,14 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
         with open(commit_path, "r") as f:
             commit_data = json.load(f)
         try:
-            upload_commit_objects(repo_root, client, commit_data.get("tree", {}))
-            if client.push_commit(commit_data):
+            # v1.3.0 (Probleme #126): a False return means an object genuinely failed to
+            # upload again (the server accepts a commit's tree unconditionally — see
+            # upload_commit_objects()'s own docstring — so this return value is the only
+            # signal of that). Skip push_commit() entirely and fall through to
+            # still_pending.append(entry) below, exactly as if push_commit() itself had
+            # failed — never land commit metadata for bytes that still aren't stored.
+            if upload_commit_objects(repo_root, client, commit_data.get("tree", {})) \
+                    and client.push_commit(commit_data):
                 ref_ok = True
                 if entry.get("ref_name"):
                     _parents = commit_data.get("parents") or []
@@ -1023,12 +1044,22 @@ def _finalize_commit(
             click.secho("  Upload deferred — queued for `av push`", fg="yellow")
     elif client.server_available():
         try:
-            # Objects must reach the server before the commit: the server's tree rows store
-            # each entry's object hash as a foreign key, so pushing the commit first makes
-            # that insert fail (previously misreported as a successful 409 "already exists" —
-            # see upload_commit_objects()'s docstring / development/Probleme.md).
-            upload_commit_objects(repo_root, client, tree)
-            if client.push_commit(commit_data):
+            # Objects must reach the server before the commit — NOT because the server
+            # enforces this at the DB level (it deliberately doesn't; see
+            # upload_commit_objects()'s own docstring), but because that function's
+            # return value is the ONLY signal a real object-write failure (a full/
+            # unwritable registry disk, mid-upload) ever produces. Queue exactly like a
+            # failed push_commit() rather than land commit metadata referencing bytes
+            # that were never actually stored (v1.3.0, Probleme #126).
+            if not upload_commit_objects(repo_root, client, tree):
+                queue_pending_push(repo_root, commit_hash, remote_ref_name)
+                _queued("object_upload_failed")
+                if result_sink is None:
+                    click.secho(
+                        "  One or more objects failed to upload — commit queued for "
+                        "retry (run `av push` later)", fg="yellow",
+                    )
+            elif client.push_commit(commit_data):
                 ref_ok = True
                 if remote_ref_name:
                     try:

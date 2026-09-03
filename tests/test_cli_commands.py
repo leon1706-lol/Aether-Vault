@@ -148,9 +148,76 @@ def test_upload_commit_objects_uploads_only_missing_hashes(repo, monkeypatch):
             calls["uploaded"].append((h, known_missing))
             return True
 
-    main_module.upload_commit_objects(repo, FakeClient(), tree)
+    result = main_module.upload_commit_objects(repo, FakeClient(), tree)
 
     assert calls["uploaded"] == [(missing_hash, True)]
+    assert result is True
+
+
+def test_upload_commit_objects_returns_false_when_any_upload_fails(repo, monkeypatch):
+    # v1.3.0 (Probleme #126): found live on a real Docker/GHA registry with an unwritable
+    # data dir — the server's storage write failed (a clean 500, upload_object() correctly
+    # returned False for it), but this function's return value was discarded by every
+    # caller, so a commit landed referencing an object that was never actually stored.
+    # DBTree.object_hash is deliberately NOT a real DB foreign key (see its own comment in
+    # av_server/models.py — layer-split artifacts never get a whole-file object row), so
+    # this return value is the ONLY signal a real upload failure ever produces; callers
+    # MUST treat False as a reason to queue instead of pushing the commit.
+    import python.av_cli.main as main_module
+
+    (repo / "c.py").write_text("c = 1")
+    invoke("add", "c.py")
+    invoke("commit", "-m", "first")
+
+    idx_entries = json.loads((repo / ".av" / "index").read_text())["entries"]
+    tree = {
+        rel: {"hash": e["hash"], "size": e["size"], "type": e["type"], "layers": e.get("layers", [])}
+        for rel, e in idx_entries.items()
+    }
+    all_hashes = {info["hash"] for info in tree.values()}
+
+    class FakeClient:
+        def batch_check_objects(self, hashes):
+            return set()  # nothing on the server yet -> every hash is missing
+
+        def upload_object(self, path, h, known_missing=False):
+            return False  # simulates a real storage write failure (e.g. unwritable disk)
+
+    result = main_module.upload_commit_objects(repo, FakeClient(), tree)
+
+    assert result is False
+
+
+def test_commit_queues_instead_of_pushing_when_an_object_upload_fails(repo, monkeypatch):
+    # End-to-end version of the unit test above: drives the real `av commit` command and
+    # asserts the commit lands locally but gets QUEUED for retry, never pushed, when an
+    # object upload fails — the exact scenario a real unwritable/full registry disk
+    # produces (development/Probleme.md #126; caught live by scripts/e2e_scenario.sh's
+    # Phase M on a real GHA Linux runner).
+    from python.av_cli.client import VaultClient
+
+    monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
+    monkeypatch.setattr(VaultClient, "batch_check_objects", lambda self, hashes: set())
+    monkeypatch.setattr(VaultClient, "upload_object",
+                        lambda self, path, h, known_missing=False: False)
+    # push_commit must never even be attempted once the object upload has already failed —
+    # fail loudly if it is, rather than silently landing metadata for unstored bytes.
+    monkeypatch.setattr(
+        VaultClient, "push_commit",
+        lambda self, commit_data: (_ for _ in ()).throw(
+            AssertionError("push_commit() must not be called after a failed object upload")
+        ),
+    )
+
+    (repo / "train.py").write_text("print('hi')")
+    invoke("add", "train.py")
+    result = invoke("commit", "-m", "should queue, not push unstored content")
+    assert result.exit_code == 0, result.output
+    assert "queued for retry" in result.output.lower()
+
+    commit_hash = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+    pending = json.loads((repo / ".av" / "pending_push").read_text())
+    assert any(p["commit_hash"] == commit_hash for p in pending)
 
 
 # ---------------------------------------------------------------------------
