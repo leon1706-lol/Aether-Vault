@@ -470,8 +470,18 @@ log "Phase M — storage write failure: upload fails honestly, nothing partial l
 # exactly as it does for any other unreachable-server case (Phase B).
 stop_server
 READONLY_DATA="$WORK/data-readonly"
-mkdir -p "$READONLY_DATA"
-chmod 555 "$READONLY_DATA"
+# Pre-create the three top-level dirs CASStorage.__init__ itself creates at import time
+# (objects/commits/refs) BEFORE locking the tree down — its own `mkdir(exist_ok=True)`
+# calls only need to STAT an already-existing path, not write a new one, so the server can
+# still boot against a read-only data dir. Locking down the FULL tree (-R), not just the
+# top level, is what then makes the real write this phase cares about — a NEW per-object
+# shard subdirectory created during an actual upload — fail honestly instead of quietly
+# succeeding into an already-writable subdirectory. (Found live: the non-recursive,
+# subdirs-not-precreated version of this crashed the whole server at import/startup with
+# an uncaught PermissionError instead of the intended "server's up, one write fails"
+# scenario — see development/Probleme.md.)
+mkdir -p "$READONLY_DATA/objects" "$READONLY_DATA/commits" "$READONLY_DATA/refs"
+chmod -R 555 "$READONLY_DATA"
 if ! ( : > "$READONLY_DATA/write-probe" ) 2>/dev/null; then
   start_server chaos-M-readonly AV_DATA_DIR="$READONLY_DATA"
 
@@ -488,7 +498,7 @@ if ! ( : > "$READONLY_DATA/write-probe" ) 2>/dev/null; then
   [[ "$MOBJ_COUNT" == "0" ]] || die "Phase M: a partial object landed in the unwritable data dir ($MOBJ_COUNT file(s)) — should be zero"
 
   stop_server
-  chmod 755 "$READONLY_DATA"
+  chmod -R 755 "$READONLY_DATA"
   start_server chaos-M-recovered
   av . push >/dev/null
   [[ "$(pending_count "$WORK/repoM")" -eq 0 ]] || die "Phase M: queued commit did not drain once storage was writable again"
@@ -497,7 +507,7 @@ else
   rm -f "$READONLY_DATA/write-probe"
   log "Phase M SKIPPED — this environment does not honor chmod 555 as unwritable (root, or a filesystem that ignores POSIX perms)"
 fi
-chmod 755 "$READONLY_DATA" 2>/dev/null || true
+chmod -R 755 "$READONLY_DATA" 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
 log "Phase N — server killed mid-push (SIGKILL, not graceful): pending_push survives intact, later push drains cleanly"
