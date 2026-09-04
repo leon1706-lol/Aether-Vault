@@ -263,10 +263,9 @@ def resolve_replay_target(repo_root: Path, target: str | None):
     client = None
     try:
         from .client import VaultClient
+        from .core import resolve_remote
 
-        cfg = load_config(repo_root)
-        client = VaultClient(cfg.get("remote_url", "http://localhost:8000"),
-                             cfg.get("remote_api_token"))
+        client = VaultClient(*resolve_remote(repo_root))
     except Exception:
         client = None
 

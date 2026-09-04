@@ -29,15 +29,23 @@ def test_migration_chain_resolves_to_single_head():
 
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
-    assert heads == ["0005"], f"unexpected heads: {heads}"
+    assert heads == ["0010"], f"unexpected heads: {heads}"
     # walk_revisions() yields every revision reachable from head exactly once —
     # no dangling down_revisions, no surprise second branch. The chain is strictly
     # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline),
     # 0003 (webhook_deliveries/audit outcome/signature) descends from 0002,
     # 0004 (webhook health tracking/runs.avh_object_id/audit indexes) descends from 0003,
-    # 0005 (runs.policy_outcome) descends from 0004.
+    # 0005 (runs.policy_outcome) descends from 0004, 0006 (RSI R1: runs.kind/improver_id,
+    # improver_versions, change_sets, policy_packs, canary_results, project_freeze)
+    # descends from 0005, 0007 (RSI R2: runs.integrity_signals, eval_suites,
+    # eval_results, eval_adapters, tasks) descends from 0006, 0008 (RSI R3:
+    # runs.plan_id/budget_id/stop_reason, plans, budgets) descends from 0007, 0009 (RSI
+    # R4: runs.lessons_id, causal_links, strategy_entries, lessons, reviews, critiques,
+    # blackboard_entries) descends from 0008, 0010 (RSI R5: sandbox_jobs, tool_manifests,
+    # action_logs) descends from 0009.
     walked = sorted(rev.revision for rev in script.walk_revisions())
-    assert walked == ["0001", "0002", "0003", "0004", "0005"]
+    assert walked == ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008",
+                      "0009", "0010"]
 
 
 def test_env_py_is_valid_python():
@@ -75,6 +83,12 @@ def test_legacy_columns_map_matches_models():
         "commits": "DBCommit", "trees": "DBTree", "audit_log": "DBAuditLog",
         "webhooks": "DBWebhook", "runs": "DBRun",
     }
+    # If this ever assert-fails, the model class for a NEW `_LEGACY_COLUMNS` table entry
+    # is missing from the map above — add it, don't skip the check.
+    assert set(_LEGACY_COLUMNS) <= set(model_class), (
+        f"_LEGACY_COLUMNS references tables with no model_class entry: "
+        f"{set(_LEGACY_COLUMNS) - set(model_class)}"
+    )
     for table, cols in _LEGACY_COLUMNS.items():
         block = re.search(
             rf"class {model_class[table]}\(Base\):(.*?)(?=\nclass |\Z)",
@@ -248,6 +262,42 @@ def test_chain_renders_complete_postgres_ddl_offline():
     # v1.3.0 runs.policy_outcome (0005):
     assert "policy_outcome" in ddl, "offline DDL missing 0005 column policy_outcome"
 
+    # v1.3.1 RSI R1 (0006): runs.kind/improver_id + five new tables.
+    assert "CREATE INDEX ix_runs_improver_id" in ddl
+    for table in ("improver_versions", "change_sets", "policy_packs",
+                  "canary_results", "project_freeze"):
+        assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
+    for col in ("manifest_object_id", "chain_hash", "suite_object_id", "frozen"):
+        assert col in ddl, f"offline DDL missing 0006 column {col}"
+
+    # v1.3.1 RSI R2 (0007): runs.integrity_signals + four new tables.
+    assert "integrity_signals" in ddl, "offline DDL missing 0007 column integrity_signals"
+    for table in ("eval_suites", "eval_results", "eval_adapters", "tasks"):
+        assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
+    for col in ("blind", "revealed", "scored_by", "difficulty"):
+        assert col in ddl, f"offline DDL missing 0007 column {col}"
+
+    # v1.3.1 RSI R3 (0008): runs.plan_id/budget_id/stop_reason + two new tables.
+    for table in ("plans", "budgets"):
+        assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
+    for col in ("compute_seconds_limit", "storage_bytes_used", "steps_used", "stop_reason"):
+        assert col in ddl, f"offline DDL missing 0008 column {col}"
+
+    # v1.3.1 RSI R5 (0010): three new tables — checked before R4's own assertion block so
+    # the diff reads chronologically bottom-up like the chain itself (0010 depends on
+    # 0009's schema existing, not the other way around; order here is cosmetic only).
+    for table in ("sandbox_jobs", "tool_manifests", "action_logs"):
+        assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
+    for col in ("driver", "exit_code", "improver_id"):
+        assert col in ddl, f"offline DDL missing 0010 column {col}"
+
+    # v1.3.1 RSI R4 (0009): runs.lessons_id + six new tables.
+    for table in ("causal_links", "strategy_entries", "lessons", "reviews", "critiques",
+                  "blackboard_entries"):
+        assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
+    for col in ("effect_delta", "hyperparameters", "decision", "target_type", "objection", "claim"):
+        assert col in ddl, f"offline DDL missing 0009 column {col}"
+
     # Every table from 0001_baseline exists in the rendered schema.
     for table in ("objects", "trees", "commits", "refs"):
         assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
@@ -282,12 +332,20 @@ def test_chain_renders_downgrade_ddl_offline_for_every_revision():
     cfg.set_main_option("sqlalchemy.url", "postgresql://av_user:av_password@localhost/aether_vault")
     script = ScriptDirectory.from_config(cfg)
     chain = [rev.revision for rev in script.walk_revisions()]  # head -> base order
-    assert chain == ["0005", "0004", "0003", "0002", "0001"]
+    assert chain == ["0010", "0009", "0008", "0007", "0006", "0005", "0004", "0003",
+                     "0002", "0001"]
 
     # Revision-specific DDL each downgrade step must emit, in the order downgrade() drops
     # things — proves the rendered SQL is THIS revision's downgrade, not a no-op or a
     # copy-paste of the wrong one.
     expected_per_step = {
+        "0010": ["action_logs", "tool_manifests", "sandbox_jobs"],
+        "0009": ["blackboard_entries", "critiques", "reviews", "lessons",
+                 "strategy_entries", "causal_links", "lessons_id"],
+        "0008": ["budgets", "plans", "stop_reason", "budget_id", "plan_id"],
+        "0007": ["tasks", "eval_adapters", "eval_results", "eval_suites", "integrity_signals"],
+        "0006": ["project_freeze", "canary_results", "policy_packs", "change_sets",
+                 "improver_versions", "improver_id", "kind"],
         "0005": ["policy_outcome"],
         "0004": ["disabled_reason", "consecutive_failures", "avh_object_id"],
         "0003": ["webhook_deliveries", "signature", "status_code"],

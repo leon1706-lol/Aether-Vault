@@ -10,15 +10,13 @@ DELETE /api/admin/audit and the AV_AUDIT_RETENTION_DAYS GC sweep).
 import datetime
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
-from .core import current_output_mode, emit_json
+from .core import current_output_mode, emit_json, resolve_remote
 
 
 def _client(repo_root):
     from .client import VaultClient
 
-    cfg = load_config(repo_root)
-    return VaultClient(cfg.get("remote_url", "http://localhost:8000"),
-                       cfg.get("remote_api_token"))
+    return VaultClient(*resolve_remote(repo_root))
 
 
 @click.group()

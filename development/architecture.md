@@ -281,6 +281,35 @@ Everything else — reads included — requires a valid credential once Protecte
 
 Client side: `python/av_cli/client.py::VaultClient` raises `AuthenticationError` on any 401; the CLI catches it centrally (the custom `_AuthRetryGroup`), prompts interactively, saves, and asks for a re-run — or queues the work when it can. Per-user tokens ride the exact same client path (`av auth set-token <personal-token>` in a teammate's repo). The webui wraps everything in `TokenGate`, which accepts a one-time `?av_token=` query parameter appended by `av webui`, saves it to localStorage, and strips it from the URL immediately on mount.
 
+### Token scopes (v1.3.1)
+
+An `AV_AUTH_USERS` entry may additionally carry `"scopes": [str, ...]` (`av auth add-user
+NAME TOKEN --scope <s>`, repeatable). Absence — every entry that predates this feature,
+every bare-string entry, and the owner's `AV_API_TOKEN` itself — resolves to the
+unrestricted wildcard `["*"]` (`server.py::_scopes_for_identity`), so this is purely
+additive: no existing deployment loses access to anything it could already reach.
+`require_token` resolves `request.state.scopes` alongside `request.state.username`
+(unconditionally, in the same pass); a route opts into a scope check by adding
+`Depends(require_scope("<scope>"))`.
+
+This is the one deliberate amendment to this file's historical framing that "enforcement
+is CLIENT-SIDE v1; server-side authz is enterprise-tier" (see the Promotion Policy
+Contract below): that statement remains true for the metric/signature promotion gates
+introduced in v1.2.0/v1.2.5, which stay client-side by design. It is no longer true
+project-wide — the held-out eval vault, improver promotion, and policy-pack publication
+introduced in v1.3.1 are enforced server-side via scopes, because a client-side-only gate
+cannot protect an eval suite from the very agent being scored against it. A `require_scope`
+denial is a `403` with `{"error": "scope_denied", "required_scope": "<scope>"}`, distinct
+from `require_token`'s `401` (the caller authenticated fine; they lack one permission),
+audited as `scope.denied`, and surfaced by the CLI as exit code 20 wherever a call site
+maps it (see docs/for-agents.md's exit-code table).
+
+**Verified:** stack-free unit tests (`tests/test_scopes.py`) cover scopes parsing
+(additive, omitted-when-absent), `_scopes_for_identity`'s default-to-wildcard behavior,
+and `require_scope()`'s allow/deny/audit logic against a stub session — no Postgres
+needed. Live end-to-end 403s are proven in `tests/test_server.py` once a real route
+declares a scope requirement (v1.3.1 R1/R2).
+
 ## Transport Hardening Contract
 
 Two middleware layers harden the transport; both are env-configurable and default to safe values.
@@ -300,7 +329,19 @@ Exemptions mirror auth exactly (health + docs routes). Responses are `429` JSON 
 
 ## Web UI Contract
 
-The dashboard is a Next.js App Router application under `webui/src/app`, talking straight to the registry API. The API base URL bakes in at build time via the `NEXT_PUBLIC_API_URL` argument (the compose file passes `http://localhost:8000`), so a registry behind a proxy needs a rebuild, not just a config change. Sidebar tabs: Dashboard, Commits, Branches, Metrics, Storage, Weight Diff, Projects. Project selection persists in localStorage and scopes every panel.
+The dashboard is a Next.js App Router application under `webui/src/app`, talking straight to the registry API. The API base URL bakes in at build time via the `NEXT_PUBLIC_API_URL` argument (the compose file passes `http://localhost:8000`), so a registry behind a proxy needs a rebuild, not just a config change. Sidebar tabs: Dashboard, Commits, Branches, Metrics, Storage, Weight Diff, Projects, Runs, Improver, Regression. Project selection persists in localStorage and scopes every panel.
+
+**Improver / Regression tabs (v1.3.1, RSI R6, WP-35/WP-38):** `ImproverPanel` (lineage +
+pending self-edits, from `GET /api/improvers`/`GET /api/change-sets`) and
+`RegressionPanel` (improver churn by change-set status, the anomaly event feed via
+`GET /api/events?kinds=anomaly`, and an embedded `CanaryPanel` showing pass/fail trend
+from `GET /api/canary-results`) are the WebUI counterparts of `av improver`/`av canary`
+and the server-side anomaly detectors (see this file's "Improver Artifact" and "Anomaly
+Alerts" contract sections). `CanaryPanel` is a standalone, independently-testable
+component (matching the plan's naming) embedded inside the Regression tab rather than
+given its own top-level sidebar destination — one small status widget didn't warrant a
+fourth new tab. All three fetch functions live in `webui/src/lib/api.ts` alongside every
+other panel's, following the same typed-response convention.
 
 Panel responsibilities, each backed by the same `/api` surface the CLI uses:
 
@@ -405,7 +446,9 @@ unknown project/kind narrows to nothing rather than erroring. The response also 
 retained event id (swept by `AV_EVENT_RETENTION_DAYS`) — a resuming consumer can tell
 "I fell behind and missed events" apart from "there's simply nothing new yet", which a
 stale cursor used to make silently indistinguishable. Kinds today: commit · ref · run ·
-gc · webhook_test. Webhooks POST the raw JSON body with
+gc · webhook_test, plus the v1.3.1 RSI additions — improver · change_set · policy ·
+canary · freeze · eval · review · blackboard · sandbox · **anomaly** (see this file's
+"Anomaly Alerts Contract" section). Webhooks POST the raw JSON body with
 `X-AV-Event-Id/-Kind/X-AV-Signature: hex(hmac-sha256(secret, body))`; secrets live in the
 registry (signing requirement) and are never returned (masked listings only). Zero active hooks ⇒
 zero background work. Retention: `AV_EVENT_RETENTION_DAYS` (default 30) swept during GC,
@@ -569,6 +612,435 @@ folding in the merge result under `data.merge` — the nested `merge` invocation
 stdout is captured, not let through directly, specifically so one `av promote` call never
 prints two top-level JSON objects (Probleme #114/#115).
 
+## Improver Artifact Contract (v1.3.1, RSI R1, migration 0006)
+
+An improver version is the agent's OWN stack (code paths, prompt files, tool schemas, a
+policy-pack pointer) — content-addressed exactly like an env snapshot: canonical
+sorted-keys JSON → sha256 id → CAS object (`python/av_cli/casobj.py`, generalizing
+`core.py::canonical_env_bytes`/`env_snapshot_id`) → uploaded through the normal object
+flow → a lightweight server index row (`improver_versions`: `id`, `project_id`,
+`manifest_object_id`, `parent_id`, no FK on `parent_id` — same shallow/out-of-order-write
+rationale as `commits.parent_hash`/`runs.parent_run_id`). `GET /api/improvers/{id}/lineage`
+is the parent-chain walk, byte-for-byte the same depth/cursor/cycle-guard shape as
+`GET /api/runs/{id}/lineage`. Client surface: `av improver register/init/list/show/
+lineage/current/use`; local state is `.av/improver/current` (the active pointer, a plain
+text file — same idiom as `.av/HEAD`) and `.av/improver/last_good` (written by `apply`,
+read by `rollback`).
+
+**Self-edit proposals (`change_sets`, todo.md A.3/A.4):** `av improver propose --diff FILE
+--rationale TEXT --risk low|medium|high` is a CAS object (diff + rationale + risk) indexed
+server-side with an explicit state machine — `proposed → approved|rejected`,
+`approved → applied|rejected`, `applied → rolled_back` — enforced by
+`POST /api/change-sets/{id}/status` (`_CHANGE_SET_TRANSITIONS`, `server.py`); an illegal
+jump (e.g. straight to `applied`) is a 422, not a silent overwrite, so `av improver apply`
+can never apply something nobody approved (`av improver review ID --approve|--reject`).
+`av improver apply ID` mints the NEXT improver version (parented on the change set's
+`improver_id`), marks the change set `applied`, records the previous pointer as
+`.av/improver/last_good`, and advances `.av/improver/current`. Scope note: this records
+the version/lineage transition and its audit trail; executing a diff's content inside an
+isolated sandbox is `av sandbox run` (R5, todo.md G.29) — a future step can run that
+first and then call `apply` to make the result official. `av improver rollback [--to ID]`
+is the one-command undo: resets `.av/improver/current`, defaulting to `last_good`.
+
+## Dual-Gate Promotion Contract (v1.3.1, RSI R1)
+
+Aether-Vault now has TWO independent promotion gates, deliberately living in separate
+files rather than one merged envelope:
+
+| Gate | Command | Rule file | Enforcement |
+|---|---|---|---|
+| Model | `av promote` | `.av/policies.json` | Client-side (unchanged since v1.2.0) |
+| Improver | `av improver promote` | `.av/improver_policy.json` | Client-side evaluation + server-side scope on the artifacts it reads |
+
+They were considered as one `policy_version: 2` envelope and rejected: every existing
+model-gate reader (`enforce_policy()`, `promote()`, `av policy set/list/remove`) does
+`load_policies(repo_root).get(branch)` directly on the top-level dict — folding improver
+rules in would have been a breaking change to a shape `tests/test_v120.py` already pins,
+for no functional benefit. `.av/improver_policy.json` is `{branch: {require_canaries:
+bool, require_signature: bool}}`, evaluated by `av improver promote [CANDIDATE] --into
+BRANCH [--dry-run] [--force]` — same `--dry-run` contract as the model gate (exits 0 for
+BOTH decisions; a script branches on `data.decision`, never the exit code).
+`require_canaries` checks `GET /api/canary-results` for the MOST RECENT result on the
+candidate improver (`av canary run` populates it — see below); `require_signature` fetches
+the candidate's manifest object and verifies it via `casobj.verify_object()`. A real
+(non-dry-run) landing writes `.av/improver/promoted/<branch>` = the candidate id — the
+improver-side analogue of a model branch ref, though nothing else currently reads it
+(a future WebUI/CLI surface can). Denial exits 16 (`policy_denied`, shared with the model
+gate — this is the SAME kind of decision, just over a different artifact).
+
+## Signed Policy Pack Contract (v1.3.1, RSI R1: todo.md C.13/I.39)
+
+A policy pack is a PUBLISHED SNAPSHOT of some policy state (typically `.av/policies.json`
+and/or `.av/improver_policy.json`, though `av policy pack publish` accepts any JSON
+document) on an append-only, hash-chained log — the promotion-rule analogue of signed
+commits. `av policy pack publish FILE [--sign/--no-sign]`: the document is optionally
+signed with this repo's ed25519 key (`casobj.sign_object`, generalizing
+`signing.sign_payload` — see `casobj.py`'s module docstring for why the generic canonical
+form doesn't need commit-signing's timestamp-echo normalization), written to the CAS,
+uploaded, then `POST /api/policy-packs` computes `chain_hash =
+sha256(f"{prev_id or ''}:{object_id}")` server-side — each pack cryptographically commits
+to its predecessor, so the SEQUENCE of promotion-rule changes is tamper-evident, not just
+each pack's own signature. `prev_id` defaults to the project's current tip
+(`GET /api/policy-packs/latest`). There is deliberately no PUT/DELETE route for
+`policy_packs` — publishing a new pack is the only mutation, which is what "append-only"
+actually means here. `av policy pack show/log/verify` read the chain and (verify) confirm
+both the recomputed `chain_hash` and the embedded signature. `POST /api/policy-packs`
+requires the `policy:write` scope server-side (see Token scopes, above) — this is one of
+the routes the client-side/server-side authz split now genuinely differs on.
+
+## Capability Canary Contract (v1.3.1, RSI R1: todo.md B.9/C.14)
+
+A canary suite is a small, fixed set of metric-threshold checks that must not regress —
+`{"checks": [{"name", "metric", "op", "threshold"}, ...]}`, evaluated against the CURRENT
+HEAD commit's metrics using `cmd_policy.py`'s own `_OPS`/comparison primitives (reused,
+not reimplemented). `av canary register NAME FILE` content-addresses the suite and records
+`name -> object_id` in `.av/canaries.json`; `av canary run NAME [--improver ID]` evaluates
+it locally and, when an improver id is known and the registry is reachable, reports the
+result via `POST /api/canary-results` (`canary_results`: `project_id`, `improver_id`,
+`suite_object_id`, `passed`, `details`, best-effort — a failed report never fails the
+canary run itself, mirroring `_report_policy_outcome`'s telemetry-only contract). This is
+the v1.3.1 scope: a canary that needs to actually EXECUTE arbitrary code (a held-out
+benchmark script, a full eval harness) is `av sandbox run` (R5) reporting through this
+exact same endpoint — the check-evaluation path here and the sandboxed-execution path
+there converge on one result shape.
+
+## Project Freeze Contract (v1.3.1, RSI R1: todo.md C.15/I.40)
+
+Global per-project kill-switch, scoped PRECISELY per todo.md C.15 ("no promotes, no
+self-edits, only read + rollback") — not a blanket gate over every CLI invocation.
+`freeze_guard()` (`cmd_freeze.py`) is called explicitly from exactly the promotion/self-
+edit gate commands: `av promote`, `av improver register/propose/apply`, `av policy pack
+publish`. It is deliberately NOT wired into `_AuthRetryGroup.invoke()` as a hook over
+every command — those specific gate commands already talk to the registry (promotion and
+publishing are inherently online operations), so the freeze check adds no network round
+trip to a path that didn't already have one, whereas `av commit`/`av add`/`av status` must
+stay instant and fully offline-capable (AGENTS.md non-negotiable #3). `av improver
+rollback` and `av freeze off` are exempt by construction — neither calls `freeze_guard()`,
+so an incident response is never blocked by the incident it's responding to.
+
+State is server-authoritative (`project_freeze`: `project_id`, `frozen`, `reason`,
+`frozen_by`, `frozen_at`) — `GET /api/freeze/{project_id}` is unauthenticated-scope (any
+reachable caller can check), `POST /api/freeze/{project_id}` requires the `admin` scope
+so a compromised or rogue local client can't unfreeze by simply not calling
+`freeze_guard()`. `project_frozen()` fails OPEN on an unreachable registry or missing
+config — freeze is an explicit, online, opt-in gate that must never itself become a new
+offline-resilience hazard; it does not (and cannot) stop a fully air-gapped client, which
+is a documented, deliberate trade-off, the same kind the model policy gate's own
+"client-side enforcement" already makes. `av incident rollback` composes `freeze on` +
+`av improver rollback` in one command — freeze first, so nothing new can land while the
+rollback itself is in flight.
+
+## Eval Registry & Integrity Contract (v1.3.1, RSI R2, migration 0007)
+
+A task/eval suite (`eval_suites`) is content-addressed exactly like an improver version —
+`av eval register NAME FILE [--blind]` writes a CAS object, uploads it, and indexes it
+server-side with `frozen`/`blind` flags. **Eval immutability locks (todo.md B.7):**
+`PUT /api/eval/suites/{id}` (the only route that can change `object_id`/metadata) returns
+`409` unconditionally once `frozen=true` — a training run cannot modify the eval it is
+scored against, enforced server-side, not by convention. `av eval freeze ID` sets that
+flag; there is no unfreeze route (freezing is one-way by design).
+
+**The held-out eval vault (todo.md F.25) is the token-scope mechanism, not a separate
+one:** `POST /api/eval/results` requires the `scorer` scope. Operationally this means
+pointing the training agent's token at a project/token pair with no `scorer` scope and a
+scorer's token at one that has it — the SAME `require_scope()` machinery introduced for
+freeze/policy-pack routes (see Token scopes, above) is what makes the vault a vault, not a
+new isolation mechanism. `av eval:write` similarly gates suite registration/freezing.
+
+**Blind / delayed scoring (todo.md F.26):** a `blind` suite's results are created with
+`revealed=False`; `GET /api/eval/results` redacts `score`/`details` to `null` (while still
+reporting a result EXISTS) for any reader whose token lacks the `scorer` scope — the
+agent sees its own training metrics live, the held-out score only after
+`av eval reveal RESULT_ID` (also `scorer`-scoped). `_eval_result_to_dict(r, redact=...)` is
+the single function both the redacted and full renderings go through, so there is exactly
+one code path to audit for a leak, not two independently-maintained ones.
+
+**External eval adapters (todo.md F.27):** `av eval adapter add NAME --command "..."`
+registers a subprocess contract (`eval_adapters.command`, a JSON argv list) so a
+benchmark's pass/fail can't be silently redefined by whatever happens to be checked into
+the training repo at the time — `av eval adapter run NAME [--input FILE]` pipes JSON to
+the adapter's stdin and requires JSON back on stdout with exit 0; a non-zero exit is
+treated as a failed scoring, not swallowed.
+
+**Reproducible scoring runs (todo.md F.28):** `av run start --kind scoring` requires BOTH
+an env snapshot (`av env snapshot` first) and a pinned git revision
+(`core.capture_code_pointer()` must find a real `git_sha`) — rejected with `validation`
+(exit 15) up front rather than silently accepted and discovered irreproducible only when
+someone actually needs to re-run the score. `kind ∈ {train, meta, scoring, eval}` rides
+`runs.kind` (migration 0006); `scoring`/`eval` are the two kinds this contract cares about.
+
+**Metric-gaming detection signals (todo.md B.10):** `av run integrity-check RUN_ID --suite
+SUITE_ID` compares the run's `metrics_summary` (training-time metrics) against the most
+recent REVEALED eval result for that suite+run, flags any metric whose relative gap
+exceeds 20%, and reports the comparison via `POST /api/runs/{id}/integrity-signals` —
+best-effort telemetry (`runs.integrity_signals`, migration 0007), never a gate, same
+contract as `policy-outcome`. Two signals this cycle deliberately reports as explicit
+`false`/`null` rather than guessing: `eval_only_improvement` (needs a training-metric time
+series this one-shot comparison doesn't have) and `data_overlap` (needs eval suites to
+declare the dataset object hashes they're built from, which isn't modeled yet) — an honest
+"not yet computed" beats a fabricated zero that would look like a clean bill of health.
+
+**Curriculum tasks (todo.md B.8):** `av task propose/list/accept/reject` — a lightweight
+`proposed → accepted|rejected` record (`tasks`), independent of the eval-suite machinery
+above; a task is a proposal for what to build an eval suite FOR, not a suite itself.
+
+## Research Control Contract (v1.3.1, RSI R3, migration 0008)
+
+**Experiment plans (todo.md D.16):** `av plan create/show/attach/validate` — a plan
+(hypotheses, ablations, budget, stop rules) is a CAS object, same pattern as an improver
+manifest; `validate` is a pure local structural check (no network) so an agent can sanity
+a plan before ever registering it. `attach` (`POST /api/runs/{id}/plan`) is deliberately
+usable both before AND after `av run start` — real planning happens both ways, and there
+is no reason to force a plan to exist before a run can begin.
+
+**Budget accounts (todo.md D.17):** `budgets` scopes to one run or a whole lineage
+(`scope ∈ {"run","lineage"}`, `scope_ref` = a run id either way) with three independent
+dimensions — compute seconds, storage bytes, steps — each an optional limit. `POST
+/api/budgets/{id}/consume` increments usage counters via `SELECT ... FOR UPDATE` (same
+serialization primitive `PUT /api/refs/{name}`'s compare-and-swap already uses) and reports
+`exhausted`/`exceeded_dims` in the SAME response that recorded the spend — no separate
+read-after-write that could race a second concurrent consumer of the same budget. `av
+budget consume` records the spend UNCONDITIONALLY (a budget is spent, never refunded, and
+the record must survive even when it turns out to be over the limit) and only then exits
+**17** (`budget_exhausted`) via the normal `fail()` path — `ok:false`,
+`error.code=="budget_exhausted"`, `error.data` carrying the full updated row so a caller
+doesn't need a second round trip to see what was actually spent. This matches every other
+non-zero exit code's `ok:false` contract; `unreachable_queued`'s exit-0-on-success shape
+(queued work is a SAFE, complete outcome) is the one documented exception to it, not a
+precedent this code follows.
+
+**Branch exploration policy (todo.md D.18):** `av run branch-policy set/show/check` is
+advisory-only by design — `.av/branch_policy.json` (`{branch_if, merge_if, abandon_if}`,
+each `{metric, op, threshold}`, reusing `cmd_policy.py`'s own `_OPS` comparison table) is
+evaluated against a run's LIVE `metrics_summary` and returns a recommendation
+(`abandon` > `merge` > `branch` > `continue`, most consequential first), but never itself
+branches, merges, or stops anything — those remain separate, deliberate calls
+(`av branch`, `av merge`, `av run stop`). A recommendation engine that could silently
+abandon a promising run on its own would be a worse failure mode than one that sometimes
+has to be told twice.
+
+**Auto-stop conditions (todo.md D.19):** `av run auto-stop-check RUN_ID --metric NAME
+[--stop]` is a one-shot check an external loop re-invokes periodically (`av watch`, a
+scheduler, a cron) — not a daemon of its own. It reuses the EXISTING uncapped per-commit
+metric series (`GET /api/runs/{id}/metrics`, v1.3.0) rather than tracking a second copy of
+training history anywhere, and checks three conditions in priority order: `nan` (any
+NaN value ever reported), `divergence` (the latest value is worse than the best-seen value
+by more than `--divergence-factor` × the best value's own scale — scale floors at 1.0 so a
+loss that legitimately bottomed out near zero doesn't make every later point look
+divergent), `plateau` (no improvement over the best-seen-before-the-tail across the last
+`--patience` points). `--stop` (default off — report-only) calls the same
+`POST /api/runs/{id}/stop` the scheduler hooks below use.
+
+**Scheduler hooks (todo.md D.20):** `POST /api/runs/{id}/stop` sets `status="stopped"` —
+deliberately a THIRD terminal state alongside `"completed"`/`"failed"`, so a lineage query
+can tell "the training genuinely failed" apart from "something outside the run (a
+scheduler, an auto-stop check) decided to end it," with `stop_reason` recording why.
+`GET /api/scheduler/queue` is a purpose-named `status=="running"` listing (same row shape
+as `GET /api/runs`) so an external bandit/scheduler doesn't have to guess which generic
+endpoint models "what's currently in flight." No new event kind: a stop rides the
+existing `run` event kind's `action` field, so anything already polling
+`GET /api/events?kinds=run` sees it for free.
+
+## Multi-Agent & Strategy Memory Contract (v1.3.1, RSI R4, migration 0009)
+
+**Causal run graphs (todo.md E.21):** `av lineage link --cause-type change_set|commit
+--cause REF --metric NAME [--delta X] [--verified]` records an explicit, agent-authored
+(or independently verified) claim — "this change caused that metric delta" — beyond the
+bare `parent_run_id` pointer lineage already had. `causal_links` is a flat, append-only
+log (`av lineage show [--cause REF]` filters it); nothing currently computes these
+automatically, matching the todo.md wording ("agent-authored + optional verified").
+
+**Strategy memory (todo.md E.22):** `av strategy add TECHNIQUE --outcome
+worked|failed|inconclusive [--hyperparameters JSON] [--data-mix JSON] [--run ID]...` is a
+searchable record beyond `.avh`'s per-repo context-memory notes — `av strategy search
+[--technique] [--outcome] [--q SUBSTRING]` queries across the whole project, not just the
+current checkout. `q` does a simple case-insensitive substring match over `technique`
+(`ilike`) rather than a full-text engine — the searchable store this item asks for, sized
+for a table an agent skims, not one it fuzzy-searches at scale.
+
+**Distilled lessons (todo.md E.23):** `av lessons update FILE` publishes a new CAS-object
+version of the project's "what we believe now" document; `av lessons show` resolves the
+latest by `created_at`, same `/latest` pattern as policy packs (migration 0006) minus the
+hash-chain — lessons revise freely, they are not a tamper-evident policy log. `runs.lessons_id`
+(this run's agent read this version before starting) exists in the schema for a future
+`av run start --require-lessons-read` warn-don't-block check; not yet wired into `av run
+start` itself this cycle — an honest scope note, not a silent gap (the column is real, the
+CLI enforcement is the one todo.md E.23 sub-item this pass left for the wrap-up docs to
+name explicitly rather than build speculatively into an already-large `run start`).
+
+**Cross-run search (todo.md E.24):** `av search runs --metric NAME --direction up|down
+[--min-delta X]` — e.g. "all runs where eval_acc rose after the change that produced
+them." Deterministic and structured (fixed query parameters, not a free-text/LLM query
+grammar): `GET /api/search/runs` scans one project's runs (bounded at 500, newest-first)
+and compares each to its PARENT run's latest value for the same metric — no external
+index, no vector store, exactly the shape needed at the scale this tool targets.
+
+**Reviewer gate + critiques (todo.md H.34/H.35):** `av review approve|reject TARGET_ID
+[--target-type change_set|improver]` requires the `review` scope AND rejects a
+self-review (the target's own proposer) with 422 — "another agent (or human) must
+approve" is an enforced server-side fact, not a client-side convention. `reviews` and
+`critiques` both use a `target_type`/`target_id` pair (not a `change_set_id` column) so
+the SAME review/critique mechanism covers both an in-flight change set AND the improver
+version that eventually gets promoted — `av improver promote`'s `require_review` policy
+checks `GET /api/reviews?target_type=improver&target_id=<candidate>` and
+`GET /api/critiques?target_type=improver&target_id=<candidate>&status=open` directly
+against the CANDIDATE, regardless of which change set (if any) produced it. A denial from
+`require_review` specifically exits **19** (`review_required`), not 16 — "nobody has
+signed off yet" needs a different remediation than "the metrics/signature don't qualify."
+`av critique resolve ID` (anyone) vs. `av critique waive ID --resolution TEXT` (the
+`review` scope only) are deliberately different verbs: waiving means the objection STANDS
+but is overridden, always audited (`critique.waived`), never a silent bypass.
+
+**Shared blackboard (todo.md H.36):** `av blackboard post CLAIM [--evidence type:ref]...`
+/ `list [--status]` / `resolve ID` — a durable claim store beyond the ordered event
+stream, for hypotheses that outlive any single event (`evidence` is a flat
+`[{"type","ref"}]` list, not a foreign-keyed join, matching this schema's shallow-write
+convention throughout).
+
+## Sandbox Execution Contract (v1.3.1, RSI R5, migration 0010)
+
+**Sandbox executor (todo.md G.29):** `python/av_cli/sandbox/` defines one driver
+protocol (`base.py::SandboxDriver` — `submit`/`status`/`cancel`/`logs`) resolved by name
+via `get_driver(name, repo_root)`. `local` (`drivers/local.py`) is deliberately
+**synchronous** — it runs the real command inside `submit()` via `subprocess.run()` and
+persists the terminal result to `.av/sandbox/jobs/<job_id>.json`; `docker`
+(`drivers/docker.py`) is **asynchronous**, starting a detached container
+(`docker run -d --name av-sandbox-<job_id>`) that `status()`/`cancel()`/`logs()`
+re-query by name from a later, separate CLI invocation. A bare subprocess PID is not a
+safe handle to re-attach to days later (PIDs recycle); a container name, Kubernetes pod,
+or Slurm job name are real backend-tracked handles, which is why only `local` collapses
+submit-and-wait into one call — see `base.py`'s module docstring for the full reasoning.
+`av sandbox run/status/cancel/logs` is the CLI surface; jobs are best-effort reported to
+`sandbox_jobs` (`POST/GET /api/sandbox/jobs`) after the local operation completes, never
+blocking it — a reporting failure never masks or reverses a real sandbox result.
+
+**Tool permission manifests (todo.md G.30):** a per-improver-version allowlist CAS object
+(`sandbox/manifest.py`) — `{"writable_paths": [glob,...], "network": "none"|"bridge",
+"network_destinations": [...], "gpu": bool}` — stored locally at
+`.av/tool_manifests/<improver_id>.json` and optionally published to `tool_manifests`
+(`POST /api/tool-manifests`, `improver:write` scope). `load_manifest()` fails **closed**:
+a missing manifest resolves to `DEFAULT_MANIFEST` (no writable paths, no network, no GPU),
+matching this project's freeze/scope convention of denying by default rather than
+allowing. `verify_spec_against_manifest(spec, manifest)` is the ONE place a `JobSpec` is
+checked against its manifest — `cmd_sandbox.py::sandbox_run()` calls it before
+`get_driver(...).submit(spec)`, so a violation aborts before any driver ever runs
+anything; no driver re-implements the parsing, each only enforces what it is actually
+capable of (`docker`'s `--network none` is a real, binary block; `local` cannot sandbox
+network access without extra OS tooling this project doesn't depend on, which
+`drivers/local.py`'s own docstring says plainly rather than implying a guarantee it can't
+keep). `av tools manifest show/set/verify` — `verify` is a pure dry-run that touches
+nothing, letting an agent check a prospective job against a manifest before ever
+submitting it.
+
+**Deterministic action replay (todo.md G.31):** `.av/actions.jsonl`
+(`python/av_cli/actionlog.py::log_action()`) is an append-only per-decision log — the same
+shape `.avh`'s `.av/context/memory.jsonl` already established for free-text agent notes,
+applied here to structured `{"ts","actor","action","details","command"}` entries instead.
+`publish_action_log()` content-addresses the full log (the same CAS pattern every other
+RSI artifact uses) and posts it to `action_logs` (`POST /api/action-logs`). `av
+replay-actions <run-id|log-id>` fetches the log (by id directly, or by resolving a run's
+recorded action-log id), prints the recorded action sequence, and — with `--execute` —
+re-runs each entry's recorded `command` through the **local driver only** (a fixed safety
+default, not configurable per-invocation) comparing exit codes against what was originally
+recorded, so replay can prove a training agent's non-training DECISIONS were reproducible,
+not just its training code.
+
+**Resource controller integration (todo.md G.32):** `drivers/kubernetes.py`
+(`kubectl apply -f -` / `get pod -o jsonpath` / `delete pod --now` / `logs`) and
+`drivers/slurm.py` (`sbatch` a generated batch script / `squeue --name` falling back to
+`sacct --name` for completed jobs / `scancel --name`) implement the identical protocol,
+addressed by the same `av-sandbox-<job_id>` name Slurm and Kubernetes jobs share with
+Docker's container-naming convention. Both are proven by contract tests against a faked
+`subprocess.run` (`tests/test_sandbox_drivers.py`, mirroring `tests/test_docker_runtime.py`'s
+established fake-subprocess pattern) — command construction and status-string parsing are
+real, exercised code; no live cluster is required or assumed. `av sandbox queue` lists
+`sandbox_jobs` server-side across drivers, giving an external scheduler one place to see
+what's in flight regardless of which backend is running it.
+
+**Migration 0010** adds `sandbox_jobs`, `tool_manifests`, and `action_logs` — no columns on
+any existing table, since a sandbox job, manifest, or action log is always independently
+addressable and never mandatory context for a run the way `runs.plan_id`/`runs.budget_id`
+were in R3.
+
+## RSI SDK Surface Contract (v1.3.1, RSI R6, WP-37)
+
+`av_sdk.Repo` gained one method per WRITE operation an autonomous loop actually needs to
+ACT on its own self-improvement cycle: `improver_register/propose/review/apply/rollback/
+promote/show/lineage/current/use`, `canary_run`, `freeze_status/set`, `eval_show/freeze/
+score/reveal`, `budget_set/show/consume`, `plan_create/attach`, `review_submit`,
+`critique_add/finalize`, `lessons_update/show`, `blackboard_post/resolve`, `strategy_add`,
+`lineage_link`, `search_runs`, `sandbox_run/status`, `tool_manifest_set`. Each raises the
+matching typed `SDKError` subclass (`ScopeDeniedError`, `BudgetExhaustedError`,
+`ReviewRequiredError`, …) rather than a bare exit code, continuing the pattern
+`av_sdk/exceptions.py` already established for the substrate surfaces.
+
+**Single code path, with one necessary exception.** Every method reuses the SAME plain
+(non-click) data/decision functions the CLI commands themselves call, wherever a command
+module had already factored that logic out of its click function body independently of
+this work (`current_improver_id`, `_evaluate_improver_policy`, `project_frozen`,
+`latest_canary_passed`, `_hash_paths`, `_report_job`/`_report_status`, every `casobj.*`
+function) — this is `commit_staged()`'s single-code-path principle applied to the RSI
+surfaces. **Found live while writing this section's own tests**
+(`tests/test_av_sdk_rsi.py`): a handful of those "already-factored-out" helpers
+(`_transition`, `_set_freeze`, `freeze_guard`) still call the CLI's `fail()`, which raises
+a bare `SystemExit` — correct for a click command (the whole process is expected to exit
+with that code) but wrong for a library call, which must raise something the caller can
+catch. `improver_review()`/the internal transition inside `improver_apply()`/`freeze_set()`
+reimplement that one request-plus-typed-error step inline instead (a few lines each),
+while still sharing every actual DECISION function (`_evaluate_improver_policy`,
+`project_frozen`) with the CLI. `Repo._freeze_guard()`/`Repo._transition_change_set()` are
+the SDK-side, typed-error equivalents of `cmd_freeze.py::freeze_guard()`/
+`cmd_improver.py::_transition()` for exactly this reason — not a duplicate for its own
+sake, but the boundary where "raise for the caller to catch" and "exit the process" must
+diverge.
+
+**Scope decision, documented rather than silently cut:** pure list/search/show-many
+endpoints (`av improver list`, `av task list`, `av strategy search`, `av eval adapter
+list`, etc.) are NOT mirrored on `Repo` — each is one `GET` with no decision logic, no
+more discoverable through the SDK than `av ... list` itself, and thirty near-identical
+passthrough methods would add class surface for negative real value. An agent that needs
+one reaches it via `self._client()` directly or the CLI. `av improver policy set/list/
+remove` (local-only config, never a network call) is CLI/SDK-`self._client()`-only for the
+same reason.
+
+**The two pre-existing SDK/CLI divergences this closes:** `run_start()` never captured
+`code_pointer` (fixed earlier in this cycle via `core.capture_code_pointer()`, R1);
+`context_note()` omitted `run_id`, unlike `cmd_context.py::note()` (which has always
+stamped it via `resolve_run_id()`) — fixed here, and `tests/test_av_sdk.py`'s parity test
+(which had pinned the WRONG, incomplete shape) corrected alongside it.
+
+## Anomaly Alerts Contract (v1.3.1, RSI R6, WP-36, todo.md I.38)
+
+Four server-side detectors, each emitting a `kind="anomaly"` event (payload always
+carries a `"type"` discriminator) ALONGSIDE whatever event the mutation already emits —
+`server.py::_emit_event()`'s existing webhook fan-out is the ONLY delivery path; a
+monitoring hook subscribes to `kinds=anomaly` to get a low-noise security/regression feed
+without filtering the full event stream itself. No new table, no new delivery mechanism.
+
+| Type | Trigger | Detector |
+|---|---|---|
+| `metric_jump` | A metric present in both a commit and its parent changed by ≥ `AV_ANOMALY_METRIC_JUMP_RATIO`x (default 3.0) | `_detect_metric_jump()`, called from `POST /api/commits` |
+| `mass_rewrite` | ≥ `AV_ANOMALY_MASS_REWRITE_FILES` (default 200) files added/removed/changed vs. the parent commit's tree | Same call site, reusing `_summarize_tree_diff()` (the Run Summary endpoint's own tree-diff function — one implementation, not a second one) |
+| `policy_change` | Any policy pack publish, in either direction (tightened or loosened) | `POST /api/policy-packs`, alongside its existing `kind="policy"` event |
+| `auth_spike` | ≥ `AV_ANOMALY_AUTH_SPIKE_THRESHOLD` (default 5) auth failures for the same identifier within `AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS` (default 60s) | `require_token`'s 401 branch (keyed by client host — no identity resolved yet) and `require_scope()`'s 403 branch (keyed by the resolved identity) |
+
+**Detectors never fail the mutation they're inspecting** — `_detect_commit_anomalies()`
+wraps its own body in a bare `except Exception` (logged, not raised): a detector bug must
+never turn into a failed commit. The auth-spike counter (`_AUTH_FAILURE_WINDOW`) is
+**deliberately in-process, not Redis-backed** — it is a single-process best-effort "this
+process just saw a burst" signal, not a durable security record (the audit log via
+`_audit()` already *is* the durable per-denial record; this only decides when a BURST of
+denials is itself worth one dedicated event). The window clears the moment it trips, so
+one burst raises exactly one anomaly rather than one per subsequent failure — a consumer
+wanting a per-request feed already has the audit log for that.
+
+**Stop:** `mass_rewrite`'s file-count-based heuristic and `metric_jump`'s fixed ratio are
+both context-free (a canary suite's own thresholds are far more precise, per-metric
+signals — this is a cheap, dependency-free coarse net over train/eval commits that never
+went through a canary at all). No statistical baseline/rolling-average model backs
+either; tightening them from a fixed constant to something adaptive is future work, not
+attempted this cycle.
+
 ## Testing And Verification Map
 
 | Surface | Test file(s) | Notes |
@@ -587,6 +1059,30 @@ prints two top-level JSON objects (Probleme #114/#115).
 | Dataset CDC matrix | `tests/test_dataset_cdc.py` | Boundary stability/determinism across every CHUNKABLE_EXT + `.avattributes` enforcement matrix |
 | V1.2.2 units | `tests/test_v122.py` | dedup_efficiency→.avh flow, avh schema-file validation path, audit-list param contract |
 | Agent surface (v1.2.0) | `tests/test_v120.py`, `tests/test_av_sdk.py`, `tests/test_semdiff.py`, `tests/test_webhooks_cli.py` | Envelope/exit codes, SDK seam, semdiff math, webhooks CLI |
+| RSI R1 — CAS objects | `tests/test_casobj.py` | Canonicalization, id/round-trip, sign/verify, signing.py delegation guard |
+| RSI R1 — improver lifecycle | `tests/test_improver.py` | register/list/show/lineage/current/use, propose→review→apply→rollback, dual-gate promote, in-memory fake registry |
+| RSI R1 — canaries | `tests/test_canary.py` | Check evaluation against HEAD metrics (reuses `cmd_policy._OPS`), offline degrade-gracefully reporting |
+| RSI R1 — freeze | `tests/test_freeze.py` | fail-open when unreachable, gate commands blocked/exempt, `av incident rollback` |
+| RSI R1 — policy packs | `tests/test_policy_pack.py` | Chain-hash computation, publish/show/log/verify, freeze gating |
+| RSI R1 — server routes (live) | `tests/test_server.py::TestImproverVersions/TestChangeSets/TestPolicyPacks/TestCanaryResults/TestProjectFreeze` | Idempotent create, 422s on unresolved object ids, the change-set transition state machine, chain-hash formula, scope 403s (`policy:write`/`admin`) |
+| RSI R1 — scopes | `tests/test_scopes.py` | `_parse_auth_users` scopes parsing (additive), `_scopes_for_identity` defaults, `require_scope()` allow/deny/audit against a stub session |
+| RSI R2 — eval registry | `tests/test_eval.py` | register/list/show/freeze, blind score+reveal, adapter add/list/run (subprocess contract, non-zero exit), scope denials |
+| RSI R2 — curriculum tasks | `tests/test_task.py` | propose/list/accept/reject, status filtering |
+| RSI R2 — run integrity | `tests/test_run_integrity.py` | `--kind scoring`'s env-snapshot+git-sha gate, `integrity-check`'s gap flagging and unrevealed-result exclusion |
+| RSI R2 — server routes (live) | `tests/test_server.py::TestImproverVersions`…(R1 classes, see above) plus eval-suite/-result/-adapter/task route coverage to add alongside R2's live verification pass | Frozen-suite 409, `scorer`/`eval:write` 403s, blind-result redaction, adapter/task CRUD |
+| RSI R3 — plans/budgets | `tests/test_plan_budget.py` | Plan validate/create/show/attach, budget set/show/attach/consume, exit-17 on exhaustion |
+| RSI R3 — branch-policy/auto-stop/scheduler | `tests/test_run_scheduler.py` | Advisory branch-policy recommendation ordering, plateau/divergence/NaN detection (both minimize/maximize directions), scheduler queue listing |
+| RSI R4 — reviewer gate + critiques | `tests/test_review.py` | Approve/reject, scope denial (403->20), self-review rejection, critique add/list/resolve/waive, terminal-state 409 |
+| RSI R4 — lineage/search/strategy/lessons/blackboard | `tests/test_lineage_strategy_lessons_blackboard.py` | Causal link record/list, structured cross-run search, strategy add/search/show, lessons update/show (incl. none-published), blackboard post/list/resolve, malformed-evidence validation |
+| RSI R4 — leaked-output regression guards | `tests/test_exit_codes.py::test_policy_denied_exits_16_json`, `tests/test_canary.py`/`tests/test_policy_pack.py`'s JSON-mode exit assertions | Locks in Probleme #131's fix: no command may leak text after its JSON envelope, or disagree between text/JSON mode on an exit code, on a DENY/FAIL outcome specifically |
+| RSI R5 — sandbox protocol + manifests | `tests/test_sandbox.py` | Manifest load/save/corrupt-fallback, `verify_spec_against_manifest` mount/network/gpu escalation checks, `get_driver` resolution for all four names + unknown-name rejection |
+| RSI R5 — sandbox drivers | `tests/test_sandbox_drivers.py` | `local` via real subprocess (success/failure/timeout/cancel/status-replay); `docker`/`kubernetes`/`slurm` via fake-subprocess contract tests (command construction, status parsing, cancel-only-when-running) — no daemon or cluster required |
+| RSI R5 — CLI + action replay | `tests/test_action_replay.py` | `av sandbox run/status/cancel/logs/queue`, `av tools manifest show/set/verify` (incl. `--publish`), `actionlog.py` round-trip, `av replay-actions` incl. `--execute` |
+| RSI R5 — server routes (live) | `tests/test_server.py` (sandbox-jobs/tool-manifests/action-logs routes) | `improver:write`-scoped mutations, id-lookup 404s |
+| RSI R6 — SDK surface | `tests/test_av_sdk_rsi.py` | Full propose→review→apply→canary→promote(deny)→review→promote(allow)→rollback→lessons loop via `av_sdk.Repo` alone; typed-error assertions for `budget_exhausted`/`review_required`/`unreachable_queued`; critique resolve/waive; freeze status/set |
+| RSI R6 — reference loop | `tests/test_rsi_loop.py` | Runs `examples/rsi_loop/agent.py::run_rsi_loop()` stack-free against an in-memory fake registry — the exact function a live run calls, proving the narrative's ordering and every denial without Docker |
+| RSI R6 — anomaly detection (live) | `tests/test_server.py::TestAnomalyDetection` | metric_jump/mass_rewrite on commit push, policy_change on pack publish, auth_spike on a 403 burst (and confirms below-threshold bursts stay silent) |
+| RSI R6 — WebUI Improver/Regression tabs | `webui/` Vitest: `ImproverPanel.test.tsx`, `CanaryPanel.test.tsx`, `RegressionPanel.test.tsx` | Loading/empty/error states, lineage + pending-self-edit filtering, pass/fail badge math, churn tally by status, anomaly-type labeling |
 | Perf gate | `tests/test_perf_gate.py` | speedcheck synthetic probes, median-of-N (v1.2.5) vs. per-class budgets — CPU 2×, disk 3× (+1.5× more on Windows); fails only when the median AND ≥2/N samples exceed budget; `AV_PERF_BUDGET_MULTIPLIER` escape hatch; incl. semdiff, commit_staged, compute_status, log probes |
 | Web UI units | `webui/` Vitest suite (`npm test`) | Components plus pure logic incl. `diffWeights` and `runDetail` (lineage chain + client-side tree-diff summary) |
 | Web UI browser E2E | `webui/e2e/*.spec.ts` (Playwright, CI `webui-e2e`) | Seeded live stack: dashboard, weight-diff, and Protected-mode token gate |

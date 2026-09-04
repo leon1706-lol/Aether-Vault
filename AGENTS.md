@@ -26,9 +26,9 @@ file defers to — treat it as part of this contract, not optional extra credit.
    `_materialize_tree()`.
 3. **Offline resilience is sacred.** Any network failure must queue work
    (`.av/pending_push`), never lose it. `unreachable_queued` = safe, not an error.
-4. **Contracts are versioned.** JSON envelope shapes, exit codes 10–16, `.avh`
-   (`avh_version`), and HTTP payloads are user-facing contracts. Additive changes only,
-   with a MINOR bump + CHANGELOG entry.
+4. **Contracts are versioned.** JSON envelope shapes, exit codes 10–20 (17-20 added
+   v1.3.1), `.avh` (`avh_version`), and HTTP payloads are user-facing contracts. Additive
+   changes only, with a MINOR bump + CHANGELOG entry.
 5. **Nothing is done until it's verified.** New behavior ships with its own tests
    (`pytest tests/ -q` green) *and* a manual, real-CLI repro in a scratch repo outside
    this checkout — unit tests alone have repeatedly missed real bugs here. Full sequence
@@ -73,17 +73,29 @@ Prefix any agent-surface command with `--output json`:
 Failures return `ok:false` with `error.code ∈ {not_a_repo, nothing_to_commit,
 auth_failed, unreachable_queued, merge_conflict, validation, policy_denied}` and exit
 codes `10–16` respectively (`0` ok, `2` usage). `unreachable_queued` means the work is
-SAFE — persisted locally and queued for `av push`.
+SAFE — persisted locally and queued for `av push`. v1.3.1 adds `budget_exhausted` (17,
+`av budget consume` over a limit), `frozen` (18, `av freeze on` pauses promotions/
+self-edits), `review_required` (19, `av improver promote`'s reviewer gate denied), and
+`scope_denied` (20, a server-side token-scope 403) to the same registry — see
+`docs/for-agents.md`'s full table.
 
-Supported commands (v1.3): every CLI command supports `--output json` except `watch`
+Supported commands (v1.3.1): every CLI command supports `--output json` except `watch`
 (streams one envelope per auto-commit — NDJSON, not one envelope per invocation) and the
 dev-only `test`/`benchmark`/`webui` (see `docs/contracts.md`'s leakage-exemption list for
 why). Originally-agent-facing core: status · add · commit · push · diff · run
 start/finish/list/show · context note/show/validate/export/search · env snapshot/replay ·
 policy set/list/remove/promote --dry-run · registry export/keygen/attest/verify · auth
-doctor/rotate · audit list/export/prune --dry-run. A generic anti-leakage test
-(`tests/test_contract_matrix.py`) walks every command and asserts `--output json` never
-mixes human text with the envelope — see that file before adding a new command.
+doctor/rotate · audit list/export/prune --dry-run. **v1.3.1 RSI control plane** (see
+`docs/rsi-operator-guide.md`): improver register/propose/review/apply/rollback/promote/
+lineage · canary register/run/status · freeze on/off/status · incident rollback · eval
+register/freeze/score/reveal/adapter · task propose/accept/reject · plan create/attach/
+validate · budget set/consume · scheduler queue · review approve/reject · critique add/
+resolve/waive · lineage link/show · search runs · strategy add/search · lessons update/
+show · blackboard post/resolve · sandbox run/status/cancel/logs/queue ·
+replay-actions · tools manifest show/set/verify · policy pack publish/show/log/verify. A
+generic anti-leakage test (`tests/test_contract_matrix.py`) walks every command and
+asserts `--output json` never mixes human text with the envelope — see that file before
+adding a new command.
 
 ### Python SDK — `from av_sdk import Repo`
 

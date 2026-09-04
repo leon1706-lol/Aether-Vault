@@ -774,7 +774,7 @@ def test_seam_parity_env_snapshot_id(tmp_path):
     assert seam_sid == sdk_sid == cli_sid
 
 
-def test_seam_parity_queued_when_server_unreachable(tmp_path):
+def test_seam_parity_queued_when_server_unreachable(tmp_path, unreachable_client):
     """v1.2.5: all three surfaces queue (never fail/lose the commit) identically when
     the registry is unreachable — matches the queued/queued_reason contract."""
     from av_sdk import Repo

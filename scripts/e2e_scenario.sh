@@ -218,7 +218,7 @@ start_server legacy-C     # boot must detect the pre-Alembic shape, heal, stamp
 
 [[ "$(psqlq "SELECT count(*) FROM information_schema.columns WHERE table_name='commits' AND column_name='extra_parents'")" == "1" ]] \
   || die "legacy boot did not restore commits.extra_parents"
-[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0005" ]] || die "legacy boot did not stamp chain head (0005)"
+[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0010" ]] || die "legacy boot did not stamp chain head (0010)"
 [[ "$(psqlq "SELECT count(*) FROM commits")" == "$COMMITS_BEFORE" ]] || die "heal lost commit rows!"
 pass "Phase C: pre-Alembic volume healed + stamped zero-touch, data intact"
 
@@ -426,6 +426,154 @@ AV_AUDIT_OUT="$(cd "$WORK/repoC" && command av audit list --action commit.push -
   || true
 grep -q "commit.push" <<<"$AV_AUDIT_OUT" || die "av audit list failed: $AV_AUDIT_OUT"
 pass "Phase K: audit outcome capture + filters live (server + CLI)"
+
+# ============================================================================
+# Phases O-T — v1.3.1 RSI control plane, live (todo.md's 46-item backlog, WP-43).
+# Each phase restarts the server itself rather than threading through the substrate
+# phases' state above, matching the chaos phases' own convention — the RSI surfaces
+# below are independent of A-K's git/merge/auth narrative and reads more clearly with
+# a clean slate per concern.
+# ============================================================================
+log "Phase O — improver lifecycle: register -> propose -> apply -> rollback"
+
+stop_server
+start_server anon-O
+
+mkdir -p "$WORK/repoO" && cd "$WORK/repoO"
+av . init --mode local --yes --no-repl >/dev/null
+echo "print('v1')" > train.py
+av . add train.py >/dev/null
+av . commit -m "seed" --metric val_loss=0.5 >/dev/null
+
+BASE_IMP="$(av . --output json improver init | jsonget "d['data']['id']")"
+[[ -n "$BASE_IMP" ]] || die "improver init did not return an id"
+
+echo -e "--- a\n+++ b\n-x\n+y" > change-o.diff
+CS_O="$(av . --output json improver propose --diff change-o.diff --rationale "e2e phase O" --risk low \
+        | jsonget "d['data']['id']")"
+av . improver review "$CS_O" --approve >/dev/null
+NEW_IMP_O="$(av . --output json improver apply "$CS_O" | jsonget "d['data']['new_improver_id']")"
+[[ "$NEW_IMP_O" != "$BASE_IMP" ]] || die "apply should mint a NEW improver version, not reuse the base one"
+CUR_O="$(av . --output json improver current | jsonget "d['data']['id']")"
+[[ "$CUR_O" == "$NEW_IMP_O" ]] || die "current pointer should be the newly applied version"
+
+av . improver rollback >/dev/null
+CUR_O2="$(av . --output json improver current | jsonget "d['data']['id']")"
+[[ "$CUR_O2" == "$BASE_IMP" ]] || die "rollback should restore the pre-apply improver version"
+pass "Phase O: improver register->propose->apply->rollback, live"
+
+# ============================================================================
+log "Phase P — dual-gate promotion: DENY (no review) then ALLOW (reviewed)"
+
+cd "$WORK/repoO"
+echo -e "--- a\n+++ b\n-lr=3e-4\n+lr=1e-4" > change-p.diff
+CS_P="$(av . --output json improver propose --diff change-p.diff --rationale "e2e phase P" --risk low \
+        | jsonget "d['data']['id']")"
+av . improver review "$CS_P" --approve >/dev/null
+CANDIDATE_P="$(av . --output json improver apply "$CS_P" | jsonget "d['data']['new_improver_id']")"
+
+av . improver policy set main --require-review >/dev/null
+set +e
+av . improver promote "$CANDIDATE_P"
+DENY_CODE=$?
+set -e
+[[ "$DENY_CODE" == "19" ]] || die "promote without a review must exit 19 (review_required), got $DENY_CODE"
+
+av . review approve "$CANDIDATE_P" --target-type improver >/dev/null
+ALLOW_JSON="$(av . --output json improver promote "$CANDIDATE_P")"
+[[ "$(<<<"$ALLOW_JSON" jsonget "d['data']['allowed']")" == "True" ]] \
+  || die "promote after review should now be allowed: $ALLOW_JSON"
+pass "Phase P: dual-gate promotion denied without review (exit 19), allowed once reviewed"
+
+# ============================================================================
+log "Phase Q — capability canary blocks an improver promote until it passes"
+
+cd "$WORK/repoO"
+echo -e "--- a\n+++ b\n-z\n+w" > change-q.diff
+CS_Q="$(av . --output json improver propose --diff change-q.diff --rationale "e2e phase Q" --risk low \
+        | jsonget "d['data']['id']")"
+av . improver review "$CS_Q" --approve >/dev/null
+CANDIDATE_Q="$(av . --output json improver apply "$CS_Q" | jsonget "d['data']['new_improver_id']")"
+
+av . improver policy set canary-gate --require-canaries >/dev/null
+set +e
+av . improver promote "$CANDIDATE_Q" --into canary-gate
+CANARY_DENY_CODE=$?
+set -e
+[[ "$CANARY_DENY_CODE" == "16" ]] || die "promote without a passing canary must exit 16 (policy_denied), got $CANARY_DENY_CODE"
+
+echo '{"checks": [{"name": "loss_ok", "metric": "val_loss", "op": "<=", "threshold": 0.6}]}' > canary-e2e.json
+av . canary register core-capability canary-e2e.json >/dev/null
+av . canary run core-capability --improver "$CANDIDATE_Q" >/dev/null
+CANARY_ALLOW_JSON="$(av . --output json improver promote "$CANDIDATE_Q" --into canary-gate)"
+[[ "$(<<<"$CANARY_ALLOW_JSON" jsonget "d['data']['allowed']")" == "True" ]] \
+  || die "promote after a passing canary should now be allowed: $CANARY_ALLOW_JSON"
+pass "Phase Q: canary blocks promote until it passes (exit 16 then allow)"
+
+# ============================================================================
+log "Phase R — held-out eval vault: a non-scorer identity is rejected server-side"
+
+stop_server
+start_server scoped-R AV_API_TOKEN="owner-secret-xyz" \
+  AV_AUTH_USERS='{"trainer":{"token":"trainer-tok-e2e","scopes":["read"]},"scorer":{"token":"scorer-tok-e2e","scopes":["scorer","eval:write"]}}'
+
+mkdir -p "$WORK/repoR" && cd "$WORK/repoR"
+av . init --mode local --token scorer-tok-e2e --yes --no-repl >/dev/null
+echo '{"tasks": []}' > suite-r.json
+SUITE_R="$(av . --output json eval register held-out-r suite-r.json | jsonget "d['data']['id']")"
+[[ -n "$SUITE_R" ]] || die "eval register (as scorer) should succeed"
+
+PROJ_R="$(project_of "$WORK/repoR")"
+TRAINER_SCORE_CODE="$(api_status -H "Authorization: Bearer trainer-tok-e2e" \
+  -H "Content-Type: application/json" -X POST "$API/api/eval/results" \
+  -d "{\"project_id\":\"$PROJ_R\",\"suite_id\":\"$SUITE_R\",\"score\":{\"acc\":0.9}}")"
+[[ "$TRAINER_SCORE_CODE" == "403" ]] \
+  || die "a trainer-scoped (non-scorer) token must be rejected recording a score, got $TRAINER_SCORE_CODE"
+pass "Phase R: held-out eval vault rejects a non-scorer identity server-side (403)"
+
+# ============================================================================
+log "Phase S — budget exhaustion stops a run on its own (exit 17)"
+
+stop_server
+start_server anon-S
+
+mkdir -p "$WORK/repoS" && cd "$WORK/repoS"
+av . init --mode local --yes --no-repl >/dev/null
+BUDGET_S="$(av . --output json budget set e2e-run-s --compute-seconds 10 | jsonget "d['data']['id']")"
+av . budget consume "$BUDGET_S" --compute-seconds 6 >/dev/null
+set +e
+av . budget consume "$BUDGET_S" --compute-seconds 6
+BUDGET_CODE=$?
+set -e
+[[ "$BUDGET_CODE" == "17" ]] || die "exceeding a budget must exit 17 (budget_exhausted), got $BUDGET_CODE"
+pass "Phase S: budget exhaustion stops further spend (exit 17), prior spend still recorded"
+
+# ============================================================================
+log "Phase T — freeze blocks promote/self-edit; reads and rollback still work"
+
+cd "$WORK/repoO"
+av . freeze on --reason "e2e phase T drill" >/dev/null
+
+set +e
+av . improver propose --diff change-o.diff --rationale "should be blocked" --risk low
+FREEZE_PROPOSE_CODE=$?
+set -e
+[[ "$FREEZE_PROPOSE_CODE" == "18" ]] || die "proposing a self-edit while frozen must exit 18, got $FREEZE_PROPOSE_CODE"
+
+set +e
+av . improver promote "$CANDIDATE_P"
+FREEZE_PROMOTE_CODE=$?
+set -e
+[[ "$FREEZE_PROMOTE_CODE" == "18" ]] || die "promoting while frozen must exit 18, got $FREEZE_PROMOTE_CODE"
+
+# Reads and rollback are exempt by construction (freeze_guard() is never called from them).
+av . improver current >/dev/null || die "reads must keep working while frozen"
+av . improver rollback >/dev/null || die "rollback must keep working while frozen (it's how you exit an incident)"
+
+av . freeze off >/dev/null
+FROZEN_AFTER="$(av . --output json freeze status | jsonget "d['data']['frozen']")"
+[[ "$FROZEN_AFTER" == "False" ]] || die "freeze off should clear the frozen flag"
+pass "Phase T: freeze blocks promote/self-edit (exit 18) while reads/rollback stay available"
 
 # ============================================================================
 # Phases L/M/N — chaos drills (v1.3.0, todo.md item 28). Gated behind AV_E2E_CHAOS=1

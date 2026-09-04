@@ -20,15 +20,13 @@ import pathlib  # NOT re-exported by `from .core import *` (core.py imports only
                 # av registry export/restore had literally never worked (Probleme.md).
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
-from .core import current_output_mode, emit_json
+from .core import current_output_mode, emit_json, resolve_remote
 
 
 def _client(repo_root):
     from .client import VaultClient
 
-    cfg = load_config(repo_root)
-    return VaultClient(cfg.get("remote_url", "http://localhost:8000"),
-                       cfg.get("remote_api_token"))
+    return VaultClient(*resolve_remote(repo_root))
 
 
 class _NullProgressBar:

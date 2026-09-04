@@ -22,7 +22,7 @@ def test_repo_requires_av_directory(tmp_path):
     assert ei.value.code == "not_a_repo"
 
 
-def test_commit_via_sdk_matches_cli_semantics(repo):
+def test_commit_via_sdk_matches_cli_semantics(repo, unreachable_client):
     (repo / "w.pt").write_bytes(b"weights")
     with Repo(repo) as r:
         r.add("w.pt")
@@ -161,7 +161,7 @@ def test_push_parity_sdk_vs_cli_when_nothing_pending(repo):
     assert sdk_push == cli_push == {"drained": 0, "still_queued": 0, "reachable": None}
 
 
-def test_push_parity_sdk_vs_cli_when_queued(repo):
+def test_push_parity_sdk_vs_cli_when_queued(repo, unreachable_client):
     (repo / "q.pt").write_bytes(b"q")
     inv_cli(repo, "add", "q.pt")
     inv_cli(repo, "commit", "-m", "queued one")  # unreachable server -> queues
@@ -200,7 +200,12 @@ def test_context_note_parity_sdk_vs_cli_shape(repo):
     # Both are {"appended": True, "entry": {...}} — the entry SHAPE (not content, which
     # differs by design) must match across surfaces.
     assert sdk_result["appended"] is True and cli_result.get("appended", True) is not False
-    assert set(sdk_result["entry"]) == {"ts", "agent", "note"}
+    # v1.3.1 fix (WP-37): this used to pin {"ts", "agent", "note"} — missing "run_id",
+    # which `av context note` (cmd_context.py) has always stamped via resolve_run_id().
+    # The SDK's own context_note() silently diverged from its own parity target; fixed to
+    # actually stamp _run_id(), and this test now pins the CORRECT shared shape.
+    assert set(sdk_result["entry"]) == {"ts", "agent", "note", "run_id"}
+    assert set(cli_result["entry"]) == {"ts", "agent", "note", "run_id"}
 
 
 def test_handoff_dict_parity_sdk_vs_cli_export(repo):

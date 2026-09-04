@@ -281,6 +281,16 @@ def _user_expiry(value) -> str | None:
     return value.get("expires_at") if isinstance(value, dict) else None
 
 
+def _user_scopes(value) -> list[str] | None:
+    """v1.3.1: this user's declared scopes, or None when unrestricted (the default for
+    every bare-string/legacy entry and any entry that never set --scope)."""
+    if isinstance(value, dict):
+        scopes = value.get("scopes")
+        if isinstance(scopes, list) and scopes:
+            return scopes
+    return None
+
+
 def _write_auth_users(compose_file: Path, users: dict) -> None:
     """Writes the merged map back; an empty map removes the line entirely (Anonymous)."""
     from . import docker_runtime
@@ -296,7 +306,14 @@ def _write_auth_users(compose_file: Path, users: dict) -> None:
 @click.option("--expires-in-days", "expires_in_days", type=int, default=None,
               help="Optional: this user's token stops authenticating after N days "
                    "(default: never expires).")
-def auth_add_user(name: str, token: str | None, expires_in_days: int | None) -> None:
+@click.option("--scope", "scopes", multiple=True,
+              help="v1.3.1: restrict this token to specific permissions (repeatable), "
+                   "e.g. --scope eval:write --scope review. Omit for an unrestricted "
+                   "token (the default — matches every pre-v1.3.1 user). Enforced "
+                   "server-side (server.py::require_scope) on routes that declare one;"
+                   " see docs/rsi-operator-guide.md for the scope vocabulary.")
+def auth_add_user(name: str, token: str | None, expires_in_days: int | None,
+                   scopes: tuple[str, ...]) -> None:
     """Grant NAME its own access token (generating one if TOKEN is omitted).
 
     Per-user tokens work alongside the owner's shared secret: each teammate puts their
@@ -329,16 +346,28 @@ def auth_add_user(name: str, token: str | None, expires_in_days: int | None) -> 
 
         expires_at = (_dt.datetime.now(_dt.timezone.utc)
                      + _dt.timedelta(days=expires_in_days)).isoformat()
-    users[name] = {"token": token, "expires_at": expires_at} if expires_at else token
+    scope_list = sorted(set(scopes)) if scopes else None
+    if expires_at is not None or scope_list:
+        value: dict = {"token": token}
+        if expires_at is not None:
+            value["expires_at"] = expires_at
+        if scope_list:
+            value["scopes"] = scope_list
+    else:
+        value = token
+    users[name] = value
     _write_auth_users(compose_file, users)
     _restart_server_for_token_change(repo_root)
     if current_output_mode() == "json":
         emit_json(None, "auth add-user", data={"name": name, "added": True, "token": token,
-                                                "expires_at": expires_at})
+                                                "expires_at": expires_at,
+                                                "scopes": scope_list})
         return
     click.secho(f"User '{name}' added. Token: {token}", fg="green")
     if expires_at:
         click.secho(f"Expires: {expires_at}", fg="cyan")
+    if scope_list:
+        click.secho(f"Scopes: {', '.join(scope_list)}", fg="cyan")
     click.secho(
         "Share it with them — they enable it via `av auth set-token <token>` in their repo.",
         fg="yellow",
@@ -355,7 +384,7 @@ def auth_list_users() -> None:
     if current_output_mode() == "json":
         emit_json(None, "auth list-users", data={
             "users": [{"name": n, "masked_token": f"{'*' * max(len(_user_token(v)) - 4, 0)}{_user_token(v)[-4:]}",
-                      "expires_at": _user_expiry(v)}
+                      "expires_at": _user_expiry(v), "scopes": _user_scopes(v)}
                       for n, v in sorted(users.items())],
         })
         return
@@ -366,7 +395,9 @@ def auth_list_users() -> None:
         tok = _user_token(val)
         masked = f"{'*' * max(len(tok) - 4, 0)}{tok[-4:]}"
         expiry_suffix = f"  (expires {_user_expiry(val)})" if _user_expiry(val) else ""
-        click.echo(f"  {name}: {masked}{expiry_suffix}")
+        scopes = _user_scopes(val)
+        scope_suffix = f"  [scopes: {', '.join(scopes)}]" if scopes else ""
+        click.echo(f"  {name}: {masked}{expiry_suffix}{scope_suffix}")
 
 
 @auth.command(name="remove-user")

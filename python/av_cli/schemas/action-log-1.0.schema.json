@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/action-log-1.0.json",
+  "title": "Aether-Vault action log (GET /api/action-logs/{id}, v1.3.1)",
+  "description": "python/av_server/server.py::_action_log_to_dict(). The registry-published INDEX ROW pointing at an append-only agent-decision log; the log itself ({\"kind\": \"action_log\", \"actions\": [{ts, actor, action, details, command}, ...]}, see python/av_cli/actionlog.py) is the referenced CAS object. `av replay-actions` fetches and optionally re-executes it. See docs/contracts.md.",
+  "type": "object",
+  "required": ["id", "project_id", "run_id", "object_id", "created_by", "created_at"],
+  "properties": {
+    "id": {"type": "string"},
+    "project_id": {"type": "string"},
+    "run_id": {"type": ["string", "null"]},
+    "object_id": {
+      "type": "string",
+      "description": "CAS object id of {kind: \"action_log\", actions: [...]} — python/av_cli/actionlog.py."
+    },
+    "created_by": {"type": ["string", "null"]},
+    "created_at": {"type": ["string", "null"]}
+  }
+}

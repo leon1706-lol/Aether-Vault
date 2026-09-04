@@ -13,7 +13,7 @@ def diff(target: str | None, base_ref: str | None) -> None:
     Reports layer-level movement for safetensors models, chunk reuse for CDC-chunked
     checkpoints, dataset changes, and byte totals — not just a file list.
     """
-    from .handoff import load_commit, resolve_head
+    from .handoff import _commit_parent, load_commit, resolve_head
     from .semdiff import diff_trees, human_summary
 
     repo_root = ensure_repo()
@@ -43,7 +43,15 @@ def diff(target: str | None, base_ref: str | None) -> None:
         new_hash, new_tree = _tree_of(target)
     else:
         head_commit = load_commit(repo_root, head_hash) if head_hash else None
-        parent = (head_commit or {}).get("parent_hash")
+        # v1.3.1 fix (found via av_sdk.Repo.diff_semantic()'s own parity-test regression
+        # after ITS matching bug was fixed — see repo.py): local commit JSON only ever has
+        # a `parents` LIST, never `parent_hash` (that's the registry DB column name).
+        # Reading `parent_hash` directly meant `av diff`'s no-argument default (HEAD vs its
+        # parent) ALWAYS compared against an empty tree for every locally-authored commit —
+        # i.e. every normal repo that never fetched this commit from the registry —
+        # reporting every file as "added" instead of "changed". `_commit_parent()`
+        # tolerates both shapes.
+        parent = _commit_parent(head_commit)
         base_hash, old_tree = _tree_of(parent)
         new_hash = head_hash
         new_tree = (head_commit or {}).get("tree", {})

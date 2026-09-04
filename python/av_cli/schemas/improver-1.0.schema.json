@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/improver-1.0.json",
+  "title": "Aether-Vault improver version (GET /api/improvers/{id}, v1.3.1)",
+  "description": "python/av_server/server.py::_improver_to_dict(). See docs/contracts.md.",
+  "type": "object",
+  "required": ["id", "project_id", "manifest_object_id", "parent_id", "created_by", "created_at"],
+  "properties": {
+    "id": {"type": "string"},
+    "project_id": {"type": "string"},
+    "manifest_object_id": {
+      "type": "string",
+      "description": "CAS object id of the improver manifest (code/prompt/tool-schema file hashes + policy-pack pointer) — GET /api/objects/{id}."
+    },
+    "parent_id": {"type": ["string", "null"]},
+    "created_by": {"type": ["string", "null"]},
+    "created_at": {"type": ["string", "null"]}
+  }
+}

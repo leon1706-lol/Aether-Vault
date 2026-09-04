@@ -15,6 +15,12 @@ checkout or an installed wheel — `importlib.resources` under the hood).
 | Event | `event-1.0.schema.json` | `GET /api/events` (each row of `data.events`) |
 | Run | `run-1.0.schema.json` | `GET /api/runs/{id}`, each row of `GET /api/runs` |
 | Webhook delivery body | `webhook-payload-1.0.schema.json` | The exact signed bytes POSTed to a webhook URL (verify against `X-AV-Signature`) |
+| Improver version (v1.3.1) | `improver-1.0.schema.json` | `GET /api/improvers/{id}`, each row of `GET /api/improvers` |
+| Change set (v1.3.1) | `change-set-1.0.schema.json` | `GET /api/change-sets/{id}`, each row of `GET /api/change-sets` |
+| Policy pack (v1.3.1) | `policy-pack-1.0.schema.json` | `GET /api/policy-packs/{id}`, `.../latest`, each row of `GET /api/policy-packs` |
+| Eval suite (v1.3.1) | `eval-suite-1.0.schema.json` | `GET /api/eval/suites/{id}`, each row of `GET /api/eval/suites` |
+| Tool manifest (v1.3.1) | `tool-manifest-1.0.schema.json` | `GET /api/tool-manifests/{id}`, `.../latest` — the index row; the manifest document itself is the referenced CAS object |
+| Action log (v1.3.1) | `action-log-1.0.schema.json` | `GET /api/action-logs/{id}`, each row of `GET /api/action-logs` — the index row; the action list itself is the referenced CAS object |
 
 ## Loading a schema
 

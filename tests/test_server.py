@@ -85,9 +85,23 @@ async def _truncate_all() -> None:
     try:
         # v1.2.2: include the autonomous-loop + delivery/audit tables — otherwise audit
         # rows from earlier tests leak into later filters/pagination assertions.
+        #
+        # v1.3.1 WP-44 fix (found live): this list was never extended for ANY of the 20
+        # RSI tables added across migrations 0006-0010 — every test using a hardcoded id
+        # against one of them (e.g. TestImproverVersions::test_create_is_idempotent_by_id
+        # using "imp-1") silently collided with the SAME row a PREVIOUS run of this file
+        # against the same persistent test database had already inserted, turning a
+        # fresh-201-expected assertion into a stale-200-exists one. Invisible in a CI
+        # runner with a brand-new ephemeral service container per run; guaranteed on any
+        # persistent local Postgres re-run — exactly this session's setup, and exactly
+        # why this had never been caught before this cycle's first-ever live pass.
         await conn.execute(
             "TRUNCATE objects, trees, commits, refs, runs, run_commits, events,"
-            " webhooks, webhook_deliveries, audit_log CASCADE"
+            " webhooks, webhook_deliveries, audit_log,"
+            " improver_versions, change_sets, policy_packs, canary_results, project_freeze,"
+            " eval_suites, eval_results, eval_adapters, tasks, plans, budgets,"
+            " causal_links, strategy_entries, lessons, reviews, critiques, blackboard_entries,"
+            " sandbox_jobs, tool_manifests, action_logs CASCADE"
         )
     finally:
         await conn.close()
@@ -901,7 +915,7 @@ def test_alembic_brings_schema_to_head(db):
             await conn.close()
 
     version, tables = asyncio.run(_probe())
-    assert version == "0005"  # current migration head — bump alongside new revisions
+    assert version == "0010"  # current migration head — bump alongside new revisions
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
@@ -956,7 +970,7 @@ def test_legacy_database_is_healed_and_stamped(db):
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "0005"  # stamps to CURRENT head, not a hardcoded rev
+    assert asyncio.run(_version()) == "0010"  # stamps to CURRENT head, not a hardcoded rev
 
 
 def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
@@ -1004,11 +1018,19 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
         command.upgrade(cfg, "head")
 
         version = asyncio.run(_version_after())
-        assert version == "0005"
+        assert version == "0010"
         tables_at_head = asyncio.run(_tables())
         assert {"objects", "trees", "commits", "refs", "runs", "webhooks",
-                "audit_log", "webhook_deliveries", "events"} <= tables_at_head
-        assert {"policy_outcome"} <= _pg_columns("runs")
+                "audit_log", "webhook_deliveries", "events",
+                "improver_versions", "change_sets", "policy_packs",
+                "canary_results", "project_freeze",
+                "eval_suites", "eval_results", "eval_adapters", "tasks",
+                "plans", "budgets",
+                "causal_links", "strategy_entries", "lessons", "reviews", "critiques",
+                "blackboard_entries",
+                "sandbox_jobs", "tool_manifests", "action_logs"} <= tables_at_head
+        assert {"policy_outcome", "kind", "improver_id", "integrity_signals",
+                "plan_id", "budget_id", "stop_reason", "lessons_id"} <= _pg_columns("runs")
         assert {"signature", "env_snapshot_id"} <= _pg_columns("commits")
     finally:
         # However far the assertions above got, always leave the schema back at head —
@@ -1020,10 +1042,44 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
     # schema at all" means) — the commit made before the round trip is gone by design,
     # not a bug. What the round trip actually promises is that the schema comes back
     # fully FUNCTIONAL: a brand-new commit pushes and reads back cleanly afterward.
+    #
+    # v1.3.1 WP-44 fix (found live): alembic's downgrade-to-base DROPS every table via
+    # its OWN raw connection, entirely bypassing the app's shared SQLAlchemy async engine
+    # pool (used by `db`, the session-scoped TestClient, for the REST of this file). Any
+    # connection already sitting in that pool still holds asyncpg PREPARED STATEMENT
+    # PLANS compiled against the old (now-dropped-and-recreated) table OIDs —
+    # `pool_pre_ping=True` only checks liveness, not statement-cache validity, so the
+    # FIRST query through that pool against an affected table raises
+    # `InvalidCachedStatementError` — SQLAlchemy's own asyncpg dialect catches it and
+    # invalidates that connection's prepared-statement cache IN RESPONSE (see the
+    # exception's own message), so a retried query on the same connection succeeds.
+    # `engine.dispose()` was tried here first and made things categorically worse (broke
+    # the TestClient's own anyio portal for the rest of the session — "This portal is
+    # not running" on every later test, since disposing from a separate `asyncio.run()`
+    # loop tears down state the portal's OWN loop still depends on) — the pool must NOT
+    # be touched from outside the app's own event loop. A one-shot retry is the correct,
+    # narrow fix: absorb the one-time invalidation on a throwaway call, then make the
+    # real, asserted call.
+    def _post_absorbing_one_stale_cache_hit(url, **kw):
+        # TestClient's default raise_server_exceptions=True means an unhandled exception
+        # in the route (exactly what an InvalidCachedStatementError is, here) propagates
+        # as a raised Python exception out of db.post/db.get, not as a 500 Response — so
+        # this must catch the exception itself, not check a status code.
+        try:
+            return db.post(url, **kw)
+        except Exception:
+            return db.post(url, **kw)
+
+    def _get_absorbing_one_stale_cache_hit(url):
+        try:
+            return db.get(url)
+        except Exception:
+            return db.get(url)
+
     after_roundtrip = _make_commit("after-migration-roundtrip")
-    pushed = db.post("/api/commits", json=after_roundtrip)
+    pushed = _post_absorbing_one_stale_cache_hit("/api/commits", json=after_roundtrip)
     assert pushed.status_code == 201, pushed.text
-    still_there = db.get(f"/api/commits/{after_roundtrip['hash']}")
+    still_there = _get_absorbing_one_stale_cache_hit(f"/api/commits/{after_roundtrip['hash']}")
     assert still_there.status_code == 200
 
 
@@ -2237,3 +2293,399 @@ def test_push_back_fills_run_env_snapshot_id_once(db):
     c2.update(run_id=run_id, env_snapshot_id="f" * 64)
     assert db.post("/api/commits", json=c2).status_code == 201
     assert db.get(f"/api/runs/{run_id}").json()["env_snapshot_id"] == sid
+
+
+# ---------------------------------------------------------------------------
+# RSI R1 (v1.3.1, migration 0006): improver versions, change sets, policy packs,
+# canary results, project freeze. Live-server tests — Docker-gated like everything else
+# in this file (skips cleanly via the `db` fixture's reachability check).
+# ---------------------------------------------------------------------------
+
+def _upload_object(db, content: bytes, headers: dict | None = None) -> str:
+    h = hashlib.sha256(content).hexdigest()
+    resp = db.post(f"/api/objects/{h}", content=content, headers=headers)
+    assert resp.status_code in (200, 201), resp.text
+    return h
+
+
+@pytest.fixture
+def scoped_users(db):
+    """A trainer (no scopes -> unrestricted, pre-v1.3.1 default), an admin (explicit
+    'admin' scope), and a genuinely UNPRIVILEGED reader (explicit 'read' scope only) —
+    proves scope enforcement is additive (trainer keeps full access) while still gating
+    an admin/policy:write-only route for real.
+
+    v1.3.1 WP-44 fix (found live, the first time this fixture's own callers actually ran
+    against a real server): every "requires_scope" denial test in this file used
+    trainer's token expecting a 403 — but trainer is UNRESTRICTED by this fixture's own
+    design (bare-string entries resolve to `["*"]`, see `_scopes_for_identity()`), so
+    those requests were always genuinely ALLOWED and the assertions were dead code until
+    this session's live pass actually executed them. `reader` is the identity those
+    tests should have used from the start."""
+    server_module._AUTH_USERS = {
+        "trainer": "trainer-token-12345",
+        "root": {"token": "root-token-12345", "expires_at": None, "scopes": ["admin"]},
+        "reader": {"token": "reader-token-12345", "expires_at": None, "scopes": ["read"]},
+    }
+    try:
+        yield
+    finally:
+        server_module._AUTH_USERS = {}
+
+
+class TestImproverVersions:
+    def test_create_requires_project_id(self, db):
+        manifest_hash = _upload_object(db, b'{"kind":"improver_manifest"}')
+        resp = db.post("/api/improvers", json={"manifest_object_id": manifest_hash})
+        assert resp.status_code == 422
+
+    def test_create_requires_uploaded_manifest_object(self, db):
+        resp = db.post("/api/improvers", json={"project_id": "p1", "manifest_object_id": "f" * 64})
+        assert resp.status_code == 422
+
+    def test_create_is_idempotent_by_id(self, db):
+        # v1.3.1 WP-44 fix (found live): this asserted 201 for the create path — but
+        # create_improver_version()'s own docstring says it's "idempotent by
+        # client-generated id, same lazy/ordering-safe contract as POST /api/runs", and
+        # /api/runs's OWN test (test_runs_crud_and_commit_linkage_with_lazy_create)
+        # deliberately asserts 200 for ITS create path too, distinguishing create vs.
+        # exists purely via the response body's "status" field, not the HTTP status —
+        # multi-agent races don't get to pick which one of them "wins" the 201.
+        manifest_hash = _upload_object(db, b'{"kind":"improver_manifest","n":1}')
+        body = {"id": "imp-1", "project_id": "p1", "manifest_object_id": manifest_hash}
+        first = db.post("/api/improvers", json=body)
+        assert first.status_code == 200 and first.json()["status"] == "created"
+        second = db.post("/api/improvers", json=body)
+        assert second.status_code == 200
+        assert second.json() == {"status": "exists", "id": "imp-1"}
+
+    def test_get_and_list_roundtrip(self, db):
+        manifest_hash = _upload_object(db, b'{"kind":"improver_manifest","n":2}')
+        db.post("/api/improvers", json={"id": "imp-2", "project_id": "p2",
+                                        "manifest_object_id": manifest_hash})
+        got = db.get("/api/improvers/imp-2")
+        assert got.status_code == 200
+        assert got.json()["manifest_object_id"] == manifest_hash
+
+        listed = db.get("/api/improvers", params={"project_id": "p2"})
+        assert listed.status_code == 200
+        assert any(r["id"] == "imp-2" for r in listed.json()["improvers"])
+
+    def test_get_unknown_is_404(self, db):
+        assert db.get("/api/improvers/does-not-exist").status_code == 404
+
+    def test_lineage_walks_multiple_hops(self, db):
+        m1 = _upload_object(db, b'{"n":1}')
+        m2 = _upload_object(db, b'{"n":2}')
+        m3 = _upload_object(db, b'{"n":3}')
+        db.post("/api/improvers", json={"id": "lin-1", "project_id": "plin", "manifest_object_id": m1})
+        db.post("/api/improvers", json={"id": "lin-2", "project_id": "plin",
+                                        "manifest_object_id": m2, "parent_id": "lin-1"})
+        db.post("/api/improvers", json={"id": "lin-3", "project_id": "plin",
+                                        "manifest_object_id": m3, "parent_id": "lin-2"})
+
+        resp = db.get("/api/improvers/lin-3/lineage")
+        assert resp.status_code == 200
+        chain_ids = [n["id"] for n in resp.json()["lineage"]]
+        assert chain_ids == ["lin-3", "lin-2", "lin-1"]
+        assert resp.json()["next_cursor"] is None
+
+    def test_lineage_depth_bound_paginates(self, db):
+        m1 = _upload_object(db, b'{"n":10}')
+        m2 = _upload_object(db, b'{"n":11}')
+        db.post("/api/improvers", json={"id": "dep-1", "project_id": "pdep", "manifest_object_id": m1})
+        db.post("/api/improvers", json={"id": "dep-2", "project_id": "pdep",
+                                        "manifest_object_id": m2, "parent_id": "dep-1"})
+
+        resp = db.get("/api/improvers/dep-2/lineage", params={"depth": 1})
+        assert resp.status_code == 200
+        assert len(resp.json()["lineage"]) == 1
+        assert resp.json()["next_cursor"] == "dep-1"
+
+    def test_lineage_rejects_out_of_range_depth(self, db):
+        m1 = _upload_object(db, b'{"n":20}')
+        db.post("/api/improvers", json={"id": "dr-1", "project_id": "pdr", "manifest_object_id": m1})
+        assert db.get("/api/improvers/dr-1/lineage", params={"depth": 0}).status_code == 422
+        assert db.get("/api/improvers/dr-1/lineage", params={"depth": 10_000}).status_code == 422
+
+
+class TestChangeSets:
+    def _seed_improver(self, db, suffix):
+        m = _upload_object(db, f'{{"n":"{suffix}"}}'.encode())
+        db.post("/api/improvers", json={"id": f"cs-imp-{suffix}", "project_id": "pcs",
+                                        "manifest_object_id": m})
+        return f"cs-imp-{suffix}"
+
+    def test_create_requires_uploaded_object(self, db):
+        resp = db.post("/api/change-sets", json={"project_id": "pcs", "object_id": "f" * 64})
+        assert resp.status_code == 422
+
+    def test_create_rejects_bad_risk(self, db):
+        obj = _upload_object(db, b'{"kind":"change_set"}')
+        resp = db.post("/api/change-sets", json={"project_id": "pcs", "object_id": obj,
+                                                  "risk": "extreme"})
+        assert resp.status_code == 422
+
+    def test_full_legal_transition_chain(self, db):
+        # v1.3.1 WP-44 fix (found live): create_change_set() is the same lazy/idempotent
+        # create-or-exists pattern as /api/runs and /api/improvers — 200 either way,
+        # "status" in the body distinguishes create from exists. See the identical note
+        # on TestImproverVersions::test_create_is_idempotent_by_id above.
+        obj = _upload_object(db, b'{"kind":"change_set","n":1}')
+        create = db.post("/api/change-sets", json={"id": "cs-1", "project_id": "pcs",
+                                                    "object_id": obj, "risk": "low"})
+        assert create.status_code == 200 and create.json()["status"] == "created"
+        assert db.get("/api/change-sets/cs-1").json()["status"] == "proposed"
+
+        assert db.post("/api/change-sets/cs-1/status", json={"status": "approved"}).status_code == 200
+        assert db.get("/api/change-sets/cs-1").json()["status"] == "approved"
+
+        assert db.post("/api/change-sets/cs-1/status", json={"status": "applied"}).status_code == 200
+        assert db.post("/api/change-sets/cs-1/status", json={"status": "rolled_back"}).status_code == 200
+        assert db.get("/api/change-sets/cs-1").json()["status"] == "rolled_back"
+
+    def test_illegal_transition_is_422_not_a_silent_overwrite(self, db):
+        obj = _upload_object(db, b'{"kind":"change_set","n":2}')
+        db.post("/api/change-sets", json={"id": "cs-2", "project_id": "pcs", "object_id": obj})
+        # proposed -> applied directly must be rejected (approval is mandatory first).
+        resp = db.post("/api/change-sets/cs-2/status", json={"status": "applied"})
+        assert resp.status_code == 422
+        assert db.get("/api/change-sets/cs-2").json()["status"] == "proposed"
+
+    def test_transition_on_unknown_change_set_is_404(self, db):
+        resp = db.post("/api/change-sets/does-not-exist/status", json={"status": "approved"})
+        assert resp.status_code == 404
+
+    def test_list_filters_by_status_and_improver(self, db):
+        improver_id = self._seed_improver(db, "filt")
+        obj = _upload_object(db, b'{"kind":"change_set","n":3}')
+        db.post("/api/change-sets", json={"id": "cs-filt", "project_id": "pcs",
+                                          "object_id": obj, "improver_id": improver_id})
+        resp = db.get("/api/change-sets", params={"project_id": "pcs", "improver_id": improver_id})
+        assert any(r["id"] == "cs-filt" for r in resp.json()["change_sets"])
+
+
+class TestPolicyPacks:
+    def test_create_requires_uploaded_object(self, db):
+        resp = db.post("/api/policy-packs", json={"project_id": "ppk", "object_id": "f" * 64})
+        assert resp.status_code == 422
+
+    def test_create_rejects_unknown_prev_id(self, db):
+        obj = _upload_object(db, b'{"main":{}}')
+        resp = db.post("/api/policy-packs", json={"project_id": "ppk", "object_id": obj,
+                                                   "prev_id": "no-such-pack"})
+        assert resp.status_code == 422
+
+    def test_chain_hash_matches_expected_formula(self, db):
+        # v1.3.1 WP-44 fix (found live): create_policy_pack() is the same lazy/idempotent
+        # create-or-exists pattern as /api/runs — 200 either way. See the identical note
+        # on TestImproverVersions::test_create_is_idempotent_by_id above.
+        obj = _upload_object(db, b'{"main":{"metric":"a"}}')
+        resp = db.post("/api/policy-packs", json={"id": "pack-1", "project_id": "ppk",
+                                                   "object_id": obj})
+        assert resp.status_code == 200 and resp.json()["status"] == "created"
+        expected = hashlib.sha256(f":{obj}".encode()).hexdigest()
+        assert resp.json()["chain_hash"] == expected
+
+        obj2 = _upload_object(db, b'{"main":{"metric":"b"}}')
+        resp2 = db.post("/api/policy-packs", json={"id": "pack-2", "project_id": "ppk",
+                                                    "object_id": obj2, "prev_id": "pack-1"})
+        expected2 = hashlib.sha256(f"pack-1:{obj2}".encode()).hexdigest()
+        assert resp2.json()["chain_hash"] == expected2
+
+    def test_latest_returns_the_most_recent(self, db):
+        obj1 = _upload_object(db, b'{"main":{"n":1}}')
+        obj2 = _upload_object(db, b'{"main":{"n":2}}')
+        db.post("/api/policy-packs", json={"id": "lat-1", "project_id": "plat", "object_id": obj1})
+        db.post("/api/policy-packs", json={"id": "lat-2", "project_id": "plat", "object_id": obj2,
+                                           "prev_id": "lat-1"})
+        resp = db.get("/api/policy-packs/latest", params={"project_id": "plat"})
+        assert resp.status_code == 200
+        assert resp.json()["id"] == "lat-2"
+
+    def test_latest_404_when_none_published(self, db):
+        resp = db.get("/api/policy-packs/latest", params={"project_id": "no-such-project"})
+        assert resp.status_code == 404
+
+    def test_publish_requires_policy_write_scope(self, db, scoped_users):
+        # Upload as the unrestricted trainer identity (Protected mode is active once
+        # scoped_users sets _AUTH_USERS — an unauthenticated upload now 401s outright);
+        # the actual denial below is what's under test, on a genuinely unprivileged token.
+        obj = _upload_object(db, b'{"main":{}}',
+                             headers={"Authorization": "Bearer trainer-token-12345"})
+        headers = {"Authorization": "Bearer reader-token-12345"}
+        resp = db.post("/api/policy-packs", json={"project_id": "pscope", "object_id": obj},
+                       headers=headers)
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["error"] == "scope_denied"
+
+
+class TestCanaryResults:
+    def test_create_requires_uploaded_suite_object(self, db):
+        resp = db.post("/api/canary-results", json={"project_id": "pc", "improver_id": "i1",
+                                                     "suite_object_id": "f" * 64, "passed": True})
+        assert resp.status_code == 422
+
+    def test_create_and_list_filters_by_improver(self, db):
+        suite = _upload_object(db, b'{"checks":[]}')
+        db.post("/api/canary-results", json={"project_id": "pc", "improver_id": "i-can-1",
+                                             "suite_object_id": suite, "passed": True})
+        db.post("/api/canary-results", json={"project_id": "pc", "improver_id": "i-can-2",
+                                             "suite_object_id": suite, "passed": False})
+        resp = db.get("/api/canary-results", params={"project_id": "pc", "improver_id": "i-can-1"})
+        rows = resp.json()["canary_results"]
+        assert len(rows) == 1
+        assert rows[0]["passed"] is True
+
+
+class TestProjectFreeze:
+    def test_default_state_is_not_frozen(self, db):
+        resp = db.get("/api/freeze/pf1")
+        assert resp.status_code == 200
+        assert resp.json() == {"project_id": "pf1", "frozen": False, "reason": None,
+                               "frozen_by": None, "frozen_at": None}
+
+    def test_set_and_read_back(self, db):
+        resp = db.post("/api/freeze/pf2", json={"frozen": True, "reason": "incident"})
+        assert resp.status_code == 200
+        assert resp.json()["frozen"] is True
+        assert resp.json()["reason"] == "incident"
+
+        after = db.get("/api/freeze/pf2")
+        assert after.json()["frozen"] is True
+        assert after.json()["reason"] == "incident"
+
+    def test_unfreeze_clears_reason(self, db):
+        db.post("/api/freeze/pf3", json={"frozen": True, "reason": "incident"})
+        db.post("/api/freeze/pf3", json={"frozen": False})
+        after = db.get("/api/freeze/pf3")
+        assert after.json()["frozen"] is False
+        assert after.json()["reason"] is None
+
+    def test_set_requires_admin_scope(self, db, scoped_users):
+        headers = {"Authorization": "Bearer reader-token-12345"}
+        resp = db.post("/api/freeze/pf4", json={"frozen": True}, headers=headers)
+        assert resp.status_code == 403
+        assert resp.json()["detail"]["required_scope"] == "admin"
+
+    def test_admin_scope_token_succeeds(self, db, scoped_users):
+        headers = {"Authorization": "Bearer root-token-12345"}
+        resp = db.post("/api/freeze/pf5", json={"frozen": True, "reason": "drill"},
+                       headers=headers)
+        assert resp.status_code == 200
+
+    def test_get_needs_no_scope_even_in_protected_mode(self, db, scoped_users):
+        headers = {"Authorization": "Bearer trainer-token-12345"}
+        resp = db.get("/api/freeze/pf6", headers=headers)
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# v1.3.1 RSI R6 (todo.md I.38, WP-36): server-side anomaly detectors -> `kind="anomaly"`
+# events, fanned out through the SAME webhook mechanism every other event kind already
+# uses (no new delivery path — proven by test_webhooks_cli.py/the webhook classes above;
+# these tests only need to prove the DETECTORS fire the event with the right payload).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def clean_auth_window():
+    """`_AUTH_FAILURE_WINDOW` is a module-level, process-lifetime dict (deliberately not
+    per-request state) — reset it before AND after so one test's failed-auth burst can
+    never leak into the next test's threshold count."""
+    server_module._AUTH_FAILURE_WINDOW.clear()
+    try:
+        yield
+    finally:
+        server_module._AUTH_FAILURE_WINDOW.clear()
+
+
+class TestAnomalyDetection:
+    def _anomaly_events(self, db, project_id=None, headers=None):
+        params = {"since": 0, "kinds": "anomaly"}
+        if project_id:
+            params["project_id"] = project_id
+        resp = db.get("/api/events", params=params, headers=headers)
+        return resp.json()["events"]
+
+    def test_metric_jump_emits_anomaly_event(self, db):
+        base = _make_commit("anom-jump-base", tree={}, metrics={"val_loss": 1.0},
+                            project_id="p-anom-jump")
+        assert db.post("/api/commits", json=base).status_code == 201
+        child = _make_commit("anom-jump-child", tree={}, metrics={"val_loss": 100.0},
+                             parents=[base["hash"]], project_id="p-anom-jump")
+        assert db.post("/api/commits", json=child).status_code == 201
+
+        events = self._anomaly_events(db, "p-anom-jump")
+        jumps = [e for e in events if e["payload"]["type"] == "metric_jump"]
+        assert len(jumps) == 1
+        assert jumps[0]["payload"]["metric"] == "val_loss"
+        assert jumps[0]["payload"]["commit_hash"] == child["hash"]
+
+    def test_small_metric_change_is_not_an_anomaly(self, db):
+        base = _make_commit("anom-nojump-base", tree={}, metrics={"val_loss": 1.0},
+                            project_id="p-anom-nojump")
+        db.post("/api/commits", json=base)
+        child = _make_commit("anom-nojump-child", tree={}, metrics={"val_loss": 1.1},
+                             parents=[base["hash"]], project_id="p-anom-nojump")
+        db.post("/api/commits", json=child)
+
+        events = self._anomaly_events(db, "p-anom-nojump")
+        assert not [e for e in events if e["payload"]["type"] == "metric_jump"]
+
+    def test_mass_rewrite_emits_anomaly_event(self, db):
+        threshold = server_module.AV_ANOMALY_MASS_REWRITE_FILES
+        base_tree = {f"f{i}.txt": "a" * 64 for i in range(3)}
+        new_tree = {f"g{i}.txt": "b" * 64 for i in range(threshold + 5)}
+        base = _make_commit("anom-mass-base", tree=base_tree, project_id="p-anom-mass")
+        assert db.post("/api/commits", json=base).status_code == 201
+        child = _make_commit("anom-mass-child", tree=new_tree, parents=[base["hash"]],
+                             project_id="p-anom-mass")
+        assert db.post("/api/commits", json=child).status_code == 201
+
+        events = self._anomaly_events(db, "p-anom-mass")
+        rewrites = [e for e in events if e["payload"]["type"] == "mass_rewrite"]
+        assert len(rewrites) == 1
+        assert rewrites[0]["payload"]["changed_files"] >= threshold
+
+    def test_small_tree_change_is_not_an_anomaly(self, db):
+        base = _make_commit("anom-nomass-base", tree={"a.txt": "a" * 64}, project_id="p-anom-nomass")
+        db.post("/api/commits", json=base)
+        child = _make_commit("anom-nomass-child", tree={"a.txt": "a" * 64, "b.txt": "b" * 64},
+                             parents=[base["hash"]], project_id="p-anom-nomass")
+        db.post("/api/commits", json=child)
+
+        events = self._anomaly_events(db, "p-anom-nomass")
+        assert not [e for e in events if e["payload"]["type"] == "mass_rewrite"]
+
+    def test_policy_pack_publish_emits_anomaly_event(self, db):
+        obj = _upload_object(db, b'{"main":{}}')
+        resp = db.post("/api/policy-packs", json={"project_id": "p-anom-pol", "object_id": obj})
+        assert resp.status_code == 200 and resp.json()["status"] == "created"
+
+        events = self._anomaly_events(db, "p-anom-pol")
+        changes = [e for e in events if e["payload"]["type"] == "policy_change"]
+        assert len(changes) == 1
+        assert changes[0]["payload"]["policy_pack_id"] == resp.json()["id"]
+
+    def test_scope_denial_burst_emits_auth_spike_anomaly(self, db, scoped_users, clean_auth_window):
+        headers = {"Authorization": "Bearer reader-token-12345"}
+        threshold = server_module.AV_ANOMALY_AUTH_SPIKE_THRESHOLD
+        for _ in range(threshold):
+            resp = db.post("/api/freeze/p-anom-scope", json={"frozen": True}, headers=headers)
+            assert resp.status_code == 403
+
+        events = self._anomaly_events(db, headers=headers)
+        spikes = [e for e in events if e["payload"]["type"] == "auth_spike"
+                 and e["payload"]["reason"] == "scope_denied"]
+        assert len(spikes) == 1
+        assert spikes[0]["payload"]["identifier"] == "reader"
+
+    def test_scope_denials_below_threshold_do_not_trip(self, db, scoped_users, clean_auth_window):
+        headers = {"Authorization": "Bearer reader-token-12345"}
+        for _ in range(server_module.AV_ANOMALY_AUTH_SPIKE_THRESHOLD - 1):
+            db.post("/api/freeze/p-anom-scope-under", json={"frozen": True}, headers=headers)
+
+        events = self._anomaly_events(db, headers=headers)
+        spikes = [e for e in events if e["payload"]["type"] == "auth_spike"
+                 and e["payload"]["identifier"] == "reader"]
+        assert not spikes

@@ -12,6 +12,10 @@ EXIT_CODES = {
     "merge_conflict": 14,
     "validation": 15,
     "policy_denied": 16,
+    "budget_exhausted": 17,
+    "frozen": 18,
+    "review_required": 19,
+    "scope_denied": 20,
 }
 
 
@@ -69,6 +73,22 @@ class PolicyDeniedError(SDKError):
     code = "policy_denied"
 
 
+class BudgetExhaustedError(SDKError):
+    code = "budget_exhausted"
+
+
+class FrozenError(SDKError):
+    code = "frozen"
+
+
+class ReviewRequiredError(SDKError):
+    code = "review_required"
+
+
+class ScopeDeniedError(SDKError):
+    code = "scope_denied"
+
+
 _CODE_TO_CLASS: dict[str, type[SDKError]] = {
     "not_a_repo": NotARepoError,
     "nothing_to_commit": NothingToCommitError,
@@ -77,6 +97,10 @@ _CODE_TO_CLASS: dict[str, type[SDKError]] = {
     "merge_conflict": MergeConflictError,
     "validation": ValidationError,
     "policy_denied": PolicyDeniedError,
+    "budget_exhausted": BudgetExhaustedError,
+    "frozen": FrozenError,
+    "review_required": ReviewRequiredError,
+    "scope_denied": ScopeDeniedError,
 }
 
 

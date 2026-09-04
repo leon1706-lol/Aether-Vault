@@ -1184,8 +1184,7 @@ def commit_staged(
     if not idx.get_staged_entries():
         return None
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"),
-                         cfg.get("remote_api_token"))
+    client = VaultClient(*resolve_remote(repo_root, cfg))
 
     tree: dict = {}
     for rel_path, e in idx.entries.items():
@@ -1245,6 +1244,62 @@ def commit_staged(
         idx=idx, tags=tags, metrics=metrics or {},
         result_sink=result_sink, defer_upload=defer_upload, outcome_sink=outcome_sink,
     )
+
+
+def parse_metric_args(raw_metrics: tuple) -> dict:
+    """v1.3.1: THE shared `--metric key=value` parser — extracted verbatim from two
+    call sites that had drifted into copies of the same logic (`cmd_history.py`'s
+    `av commit --metric` and `cmd_run.py`'s `av run finish --metric`). Values with a
+    literal `.` parse as float, else int, else fall back to the raw string unchanged;
+    entries without an `=` are silently skipped (matches both callers' prior behavior).
+    """
+    metrics: dict = {}
+    for raw in raw_metrics:
+        if "=" in raw:
+            k, v = raw.split("=", 1)
+            try:
+                metrics[k.strip()] = float(v) if "." in v else int(v)
+            except ValueError:
+                metrics[k.strip()] = v
+    return metrics
+
+
+def resolve_remote(repo_root: Path, cfg: dict | None = None) -> tuple[str, str | None]:
+    """v1.3.1: THE shared `(remote_url, api_token)` resolution — extracted from the
+    identical `cfg.get("remote_url", "http://localhost:8000")` /
+    `cfg.get("remote_api_token")` idiom that had been copy-pasted at eight call sites
+    (this module, `cmd_run.py`, `cmd_policy.py`, `cmd_registry.py`, `cmd_env.py`,
+    `cmd_audit.py`, `av_sdk/repo.py`, `av_plugins/_shared.py`). No behavior change —
+    same default URL, same config keys. Pass an already-loaded `cfg` (several callers
+    need it for other fields too) to skip a redundant `load_config()` read."""
+    cfg = cfg if cfg is not None else load_config(repo_root)
+    return cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token")
+
+
+def capture_code_pointer(repo_root: Path) -> dict | None:
+    """v1.3.1: THE shared git code-provenance capture for `av run start` — extracted
+    verbatim from `cmd_run.py::start()`'s inline subprocess calls so `av_sdk.Repo.run_start()`
+    can capture the same `{git_remote, git_sha, dirty}` instead of always passing `None`
+    (a documented divergence from the CLI — `av_sdk/repo.py`'s own comment on `run_start()`
+    used to note it explicitly). `None` when this isn't a git checkout, or on any
+    subprocess failure/timeout — code provenance is best-effort, never a hard requirement."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root,
+                             capture_output=True, text=True, timeout=10)
+        sha = out.stdout.strip() or None
+        if not sha:
+            return None
+        remote = subprocess.run(["git", "remote", "get-url", "origin"], cwd=repo_root,
+                                capture_output=True, text=True, timeout=10
+                                ).stdout.strip() or None
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=repo_root,
+                                    capture_output=True, text=True,
+                                    timeout=10).stdout.strip())
+        return {"git_remote": remote, "git_sha": sha, "dirty": dirty}
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
 
 def resolve_run_id(repo_root: Path, explicit: str | None = None) -> str | None:
@@ -1497,6 +1552,17 @@ EXIT_UNREACHABLE_QUEUED = 13      # work is SAFE (queued), registry unreachable
 EXIT_CONFLICT = 14                # merge conflicts present, nothing touched
 EXIT_VALIDATION = 15              # bad input values
 EXIT_POLICY_DENIED = 16           # promotion/branch policy rejected the action
+# v1.3.1 (RSI control plane): every reserved code is now real. `av budget consume` exits
+# 17 when any dimension is now exceeded; `av freeze on` blocks `av promote`/`av improver
+# register|propose|apply`/`av policy pack publish` with 18; `av improver promote`'s
+# `require_review` denies with 19 when no approving review is on file for the candidate
+# (distinct from 16 — this is specifically "nobody has signed off yet", not "the metrics/
+# signature don't qualify"); `av freeze on/off` maps the server's 403
+# {"error":"scope_denied"} to 20.
+EXIT_BUDGET_EXHAUSTED = 17        # a budget dimension is now exceeded (the spend still recorded)
+EXIT_FROZEN = 18                  # project is frozen; promotions/self-edits are paused
+EXIT_REVIEW_REQUIRED = 19         # improver promotion needs reviewer approval / has open critiques
+EXIT_SCOPE_DENIED = 20            # token authenticated but lacks the required scope (server 403)
 
 _EXIT_CODES = {
     "not_a_repo": EXIT_NOT_A_REPO,
@@ -1506,6 +1572,10 @@ _EXIT_CODES = {
     "merge_conflict": EXIT_CONFLICT,
     "validation": EXIT_VALIDATION,
     "policy_denied": EXIT_POLICY_DENIED,
+    "budget_exhausted": EXIT_BUDGET_EXHAUSTED,
+    "frozen": EXIT_FROZEN,
+    "review_required": EXIT_REVIEW_REQUIRED,
+    "scope_denied": EXIT_SCOPE_DENIED,
 }
 
 
@@ -1563,6 +1633,9 @@ def emit_json(ctx, command: str, data=None) -> None:
 
 _CONTRACT_SCHEMA_NAMES = (
     "envelope-1.0", "event-1.0", "run-1.0", "webhook-payload-1.0", "semdiff-1.0", "avh-2.0",
+    # v1.3.1 RSI additions
+    "improver-1.0", "change-set-1.0", "policy-pack-1.0", "eval-suite-1.0",
+    "tool-manifest-1.0", "action-log-1.0",
 )
 
 

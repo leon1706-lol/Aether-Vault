@@ -68,6 +68,10 @@ Every failure — CLI exit code, JSON envelope `error.code`, and (v1.3.0+) a mat
 | `merge_conflict` | 14 | `MergeConflictError` | Conflicting changes; `error.data` carries remediation |
 | `validation` | 15 | `ValidationError` | Bad input (unknown ref, malformed flag, policy misconfiguration) |
 | `policy_denied` | 16 | `PolicyDeniedError` | `av promote`/`av merge` blocked by an armed policy |
+| `budget_exhausted` | 17 | `BudgetExhaustedError` | v1.3.1: `av budget consume` reports a dimension now over its limit — the spend is recorded either way, never lost |
+| `frozen` | 18 | `FrozenError` | v1.3.1: project is frozen (`av freeze on`) — `av promote`/`av improver register\|propose\|apply`/`av policy pack publish` are paused |
+| `review_required` | 19 | `ReviewRequiredError` | v1.3.1: `av improver promote`'s `require_review` gate denied — nobody has approved this candidate yet (distinct from `policy_denied`: "get it reviewed" is a different remediation than "the metrics/signature don't qualify") |
+| `scope_denied` | 20 | `ScopeDeniedError` | v1.3.1: token authenticated but lacks the required scope — the server returned 403 (e.g. `av freeze on/off` needs the `admin` scope) |
 | — | 0 | — | Success, **including a queued commit** — see below |
 | — | 2 | — | Click's own usage error (missing/bad CLI argument) — not part of this registry |
 
@@ -105,9 +109,36 @@ av promote --into main             # exit 16 (policy_denied) on DENY
 Three worked `.av/policies.json` shapes (metric gate, signature gate, both combined) live
 in `examples/policies/` — copy one in directly or use it as a reference for `av policy set`.
 
+## RSI control plane (v1.3.1)
+
+Versioning the IMPROVER (the agent's own code/prompts/tools/policy), not just the model
+it produces, is a separate surface — `av_sdk.Repo` gained one method per write-capable
+RSI operation (`improver_propose`/`improver_apply`/`improver_promote`, `canary_run`,
+`review_submit`, `budget_consume`, `lessons_update`, `sandbox_run`, …), each raising the
+same typed `SDKError` subclasses as the substrate:
+
+```python
+from av_sdk import Repo, SDKError
+
+with Repo(".") as repo:
+    try:
+        repo.improver_promote(candidate_id)
+    except SDKError as e:
+        if e.code == "review_required":       # exit 19 — get it reviewed, don't retry
+            ...
+        elif e.code == "budget_exhausted":     # exit 17 — the spend was still recorded
+            ...
+```
+
+`docs/rsi-operator-guide.md` is this page's RSI counterpart — the same continuous-path
+walkthrough, covering propose→apply→canary→dual-gate-promote→review→promote→lessons→
+budget-stop end to end; `examples/rsi_loop/` is the same narrative as a deterministic,
+runnable reference agent with no LLM key.
+
 ## Where to go next
 
 - `docs/contracts.md` — every published JSON schema and the stability policy.
+- `docs/rsi-operator-guide.md` — the RSI control plane's continuous operator+agent path.
 - `docs/avattributes.md` — per-path staging directives (`no-chunk`, `chunk`, `no-layer-split`).
 - `docs/tutorial.md` — the full operator+agent walkthrough this page is the quick-reference for.
 - `AGENTS.md` — guidance for agents *contributing to this repo's own source*, not for

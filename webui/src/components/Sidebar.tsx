@@ -97,6 +97,33 @@ const navItems: NavItem[] = [
       </svg>
     ),
   },
+  {
+    id: "improver",
+    // v1.3.1 (RSI R6, WP-38): improver lineage + pending self-edits.
+    label: "Improver",
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="6" cy="6" r="3" />
+        <circle cx="6" cy="18" r="3" />
+        <path d="M6 9v6" />
+        <circle cx="18" cy="12" r="3" />
+        <path d="M9 6h4a2 2 0 012 2v1" />
+        <path d="M9 18h4a2 2 0 002-2v-1" />
+      </svg>
+    ),
+  },
+  {
+    id: "regression",
+    // v1.3.1 (RSI R6, WP-35/WP-36): canaries, improver churn, anomaly feed.
+    label: "Regression",
+    icon: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+        <line x1="12" y1="9" x2="12" y2="13" />
+        <line x1="12" y1="17" x2="12.01" y2="17" />
+      </svg>
+    ),
+  },
 ];
 
 interface Props {
@@ -155,7 +182,7 @@ export function Sidebar({ active, onSelect }: Props) {
         lineHeight: 1.6,
       }}>
         <div style={{ fontWeight: 600, color: "var(--text-secondary)", marginBottom: 4 }}>Open Source</div>
-        <div>Aether-Vault v1.4.0</div>
+        <div>Aether-Vault v1.3.1</div>
         <div>github.com/leon1706</div>
       </div>
     </aside>

@@ -165,7 +165,21 @@ class FakeRemoteClient(client_module.VaultClient):
 
 
 def _seed_source_repo(root: Path, monkeypatch) -> str:
-    """A real 2-commit repo (code + above-threshold artifact) to serve clones from."""
+    """A real 2-commit repo (code + above-threshold artifact) to serve clones from.
+
+    These two commits are made BEFORE `fake_registry` patches VaultClient to the
+    FakeRemoteClient, so they must be forced unreachable here — otherwise, on a machine
+    where a real dev stack happens to be reachable (Docker Desktop), they'd push for real
+    against it, leaving the fake's recorded_refs empty and desynced from the local "main"
+    ref. The very next push through the fake (once patched in) would then lose a ref race
+    against a remote state the fake never saw, since flush_pending_push only replays a
+    LOCAL queue — it has nothing to replay if these commits never queued in the first
+    place. Forcing unreachable here means they queue locally instead, and the first
+    `fake`-backed commit naturally flushes them through in order, keeping the fake's
+    ref state consistent with local history regardless of ambient server reachability."""
+    import python.av_cli.client as client_module
+
+    monkeypatch.setattr(client_module.VaultClient, "server_available", lambda self: False)
     root.mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(root)
     result = invoke("init", "--mode", "local", "--yes", "--no-repl")

@@ -600,7 +600,9 @@ jobs:
           # checkout.
           "$PYBIN" -c "
           import importlib.resources as r
-          names = {'envelope-1.0','event-1.0','run-1.0','webhook-payload-1.0','semdiff-1.0','avh-2.0'}
+          names = {'envelope-1.0','event-1.0','run-1.0','webhook-payload-1.0','semdiff-1.0','avh-2.0',
+                   'improver-1.0','change-set-1.0','policy-pack-1.0','eval-suite-1.0',
+                   'tool-manifest-1.0','action-log-1.0'}
           for name in names:
               ref = r.files('av_cli').joinpath('schemas', f'{name}.schema.json')
               assert ref.is_file(), f'{name}.schema.json missing from installed wheel'

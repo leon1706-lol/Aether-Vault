@@ -30,6 +30,10 @@
             "git_sha": {"type": ["string", "null"]},
             "dirty": {"type": ["boolean", "null"]}
           }
+        },
+        "improver_id": {
+          "type": ["string", "null"],
+          "description": "v1.3.1+, additive. The locally active improver version pointer (`.av/improver/current`) — null when none is set. Absent entirely on documents from before this field existed."
         }
       }
     },

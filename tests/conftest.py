@@ -26,6 +26,40 @@ def repo(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def unreachable_client(monkeypatch):
+    """Forces `VaultClient.server_available()` to return False regardless of what's
+    ACTUALLY reachable on this machine (v1.3.1 fix: a real dev stack can genuinely be up
+    on localhost:8000 — Docker Desktop with `docker compose up` — in which case a test's
+    "no server configured" assumption silently becomes false, and a call that expected to
+    queue instead hits the real (differently-versioned) server and gets a live but wrong
+    response, e.g. a 404 for an endpoint this checkout added that the running container's
+    baked-in code predates). Any test asserting `unreachable_queued`/13 behavior MUST
+    request this fixture rather than relying on ambient non-configuration — this is
+    exactly the class of bug development/Probleme.md's "test-suite-touched-real-Docker-
+    infra" entry already covers for a different code path; this fixture is the general
+    fix so it can't recur test-by-test.
+
+    Patches BOTH `python.av_cli.client` and the bare `av_cli.client` import — the two
+    resolve to the same file but are DISTINCT module objects (no package alias unifies
+    them), and core.py imports via the former (`from .client import VaultClient`) while
+    av_sdk/repo.py imports via the latter (`from av_cli.client import VaultClient`).
+    Patching only one leaves the SDK seam silently hitting the real server."""
+    import python.av_cli.client as client_module
+
+    class _UnreachableClient(client_module.VaultClient):
+        def server_available(self) -> bool:
+            return False
+
+    monkeypatch.setattr(client_module, "VaultClient", _UnreachableClient)
+    try:
+        import av_cli.client as bare_client_module
+    except ImportError:
+        bare_client_module = None
+    if bare_client_module is not None and bare_client_module is not client_module:
+        monkeypatch.setattr(bare_client_module, "VaultClient", _UnreachableClient)
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Explains skips-by-design at the end of the run.
 

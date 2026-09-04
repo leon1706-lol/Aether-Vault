@@ -105,6 +105,62 @@ def seed_run() -> None:
     print(f"Seeded run 'e2e-runs-spec-run' with 3 commits, from {repo_root}")
 
 
+def seed_rsi() -> None:
+    """v1.3.1 (RSI R6, WP-43): a real improver lineage, one PENDING self-edit, a passing
+    canary result, and a metric-jump anomaly, for webui/e2e/improver.spec.ts — the
+    ImproverPanel/CanaryPanel/RegressionPanel tabs' live-data proof. Distinctive names
+    throughout so the spec can pick these rows out of a shared dev registry's history."""
+    repo_root = Path(tempfile.mkdtemp(prefix="av-e2e-rsi-seed-"))
+    os.chdir(repo_root)
+    runner = CliRunner()
+
+    def run(*args):
+        result = runner.invoke(cli, list(args))
+        if result.exit_code != 0:
+            print(result.output, file=sys.stderr)
+            raise SystemExit(f"av {' '.join(args)} failed: {result.exit_code}")
+        return result
+
+    def run_json(*args):
+        result = run("--output", "json", *args)
+        return json.loads(result.output)["data"]
+
+    run("init")
+    run("config", "--remote-url", "http://localhost:8000")
+    (repo_root / "train.py").write_text("print('e2e-rsi-seed')")
+    run("add", "train.py")
+    run("commit", "-m", "e2e-rsi-seed baseline", "--metric", "val_loss=0.5")
+
+    base = run_json("improver", "init")
+    diff_file = repo_root / "change.diff"
+    diff_file.write_text("--- a\n+++ b\n-x\n+y")
+    cs_applied = run_json("improver", "propose", "--diff", str(diff_file),
+                          "--rationale", "e2e-rsi-seed applied edit", "--risk", "low")
+    run("improver", "review", cs_applied["id"], "--approve")
+    applied = run_json("improver", "apply", cs_applied["id"])
+
+    # A SECOND proposal, deliberately left unresolved — this is what ImproverPanel's
+    # "Pending Self-Edits" section renders.
+    cs_pending = run_json("improver", "propose", "--diff", str(diff_file),
+                          "--rationale", "e2e-rsi-seed pending edit", "--risk", "medium")
+
+    suite = repo_root / "canary-e2e-seed.json"
+    suite.write_text(json.dumps({"checks": [
+        {"name": "loss_ok", "metric": "val_loss", "op": "<=", "threshold": 0.6}
+    ]}))
+    run("canary", "register", "e2e-seed-canary", str(suite))
+    run("canary", "run", "e2e-seed-canary", "--improver", applied["new_improver_id"])
+
+    # A metric-jump anomaly the RegressionPanel's feed renders.
+    (repo_root / "train.py").write_text("print('e2e-rsi-seed v2')")
+    run("add", "train.py")
+    run("commit", "-m", "e2e-rsi-seed metric jump", "--metric", "val_loss=50.0")
+
+    print(f"Seeded RSI data: improver {base['id']} -> {applied['new_improver_id']}, "
+          f"pending change set {cs_pending['id']}, from {repo_root}")
+
+
 if __name__ == "__main__":
     main()
     seed_run()
+    seed_rsi()

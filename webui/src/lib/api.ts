@@ -370,6 +370,102 @@ export async function fetchDashboardData(projectId?: string | null): Promise<Das
   }
 }
 
+// ---------------------------------------------------------------------------
+// RSI control plane (v1.3.1, RSI R6, WP-38): improver lineage, self-edits, canaries,
+// and the anomaly feed — the WebUI counterparts of `av improver`/`av canary`/the
+// server-side anomaly detectors (see development/architecture.md's "Improver Artifact",
+// "Capability Canary", and "Anomaly Alerts" contract sections).
+// ---------------------------------------------------------------------------
+
+export interface ImproverVersion {
+  id: string;
+  project_id: string;
+  manifest_object_id: string;
+  parent_id: string | null;
+  created_by: string | null;
+  created_at: string | null;
+}
+
+export type ChangeSetStatus = "proposed" | "approved" | "rejected" | "applied" | "rolled_back";
+
+export interface ChangeSet {
+  id: string;
+  project_id: string;
+  improver_id: string | null;
+  object_id: string;
+  status: ChangeSetStatus;
+  risk: "low" | "medium" | "high" | null;
+  created_by: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface CanaryResult {
+  id: number;
+  project_id: string;
+  improver_id: string;
+  suite_object_id: string;
+  passed: boolean;
+  details: unknown;
+  run_id: string | null;
+  created_at: string | null;
+}
+
+export interface AnomalyEvent {
+  id: number;
+  ts: string | null;
+  kind: string;
+  project_id: string | null;
+  payload: Record<string, unknown> & { type?: string };
+}
+
+export async function fetchImproverVersions(
+  opts: { projectId?: string | null; limit?: number } = {}
+): Promise<ImproverVersion[]> {
+  const params = new URLSearchParams({ limit: String(opts.limit ?? 50) });
+  if (opts.projectId) params.set("project_id", opts.projectId);
+  const data = await fetchJSON<{ improvers: ImproverVersion[] }>(`/api/improvers?${params.toString()}`);
+  return data.improvers ?? [];
+}
+
+export async function fetchImproverLineage(improverId: string, depth = 50): Promise<ImproverVersion[]> {
+  const data = await fetchJSON<{ improver_id: string; lineage: ImproverVersion[] }>(
+    `/api/improvers/${encodeURIComponent(improverId)}/lineage?depth=${depth}`
+  );
+  return data.lineage ?? [];
+}
+
+export async function fetchChangeSets(
+  opts: { projectId?: string | null; status?: ChangeSetStatus; limit?: number } = {}
+): Promise<ChangeSet[]> {
+  const params = new URLSearchParams({ limit: String(opts.limit ?? 50) });
+  if (opts.projectId) params.set("project_id", opts.projectId);
+  if (opts.status) params.set("status", opts.status);
+  const data = await fetchJSON<{ change_sets: ChangeSet[] }>(`/api/change-sets?${params.toString()}`);
+  return data.change_sets ?? [];
+}
+
+export async function fetchCanaryResults(
+  opts: { projectId?: string | null; improverId?: string; limit?: number } = {}
+): Promise<CanaryResult[]> {
+  const params = new URLSearchParams({ limit: String(opts.limit ?? 50) });
+  if (opts.projectId) params.set("project_id", opts.projectId);
+  if (opts.improverId) params.set("improver_id", opts.improverId);
+  const data = await fetchJSON<{ canary_results: CanaryResult[] }>(`/api/canary-results?${params.toString()}`);
+  return data.canary_results ?? [];
+}
+
+export async function fetchAnomalyEvents(
+  opts: { projectId?: string | null; since?: number; limit?: number } = {}
+): Promise<AnomalyEvent[]> {
+  const params = new URLSearchParams({
+    kinds: "anomaly", since: String(opts.since ?? 0), limit: String(opts.limit ?? 50),
+  });
+  if (opts.projectId) params.set("project_id", opts.projectId);
+  const data = await fetchJSON<{ events: AnomalyEvent[] }>(`/api/events?${params.toString()}`);
+  return data.events ?? [];
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
   const k = 1024;

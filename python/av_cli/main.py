@@ -186,15 +186,71 @@ from .cmd_policy import policy as policy_group, promote  # noqa: E402
 from .cmd_watch import watch  # noqa: E402
 
 cli.add_command(watch)
-from .cmd_registry import registry  # noqa: E402
+from .cmd_registry import registry, verify as registry_verify  # noqa: E402
 
 cli.add_command(registry)
+# Top-level alias (v1.3.1): docs (`signing.py`, `AGENTS.md`) and `av registry attest`'s
+# own error text have always told users to run `av verify <hash>` — it was never actually
+# registered on the Click tree, only `av registry verify` was. Same object, same name
+# ("verify" — the Click default derived from the function name), so `av verify` and
+# `av registry verify` share one implementation with zero drift risk, mirroring the
+# `replay`/`env replay` alias pattern below.
+cli.add_command(registry_verify)
 from .cmd_webhooks import webhooks  # noqa: E402
 
 cli.add_command(webhooks)
 from .cmd_audit import audit as audit_group  # noqa: E402
 
 cli.add_command(audit_group)
+from .cmd_improver import improver  # noqa: E402
+
+cli.add_command(improver)
+from .cmd_freeze import freeze, incident  # noqa: E402
+
+cli.add_command(freeze)
+cli.add_command(incident)
+from .cmd_canary import canary  # noqa: E402
+
+cli.add_command(canary)
+from .cmd_eval import eval_group  # noqa: E402
+
+cli.add_command(eval_group)
+from .cmd_task import task  # noqa: E402
+
+cli.add_command(task)
+from .cmd_plan import plan  # noqa: E402
+
+cli.add_command(plan)
+from .cmd_budget import budget  # noqa: E402
+
+cli.add_command(budget)
+from .cmd_scheduler import scheduler  # noqa: E402
+
+cli.add_command(scheduler)
+from .cmd_review import critique, review  # noqa: E402
+
+cli.add_command(review)
+cli.add_command(critique)
+from .cmd_lineage import lineage, search  # noqa: E402
+
+cli.add_command(lineage)
+cli.add_command(search)
+from .cmd_strategy import strategy  # noqa: E402
+
+cli.add_command(strategy)
+from .cmd_lessons import lessons  # noqa: E402
+
+cli.add_command(lessons)
+from .cmd_blackboard import blackboard  # noqa: E402
+
+cli.add_command(blackboard)
+from .cmd_sandbox import replay_actions, sandbox  # noqa: E402
+
+cli.add_command(sandbox)
+cli.add_command(replay_actions)
+from .cmd_tools import tools  # noqa: E402
+
+cli.add_command(tools)
 
 cli.add_command(policy_group)
 cli.add_command(promote)

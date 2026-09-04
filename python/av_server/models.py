@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import declarative_base
 
@@ -135,6 +135,27 @@ class DBRun(Base):
     name = Column(String, nullable=True)
     # created | running | completed | failed — plain strings keep SQLite heal-tests portable.
     status = Column(String, nullable=False, default="created")
+    # v1.3.1 (RSI R1, todo.md A.1): train | meta | scoring | eval — a "meta" run improves
+    # the improver (agent code/prompts/tools/policy), not the target model directly.
+    # server_default="train" so migration 0006 backfills every pre-v1.3.1 row without a
+    # NULL, matching what every existing run always semantically was.
+    kind = Column(String, nullable=False, default="train")
+    # v1.3.1: which improver version (DBImproverVersion.id) authored this run, when known.
+    # No FK — same shallow/out-of-order-write rationale as parent_run_id below.
+    improver_id = Column(String, nullable=True, index=True)
+    # v1.3.1 (RSI R2, migration 0007): metric-gaming detection signals — train/eval gap,
+    # eval-only improvement, data-overlap (exact set intersection of CAS object hashes
+    # between the training tree and an eval suite's objects). Computed and attached by
+    # the CLI/SDK at run-finish time; null until then.
+    integrity_signals = Column(JSON, nullable=True)
+    # v1.3.1 (RSI R3, migration 0008): experiment planner + budget account pointers, and
+    # why an auto-stopped run stopped (plateau|divergence|nan|canary_failure|budget|None).
+    plan_id = Column(String, nullable=True, index=True)
+    budget_id = Column(String, nullable=True, index=True)
+    stop_reason = Column(String, nullable=True)
+    # v1.3.1 (RSI R4, migration 0009): which lessons-object version this run's agent
+    # last read before starting — `av run start` warns (never blocks) when unset.
+    lessons_id = Column(String, nullable=True, index=True)
     parent_run_id = Column("parent_run_id", String, ForeignKey("runs.id"), nullable=True)
     created_by = Column(String, nullable=True)  # resolved auth identity ('owner'/username)
     config_hash = Column(String, nullable=True)
@@ -265,3 +286,349 @@ class DBWebhookDelivery(Base):
     next_retry_at = Column(DateTime, nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow_naive)
     updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+
+# ---------------------------------------------------------------------------
+# RSI R1 (v1.3.1, migration 0006): improver versioning, self-edit proposals, signed
+# policy packs, capability canaries, and project freeze state.
+#
+# Each of ImproverVersion/ChangeSet/PolicyPack is a lightweight server-side index row
+# over a CAS object (`python/av_cli/casobj.py`) — the actual manifest/diff/policy
+# document lives content-addressed in `.av/objects/`, exactly like `runs.env_snapshot_id`
+# already indexes an env snapshot object. No new persistence mechanism.
+# ---------------------------------------------------------------------------
+
+class DBImproverVersion(Base):
+    """One version of the improver (agent code/prompts/tool schemas/policy-pack ref),
+    content-addressed via `manifest_object_id`. `parent_id` (no FK — see module-level
+    rationale) forms the improver lineage graph `GET /api/improvers/{id}/lineage` walks."""
+    __tablename__ = "improver_versions"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    manifest_object_id = Column(String, nullable=False)
+    parent_id = Column(String, nullable=True, index=True)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBChangeSet(Base):
+    """A structured self-edit proposal (diff + rationale + predicted risk) against an
+    improver version. `object_id` is the CAS id of the actual proposal document."""
+    __tablename__ = "change_sets"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    improver_id = Column(String, nullable=True, index=True)
+    object_id = Column(String, nullable=False)
+    # proposed | approved | rejected | applied | rolled_back
+    status = Column(String, nullable=False, default="proposed")
+    risk = Column(String, nullable=True)  # low | medium | high
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+    __table_args__ = (Index("ix_change_sets_project_status", "project_id", "status"),)
+
+
+class DBPolicyPack(Base):
+    """A published, signed policy pack — append-only and hash-chained (`prev_id` +
+    `chain_hash`) so the sequence of promotion-rule changes is itself tamper-evident,
+    the same "tamper evidence, not a trust network" guarantee signed commits carry
+    (`python/av_cli/signing.py`). `object_id` is the CAS id of the actual pack document
+    (see `.av/policies.json`'s `policy_version: 2` shape, `cmd_policy.py`)."""
+    __tablename__ = "policy_packs"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    object_id = Column(String, nullable=False)
+    prev_id = Column(String, nullable=True)
+    chain_hash = Column(String, nullable=False)
+    published_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+    __table_args__ = (Index("ix_policy_packs_project_created", "project_id", "created_at"),)
+
+
+class DBCanaryResult(Base):
+    """One capability-canary run's outcome for a given improver version — the mandatory
+    pass gate `av improver promote` checks before allowing an improver promotion."""
+    __tablename__ = "canary_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String, nullable=False, index=True)
+    improver_id = Column(String, nullable=False, index=True)
+    suite_object_id = Column(String, nullable=False)
+    passed = Column(Boolean, nullable=False)
+    details = Column(JSON, nullable=True)
+    run_id = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBEvalSuite(Base):
+    """A task/eval suite definition — content-addressed like `DBImproverVersion`. `frozen`
+    (todo.md B.7): once true, no route may mutate this row's `object_id`/metadata again —
+    a training run may not modify the eval it's scored against. `blind` (todo.md F.26):
+    results against this suite are score-redacted for any reader without the `scorer`
+    scope until explicitly revealed (`DBEvalResult.revealed`)."""
+    __tablename__ = "eval_suites"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    object_id = Column(String, nullable=False)
+    name = Column(String, nullable=True)
+    frozen = Column(Boolean, nullable=False, default=False)
+    blind = Column(Boolean, nullable=False, default=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+
+class DBEvalResult(Base):
+    """One scoring outcome against an eval suite — `POST /api/eval/results` requires the
+    `scorer` scope (todo.md F.25: the held-out eval vault's actual enforcement is this
+    scope check, not a separate mechanism). `revealed` defaults True (ordinary, non-blind
+    scoring); a blind suite's results are created with `revealed=False` and only flipped
+    by `POST /api/eval/results/{id}/reveal` (also `scorer`-scoped)."""
+    __tablename__ = "eval_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String, nullable=False, index=True)
+    suite_id = Column(String, nullable=False, index=True)
+    run_id = Column(String, nullable=True, index=True)
+    score = Column(JSON, nullable=True)
+    details = Column(JSON, nullable=True)
+    revealed = Column(Boolean, nullable=False, default=True)
+    scored_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBEvalAdapter(Base):
+    """An external eval adapter registration (todo.md F.27): `command` is a JSON argv
+    list — the subprocess contract is JSON on stdin, JSON on stdout, non-zero exit =
+    failed scoring (see `av eval adapter run`), so success can't be silently redefined
+    in-tree by whatever's currently checked in."""
+    __tablename__ = "eval_adapters"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    command = Column(JSON, nullable=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBTask(Base):
+    """A curriculum task/difficulty-ramp proposal (todo.md B.8)."""
+    __tablename__ = "tasks"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    difficulty = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="proposed")  # proposed|accepted|rejected
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+
+class DBPlan(Base):
+    """An experiment plan (hypotheses, ablations, budget, stop rules) — content-addressed
+    like every other RSI artifact (todo.md D.16)."""
+    __tablename__ = "plans"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    object_id = Column(String, nullable=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBBudget(Base):
+    """A compute/storage/step quota, scoped to one run or a whole lineage (todo.md D.17).
+    Counters are stored inline (not JSON) so SQL can increment/aggregate them directly —
+    `av budget consume` does an atomic `UPDATE ... SET x_used = x_used + :delta`, never a
+    read-modify-write race between two processes consuming the same budget concurrently."""
+    __tablename__ = "budgets"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    scope = Column(String, nullable=False)  # "run" | "lineage"
+    scope_ref = Column(String, nullable=False, index=True)  # a run_id, or a lineage root run_id
+    compute_seconds_limit = Column(Float, nullable=True)
+    storage_bytes_limit = Column(BigInteger, nullable=True)
+    step_limit = Column(Integer, nullable=True)
+    compute_seconds_used = Column(Float, nullable=False, default=0.0)
+    storage_bytes_used = Column(BigInteger, nullable=False, default=0)
+    steps_used = Column(Integer, nullable=False, default=0)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+
+class DBCausalLink(Base):
+    """An agent-authored (or verified) claim: this change CAUSED that metric delta
+    (todo.md E.21) — explicit, beyond `parent_run_id`'s bare lineage pointer."""
+    __tablename__ = "causal_links"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String, nullable=False, index=True)
+    cause_type = Column(String, nullable=False)  # "change_set" | "commit"
+    cause_ref = Column(String, nullable=False, index=True)
+    effect_metric = Column(String, nullable=False)
+    effect_delta = Column(Float, nullable=True)
+    verified = Column(Boolean, nullable=False, default=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBStrategyEntry(Base):
+    """A searchable record of what worked/failed across lineages (todo.md E.22) — beyond
+    `.avh` context-memory notes, which are per-repo and not cross-run-queryable."""
+    __tablename__ = "strategy_entries"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    technique = Column(String, nullable=False)
+    hyperparameters = Column(JSON, nullable=True)
+    data_mix = Column(JSON, nullable=True)
+    outcome = Column(String, nullable=False)  # worked | failed | inconclusive
+    run_ids = Column(JSON, nullable=True)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBLessons(Base):
+    """A versioned "what we believe now" document (todo.md E.23) — content-addressed and
+    append-only-by-convention (each update is a NEW row; `/latest` by `created_at`
+    resolves the current version), same pattern as `policy_packs` minus the hash-chain
+    (lessons revise freely; they are not a tamper-evident policy log)."""
+    __tablename__ = "lessons"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    object_id = Column(String, nullable=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBReview(Base):
+    """A reviewer's decision on a change set OR an improver version (todo.md H.34) —
+    `av improver promote`'s dual gate consults reviews against the CANDIDATE improver id
+    directly when `.av/improver_policy.json` sets `require_review`, since one improver
+    version can be the eventual promotion target regardless of which change set (if any)
+    produced it."""
+    __tablename__ = "reviews"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    target_type = Column(String, nullable=False)  # "change_set" | "improver"
+    target_id = Column(String, nullable=False, index=True)
+    reviewer = Column(String, nullable=True)
+    decision = Column(String, nullable=False)  # approve | reject
+    comment = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBCritique(Base):
+    """A structured objection attached to a change set OR an improver version (todo.md
+    H.35) — must be resolved or explicitly waived before promotion clears; a waiver is
+    itself audited. Same target_type/target_id generalization as `DBReview`."""
+    __tablename__ = "critiques"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    target_type = Column(String, nullable=False)  # "change_set" | "improver"
+    target_id = Column(String, nullable=False, index=True)
+    author = Column(String, nullable=True)
+    objection = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="open")  # open | resolved | waived
+    resolution = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+
+class DBBlackboardEntry(Base):
+    """A durable shared claim with authors and evidence links (todo.md H.36) — beyond the
+    ordered event stream, a place for hypotheses that outlive any one event."""
+    __tablename__ = "blackboard_entries"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    claim = Column(String, nullable=False)
+    author = Column(String, nullable=True)
+    evidence = Column(JSON, nullable=True)  # [{"type": "run"|"commit"|"critique", "ref": str}]
+    status = Column(String, nullable=False, default="open")  # open | resolved
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+
+class DBProjectFreeze(Base):
+    """Global per-project kill-switch state (todo.md C.15/I.40): while `frozen`, the
+    server denies every write except reads and rollback — enforced both client-side
+    (`_AuthRetryGroup.invoke()`) and here, so a compromised/rogue local client can't just
+    skip the check."""
+    __tablename__ = "project_freeze"
+
+    project_id = Column(String, primary_key=True)
+    frozen = Column(Boolean, nullable=False, default=False)
+    reason = Column(String, nullable=True)
+    frozen_by = Column(String, nullable=True)
+    frozen_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True, onupdate=utcnow_naive)
+
+
+# ---------------------------------------------------------------------------
+# RSI R5 (v1.3.1, migration 0010): sandbox jobs, tool manifests, action logs. These are
+# server-side INDEX/AUDIT records, not the sandbox executor's own job state — a driver's
+# LIVE state lives wherever that driver can actually re-query it (a container, a Pod, a
+# Slurm job — see python/av_cli/sandbox/base.py's module docstring). `tool_manifests` and
+# `action_logs` follow the same content-addressed version-history pattern as
+# `policy_packs`/`lessons`.
+# ---------------------------------------------------------------------------
+
+class DBSandboxJob(Base):
+    """A server-side record of one sandbox job submission (todo.md G.29) — lets `av
+    sandbox queue` list jobs across drivers/machines without every driver needing its own
+    listing capability (a `local` job on a laptop has none at all)."""
+    __tablename__ = "sandbox_jobs"
+
+    id = Column(String, primary_key=True)  # the caller-assigned job_id (see sandbox.base.JobSpec)
+    project_id = Column(String, nullable=False, index=True)
+    improver_id = Column(String, nullable=True, index=True)
+    driver = Column(String, nullable=False)  # local | docker | kubernetes | slurm
+    state = Column(String, nullable=False, default="pending")
+    exit_code = Column(Integer, nullable=True)
+    command = Column(JSON, nullable=True)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+
+
+class DBToolManifest(Base):
+    """A published version of an improver version's tool permission manifest (todo.md
+    G.30) — append-only version history, `/latest` resolved by `created_at`, same pattern
+    as `DBLessons`/`DBPolicyPack` minus the hash-chain."""
+    __tablename__ = "tool_manifests"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    improver_id = Column(String, nullable=False, index=True)
+    object_id = Column(String, nullable=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBActionLog(Base):
+    """A published, content-addressed snapshot of `.av/actions.jsonl` (todo.md G.31) —
+    `av replay-actions` fetches this alongside a run's env snapshot to reconstruct not
+    just the training code but the AGENT'S DECISIONS."""
+    __tablename__ = "action_logs"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    project_id = Column(String, nullable=False, index=True)
+    run_id = Column(String, nullable=True, index=True)
+    object_id = Column(String, nullable=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)

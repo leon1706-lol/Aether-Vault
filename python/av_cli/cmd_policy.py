@@ -37,23 +37,53 @@ def save_policies(repo_root, policies: dict) -> None:
     atomic_write_text(_policies_path(repo_root), json.dumps(policies, indent=2, sort_keys=True))
 
 
+def _resolve_ref_ancestor(repo_root, ref_name: str | None) -> str | None:
+    """Resolves REF or REF~N (e.g. `main~1`) to a commit hash.
+
+    `~N` walks N first-parent hops back from REF's tip via `handoff._commit_parent()` —
+    v1.3.1 fix: this previously fell through to "treat the whole string as a commit hash"
+    (always `None` for anything shaped like `main~1`), which is exactly the form the
+    shipped `examples/policies/metric-gate.json` uses, so a fresh policy silently found no
+    baseline the very first time anyone tried the documented example."""
+    from .handoff import _commit_parent, load_commit, resolve_head
+
+    base_name, sep, hops_raw = (ref_name or "").partition("~")
+    hops = 0
+    if sep:
+        try:
+            hops = int(hops_raw)
+        except ValueError:
+            base_name = ref_name  # not a real ~N suffix — fall through, treat literally
+            hops = 0
+
+    if base_name in (None, "", "HEAD"):
+        cur = resolve_head(repo_root)[1]
+    else:
+        p = repo_root / ".av" / "refs" / "heads" / base_name
+        cur = p.read_text().strip() if p.exists() else base_name  # else: raw commit hash
+
+    seen = set()
+    for _ in range(hops):
+        if not cur or cur in seen:
+            return None
+        seen.add(cur)
+        cur = _commit_parent(load_commit(repo_root, cur))
+    return cur
+
+
 def _latest_metrics_for_ref(repo_root, ref_name: str | None) -> dict | None:
     """Walks from ref tip backwards, returning the first commit with non-empty metrics.
 
-    `ref_name` may be a branch name (refs/heads lookup) or a raw commit hash — both are
-    supported; anything else falls back to HEAD.
-    """
-    from .handoff import load_commit, resolve_head
+    `ref_name` may be a branch name (refs/heads lookup), `branch~N` ancestry, or a raw
+    commit hash — anything else falls back to HEAD. v1.3.1 fix: walks
+    `handoff._commit_parent()` (tolerates both the local `parents` list shape and the
+    registry's `parent_hash` shape) instead of reading `parent_hash` directly — locally-
+    authored commits only ever have `parents`, so the old walk stopped after one hop for
+    every baseline that was never fetched from the registry (the dual-gate promotion
+    baseline in v1.3.1 depends on this being correct)."""
+    from .handoff import _commit_parent, load_commit
 
-    cur = None
-    if ref_name in (None, "", "HEAD"):
-        cur = resolve_head(repo_root)[1]
-    else:
-        p = repo_root / ".av" / "refs" / "heads" / ref_name
-        if p.exists():
-            cur = p.read_text().strip()
-        else:
-            cur = ref_name  # treat as a commit hash
+    cur = _resolve_ref_ancestor(repo_root, ref_name)
     seen = set()
     while cur and cur not in seen:
         seen.add(cur)
@@ -63,7 +93,7 @@ def _latest_metrics_for_ref(repo_root, ref_name: str | None) -> dict | None:
         m = c.get("metrics") or {}
         if isinstance(m, dict) and m:
             return m
-        cur = c.get("parent_hash")
+        cur = _commit_parent(c)
     return None
 
 
@@ -206,13 +236,12 @@ def _report_policy_outcome(repo_root, decision: str, rule: str | None) -> None:
     or no reachable server (offline resilience is sacred; this is reporting, not a gate)."""
     try:
         from .client import VaultClient
+        from .core import resolve_remote
 
         run_id = resolve_run_id(repo_root)
         if not run_id:
             return
-        cfg = load_config(repo_root)
-        client = VaultClient(cfg.get("remote_url", "http://localhost:8000"),
-                             cfg.get("remote_api_token"))
+        client = VaultClient(*resolve_remote(repo_root))
         client.report_run_policy_outcome(run_id, decision, rule)
     except Exception:
         pass  # telemetry only — a reporting failure must never affect the promotion itself
@@ -315,6 +344,14 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
                     + (f" (rule: {deciding_rule})" if deciding_rule else ""), fg=color)
         return
 
+    # v1.3.1: freeze blocks the real landing (never dry-run, which "touches nothing
+    # either way" by contract) — checked AFTER policy evaluation but before anything is
+    # written, and even when --force would otherwise bypass the policy itself: freeze is
+    # a higher-priority safety gate than any single policy override.
+    from .cmd_freeze import freeze_guard
+
+    freeze_guard(repo_root)
+
     # v1.3.0: report the real decision for the active run — dry runs above are deliberately
     # excluded ("touches nothing either way" is the documented dry-run contract).
     if pol_entry:
@@ -325,7 +362,12 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
             emit_json(None, "promote", data={"allowed": False,
                                              "forced": bool(force and pol_entry),
                                              "reason": reason, "rule": deciding_rule})
-        click.secho(f"DENIED: {reason}", fg="red", err=True)
+        else:
+            # v1.3.1 fix (Probleme.md): this used to secho unconditionally too — the
+            # SAME leak the comment below already fixed for the landing case, just never
+            # caught here because no existing test parsed a JSON-mode DENY as strict JSON
+            # (test_policy_denied_exits_16 only ever checked exit_code, in text mode).
+            click.secho(f"DENIED: {reason}", fg="red", err=True)
         ctx_exit(EXIT_POLICY_DENIED)
     # v1.3.0 fix (Probleme.md): this used to secho unconditionally, leaking human text
     # ahead of the JSON envelope emitted below for the landing case — the same bug class
@@ -382,3 +424,180 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
 
 def ctx_exit(code):
     raise SystemExit(code)
+
+
+# ---------------------------------------------------------------------------
+# Signed policy packs (v1.3.1, RSI R1: todo.md C.13/I.39) — an append-only, hash-chained
+# publication log for promotion-rule changes. Deliberately separate from `.av/policies.json`
+# (the LOCAL, mutable, currently-armed rules `av policy set/promote` read) — a policy pack
+# is a PUBLISHED SNAPSHOT of some policy state (model gate, improver gate, or both) with a
+# tamper-evident history, the same relationship signed commits have to the working tree.
+# ---------------------------------------------------------------------------
+
+def _client(repo_root):
+    from .client import VaultClient
+    from .core import resolve_remote
+
+    return VaultClient(*resolve_remote(repo_root))
+
+
+def _pack_require_online(repo_root):
+    """Same reachability contract every other read/write against the registry uses
+    (`cmd_improver.py::_require_online`) — an unguarded `client.session.get/post` raises
+    a raw `requests.exceptions.ConnectionError` on an unreachable server, which crashes
+    with exit 1 and no JSON envelope instead of the documented `unreachable_queued`/13
+    (found via `tests/test_contract_matrix.py`'s anti-leakage sweep on `policy pack log`)."""
+    client = _client(repo_root)
+    if not client.server_available():
+        fail(None, "unreachable_queued",
+             f"Registry unreachable at {client.server_url} — policy packs are server-"
+             "authoritative.")
+    return client
+
+
+@click.group("pack")
+def policy_pack() -> None:
+    """Signed, hash-chained, append-only publication log for promotion-rule changes."""
+
+
+@policy_pack.command("publish")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--sign/--no-sign", default=True, show_default=True)
+def pack_publish(file: str, sign: bool) -> None:
+    """Publish FILE (any JSON document — typically .av/policies.json and/or
+    .av/improver_policy.json) as the next entry on this project's policy-pack chain."""
+    from . import casobj
+    from .cmd_freeze import freeze_guard
+
+    repo_root = ensure_repo()
+    freeze_guard(repo_root)
+    try:
+        doc = json.loads(Path(file).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        fail(None, "validation", f"{file} is not valid JSON: {exc}")
+    if not isinstance(doc, dict):
+        fail(None, "validation", "Policy pack document must be a JSON object.")
+
+    if sign:
+        sig = casobj.sign_object(doc, repo_root)
+        if sig:
+            doc["signature"] = sig
+    object_id = casobj.write_object(repo_root, doc)
+
+    client = _pack_require_online(repo_root)
+    if not client.upload_object(casobj.object_path(repo_root, object_id), object_id):
+        fail(None, "unreachable_queued", "Failed to upload the policy pack object.")
+
+    cfg = load_config(repo_root)
+    prev = (client.session.get(f"{client.server_url}/api/policy-packs/latest",
+                               params={"project_id": cfg["project_id"]}))
+    prev_id = prev.json().get("id") if prev.status_code == 200 else None
+
+    resp = client.session.post(f"{client.server_url}/api/policy-packs", json={
+        "project_id": cfg["project_id"], "object_id": object_id, "prev_id": prev_id,
+    })
+    if resp.status_code not in (200, 201):
+        fail(None, "validation", f"Registry rejected the policy pack: {resp.text[:200]}")
+    body = resp.json()
+
+    if current_output_mode() == "json":
+        emit_json(None, "policy pack publish", data={**body, "object_id": object_id,
+                                                      "prev_id": prev_id, "signed": sign and "signature" in doc})
+        return
+    click.secho(f"Policy pack {body['id']} published (prev: {(prev_id or '-')[:8]})"
+               + (", signed" if sign and "signature" in doc else ""), fg="green")
+
+
+@policy_pack.command("show")
+@click.argument("pack_id")
+def pack_show(pack_id: str) -> None:
+    """Show one policy pack's content and chain metadata."""
+    from . import casobj
+
+    repo_root = ensure_repo()
+    client = _pack_require_online(repo_root)
+    resp = client.session.get(f"{client.server_url}/api/policy-packs/{pack_id}")
+    if resp.status_code != 200:
+        fail(None, "validation", f"Unknown policy pack: {pack_id}")
+    row = resp.json()
+    doc = casobj.read_object(repo_root, row["object_id"])
+    if doc is None:
+        client.download_object(row["object_id"], casobj.object_path(repo_root, row["object_id"]))
+        doc = casobj.read_object(repo_root, row["object_id"])
+    if current_output_mode() == "json":
+        emit_json(None, "policy pack show", data={**row, "document": doc})
+        return
+    click.secho(f"Policy pack {row['id']}", bold=True)
+    click.echo(f"  prev: {row.get('prev_id') or '-'}")
+    click.echo(f"  chain_hash: {row.get('chain_hash')}")
+    click.echo(f"  published_by: {row.get('published_by') or '-'} at {row.get('created_at')}")
+    if doc:
+        click.echo(f"  signed: {'signature' in doc}")
+
+
+@policy_pack.command("log")
+@click.option("--project", "project_id", default=None, help="Defaults to this repo's project.")
+@click.option("--limit", default=20, show_default=True)
+def pack_log(project_id: str | None, limit: int) -> None:
+    """List this project's policy-pack chain, newest first."""
+    repo_root = ensure_repo()
+    cfg = load_config(repo_root)
+    client = _pack_require_online(repo_root)
+    resp = client.session.get(f"{client.server_url}/api/policy-packs",
+                              params={"project_id": project_id or cfg.get("project_id"),
+                                      "limit": limit})
+    rows = resp.json().get("policy_packs", []) if resp.status_code == 200 else []
+    if current_output_mode() == "json":
+        emit_json(None, "policy pack log", data={"policy_packs": rows})
+        return
+    if not rows:
+        click.secho("No policy packs published yet.", fg="yellow")
+        return
+    for r in rows:
+        click.echo(f"  {r['id'][:8]}  prev={((r.get('prev_id') or '-')[:8])}  {r.get('created_at', '')}")
+
+
+@policy_pack.command("verify")
+@click.argument("pack_id")
+def pack_verify(pack_id: str) -> None:
+    """Verify one policy pack's chain hash and (if present) its signature."""
+    import hashlib as _hashlib
+
+    from . import casobj
+
+    repo_root = ensure_repo()
+    client = _pack_require_online(repo_root)
+    resp = client.session.get(f"{client.server_url}/api/policy-packs/{pack_id}")
+    if resp.status_code != 200:
+        fail(None, "validation", f"Unknown policy pack: {pack_id}")
+    row = resp.json()
+    doc = casobj.read_object(repo_root, row["object_id"])
+    if doc is None:
+        client.download_object(row["object_id"], casobj.object_path(repo_root, row["object_id"]))
+        doc = casobj.read_object(repo_root, row["object_id"])
+
+    expected_chain = _hashlib.sha256(
+        f"{row.get('prev_id') or ''}:{row['object_id']}".encode()
+    ).hexdigest()
+    chain_ok = expected_chain == row.get("chain_hash")
+
+    sig_ok, sig_reason = (None, "no document to verify")
+    if isinstance(doc, dict):
+        sig_ok, sig_reason = casobj.verify_object(doc)
+
+    data = {"id": pack_id, "chain_ok": chain_ok, "signature_ok": sig_ok, "reason": sig_reason}
+    if current_output_mode() == "json":
+        emit_json(None, "policy pack verify", data=data)
+        # v1.3.1 fix (same class as cmd_canary.py::canary_run): this used to `return`
+        # unconditionally, so a BROKEN chain in JSON mode exited 0 — data said chain_ok:
+        # false but the exit code lied about it.
+        if not chain_ok:
+            ctx_exit(EXIT_VALIDATION)
+        return
+    click.secho(f"chain: {'OK' if chain_ok else 'BROKEN'}", fg="green" if chain_ok else "red")
+    click.secho(f"signature: {sig_reason}", fg="green" if sig_ok else "yellow")
+    if not chain_ok:
+        ctx_exit(EXIT_VALIDATION)
+
+
+policy.add_command(policy_pack)

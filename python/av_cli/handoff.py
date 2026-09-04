@@ -37,6 +37,17 @@ def _code_pointer(repo_root: Path) -> dict | None:
     return {"git_remote": remote, "git_sha": sha, "dirty": dirty}
 
 
+def _current_improver_id(repo_root: Path) -> str | None:
+    """The locally active improver version pointer — deliberately re-read here rather
+    than importing `cmd_improver.current_improver_id` (same one-line file read; avoids a
+    handoff.py -> cmd_improver.py import for a single string)."""
+    path = repo_root / ".av" / "improver" / "current"
+    if not path.exists():
+        return None
+    val = path.read_text(encoding="utf-8").strip()
+    return val or None
+
+
 def _load_run_state(repo_root: Path) -> dict:
     path = repo_root / ".av" / "run.json"
     if not path.exists():
@@ -221,6 +232,12 @@ def build_handoff_dict(repo_root: Path, agent_instructions: str | None) -> dict:
             "run_id": run_id,
             "parent_run_ids": run_state.get("parent_run_ids", []),
             "code_pointer": _code_pointer(repo_root),
+            # v1.3.1+, additive: the locally active improver version pointer
+            # (`.av/improver/current`, same file `av improver current` reads) — null
+            # when none is set. `.avh` generation is deliberately local-only/offline, so
+            # this is the improver's LOCAL pointer, not a network fetch of its lineage/
+            # manifest; an agent wanting more calls `av improver show <id>` itself.
+            "improver_id": _current_improver_id(repo_root),
         },
         "semantic_summary": build_semantic_summary(repo_root, commit_data),
         "replay": replay,
@@ -242,7 +259,8 @@ def upgrade_handoff(doc: dict) -> dict:
     upgraded = dict(doc)
     upgraded.setdefault("$schema", AVH_SCHEMA_ID)
     upgraded["avh_version"] = AVH_VERSION
-    upgraded.setdefault("lineage", {"run_id": None, "parent_run_ids": [], "code_pointer": None})
+    upgraded.setdefault("lineage", {"run_id": None, "parent_run_ids": [], "code_pointer": None,
+                                    "improver_id": None})
     upgraded.setdefault("semantic_summary", None)
     upgraded.setdefault("replay", None)
     upgraded.setdefault("context_memory", {"notes": [], "metrics_history_tail": []})

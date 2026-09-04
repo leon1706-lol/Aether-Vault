@@ -217,12 +217,20 @@ def _canonical_timestamp(value) -> str | None:
 
 def canonical_commit_bytes(commit_data: dict) -> bytes:
     """Sorted-keys JSON of the commit payload minus `signature`, with the timestamp
-    normalized — the exact bytes signed and verified everywhere."""
-    canon = {k: v for k, v in commit_data.items() if k != "signature"}
+    normalized — the exact bytes signed and verified everywhere.
+
+    v1.3.1: delegates the canonicalization itself to `casobj.canonical_bytes()` (the
+    shared core every new CAS object — improver manifests, policy packs, eval suites,
+    etc. — also signs against); this function's only remaining job is the commit-specific
+    timestamp-echo normalization documented above. Byte-identical to the pre-v1.3.1
+    inline `json.dumps(canon, sort_keys=True)` — golden-fixture tests pin this."""
+    from .casobj import canonical_bytes as _canonical_bytes
+
+    canon = dict(commit_data)
     normalized_ts = _canonical_timestamp(canon.get("timestamp"))
     if normalized_ts is not None:
         canon["timestamp"] = normalized_ts
-    return json.dumps(canon, sort_keys=True).encode("utf-8")
+    return _canonical_bytes(canon, exclude=("signature",))
 
 
 def sign_payload(commit_data: dict, repo_root: Path) -> dict | None:

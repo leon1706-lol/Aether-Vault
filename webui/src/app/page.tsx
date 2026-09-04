@@ -16,6 +16,8 @@ import { CommitsPanel } from "@/components/CommitsPanel";
 import { BranchesPanel } from "@/components/BranchesPanel";
 import { MetricsPanel } from "@/components/MetricsPanel";
 import { StoragePanel } from "@/components/StoragePanel";
+import { ImproverPanel } from "@/components/ImproverPanel";
+import { RegressionPanel } from "@/components/RegressionPanel";
 import type { Project } from "@/lib/api";
 
 const SELECTED_PROJECT_KEY = "aether-vault:selected-project";
@@ -29,6 +31,8 @@ const TAB_TITLES: Record<string, string> = {
   "weight-diff": "Weight Diff",
   projects: "Projects",
   runs: "Runs",
+  improver: "Improver",
+  regression: "Regression",
 };
 
 export default function DashboardPage() {
@@ -129,6 +133,10 @@ export default function DashboardPage() {
               initialRunId={initialRunId}
               onCompareWeights={openWeightDiff}
             />
+          ) : active === "improver" ? (
+            <ImproverPanel projectId={selectedProject?.project_id ?? null} />
+          ) : active === "regression" ? (
+            <RegressionPanel projectId={selectedProject?.project_id ?? null} />
           ) : active === "commits" ? (
             <CommitsPanel refs={data?.refs ?? {}} projectId={selectedProject?.project_id ?? null} />
           ) : active === "branches" ? (

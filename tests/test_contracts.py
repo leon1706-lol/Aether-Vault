@@ -40,7 +40,12 @@ def _validate(instance: dict, schema_name: str) -> None:
 class TestLoadContractSchema:
     def test_loads_every_published_schema(self):
         for name in ("envelope-1.0", "event-1.0", "run-1.0", "webhook-payload-1.0",
-                     "semdiff-1.0", "avh-2.0"):
+                     "semdiff-1.0", "avh-2.0",
+                     # v1.3.1 RSI additions — server-authoritative like run-1.0/event-1.0,
+                     # so live-document validation lives in test_server.py, not here; this
+                     # only proves each schema FILE loads and is well-formed.
+                     "improver-1.0", "change-set-1.0", "policy-pack-1.0",
+                     "eval-suite-1.0", "tool-manifest-1.0", "action-log-1.0"):
             schema = load_contract_schema(name)
             assert schema["$id"].startswith("https://aether-vault.dev/schemas/")
 

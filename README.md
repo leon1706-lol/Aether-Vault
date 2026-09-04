@@ -125,7 +125,7 @@ Split into two focused diagrams — what happens on your machine, and how it tal
 ```mermaid
 graph TD
     Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit)")
+    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit ·<br>improver · canary · freeze · incident · eval · task · plan · budget ·<br>scheduler · review · critique · lineage · search · strategy · lessons ·<br>blackboard · sandbox · replay-actions · tools)")
     CPP("aether_core (C++)<br>(Splits Safetensors & CDC-Chunks Checkpoints,<br>Hashes in Parallel)")
     LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
     PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
@@ -167,6 +167,7 @@ graph TD
     CLI -- "Checkout: Downloads Missing Objects" --> FastAPI
     CLI -- "Clone/Pull: Discovers Projects, Fetches<br>History & Materializes Working Copies" --> FastAPI
     CLI -- "gc: Triggers Remote Garbage Collection" --> FastAPI
+    CLI -- "RSI Control Plane: Improver/Change-Set/Canary/Freeze/Eval/<br>Budget/Review/Sandbox/Policy-Pack — all server-authoritative,<br>scoped-token enforced" --> FastAPI
     PendingQ -- "Retried by av push" --> FastAPI
     WebUI -- "Fetches Commits, Refs, Metrics & Per-Layer Hashes<br>(TokenGate Prompts if 401)" --> FastAPI
 
@@ -194,7 +195,7 @@ and how it's wired in, this table is the index.
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
 | `python/av_plugins/` | Lightning / Transformers / MLflow auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
-| `tests/` | ~590-test suite across 25+ files (CLI, core, server, plugins) | [README](tests/README.md) |
+| `tests/` | ~1,340-test suite across 60+ files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
@@ -282,7 +283,7 @@ For full methodology, every raw number, and the rating legend, see [`development
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs ~590 tests across 25+ files covering the CLI, C++ bindings, live registry server, plugins, and webui logic. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge in sync with the real result — it parses pytest's summary line and rewrites the badge (and turns it red if anything failed) so the count is never manually edited. A `-k`-scoped run never touches it.
+The full suite (`av test` or `pytest tests/ -q`) runs ~1,340 tests across 60+ files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the v1.3.1 RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge in sync with the real result — it parses pytest's summary line and rewrites the badge (and turns it red if anything failed) so the count is never manually edited. A `-k`-scoped run never touches it.
 
 ```bash
 av test                  # full suite
@@ -303,7 +304,9 @@ Aether-Vault is built so autonomous agents are first-class operators. Four stabl
    `{"ok": true, "data": {…}, "error": null, "meta": {"command": "…"}}`;
    failures set `ok:false` with `error.code` in {not_a_repo, nothing_to_commit,
    auth_failed, unreachable_queued, merge_conflict, validation, policy_denied} and exit
-   codes 10–16.
+   codes 10–16; v1.3.1 adds `budget_exhausted` (17), `frozen` (18), `review_required`
+   (19), and `scope_denied` (20) for the RSI control plane — full table in
+   [`docs/for-agents.md`](docs/for-agents.md).
 2. **Python SDK** — `from av_sdk import Repo`: add/commit/push/log/diff/runs/context with
    typed `SDKError`; drives the same single-writer path as the CLI.
 3. **Event stream + webhooks** — resumable ordered feed:
@@ -827,6 +830,41 @@ av benchmark --baseline prior.json --save-json new.json   # regression-track av'
 ```
 
 Every result is a real measured number from a real subprocess/HTTP call — a tool that isn't on `PATH`, or whose primitive doesn't apply to a given benchmark, is shown as `not installed`/`N/A` with a footnote, never guessed at.
+
+#### RSI control plane (v1.3.1)
+
+Versioning the improver (agent code/prompts/tools/policy), not just the model it
+produces — see [`docs/rsi-operator-guide.md`](docs/rsi-operator-guide.md) for the full
+continuous walkthrough and every flag; brief pointers below.
+
+```bash
+av improver register --code agent.py --prompt system.md   # version the agent's own stack
+av improver propose --diff change.diff --rationale "why" --risk low   # structured self-edit
+av improver apply <change-set-id>                          # mint the next version
+av improver promote <improver-id>                           # dual-gate: separate from `av promote`
+av improver rollback                                        # one command to last known-good
+```
+
+`av canary register/run/status` — small, fixed capability checks that must not regress
+before an improver promotes. `av freeze on/off/status` and `av incident rollback` — the
+global kill-switch and one-command recovery (freeze + restore last-good improver).
+`av eval register/freeze/score/reveal` — a held-out, frozen, content-addressed eval
+vault a training token cannot write to. `av budget set/consume` — compute/storage/step
+quotas that stop a run on their own (`budget_exhausted`, exit 17). `av review approve/
+reject` and `av critique add/resolve/waive` — a reviewer gate distinct from the model
+promotion policy, with self-review rejected server-side. `av lineage link/show`,
+`av search runs`, `av strategy add/search`, `av lessons update/show`, `av blackboard
+post/resolve` — causal credit assignment and cross-lineage memory beyond `.avh`'s
+per-repo notes. `av sandbox run/status/cancel/logs/queue` and `av replay-actions` —
+pluggable isolated execution (`local`/`docker`/`kubernetes`/`slurm`, one protocol) plus
+deterministic replay of agent decisions, not just training code. `av tools manifest
+show/set/verify` — per-improver-version tool permission manifests a sandbox job is
+checked against before it ever runs. `av policy pack publish/show/log/verify` — signed,
+hash-chained policy-as-code; publishing a new pack is itself an audited, versioned event.
+
+`examples/rsi_loop/` is a deterministic, no-API-key reference agent driving this whole
+loop end to end through `av_sdk.Repo` — propose → sandbox-apply → canary → dual-gate
+promotion (denied, then reviewed and allowed) → lessons → a budget that stops itself.
 
 ---
 

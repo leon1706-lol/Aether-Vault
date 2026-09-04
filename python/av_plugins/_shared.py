@@ -38,11 +38,9 @@ def push_pending(repo_root: Path) -> dict:
     ["push"])` as the training-end flush in every plugin callback.
     """
     from av_cli.client import VaultClient
-    from av_cli.core import flush_pending_push, load_config, load_pending_push
+    from av_cli.core import flush_pending_push, load_pending_push, resolve_remote
 
-    cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"),
-                         cfg.get("remote_api_token"))
+    client = VaultClient(*resolve_remote(repo_root))
     pending = load_pending_push(repo_root)
     if not pending:
         return {"drained": 0, "still_queued": 0}

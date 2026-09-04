@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/change-set-1.0.json",
+  "title": "Aether-Vault change set (GET /api/change-sets/{id}, v1.3.1)",
+  "description": "python/av_server/server.py::_change_set_to_dict(). A structured self-edit proposal — diff + rationale + predicted risk, content-addressed (object_id). See docs/contracts.md.",
+  "type": "object",
+  "required": ["id", "project_id", "improver_id", "object_id", "status", "risk",
+               "created_by", "created_at", "updated_at"],
+  "properties": {
+    "id": {"type": "string"},
+    "project_id": {"type": "string"},
+    "improver_id": {
+      "type": ["string", "null"],
+      "description": "Which improver version this proposes to change."
+    },
+    "object_id": {
+      "type": "string",
+      "description": "CAS object id of the change-set document (diff, rationale, risk, signature)."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "approved", "rejected", "applied", "rolled_back"]
+    },
+    "risk": {"type": ["string", "null"], "enum": ["low", "medium", "high", null]},
+    "created_by": {"type": ["string", "null"]},
+    "created_at": {"type": ["string", "null"]},
+    "updated_at": {"type": ["string", "null"]}
+  }
+}

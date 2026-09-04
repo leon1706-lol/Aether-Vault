@@ -12,6 +12,15 @@
     "project_id": {"type": ["string", "null"]},
     "name": {"type": ["string", "null"]},
     "status": {"type": "string"},
+    "kind": {
+      "type": "string",
+      "enum": ["train", "meta", "scoring", "eval"],
+      "description": "v1.3.1+, additive. Absent/treated as \"train\" on runs from before this field existed."
+    },
+    "improver_id": {
+      "type": ["string", "null"],
+      "description": "v1.3.1+, additive. Which improver version authored this run, when known."
+    },
     "parent_run_id": {"type": ["string", "null"]},
     "created_by": {"type": ["string", "null"]},
     "code_pointer": {"type": ["object", "null"]},
@@ -26,6 +35,13 @@
         "at": {"type": ["string", "null"]}
       }
     },
+    "integrity_signals": {
+      "type": ["object", "null"],
+      "description": "v1.3.1+, additive. Metric-gaming detection signals from `av run integrity-check` (train/eval gap, eval-only improvement, data overlap) — absent/null until reported."
+    },
+    "plan_id": {"type": ["string", "null"], "description": "v1.3.1+, additive."},
+    "budget_id": {"type": ["string", "null"], "description": "v1.3.1+, additive."},
+    "stop_reason": {"type": ["string", "null"], "description": "v1.3.1+, additive. Set by `POST /api/runs/{id}/stop` (an external scheduler/auto-stop check, distinct from a training failure)."},
     "metrics_summary": {"type": "object"},
     "created_at": {"type": ["string", "null"]},
     "completed_at": {"type": ["string", "null"]},

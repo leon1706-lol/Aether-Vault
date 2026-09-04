@@ -133,6 +133,19 @@ AV_PERF_BUDGET_MULTIPLIER  (dev-only, tests/test_perf_gate.py) unset = the built
                per-class multipliers (CPU 2.0x, disk 3.0x, +1.5x more on Windows disk).
                Set to a float to override BOTH classes outright (not stack with them) for
                a genuinely slow/noisy machine — one number is the whole story for that run.
+AV_ANOMALY_METRIC_JUMP_RATIO  3.0   (default)
+               A metric changing by this ratio or more vs. its parent commit emits a
+               kind="anomaly" event (type: metric_jump) — see the Anomaly Alerts
+               Contract in architecture.md.
+AV_ANOMALY_MASS_REWRITE_FILES  200   (default)
+               Files added/removed/changed vs. the parent commit's tree at or above this
+               count emits an anomaly event (type: mass_rewrite).
+AV_ANOMALY_AUTH_SPIKE_THRESHOLD  5   (default)
+               Auth failures (401 or scope-denied 403) for the same identifier within the
+               window below trips an anomaly event (type: auth_spike); the in-process
+               counter then resets so one burst raises exactly one event.
+AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS  60   (default)
+               Sliding window the threshold above is measured over.
 ```
 
 **Caution:** `AV_DATA_DIR`'s `/data` default is container-oriented. Bare-metal uvicorn MUST point it at a writable directory, or every object upload fails with PermissionError while `/api/health` stays green — the most misleading failure mode in the project. This exact failure broke CI `webui-e2e` once: uploads 500ed, seed pushes queued offline, the dashboard rendered empty, Playwright failed on element-not-found. Documented in [CHANGELOG.md](CHANGELOG.md); the fix lives as explicit env vars on both uvicorn-starting CI jobs.

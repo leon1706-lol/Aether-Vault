@@ -155,6 +155,66 @@ behavior CHANGE, called out first because it is the one a script checking `$?` w
   `semdiff`'s `chunks.status` (`"measured"`/`"no_chunks"`) is a new, always-present field
   alongside the existing (still-nullable) `dedup_efficiency`.
 
+## v1.3.1 additive surfaces
+
+**Version-policy exception, recorded rather than silently contradicted:** by this page's
+own "What each bump means per surface" table, a release this overwhelmingly additive
+(new CLI commands, new HTTP endpoints, new schema fields, zero removed/renamed surfaces)
+would be tagged `v1.4.0`. Shipping it as `v1.3.1` is a deliberate owner decision (2026-09),
+not an oversight — noted here explicitly so the policy table and the tag don't quietly
+disagree with each other. Every individual surface change below still follows the
+additive-only rules this page defines; only the VERSION NUMBER chosen for the release as
+a whole departs from the table's literal recommendation.
+
+This release adds the RSI (Recursive Self-Improvement) control plane: versioned improver
+artifacts, structured self-edit proposals, a dual promotion gate (model vs. improver),
+signed/hash-chained policy-as-code, capability canaries, a held-out eval vault, budgets
+and auto-stop, a reviewer gate, causal lineage and strategy memory, a pluggable sandbox
+executor, and server-side anomaly detection — see `development/architecture.md`'s
+per-surface "RSI R1"–"RSI R6" contract sections for the full design reasoning.
+
+- **New exit codes**: `budget_exhausted` (17), `frozen` (18), `review_required` (19),
+  `scope_denied` (20) — additive to the existing 10–16 registry. See
+  `docs/for-agents.md`'s full table.
+- **HTTP API**: ~44 new routes across improvers, change-sets, policy-packs,
+  canary-results, freeze, eval suites/results/adapters, tasks, plans, budgets, scheduler,
+  causal-links, strategy, lessons, reviews, critiques, blackboard, cross-run search,
+  sandbox-jobs, tool-manifests, and action-logs — all new paths, no existing endpoint's
+  shape changed. Scoped-token authorization (`require_scope()`) is additive to
+  `AV_AUTH_USERS`: a bare-string or legacy-dict entry, and `AV_API_TOKEN`, all resolve to
+  `["*"]` (unrestricted) — zero behavior change for every deployment that predates scopes.
+- **New event kinds**: `improver`, `change_set`, `policy`, `canary`, `freeze`, `eval`,
+  `review`, `blackboard`, `sandbox`, `anomaly` — additive to the existing `commit` · `ref`
+  · `run` · `gc` · `webhook_test` set, same `GET /api/events?kinds=` filter.
+- **New schema files**: `improver-1.0`, `change-set-1.0`, `policy-pack-1.0`,
+  `eval-suite-1.0`, `tool-manifest-1.0`, `action-log-1.0` — see `docs/contracts.md`.
+  Additive optional fields on existing schemas: `run-1.0` gains `kind`, `improver_id`,
+  `integrity_signals`, `plan_id`, `budget_id`, `stop_reason` (all absent/null-tolerant on
+  older rows); `avh-2.0`'s `lineage` gains `improver_id`.
+- **CLI**: ~20 new command groups (`improver`, `canary`, `freeze`, `incident`, `eval`,
+  `task`, `plan`, `budget`, `scheduler`, `review`, `critique`, `lineage`, `search`,
+  `strategy`, `lessons`, `blackboard`, `sandbox`, `replay-actions`, `tools`) plus new
+  subcommands/flags on `av run` (`--kind`, `--improver-id`, `stop`, `branch-policy`,
+  `auto-stop-check`, `integrity-check`) and `av policy pack` (`publish`/`show`/`log`/
+  `verify`). `av verify` registered as a top-level alias (was documented, never wired —
+  a pre-existing gap, not a new feature, see Probleme.md).
+- **Python SDK**: `av_sdk.Repo` gains one method per write-capable RSI surface (see
+  `development/architecture.md`'s "RSI SDK Surface Contract"), each raising the matching
+  typed `SDKError` subclass (`BudgetExhaustedError`, `FrozenError`,
+  `ReviewRequiredError`, `ScopeDeniedError`) — additive to the existing exception set.
+- **DB schema**: migrations `0006`–`0010` add `runs.{kind, improver_id,
+  integrity_signals, plan_id, budget_id, stop_reason, lessons_id}` and 17 new tables
+  (`improver_versions`, `change_sets`, `policy_packs`, `canary_results`,
+  `project_freeze`, `eval_suites`, `eval_results`, `eval_adapters`, `tasks`, `plans`,
+  `budgets`, `causal_links`, `strategy_entries`, `lessons`, `reviews`, `critiques`,
+  `blackboard_entries`, `sandbox_jobs`, `tool_manifests`, `action_logs`) — applied
+  automatically at startup, legacy volumes healed zero-touch, same as every prior
+  migration; each has a real, tested `downgrade()`.
+- **Config files**: two new local, additive-only files — `.av/improver_policy.json`
+  (the improver-gate sibling of `.av/policies.json`, deliberately its own file so the
+  pinned model-gate contract stays untouched) and `.av/tool_manifests/<improver_id>.json`
+  (per-improver-version sandbox permissions, fails closed when absent).
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades

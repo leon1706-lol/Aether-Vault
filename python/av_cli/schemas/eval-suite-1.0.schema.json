@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/eval-suite-1.0.json",
+  "title": "Aether-Vault eval suite (GET /api/eval/suites/{id}, v1.3.1)",
+  "description": "python/av_server/server.py::_eval_suite_to_dict(). Frozen, content-addressed eval definition (the held-out vault mechanism) — a training agent's token is rejected server-side on any write once frozen or without the eval:write scope. See docs/contracts.md.",
+  "type": "object",
+  "required": ["id", "project_id", "object_id", "name", "frozen", "blind", "created_by", "created_at"],
+  "properties": {
+    "id": {"type": "string"},
+    "project_id": {"type": "string"},
+    "object_id": {"type": "string", "description": "CAS object id of the suite definition."},
+    "name": {"type": ["string", "null"]},
+    "frozen": {"type": "boolean", "description": "Once true, no route may mutate this suite again."},
+    "blind": {
+      "type": "boolean",
+      "description": "Scores against this suite are hidden from non-scorer readers until `av eval reveal`."
+    },
+    "created_by": {"type": ["string", "null"]},
+    "created_at": {"type": ["string", "null"]}
+  }
+}

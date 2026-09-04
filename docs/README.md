@@ -3,6 +3,7 @@
 | Doc | What it covers |
 |---|---|
 | [`tutorial.md`](tutorial.md) | One continuous operator + agent path: init → train under a run → env snapshot → commit → promote past a policy gate → publish a handoff → the next agent picks it up. |
+| [`rsi-operator-guide.md`](rsi-operator-guide.md) | The v1.3.1 RSI control plane's continuous path: register/propose/apply an improver self-edit → sandbox it → canary it → dual-gate promotion (denied, then reviewed and allowed) → record lessons/strategy/lineage → budgets and freeze/rollback. |
 | [`for-agents.md`](for-agents.md) | The minimal recipe for driving Aether-Vault from an autonomous loop (CLI subprocess or `av_sdk.Repo` — both equivalent), plus the shared error/exit-code registry. |
 | [`contracts.md`](contracts.md) | Every published, versioned JSON Schema (envelope, semantic diff, `.avh`, event, run, webhook payload) and where each is produced. |
 | [`avattributes.md`](avattributes.md) | `.avattributes` staging directives — forcing or suppressing chunking/layer-splitting for a specific path. |

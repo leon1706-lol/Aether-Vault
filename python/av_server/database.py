@@ -38,7 +38,21 @@ _LEGACY_COLUMNS = {
         "consecutive_failures": "INTEGER DEFAULT 0",
         "disabled_reason": "TEXT",
     },
-    "runs": {"avh_object_id": "TEXT", "policy_outcome": "JSON"},
+    # 0006 (v1.3.1): RSI R1 — runs.kind/improver_id. New tables (improver_versions,
+    # change_sets, policy_packs, canary_results, project_freeze) need no entry here —
+    # a legacy volume simply lacks them entirely, which `_create_missing_tables` already
+    # handles from Base.metadata; this map is only for columns added to an EXISTING table.
+    # 0007 (v1.3.1): RSI R2 — runs.integrity_signals. Same rationale: eval_suites/
+    # eval_results/eval_adapters/tasks are brand-new tables, healed by
+    # `_create_missing_tables`, not this map.
+    # 0008 (v1.3.1): RSI R3 — runs.plan_id/budget_id/stop_reason. plans/budgets are
+    # brand-new tables, same rationale.
+    # 0009 (v1.3.1): RSI R4 — runs.lessons_id. causal_links/strategy_entries/lessons/
+    # reviews/critiques/blackboard_entries are brand-new tables, same rationale.
+    "runs": {"avh_object_id": "TEXT", "policy_outcome": "JSON",
+             "kind": "TEXT DEFAULT 'train'", "improver_id": "TEXT",
+             "integrity_signals": "JSON", "plan_id": "TEXT", "budget_id": "TEXT",
+             "stop_reason": "TEXT", "lessons_id": "TEXT"},
 }
 
 

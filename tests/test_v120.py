@@ -44,7 +44,7 @@ def _stage(repo, name="w.pt", content=b"weights-v1"):
 # commit --no-upload + run tagging
 # ---------------------------------------------------------------------------
 
-def test_commit_no_upload_queues_without_network(repo):
+def test_commit_no_upload_queues_without_network(repo, unreachable_client):
     _stage(repo)
     env = jinv("--output", "json", "commit", "-m", "deferred", "--no-upload")["data"]
     assert env["committed"] is True
@@ -105,7 +105,7 @@ def test_run_start_registration_payload_includes_project_id(repo, monkeypatch):
     assert captured["payload"]["id"] == started["run_id"]
 
 
-def test_run_start_tags_subsequent_commits_and_finishes(repo):
+def test_run_start_tags_subsequent_commits_and_finishes(repo, unreachable_client):
     started = jinv("--output", "json", "run", "start", "smoke-run")["data"]
     rid = started["run_id"]
     assert started["registered_server_side"] is False  # offline → local-only

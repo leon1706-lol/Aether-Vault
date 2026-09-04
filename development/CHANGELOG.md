@@ -1637,4 +1637,140 @@ phase removes the legacy `aether-vault-server`/`-webui` image aliases, a breakin
   this cycle's repeated stop/restart cycles for live verification is not independently
   known — flagged explicitly in `todo.md` for the owner rather than guessed at.
 
+## Phase 59 — V1.3.1 "RSI Control Plane": from autonomous training substrate to a
+recursive-self-improvement control plane
+
+`todo.md`'s 46-item Main Objektive V1.3.1 backlog (areas A-J), executed end to end in one
+pass across plan phases R0-R7, nothing deferred except two genuinely bounded, explicitly
+scoped items noted below. The substrate versions the target MODEL; this phase adds the
+missing half — versioned improver artifacts (agent code/prompts/tools/policy) with
+lineage, structured self-edit proposals that apply in sandboxes and roll back in one
+command, a dual promotion gate (model vs. improver) with signed hash-chained
+policy-as-code, frozen content-addressed eval suites a training agent cannot write to,
+capability canaries, budgets and auto-stop, a reviewer gate with role-separated
+identities, causal lineage and strategy memory, a pluggable sandbox executor with tool
+permission manifests and deterministic action replay, and server-side anomaly detection.
+**Release ships as v1.3.1, a deliberate owner decision recorded in `VERSIONING.md`** —
+by the project's own per-surface additive-changes table this overwhelmingly additive
+release would be tagged v1.4.0; the version number departs from that table's literal
+recommendation, nothing else does.
+
+- **R0 — foundations:** new shared module `python/av_cli/casobj.py` (canonical-JSON
+  content addressing: canonicalize/id/write/read/sign/verify) — every new artifact type
+  in this release is a CAS object built on it; `signing.py::canonical_commit_bytes` now
+  delegates to it, byte-identical, golden-fixture-proven. Extracted `core.py::
+  parse_metric_args()`/`resolve_remote()` out of 8+ duplicate copy-paste sites. Fixed
+  three pre-existing bugs the dual-gate work would otherwise have built on top of:
+  `cmd_policy.py`'s baseline walk and `av_sdk/repo.py::diff_semantic()` both read the
+  wrong parent field for local commits (`parent_hash` instead of the real `parents`
+  list — Probleme #129, found via the SDK/CLI parity test), and `~N` ref-ancestry syntax
+  in `baseline_ref` was silently unparsed. Registered `av verify` as a top-level alias
+  (documented for releases, never actually wired into the Click tree). Server-side
+  scoped tokens (`require_scope()`, additive to `AV_AUTH_USERS` — legacy/bare-string
+  entries and `AV_API_TOKEN` resolve to `["*"]`, zero behavior change for any existing
+  deployment) are the actual mechanism behind the held-out eval vault (F.25) and
+  privilege levels (C.12), not a separate system. New exit codes 17-20
+  (`budget_exhausted`/`frozen`/`review_required`/`scope_denied`).
+- **R1 — make self-change explicit (A.1-5, C.11-15, B.9, I.39-40):** `runs.kind ∈
+  {train,meta,scoring,eval}`; `cmd_improver.py` (`av improver register/init/current/use/
+  list/show/lineage/propose/review/apply/rollback/promote`, `av improver policy set/
+  list/remove`); `cmd_canary.py` (`av canary register/list/run/status`); `cmd_freeze.py`
+  (`av freeze on/off/status`, `av incident rollback` = freeze + last-good improver in one
+  command); policy-as-code as a signed, append-only, hash-chained CAS-object log
+  (`av policy pack publish/show/log/verify`) via new sibling file
+  `.av/improver_policy.json` — deliberately NOT merged into `.av/policies.json`'s
+  existing, pinned model-gate schema. Migration `0006`.
+- **R2 — protect the objective (B.6-10, F.25-28):** `cmd_eval.py` (`av eval register/
+  list/show/freeze/score/results/reveal/adapter add|list|run`) — frozen suites reject
+  every mutation server-side (409), the `eval:write`/`scorer` scopes are the actual
+  held-out-vault enforcement (not convention); `cmd_task.py` curriculum proposals;
+  `runs.integrity_signals` (train/eval metric gap computed for real; `eval_only_
+  improvement`/`data_overlap` explicitly stubbed `false`/`null` — an honest gap
+  documented in architecture.md, not silently faked, since computing them needs
+  infrastructure this pass didn't build); `av run start --kind scoring` requires an env
+  snapshot + code pin. Migration `0007`.
+- **R3 — research control (D.16-20):** `cmd_plan.py` (hypotheses/ablations/budget/stop
+  rules as a CAS object); `cmd_budget.py` (`av budget set/show/attach/consume`, exit 17
+  on exhaustion, spend always recorded first); `av run branch-policy set/show/check`
+  (declarative branch/merge/abandon rules, advisory); `av run auto-stop-check` (plateau/
+  divergence/NaN detection, both minimize/maximize); `cmd_scheduler.py` (`av scheduler
+  queue`), `POST /api/runs/{id}/stop`. Migration `0008`.
+- **R4 — multi-agent + strategy memory (E.21-24, H.33-36):** `cmd_lineage.py` (`av
+  lineage link/show`, `av search runs` — structured predicate grammar, no LLM);
+  `cmd_strategy.py`/`cmd_lessons.py`/`cmd_blackboard.py`; `cmd_review.py` (`av review
+  approve/reject`, self-review rejected server-side 422; `av critique add/resolve/
+  waive` — waiving is always audited, the objection stands but is overridden). `reviews`/
+  `critiques` target `{target_type, target_id}` (change_set OR improver) so `av improver
+  promote`'s `require_review` gate checks the CANDIDATE IMPROVER directly. Migration
+  `0009`. Found and fixed Probleme #130 (`av incident rollback` double-JSON-object bug)
+  and #131 (four commands leaking text or disagreeing on exit code between text/JSON
+  mode specifically on a DENY/FAIL outcome — one instance, `av promote`, pre-existing
+  since v1.2.0; also flags an open, deliberately unfixed design question about that
+  command's deny-envelope shape, left for the owner per `VERSIONING.md`'s breaking-change
+  policy).
+- **R5 — hard isolation (G.29-32):** new package `python/av_cli/sandbox/` — one driver
+  protocol (`base.py::SandboxDriver`), `local` (real, synchronous — a subprocess PID
+  isn't a safe handle to re-attach to later, so it runs to completion inside `submit()`)
+  and `docker` (real, asynchronous — a container name IS a persistent handle) fully
+  implemented; `kubernetes`/`slurm` proven via fake-subprocess contract tests mirroring
+  `test_docker_runtime.py`'s established pattern, no live cluster needed. Tool
+  permission manifests (`manifest.py`, fails CLOSED by default) checked before every
+  `submit()`. `python/av_cli/actionlog.py` (`.av/actions.jsonl` → CAS object,
+  `av replay-actions` replays recorded decisions, not just training code). `av sandbox
+  run/status/cancel/logs/queue`, `av tools manifest show/set/verify`. Migration `0010`
+  (head). Found and fixed Probleme #132: `VaultClient.server_available()` genuinely
+  returns `True` when Docker Desktop happens to be running, silently invalidating every
+  test's "no server configured ⇒ unreachable" assumption — root-fixed via a shared
+  `unreachable_client` pytest fixture patching BOTH `python.av_cli.client.VaultClient`
+  and the bare `av_cli.client.VaultClient` (two distinct module objects for the same
+  file — `av_sdk/repo.py` imports the bare form, `core.py` the relative form).
+- **R6 — product surfaces (I.37-38, J.41-46):** `av_sdk.Repo` gained one method per
+  write-capable RSI surface (~35 new methods, typed `SDKError` subclasses throughout;
+  read/list-many endpoints deliberately CLI-only — a documented scope decision, see
+  architecture.md's "RSI SDK Surface Contract"), closing both known pre-existing SDK/CLI
+  divergences (`run_start()` now captures `code_pointer`; `context_note()` now stamps
+  `run_id`, matching `cmd_context.py::note()`). Four server-side anomaly detectors
+  (`metric_jump`, `mass_rewrite`, `policy_change`, `auth_spike`) emit `kind="anomaly"`
+  events through the EXISTING webhook fan-out, no new delivery path. WebUI gained
+  `ImproverPanel`/`CanaryPanel`/`RegressionPanel` (3 new Vitest files). `docs/
+  rsi-operator-guide.md` (the RSI counterpart to `docs/tutorial.md`) and `examples/
+  rsi_loop/agent.py` — a deterministic, no-LLM-key scripted reference agent driving the
+  full loop through `av_sdk.Repo` alone, proven stack-free by `tests/test_rsi_loop.py`.
+- **R7 — contracts, tests, CI, live verification:** 6 new published JSON Schemas
+  (`improver-1.0`, `change-set-1.0`, `policy-pack-1.0`, `eval-suite-1.0`,
+  `tool-manifest-1.0`, `action-log-1.0`); `avh-2.0`'s `lineage` gains `improver_id`
+  (`lessons`/`canaries` deliberately NOT added — `.avh` generation is local-only/offline
+  by design, fetching those needs a network round trip it doesn't make). README/
+  VERSIONING/AGENTS.md/`docs/for-agents.md` all updated, including fixing exit-code
+  tables and a supported-commands list that had gone stale mid-cycle. **Live-verification
+  gate run for real** (not deferred): `pytest tests/test_server.py -v` against a real
+  Postgres/Redis (145/145, after finding and fixing 4 more real bugs — Probleme #133:
+  the test DB truncation list never extended for 20 new RSI tables; the `mass_rewrite`
+  detector never fired because `_summarize_tree_diff()`'s lists are nested under
+  `"files"`; 3 scope-denial tests used an unrestricted token by mistake; a live alembic
+  round trip invalidated the shared connection pool's cached statement plans); a real
+  engine image rebuild + restart (found stale at migration `0005`, auto-migrated to
+  `0010` zero-touch on restart); a complete manual CLI repro of the full RSI loop against
+  the rebuilt live engine (propose→review→apply→sandbox→canary→promote-denied(19)→
+  review→promote-allowed→lessons→budget-exhausted(17)→freeze/rollback, plus a live
+  `metric_jump` anomaly firing within a second of the triggering push);
+  `scripts/e2e_scenario.sh` extended with 6 new phases (**O**-**T**: improver lifecycle,
+  dual-gate deny/allow, canary-blocks-promote, held-out-vault-403, budget-exhaustion,
+  freeze) and run start-to-finish, A through T, discovering and fixing a 6th
+  migration-chain touch point along the way (Phase C's legacy-volume drill hardcoded the
+  expected post-heal alembic head at `"0005"`, stale since `0006`); Playwright extended
+  with `improver.spec.ts` against the real rebuilt webui, 9/12 of the full suite passing
+  (the same "just-restarted engine" transient queued two seed pushes, drained with a
+  plain `av push`, exactly what the queue is for).
+- **Deferred, explicitly and narrowly:** Phase **U** (`AV_E2E_CHAOS=1` — a sandbox job
+  killed mid-execution must leave no partial improver state) — the existing chaos phases
+  L-N are their own more elaborate, separately-gated category and deserved dedicated
+  attention rather than a rushed addition at the tail of an already extensive
+  verification pass. Setting up Protected mode (`AV_API_TOKEN`+`AV_AUTH_USERS`) on the
+  real engine to unblock `webui/e2e/token-gate.spec.ts`'s 3 tests — would mean changing
+  the owner's real dev stack's auth configuration without being asked; left for the
+  owner to do explicitly when wanted.
+
+Essential-Tasks: signed off
+
 Essential-Tasks: signed off

@@ -58,14 +58,9 @@ def commit(
         tags = tuple(tags) + (f"run:{run_id}",) if f"run:{run_id}" not in tags else tags
 
     # --- Build metrics dict ---
-    metrics: dict = {}
-    for raw in metrics_raw:
-        if "=" in raw:
-            k, v = raw.split("=", 1)
-            try:
-                metrics[k.strip()] = float(v) if "." in v else int(v)
-            except ValueError:
-                metrics[k.strip()] = v
+    from .core import parse_metric_args
+
+    metrics: dict = parse_metric_args(metrics_raw)
     if metric_sharpe is not None:
         metrics["sharpe"] = metric_sharpe
     if metric_drawdown is not None:

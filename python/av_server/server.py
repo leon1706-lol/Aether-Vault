@@ -23,13 +23,33 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from .database import async_session_factory, get_session, init_db
 from . import rate_limit
 from .models import (
+    DBActionLog,
     DBAuditLog,
+    DBBlackboardEntry,
+    DBBudget,
+    DBCanaryResult,
+    DBCausalLink,
+    DBChangeSet,
     DBCommit,
+    DBCritique,
+    DBEvalAdapter,
+    DBEvalResult,
+    DBEvalSuite,
     DBEvent,
+    DBImproverVersion,
+    DBLessons,
     DBObject,
+    DBPlan,
+    DBPolicyPack,
+    DBProjectFreeze,
     DBRef,
+    DBReview,
     DBRun,
     DBRunCommit,
+    DBSandboxJob,
+    DBStrategyEntry,
+    DBTask,
+    DBToolManifest,
     DBTree,
     DBWebhook,
     DBWebhookDelivery,
@@ -141,6 +161,15 @@ def _parse_auth_users(raw: str | None) -> dict[str, dict]:
     "<ISO-8601>"} for an optional expiry (`av auth add-user NAME TOKEN --expires-in-days
     N`). Returns {username: {"token": str, "expires_at": str|None}} either way, so every
     downstream reader has one shape to handle.
+
+    v1.3.1: an object value MAY additionally carry "scopes": [str, ...] (`av auth add-user
+    NAME TOKEN --scope <s>` repeatable), restricting that token to specific permissions
+    (see `require_scope()` below). Deliberately NOT added to every entry unconditionally
+    — the returned dict omits the "scopes" key entirely when the raw value didn't specify
+    one, so `test_parse_accepts_a_valid_map`'s exact-shape assertion (and every other
+    caller comparing this dict's shape) stays byte-for-byte unchanged for every payload
+    that predates scopes. Absence is resolved to the unrestricted `["*"]` default by
+    `_scopes_for_identity()`, not baked in here.
     """
     if not raw or not raw.strip():
         return {}
@@ -157,12 +186,17 @@ def _parse_auth_users(raw: str | None) -> dict[str, dict]:
             tok = str(val.get("token", "")).strip()
             expires_at = val.get("expires_at")
             expires_at = str(expires_at).strip() if expires_at else None
+            scopes_raw = val.get("scopes")
         else:
             tok = str(val).strip()
             expires_at = None
+            scopes_raw = None
         if not name or not tok:
             raise RuntimeError("AV_AUTH_USERS entries need non-empty username and token.")
-        users[name] = {"token": tok, "expires_at": expires_at}
+        entry = {"token": tok, "expires_at": expires_at}
+        if isinstance(scopes_raw, list) and scopes_raw:
+            entry["scopes"] = sorted({str(s).strip() for s in scopes_raw if str(s).strip()})
+        users[name] = entry
     return users
 
 
@@ -201,6 +235,26 @@ def _resolve_identity(supplied_token: str) -> str | None:
     return None
 
 
+def _scopes_for_identity(username: str | None) -> list[str]:
+    """v1.3.1: scopes for an already-resolved identity — a second, independent step
+    from `_resolve_identity()` so that function's return shape (and every existing test
+    asserting it) never changes. "owner" (the shared secret, `AV_API_TOKEN`) is always
+    unrestricted. A per-user entry's scopes default to `["*"]` when it declared none
+    (every legacy/bare-string entry, and any entry created before this feature existed)
+    — additive: no existing deployment loses access to anything it could already reach.
+    Tolerates `_AUTH_USERS` values monkeypatched as bare strings (pre-v1.3.0/test style),
+    not just the normalized dict shape `_parse_auth_users()` produces.
+    """
+    if username == "owner":
+        return ["*"]
+    entry = _AUTH_USERS.get(username) if username else None
+    if isinstance(entry, dict):
+        scopes = entry.get("scopes")
+        if isinstance(scopes, list) and scopes:
+            return [str(s) for s in scopes]
+    return ["*"]
+
+
 async def require_token(request: Request, call_next):
     if request.url.path in _AUTH_EXEMPT_PATHS:
         return await call_next(request)
@@ -210,9 +264,51 @@ async def require_token(request: Request, call_next):
     scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
     identity = _resolve_identity(supplied) if scheme.lower() == "bearer" and supplied else None
     if identity is None:
+        client_host = request.client.host if request.client else "unknown"
+        if _note_auth_failure(f"401:{client_host}"):
+            asyncio.create_task(_emit_auth_spike_anomaly(client_host, "unauthenticated"))
         return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
     request.state.username = identity
+    request.state.scopes = _scopes_for_identity(identity)
     return await call_next(request)
+
+
+def require_scope(scope: str):
+    """FastAPI dependency factory (v1.3.1): denies a route unless the caller's token
+    carries `scope` or the wildcard `"*"`.
+
+    In Anonymous mode — or for any token that resolved with no explicit `scopes` list,
+    which by design is every deployment predating this feature — `request.state.scopes`
+    is `["*"]` (see `_scopes_for_identity()`), so this is purely additive: nothing that
+    could already reach a route loses access by that route later declaring a required
+    scope. `request.state.scopes` can only be genuinely absent when Anonymous mode's
+    early return in `require_token()` skipped setting any request.state at all — treated
+    identically to `["*"]` here, for the same reason.
+
+    A denial here is a 403, never `require_token`'s 401: the caller authenticated fine,
+    they just lack this one permission. Recorded as its own `scope.denied` audit action
+    (with the required scope and the path) so "who couldn't even log in" stays
+    distinguishable from "whose token doesn't cover this."
+    """
+    async def _dependency(request: Request, db: AsyncSession = Depends(get_session)) -> None:
+        scopes = getattr(request.state, "scopes", None) or ["*"]
+        if "*" in scopes or scope in scopes:
+            return
+        identity = getattr(request.state, "username", None)
+        _audit(db, identity, "scope.denied", None,
+               {"required_scope": scope, "path": request.url.path}, status_code=403)
+        if _note_auth_failure(f"403:{identity or 'unknown'}"):
+            await _emit_event(db, None, "anomaly", {
+                "type": "auth_spike", "identifier": identity or "unknown",
+                "reason": "scope_denied", "threshold": AV_ANOMALY_AUTH_SPIKE_THRESHOLD,
+                "window_secs": AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS,
+            })
+        await db.commit()
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "scope_denied", "required_scope": scope},
+        )
+    return _dependency
 
 
 # MIDDLEWARE PIPELINE — Starlette runs the LAST-added middleware OUTERMOST, so these
@@ -649,6 +745,8 @@ async def push_commit(
             "author": author,
             "run_id": run_id,
         })
+        await _detect_commit_anomalies(db, project_id, commit_hash, metrics,
+                                       parents[0] if parents else None, root_tree_hash)
         _audit(db, username, "commit.push", project_id,
                {"hash": commit_hash, "message": new_commit.message}, status_code=201)
 
@@ -1295,6 +1393,122 @@ import hmac as hmac_mod  # noqa: E402
 EVENT_RETENTION_DAYS = int(os.environ.get("AV_EVENT_RETENTION_DAYS", "30"))
 _WEBHOOK_TIMEOUT_SECS = 10
 
+# --- v1.3.1 RSI R6 (todo.md I.38, WP-36): server-side anomaly detectors ------------
+#
+# Each detector emits its own `kind="anomaly"` event (payload always carries a `"type"`
+# discriminator) ALONGSIDE whatever event the mutation already emits — a dedicated,
+# low-noise feed a monitoring webhook can subscribe to by kind alone, without filtering
+# the full event stream itself. No new delivery path: `_emit_event()` already fans every
+# event out to active webhooks (see its own docstring above); anomalies ride the exact
+# same mechanism as `commit`/`policy`/`run` events.
+AV_ANOMALY_METRIC_JUMP_RATIO = float(os.environ.get("AV_ANOMALY_METRIC_JUMP_RATIO", "3.0"))
+AV_ANOMALY_MASS_REWRITE_FILES = int(os.environ.get("AV_ANOMALY_MASS_REWRITE_FILES", "200"))
+AV_ANOMALY_AUTH_SPIKE_THRESHOLD = int(os.environ.get("AV_ANOMALY_AUTH_SPIKE_THRESHOLD", "5"))
+AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS = float(os.environ.get("AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS", "60"))
+
+# In-process sliding window of recent auth failures, keyed by client identifier (resolved
+# username for a scope denial; client host for an unauthenticated 401, where no identity
+# exists yet). Intentionally NOT Redis-backed: this is a single-process best-effort
+# signal ("this process just saw a burst"), not a durable security record — the audit
+# log (`_audit()`) already IS the durable record of every individual denial; this only
+# decides when a BURST of them is itself worth a dedicated anomaly event. Resets after
+# tripping so one burst raises exactly one anomaly, not one per subsequent failure.
+_AUTH_FAILURE_WINDOW: dict[str, list[float]] = {}
+
+
+def _note_auth_failure(key: str) -> bool:
+    """Records one auth failure for `key`; returns True the moment this failure pushes
+    the recent count (within the window) over the threshold — the caller emits an
+    anomaly exactly then, and only then."""
+    import time as _time
+
+    now = _time.monotonic()
+    window = _AUTH_FAILURE_WINDOW.setdefault(key, [])
+    window[:] = [t for t in window if now - t < AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS]
+    window.append(now)
+    if len(window) >= AV_ANOMALY_AUTH_SPIKE_THRESHOLD:
+        window.clear()
+        return True
+    return False
+
+
+async def _emit_auth_spike_anomaly(identifier: str, reason: str) -> None:
+    """Called from `require_token`'s 401 branch (raw ASGI middleware, no `db` dependency
+    injected) — opens its own short-lived session, same fire-and-forget shape as
+    `_emit_event()`'s own webhook-delivery task, so a burst of bad tokens never adds
+    latency to the 401 response itself."""
+    try:
+        async with async_session_factory() as session:
+            await _emit_event(session, None, "anomaly", {
+                "type": "auth_spike", "identifier": identifier, "reason": reason,
+                "threshold": AV_ANOMALY_AUTH_SPIKE_THRESHOLD,
+                "window_secs": AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS,
+            })
+            await session.commit()
+    except Exception:  # pragma: no cover — must never surface to the caller
+        logger.exception("auth-spike anomaly emission failed")
+
+
+def _detect_metric_jump(old_metrics: dict | None, new_metrics: dict | None) -> list[dict]:
+    """Flags any metric present in both commits whose magnitude changed by more than
+    `AV_ANOMALY_METRIC_JUMP_RATIO`x — a coarse, dependency-free proxy for "something
+    unusual just happened to training," not a statistical outlier model. `old` == 0 is
+    treated as "any nonzero new value is a jump" rather than dividing by zero."""
+    old_metrics, new_metrics = old_metrics or {}, new_metrics or {}
+    jumps = []
+    for key, new_val in new_metrics.items():
+        old_val = old_metrics.get(key)
+        if not isinstance(new_val, (int, float)) or not isinstance(old_val, (int, float)):
+            continue
+        if old_val == 0:
+            if new_val != 0:
+                jumps.append({"metric": key, "old": old_val, "new": new_val, "ratio": None})
+            continue
+        ratio = abs(new_val - old_val) / abs(old_val)
+        if ratio >= AV_ANOMALY_METRIC_JUMP_RATIO:
+            jumps.append({"metric": key, "old": old_val, "new": new_val, "ratio": ratio})
+    return jumps
+
+
+async def _detect_commit_anomalies(db: AsyncSession, project_id: str, commit_hash: str,
+                                   metrics: dict, parent_hash: str | None,
+                                   new_tree_hash: str | None) -> None:
+    """Best-effort: metric-jump and mass-rewrite detection against the parent commit.
+    Never raises — a detector failing must never fail the commit it's inspecting."""
+    if not parent_hash:
+        return
+    try:
+        parent = (await db.execute(
+            select(DBCommit).where(DBCommit.hash == parent_hash)
+        )).scalar_one_or_none()
+        if parent is None:
+            return
+        for jump in _detect_metric_jump(parent.metrics, metrics):
+            await _emit_event(db, project_id, "anomaly", {
+                "type": "metric_jump", "commit_hash": commit_hash,
+                "parent_hash": parent_hash, **jump,
+            })
+        if parent.root_tree_hash and new_tree_hash:
+            old_tree = await resolve_tree(db, parent.root_tree_hash)
+            new_tree = await resolve_tree(db, new_tree_hash)
+            diff = _summarize_tree_diff(old_tree, new_tree)
+            # v1.3.1 WP-44 fix (found live): _summarize_tree_diff() nests these three
+            # lists under "files" (`{"files": {"added": [...], ...}}`) — reading them as
+            # top-level keys always returned [], so changed_count was always 0 and this
+            # detector never fired, on any input, ever (metric_jump's own detector sits
+            # right above this and was unaffected, which is why unit tests never caught
+            # this: no stack-free test exercises the live tree-diff path this reuses).
+            diff_files = diff.get("files") or {}
+            changed_count = (len(diff_files.get("added") or []) + len(diff_files.get("removed") or [])
+                            + len(diff_files.get("changed") or []))
+            if changed_count >= AV_ANOMALY_MASS_REWRITE_FILES:
+                await _emit_event(db, project_id, "anomaly", {
+                    "type": "mass_rewrite", "commit_hash": commit_hash,
+                    "parent_hash": parent_hash, "changed_files": changed_count,
+                })
+    except Exception:  # pragma: no cover — a detector bug must never break a push
+        logger.exception("anomaly detection failed for commit %s", commit_hash)
+
 
 async def _emit_event(db: AsyncSession, project_id: str | None, kind: str, payload: dict | None):
     """Appends one event row (flushed so the cursor id exists) and schedules signed
@@ -1614,23 +1828,36 @@ async def create_run(request: Request, run: Dict[str, Any] = Body(...),
     if exists:
         return {"status": "exists", "id": exists.id}  # idempotent create (multi-agent safe)
     now = utcnow_naive()
+    # v1.3.1 (RSI R1, todo.md A.1): kind ∈ {train, meta, scoring, eval} — a "meta" run
+    # improves the improver itself, not the target model. Server-side validation (not just
+    # a CLI click.Choice) because SDK/plugin callers post here directly too. Unknown kinds
+    # fall back to "train" rather than 422ing — additive default, never a hard break for
+    # an older/other-language client that starts sending its own custom kind string.
+    kind = run.get("kind") or "train"
+    if kind not in ("train", "meta", "scoring", "eval"):
+        kind = "train"
     db_run = DBRun(
         id=run_id, project_id=project_id, name=run.get("name"),
-        status="running", parent_run_id=run.get("parent_run_id"),
+        status="running", kind=kind, improver_id=run.get("improver_id"),
+        parent_run_id=run.get("parent_run_id"),
         created_by=_identity(request), config_hash=run.get("config_hash"),
         code_pointer=run.get("code_pointer"), env_snapshot_id=run.get("env_snapshot_id"),
         created_at=now, updated_at=now,
     )
     db.add(db_run)
-    await _emit_event(db, project_id, "run", {"action": "started", "run_id": run_id, "name": run.get("name")})
-    _audit(db, _identity(request), "run.create", project_id, {"run_id": run_id}, status_code=201)
+    await _emit_event(db, project_id, "run",
+                      {"action": "started", "run_id": run_id, "name": run.get("name"),
+                       "kind": kind})
+    _audit(db, _identity(request), "run.create", project_id,
+           {"run_id": run_id, "kind": kind}, status_code=201)
     await db.commit()
     return {"status": "created", "id": run_id}
 
 
 @app.get("/api/runs")
 async def list_runs(project_id: Optional[str] = None, status: Optional[str] = None,
-                    parent_run_id: Optional[str] = None, limit: int = 50, offset: int = 0,
+                    parent_run_id: Optional[str] = None, kind: Optional[str] = None,
+                    limit: int = 50, offset: int = 0,
                     db: AsyncSession = Depends(get_session)):
     stmt = select(DBRun).order_by(DBRun.created_at.desc())
     if project_id:
@@ -1639,6 +1866,8 @@ async def list_runs(project_id: Optional[str] = None, status: Optional[str] = No
         stmt = stmt.where(DBRun.status == status)
     if parent_run_id:
         stmt = stmt.where(DBRun.parent_run_id == parent_run_id)
+    if kind:  # v1.3.1
+        stmt = stmt.where(DBRun.kind == kind)
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
     rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"runs": [_run_to_dict(r) for r in rows], "total": total,
@@ -1648,10 +1877,13 @@ async def list_runs(project_id: Optional[str] = None, status: Optional[str] = No
 def _run_to_dict(r: DBRun) -> dict:
     return {
         "id": r.id, "project_id": r.project_id, "name": r.name, "status": r.status,
+        "kind": r.kind, "improver_id": r.improver_id,
         "parent_run_id": r.parent_run_id, "created_by": r.created_by,
         "code_pointer": r.code_pointer, "env_snapshot_id": r.env_snapshot_id,
         "avh_object_id": r.avh_object_id,
         "policy_outcome": r.policy_outcome,
+        "integrity_signals": r.integrity_signals,
+        "plan_id": r.plan_id, "budget_id": r.budget_id, "stop_reason": r.stop_reason,
         "metrics_summary": r.metrics_summary or {},
         "created_at": r.created_at.isoformat() if r.created_at else None,
         "completed_at": r.completed_at.isoformat() if r.completed_at else None,
@@ -1996,6 +2228,68 @@ async def set_run_policy_outcome(run_id: str, request: Request,
     return {"status": "recorded", "run_id": run_id, "policy_outcome": outcome}
 
 
+@app.post("/api/runs/{run_id}/integrity-signals")
+async def set_run_integrity_signals(run_id: str, request: Request,
+                                    body: Dict[str, Any] = Body(...),
+                                    db: AsyncSession = Depends(get_session)):
+    """v1.3.1 (RSI R2, todo.md B.10): records metric-gaming detection signals for a run —
+    `av run integrity-check` computes these client-side (train/eval metric gap, eval-only
+    improvement, data overlap) and reports them here, same best-effort telemetry contract
+    as `policy-outcome` above: never a gate, a reporting failure never blocks anything."""
+    signals = body.get("signals")
+    if not isinstance(signals, dict):
+        raise HTTPException(status_code=422, detail="signals must be a JSON object")
+    r = await _fetch_run(db, run_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    r.integrity_signals = signals
+    r.updated_at = utcnow_naive()
+    _audit(db, _identity(request), "run.integrity_signals", r.project_id,
+          {"run_id": run_id}, status_code=200)
+    await db.commit()
+    return {"status": "recorded", "run_id": run_id, "integrity_signals": signals}
+
+
+@app.post("/api/runs/{run_id}/plan")
+async def link_run_plan(run_id: str, request: Request, body: Dict[str, Any] = Body(...),
+                        db: AsyncSession = Depends(get_session)):
+    """v1.3.1 (RSI R3, todo.md D.16): attaches an experiment plan to a run — can happen
+    at `av run start --plan ID` or any time after via `av plan attach`, since planning
+    legitimately happens both before and mid-run."""
+    plan_id = body.get("plan_id")
+    r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    plan = (await db.execute(select(DBPlan).where(DBPlan.id == plan_id))).scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=422, detail=f"Unknown plan: {plan_id}")
+    r.plan_id = plan_id
+    r.updated_at = utcnow_naive()
+    _audit(db, _identity(request), "run.plan_attach", r.project_id,
+          {"run_id": run_id, "plan_id": plan_id}, status_code=200)
+    await db.commit()
+    return {"status": "linked", "run_id": run_id, "plan_id": plan_id}
+
+
+@app.post("/api/runs/{run_id}/budget")
+async def link_run_budget(run_id: str, request: Request, body: Dict[str, Any] = Body(...),
+                          db: AsyncSession = Depends(get_session)):
+    """Attaches a budget account to a run, same optional/anytime pattern as plan linking."""
+    budget_id = body.get("budget_id")
+    r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    budget = (await db.execute(select(DBBudget).where(DBBudget.id == budget_id))).scalar_one_or_none()
+    if not budget:
+        raise HTTPException(status_code=422, detail=f"Unknown budget: {budget_id}")
+    r.budget_id = budget_id
+    r.updated_at = utcnow_naive()
+    _audit(db, _identity(request), "run.budget_attach", r.project_id,
+          {"run_id": run_id, "budget_id": budget_id}, status_code=200)
+    await db.commit()
+    return {"status": "linked", "run_id": run_id, "budget_id": budget_id}
+
+
 @app.post("/api/runs/{run_id}/avh")
 async def link_run_avh(run_id: str, request: Request,
                        body: Dict[str, Any] = Body(...),
@@ -2052,6 +2346,1485 @@ async def _finish_run(run_id: str, request: Request, status: str, body: dict, db
     _audit(db, _identity(request), f"run.{status}", r.project_id, {"run_id": run_id}, status_code=200)
     await db.commit()
     return {"status": status, "id": run_id}
+
+
+# ---------------------------------------------------------------------------
+# RSI R1 (v1.3.1, migration 0006): improver versioning, self-edit change sets, signed
+# policy packs, capability canaries, project freeze. See development/architecture.md's
+# Improver Artifact / Dual-Gate Promotion / Project Freeze contract sections.
+#
+# Every artifact row here indexes a CAS object (`python/av_cli/casobj.py`) uploaded
+# through the normal `POST /api/objects/{hash}` flow BEFORE this call — mirrors
+# `link_run_avh()`'s existing "must already exist" check above, not a new pattern.
+# ---------------------------------------------------------------------------
+
+async def _object_exists(db: AsyncSession, object_id: str) -> bool:
+    return bool((await db.execute(
+        select(DBObject.hash).where(DBObject.hash == object_id)
+    )).scalar_one_or_none())
+
+
+def _require_uploaded_object_id(field: str, object_id: Optional[str]) -> str:
+    if not object_id or not re.match(r"^[a-f0-9]{64}$", object_id):
+        raise HTTPException(status_code=422, detail=f"{field} must be a sha256 hex hash")
+    return object_id
+
+
+# --- Improver versions -------------------------------------------------------
+
+@app.post("/api/improvers", dependencies=[Depends(require_scope("improver:write"))])
+async def create_improver_version(request: Request, body: Dict[str, Any] = Body(...),
+                                  db: AsyncSession = Depends(get_session)):
+    """Registers one improver version — idempotent by client-generated id, same
+    lazy/ordering-safe contract as `POST /api/runs`."""
+    improver_id = body.get("id") or _new_uuid()
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    manifest_object_id = _require_uploaded_object_id("manifest_object_id", body.get("manifest_object_id"))
+    exists = (await db.execute(
+        select(DBImproverVersion).where(DBImproverVersion.id == improver_id)
+    )).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}
+    if not await _object_exists(db, manifest_object_id):
+        raise HTTPException(status_code=422,
+                            detail="manifest_object_id must reference an already-uploaded "
+                                   "object (POST /api/objects/{hash} first)")
+    row = DBImproverVersion(
+        id=improver_id, project_id=project_id, manifest_object_id=manifest_object_id,
+        parent_id=body.get("parent_id"), created_by=_identity(request),
+        created_at=utcnow_naive(),
+    )
+    db.add(row)
+    await _emit_event(db, project_id, "improver",
+                      {"action": "registered", "improver_id": improver_id,
+                       "parent_id": row.parent_id})
+    _audit(db, _identity(request), "improver.register", project_id,
+           {"improver_id": improver_id, "parent_id": row.parent_id}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": improver_id}
+
+
+def _improver_to_dict(r: DBImproverVersion) -> dict:
+    return {"id": r.id, "project_id": r.project_id,
+            "manifest_object_id": r.manifest_object_id, "parent_id": r.parent_id,
+            "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/improvers")
+async def list_improver_versions(project_id: Optional[str] = None, limit: int = 50,
+                                 offset: int = 0, db: AsyncSession = Depends(get_session)):
+    stmt = select(DBImproverVersion).order_by(DBImproverVersion.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBImproverVersion.project_id == project_id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    return {"improvers": [_improver_to_dict(r) for r in rows], "total": total,
+            "limit": limit, "offset": offset}
+
+
+async def _fetch_improver(db: AsyncSession, improver_id: str) -> Optional[DBImproverVersion]:
+    return (await db.execute(
+        select(DBImproverVersion).where(DBImproverVersion.id == improver_id)
+    )).scalar_one_or_none()
+
+
+@app.get("/api/improvers/{improver_id}")
+async def get_improver_version(improver_id: str, db: AsyncSession = Depends(get_session)):
+    row = await _fetch_improver(db, improver_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Improver version not found")
+    return _improver_to_dict(row)
+
+
+_IMPROVER_LINEAGE_MAX_DEPTH = 500
+
+
+@app.get("/api/improvers/{improver_id}/lineage")
+async def get_improver_lineage(improver_id: str, depth: int = 50, cursor: Optional[str] = None,
+                               db: AsyncSession = Depends(get_session)):
+    """Parent-chain walk, depth/cursor-bounded with a cycle guard — same shape as
+    `GET /api/runs/{id}/lineage` (see that endpoint's docstring for the paging contract)."""
+    r = await _fetch_improver(db, improver_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Improver version not found")
+    if depth < 1 or depth > _IMPROVER_LINEAGE_MAX_DEPTH:
+        raise HTTPException(status_code=422,
+                            detail=f"depth must be between 1 and {_IMPROVER_LINEAGE_MAX_DEPTH}")
+
+    node = r if not cursor else await _fetch_improver(db, cursor)
+    if cursor and node is None:
+        raise HTTPException(status_code=422, detail=f"Invalid cursor: unknown improver {cursor!r}")
+
+    chain: list = []
+    seen: set = set()
+    while len(chain) < depth:
+        if node is None or node.id in seen:
+            node = None
+            break
+        seen.add(node.id)
+        chain.append(_improver_to_dict(node))
+        if not node.parent_id:
+            node = None
+            break
+        node = await _fetch_improver(db, node.parent_id)
+
+    next_cursor = node.id if (len(chain) == depth and node is not None) else None
+    return {"improver_id": improver_id, "lineage": chain, "next_cursor": next_cursor}
+
+
+# --- Change sets (self-edit proposals) ---------------------------------------
+
+@app.post("/api/change-sets", dependencies=[Depends(require_scope("improver:write"))])
+async def create_change_set(request: Request, body: Dict[str, Any] = Body(...),
+                            db: AsyncSession = Depends(get_session)):
+    cs_id = body.get("id") or _new_uuid()
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
+    exists = (await db.execute(select(DBChangeSet).where(DBChangeSet.id == cs_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}
+    if not await _object_exists(db, object_id):
+        raise HTTPException(status_code=422,
+                            detail="object_id must reference an already-uploaded object "
+                                   "(POST /api/objects/{hash} first)")
+    risk = body.get("risk")
+    if risk is not None and risk not in ("low", "medium", "high"):
+        raise HTTPException(status_code=422, detail="risk must be one of low/medium/high")
+    now = utcnow_naive()
+    row = DBChangeSet(
+        id=cs_id, project_id=project_id, improver_id=body.get("improver_id"),
+        object_id=object_id, status="proposed", risk=risk,
+        created_by=_identity(request), created_at=now, updated_at=now,
+    )
+    db.add(row)
+    await _emit_event(db, project_id, "change_set",
+                      {"action": "proposed", "change_set_id": cs_id, "risk": risk})
+    _audit(db, _identity(request), "improver.propose", project_id,
+          {"change_set_id": cs_id, "risk": risk}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": cs_id}
+
+
+def _change_set_to_dict(r: DBChangeSet) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "improver_id": r.improver_id,
+            "object_id": r.object_id, "status": r.status, "risk": r.risk,
+            "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None}
+
+
+@app.get("/api/change-sets")
+async def list_change_sets(project_id: Optional[str] = None, status: Optional[str] = None,
+                           improver_id: Optional[str] = None, limit: int = 50, offset: int = 0,
+                           db: AsyncSession = Depends(get_session)):
+    stmt = select(DBChangeSet).order_by(DBChangeSet.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBChangeSet.project_id == project_id)
+    if status:
+        stmt = stmt.where(DBChangeSet.status == status)
+    if improver_id:
+        stmt = stmt.where(DBChangeSet.improver_id == improver_id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    return {"change_sets": [_change_set_to_dict(r) for r in rows], "total": total,
+            "limit": limit, "offset": offset}
+
+
+@app.get("/api/change-sets/{cs_id}")
+async def get_change_set(cs_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBChangeSet).where(DBChangeSet.id == cs_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Change set not found")
+    return _change_set_to_dict(row)
+
+
+_CHANGE_SET_TRANSITIONS = {
+    "proposed": {"approved", "rejected"},
+    "approved": {"applied", "rejected"},
+    "applied": {"rolled_back"},
+    "rejected": set(),
+    "rolled_back": set(),
+}
+
+
+@app.post("/api/change-sets/{cs_id}/status",
+         dependencies=[Depends(require_scope("improver:write"))])
+async def update_change_set_status(cs_id: str, request: Request,
+                                   body: Dict[str, Any] = Body(...),
+                                   db: AsyncSession = Depends(get_session)):
+    """Transitions a change set's lifecycle state. Only the transitions declared in
+    `_CHANGE_SET_TRANSITIONS` are legal (proposed -> approved|rejected -> applied ->
+    rolled_back) — an illegal jump (e.g. straight to "applied") is a 422, not a silent
+    overwrite, so `av improver apply` can never apply something nobody approved."""
+    new_status = body.get("status")
+    row = (await db.execute(select(DBChangeSet).where(DBChangeSet.id == cs_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Change set not found")
+    allowed = _CHANGE_SET_TRANSITIONS.get(row.status, set())
+    if new_status not in allowed:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Cannot transition change set from '{row.status}' to '{new_status!r}' "
+                   f"(allowed: {sorted(allowed) or 'none — terminal state'})",
+        )
+    row.status = new_status
+    row.updated_at = utcnow_naive()
+    await _emit_event(db, row.project_id, "change_set",
+                      {"action": new_status, "change_set_id": cs_id})
+    _audit(db, _identity(request), f"improver.{new_status}", row.project_id,
+          {"change_set_id": cs_id}, status_code=200)
+    await db.commit()
+    return {"status": "updated", "id": cs_id, "new_status": new_status}
+
+
+# --- Policy packs (signed, hash-chained, append-only) ------------------------
+
+@app.post("/api/policy-packs", dependencies=[Depends(require_scope("policy:write"))])
+async def create_policy_pack(request: Request, body: Dict[str, Any] = Body(...),
+                             db: AsyncSession = Depends(get_session)):
+    """Publishes one signed policy pack onto the project's append-only chain.
+
+    `chain_hash = sha256(f"{prev_id or ''}:{object_id}")` — each pack cryptographically
+    commits to its predecessor, so the SEQUENCE of promotion-rule changes is tamper-
+    evident (not just each pack's own signature), the same "detect silent history
+    rewrites" property an append-only audit log gives you. There is deliberately no
+    PUT/DELETE route for this table — publishing a new pack is the only mutation."""
+    pack_id = body.get("id") or _new_uuid()
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
+    exists = (await db.execute(select(DBPolicyPack).where(DBPolicyPack.id == pack_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}
+    if not await _object_exists(db, object_id):
+        raise HTTPException(status_code=422,
+                            detail="object_id must reference an already-uploaded object "
+                                   "(POST /api/objects/{hash} first)")
+    prev_id = body.get("prev_id")
+    if prev_id:
+        prev_exists = (await db.execute(
+            select(DBPolicyPack.id).where(DBPolicyPack.id == prev_id)
+        )).scalar_one_or_none()
+        if not prev_exists:
+            raise HTTPException(status_code=422,
+                                detail=f"prev_id {prev_id!r} is not a known policy pack")
+    chain_hash = hashlib.sha256(f"{prev_id or ''}:{object_id}".encode()).hexdigest()
+    row = DBPolicyPack(
+        id=pack_id, project_id=project_id, object_id=object_id, prev_id=prev_id,
+        chain_hash=chain_hash, published_by=_identity(request), created_at=utcnow_naive(),
+    )
+    db.add(row)
+    await _emit_event(db, project_id, "policy",
+                      {"action": "published", "policy_pack_id": pack_id, "prev_id": prev_id})
+    # A policy change is itself a security-relevant signal worth a dedicated anomaly
+    # feed, regardless of direction (tightened or loosened) — a monitoring webhook
+    # watching `kind=anomaly` alone should never miss "the promotion rules just changed."
+    await _emit_event(db, project_id, "anomaly", {
+        "type": "policy_change", "policy_pack_id": pack_id, "prev_id": prev_id,
+    })
+    _audit(db, _identity(request), "policy.pack_publish", project_id,
+          {"policy_pack_id": pack_id, "prev_id": prev_id, "chain_hash": chain_hash},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": pack_id, "chain_hash": chain_hash}
+
+
+def _policy_pack_to_dict(r: DBPolicyPack) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "object_id": r.object_id,
+            "prev_id": r.prev_id, "chain_hash": r.chain_hash,
+            "published_by": r.published_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/policy-packs")
+async def list_policy_packs(project_id: Optional[str] = None, limit: int = 50, offset: int = 0,
+                            db: AsyncSession = Depends(get_session)):
+    stmt = select(DBPolicyPack).order_by(DBPolicyPack.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBPolicyPack.project_id == project_id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    return {"policy_packs": [_policy_pack_to_dict(r) for r in rows], "total": total,
+            "limit": limit, "offset": offset}
+
+
+@app.get("/api/policy-packs/latest")
+async def get_latest_policy_pack(project_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(
+        select(DBPolicyPack).where(DBPolicyPack.project_id == project_id)
+        .order_by(DBPolicyPack.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="No policy pack published for this project")
+    return _policy_pack_to_dict(row)
+
+
+@app.get("/api/policy-packs/{pack_id}")
+async def get_policy_pack(pack_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBPolicyPack).where(DBPolicyPack.id == pack_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Policy pack not found")
+    return _policy_pack_to_dict(row)
+
+
+# --- Capability canaries ------------------------------------------------------
+
+@app.post("/api/canary-results")
+async def report_canary_result(request: Request, body: Dict[str, Any] = Body(...),
+                               db: AsyncSession = Depends(get_session)):
+    project_id = body.get("project_id")
+    improver_id = body.get("improver_id")
+    suite_object_id = _require_uploaded_object_id("suite_object_id", body.get("suite_object_id"))
+    if not project_id or not improver_id:
+        raise HTTPException(status_code=422, detail="project_id and improver_id are required")
+    if not await _object_exists(db, suite_object_id):
+        raise HTTPException(status_code=422,
+                            detail="suite_object_id must reference an already-uploaded "
+                                   "object (POST /api/objects/{hash} first)")
+    passed = bool(body.get("passed"))
+    row = DBCanaryResult(
+        project_id=project_id, improver_id=improver_id, suite_object_id=suite_object_id,
+        passed=passed, details=body.get("details"), run_id=body.get("run_id"),
+        created_at=utcnow_naive(),
+    )
+    db.add(row)
+    await db.flush()
+    await _emit_event(db, project_id, "canary",
+                      {"action": "recorded", "improver_id": improver_id, "passed": passed,
+                       "canary_result_id": row.id})
+    _audit(db, _identity(request), "canary.run", project_id,
+          {"improver_id": improver_id, "passed": passed}, status_code=201)
+    await db.commit()
+    return {"status": "recorded", "id": row.id, "passed": passed}
+
+
+def _canary_result_to_dict(r: DBCanaryResult) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "improver_id": r.improver_id,
+            "suite_object_id": r.suite_object_id, "passed": r.passed,
+            "details": r.details, "run_id": r.run_id,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/canary-results")
+async def list_canary_results(project_id: Optional[str] = None, improver_id: Optional[str] = None,
+                              limit: int = 50, offset: int = 0,
+                              db: AsyncSession = Depends(get_session)):
+    stmt = select(DBCanaryResult).order_by(DBCanaryResult.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBCanaryResult.project_id == project_id)
+    if improver_id:
+        stmt = stmt.where(DBCanaryResult.improver_id == improver_id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    return {"canary_results": [_canary_result_to_dict(r) for r in rows], "total": total,
+            "limit": limit, "offset": offset}
+
+
+# --- Project freeze (kill-switch) ---------------------------------------------
+
+def _freeze_to_dict(project_id: str, row: Optional[DBProjectFreeze]) -> dict:
+    if row is None:
+        return {"project_id": project_id, "frozen": False, "reason": None,
+                "frozen_by": None, "frozen_at": None}
+    return {"project_id": row.project_id, "frozen": row.frozen, "reason": row.reason,
+            "frozen_by": row.frozen_by,
+            "frozen_at": row.frozen_at.isoformat() if row.frozen_at else None}
+
+
+@app.get("/api/freeze/{project_id}")
+async def get_freeze_state(project_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(
+        select(DBProjectFreeze).where(DBProjectFreeze.project_id == project_id)
+    )).scalar_one_or_none()
+    return _freeze_to_dict(project_id, row)
+
+
+@app.post("/api/freeze/{project_id}", dependencies=[Depends(require_scope("admin"))])
+async def set_freeze_state(project_id: str, request: Request, body: Dict[str, Any] = Body(...),
+                           db: AsyncSession = Depends(get_session)):
+    """Global per-project kill-switch (todo.md C.15/I.40): while frozen, `_AuthRetryGroup`
+    (client-side) AND this scope-gated route (server-side) both refuse every write except
+    reads and rollback — a compromised or rogue local client can't just skip the client-
+    side check. Requires the `admin` scope so an improver-level identity can never
+    freeze/unfreeze its own promotion gate."""
+    frozen = bool(body.get("frozen"))
+    row = (await db.execute(
+        select(DBProjectFreeze).where(DBProjectFreeze.project_id == project_id)
+    )).scalar_one_or_none()
+    now = utcnow_naive()
+    if row is None:
+        row = DBProjectFreeze(project_id=project_id, frozen=frozen, reason=body.get("reason"),
+                              frozen_by=_identity(request) if frozen else None,
+                              frozen_at=now if frozen else None, updated_at=now)
+        db.add(row)
+    else:
+        row.frozen = frozen
+        row.reason = body.get("reason") if frozen else None
+        row.frozen_by = _identity(request) if frozen else None
+        row.frozen_at = now if frozen else None
+        row.updated_at = now
+    await _emit_event(db, project_id, "freeze",
+                      {"action": "frozen" if frozen else "unfrozen", "reason": row.reason})
+    _audit(db, _identity(request), "freeze.set", project_id,
+          {"frozen": frozen, "reason": row.reason}, status_code=200)
+    await db.commit()
+    return _freeze_to_dict(project_id, row)
+
+
+# ---------------------------------------------------------------------------
+# RSI R2 (v1.3.1, migration 0007): task/eval registry, eval integrity, held-out eval
+# vault, blind scoring, external adapters. See development/architecture.md's
+# Eval Registry & Integrity contract section.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/eval/suites", dependencies=[Depends(require_scope("eval:write"))])
+async def create_eval_suite(request: Request, body: Dict[str, Any] = Body(...),
+                            db: AsyncSession = Depends(get_session)):
+    suite_id = body.get("id") or _new_uuid()
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
+    exists = (await db.execute(select(DBEvalSuite).where(DBEvalSuite.id == suite_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}
+    if not await _object_exists(db, object_id):
+        raise HTTPException(status_code=422,
+                            detail="object_id must reference an already-uploaded object "
+                                   "(POST /api/objects/{hash} first)")
+    now = utcnow_naive()
+    row = DBEvalSuite(id=suite_id, project_id=project_id, object_id=object_id,
+                      name=body.get("name"), blind=bool(body.get("blind")),
+                      created_by=_identity(request), created_at=now, updated_at=now)
+    db.add(row)
+    await _emit_event(db, project_id, "eval",
+                      {"action": "suite_registered", "suite_id": suite_id})
+    _audit(db, _identity(request), "eval.register", project_id, {"suite_id": suite_id},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": suite_id}
+
+
+def _eval_suite_to_dict(r: DBEvalSuite) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "object_id": r.object_id,
+            "name": r.name, "frozen": r.frozen, "blind": r.blind,
+            "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/eval/suites")
+async def list_eval_suites(project_id: Optional[str] = None, limit: int = 50, offset: int = 0,
+                           db: AsyncSession = Depends(get_session)):
+    stmt = select(DBEvalSuite).order_by(DBEvalSuite.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBEvalSuite.project_id == project_id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    return {"suites": [_eval_suite_to_dict(r) for r in rows], "total": total,
+            "limit": limit, "offset": offset}
+
+
+async def _fetch_eval_suite(db: AsyncSession, suite_id: str) -> Optional[DBEvalSuite]:
+    return (await db.execute(select(DBEvalSuite).where(DBEvalSuite.id == suite_id))).scalar_one_or_none()
+
+
+@app.get("/api/eval/suites/{suite_id}")
+async def get_eval_suite(suite_id: str, db: AsyncSession = Depends(get_session)):
+    row = await _fetch_eval_suite(db, suite_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Eval suite not found")
+    return _eval_suite_to_dict(row)
+
+
+@app.put("/api/eval/suites/{suite_id}", dependencies=[Depends(require_scope("eval:write"))])
+async def update_eval_suite(suite_id: str, request: Request, body: Dict[str, Any] = Body(...),
+                            db: AsyncSession = Depends(get_session)):
+    """todo.md B.7 (eval immutability locks): rejects ANY mutation of a frozen suite with
+    409 — a training run may not modify the eval it's scored against, enforced here
+    server-side rather than by convention."""
+    row = await _fetch_eval_suite(db, suite_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Eval suite not found")
+    if row.frozen:
+        raise HTTPException(status_code=409, detail="Eval suite is frozen and cannot be modified")
+    if "object_id" in body:
+        object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
+        if not await _object_exists(db, object_id):
+            raise HTTPException(status_code=422,
+                                detail="object_id must reference an already-uploaded object")
+        row.object_id = object_id
+    if "name" in body:
+        row.name = body["name"]
+    if "blind" in body:
+        row.blind = bool(body["blind"])
+    row.updated_at = utcnow_naive()
+    _audit(db, _identity(request), "eval.update", row.project_id, {"suite_id": suite_id},
+          status_code=200)
+    await db.commit()
+    return _eval_suite_to_dict(row)
+
+
+@app.post("/api/eval/suites/{suite_id}/freeze", dependencies=[Depends(require_scope("eval:write"))])
+async def freeze_eval_suite(suite_id: str, request: Request,
+                            db: AsyncSession = Depends(get_session)):
+    row = await _fetch_eval_suite(db, suite_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Eval suite not found")
+    row.frozen = True
+    row.updated_at = utcnow_naive()
+    await _emit_event(db, row.project_id, "eval", {"action": "suite_frozen", "suite_id": suite_id})
+    _audit(db, _identity(request), "eval.freeze", row.project_id, {"suite_id": suite_id},
+          status_code=200)
+    await db.commit()
+    return _eval_suite_to_dict(row)
+
+
+# --- Eval results (the held-out vault + blind scoring) ------------------------
+
+@app.post("/api/eval/results", dependencies=[Depends(require_scope("scorer"))])
+async def create_eval_result(request: Request, body: Dict[str, Any] = Body(...),
+                             db: AsyncSession = Depends(get_session)):
+    """todo.md F.25 (held-out eval vault): requiring the `scorer` scope IS the
+    enforcement — a trainer's token (no `scorer` scope) is rejected here with 403,
+    regardless of which project it targets. No separate mechanism is needed: point a
+    training agent's token at one project and a scorer's token at another (or the same
+    project with different tokens) and this route is the actual vault wall."""
+    project_id = body.get("project_id")
+    suite_id = body.get("suite_id")
+    if not project_id or not suite_id:
+        raise HTTPException(status_code=422, detail="project_id and suite_id are required")
+    suite = await _fetch_eval_suite(db, suite_id)
+    if not suite:
+        raise HTTPException(status_code=422, detail=f"Unknown eval suite: {suite_id}")
+    row = DBEvalResult(
+        project_id=project_id, suite_id=suite_id, run_id=body.get("run_id"),
+        score=body.get("score"), details=body.get("details"),
+        revealed=not suite.blind, scored_by=_identity(request), created_at=utcnow_naive(),
+    )
+    db.add(row)
+    await db.flush()
+    await _emit_event(db, project_id, "eval",
+                      {"action": "scored", "suite_id": suite_id, "eval_result_id": row.id,
+                       "run_id": row.run_id})
+    _audit(db, _identity(request), "eval.score", project_id,
+          {"suite_id": suite_id, "eval_result_id": row.id}, status_code=201)
+    await db.commit()
+    return {"status": "recorded", "id": row.id, "revealed": row.revealed}
+
+
+def _eval_result_to_dict(r: DBEvalResult, redact: bool) -> dict:
+    """`redact=True` (a non-scorer reader against an unrevealed blind result) hides the
+    score/details entirely — the reader learns a result EXISTS, not its VALUE. This is
+    todo.md F.26 (blind/delayed scoring): the agent sees training metrics live, the final
+    held-out score only after reveal."""
+    if redact and not r.revealed:
+        return {"id": r.id, "project_id": r.project_id, "suite_id": r.suite_id,
+                "run_id": r.run_id, "revealed": False, "score": None, "details": None}
+    return {"id": r.id, "project_id": r.project_id, "suite_id": r.suite_id,
+            "run_id": r.run_id, "revealed": r.revealed, "score": r.score,
+            "details": r.details, "scored_by": r.scored_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/eval/results")
+async def list_eval_results(request: Request, project_id: Optional[str] = None,
+                            suite_id: Optional[str] = None, run_id: Optional[str] = None,
+                            limit: int = 50, offset: int = 0,
+                            db: AsyncSession = Depends(get_session)):
+    stmt = select(DBEvalResult).order_by(DBEvalResult.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBEvalResult.project_id == project_id)
+    if suite_id:
+        stmt = stmt.where(DBEvalResult.suite_id == suite_id)
+    if run_id:
+        stmt = stmt.where(DBEvalResult.run_id == run_id)
+    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
+    scopes = getattr(request.state, "scopes", None) or ["*"]
+    redact = not ("*" in scopes or "scorer" in scopes)
+    return {"eval_results": [_eval_result_to_dict(r, redact) for r in rows], "total": total,
+            "limit": limit, "offset": offset}
+
+
+@app.post("/api/eval/results/{result_id}/reveal", dependencies=[Depends(require_scope("scorer"))])
+async def reveal_eval_result(result_id: int, request: Request,
+                             db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBEvalResult).where(DBEvalResult.id == result_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Eval result not found")
+    row.revealed = True
+    await _emit_event(db, row.project_id, "eval",
+                      {"action": "revealed", "eval_result_id": result_id})
+    _audit(db, _identity(request), "eval.reveal", row.project_id,
+          {"eval_result_id": result_id}, status_code=200)
+    await db.commit()
+    return _eval_result_to_dict(row, redact=False)
+
+
+# --- External eval adapters (todo.md F.27) ------------------------------------
+
+@app.post("/api/eval/adapters", dependencies=[Depends(require_scope("eval:write"))])
+async def create_eval_adapter(request: Request, body: Dict[str, Any] = Body(...),
+                              db: AsyncSession = Depends(get_session)):
+    adapter_id = body.get("id") or _new_uuid()
+    project_id = body.get("project_id")
+    name = body.get("name")
+    command = body.get("command")
+    if not project_id or not name:
+        raise HTTPException(status_code=422, detail="project_id and name are required")
+    if not isinstance(command, list) or not command or not all(isinstance(c, str) for c in command):
+        raise HTTPException(status_code=422, detail="command must be a non-empty list of strings")
+    exists = (await db.execute(select(DBEvalAdapter).where(DBEvalAdapter.id == adapter_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}
+    row = DBEvalAdapter(id=adapter_id, project_id=project_id, name=name, command=command,
+                        created_by=_identity(request), created_at=utcnow_naive())
+    db.add(row)
+    _audit(db, _identity(request), "eval.adapter_register", project_id,
+          {"adapter_id": adapter_id, "name": name}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": adapter_id}
+
+
+@app.get("/api/eval/adapters")
+async def list_eval_adapters(project_id: Optional[str] = None, db: AsyncSession = Depends(get_session)):
+    stmt = select(DBEvalAdapter)
+    if project_id:
+        stmt = stmt.where(DBEvalAdapter.project_id == project_id)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"adapters": [{"id": r.id, "project_id": r.project_id, "name": r.name,
+                          "command": r.command, "created_by": r.created_by,
+                          "created_at": r.created_at.isoformat() if r.created_at else None}
+                         for r in rows]}
+
+
+# --- Curriculum tasks (todo.md B.8) -------------------------------------------
+
+@app.post("/api/tasks")
+async def create_task(request: Request, body: Dict[str, Any] = Body(...),
+                      db: AsyncSession = Depends(get_session)):
+    task_id = body.get("id") or _new_uuid()
+    project_id = body.get("project_id")
+    title = body.get("title")
+    if not project_id or not title:
+        raise HTTPException(status_code=422, detail="project_id and title are required")
+    exists = (await db.execute(select(DBTask).where(DBTask.id == task_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}
+    now = utcnow_naive()
+    row = DBTask(id=task_id, project_id=project_id, title=title,
+                description=body.get("description"), difficulty=body.get("difficulty"),
+                status="proposed", created_by=_identity(request), created_at=now, updated_at=now)
+    db.add(row)
+    _audit(db, _identity(request), "task.propose", project_id, {"task_id": task_id}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": task_id}
+
+
+def _task_to_dict(r: DBTask) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "title": r.title,
+            "description": r.description, "difficulty": r.difficulty, "status": r.status,
+            "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/tasks")
+async def list_tasks(project_id: Optional[str] = None, status: Optional[str] = None,
+                     db: AsyncSession = Depends(get_session)):
+    stmt = select(DBTask).order_by(DBTask.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBTask.project_id == project_id)
+    if status:
+        stmt = stmt.where(DBTask.status == status)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"tasks": [_task_to_dict(r) for r in rows]}
+
+
+@app.post("/api/tasks/{task_id}/status")
+async def update_task_status(task_id: str, request: Request, body: Dict[str, Any] = Body(...),
+                             db: AsyncSession = Depends(get_session)):
+    new_status = body.get("status")
+    if new_status not in ("accepted", "rejected"):
+        raise HTTPException(status_code=422, detail="status must be 'accepted' or 'rejected'")
+    row = (await db.execute(select(DBTask).where(DBTask.id == task_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Task not found")
+    row.status = new_status
+    row.updated_at = utcnow_naive()
+    _audit(db, _identity(request), f"task.{new_status}", row.project_id, {"task_id": task_id},
+          status_code=200)
+    await db.commit()
+    return _task_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# RSI R3 (v1.3.1, migration 0008): experiment plans, budget accounts, scheduler hooks.
+# See development/architecture.md's Research Control Contract section.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/plans")
+async def create_plan(request: Request, body: Dict[str, Any] = Body(...),
+                      db: AsyncSession = Depends(get_session)):
+    plan_id = body.get("id") or _new_uuid()
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
+    exists = (await db.execute(select(DBPlan).where(DBPlan.id == plan_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}
+    if not await _object_exists(db, object_id):
+        raise HTTPException(status_code=422,
+                            detail="object_id must reference an already-uploaded object")
+    row = DBPlan(id=plan_id, project_id=project_id, object_id=object_id,
+                created_by=_identity(request), created_at=utcnow_naive())
+    db.add(row)
+    _audit(db, _identity(request), "plan.create", project_id, {"plan_id": plan_id}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": plan_id}
+
+
+def _plan_to_dict(r: DBPlan) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "object_id": r.object_id,
+            "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/plans")
+async def list_plans(project_id: Optional[str] = None, db: AsyncSession = Depends(get_session)):
+    stmt = select(DBPlan).order_by(DBPlan.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBPlan.project_id == project_id)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"plans": [_plan_to_dict(r) for r in rows]}
+
+
+@app.get("/api/plans/{plan_id}")
+async def get_plan(plan_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBPlan).where(DBPlan.id == plan_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    return _plan_to_dict(row)
+
+
+# --- Budget accounts -----------------------------------------------------------
+
+@app.post("/api/budgets")
+async def create_budget(request: Request, body: Dict[str, Any] = Body(...),
+                        db: AsyncSession = Depends(get_session)):
+    budget_id = body.get("id") or _new_uuid()
+    project_id = body.get("project_id")
+    scope = body.get("scope")
+    scope_ref = body.get("scope_ref")
+    if not project_id or scope not in ("run", "lineage") or not scope_ref:
+        raise HTTPException(status_code=422,
+                            detail="project_id, scope ('run'|'lineage'), and scope_ref are required")
+    exists = (await db.execute(select(DBBudget).where(DBBudget.id == budget_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": exists.id}
+    row = DBBudget(
+        id=budget_id, project_id=project_id, scope=scope, scope_ref=scope_ref,
+        compute_seconds_limit=body.get("compute_seconds_limit"),
+        storage_bytes_limit=body.get("storage_bytes_limit"),
+        step_limit=body.get("step_limit"),
+        created_by=_identity(request), created_at=utcnow_naive(), updated_at=utcnow_naive(),
+    )
+    db.add(row)
+    _audit(db, _identity(request), "budget.set", project_id, {"budget_id": budget_id}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": budget_id}
+
+
+def _budget_to_dict(r: DBBudget) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "scope": r.scope, "scope_ref": r.scope_ref,
+            "compute_seconds_limit": r.compute_seconds_limit,
+            "storage_bytes_limit": r.storage_bytes_limit, "step_limit": r.step_limit,
+            "compute_seconds_used": r.compute_seconds_used,
+            "storage_bytes_used": r.storage_bytes_used, "steps_used": r.steps_used,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None}
+
+
+@app.get("/api/budgets/{budget_id}")
+async def get_budget(budget_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBBudget).where(DBBudget.id == budget_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    return _budget_to_dict(row)
+
+
+@app.get("/api/budgets")
+async def list_budgets(project_id: Optional[str] = None, scope_ref: Optional[str] = None,
+                       db: AsyncSession = Depends(get_session)):
+    stmt = select(DBBudget)
+    if project_id:
+        stmt = stmt.where(DBBudget.project_id == project_id)
+    if scope_ref:
+        stmt = stmt.where(DBBudget.scope_ref == scope_ref)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"budgets": [_budget_to_dict(r) for r in rows]}
+
+
+def _budget_exceeded_dims(row: DBBudget) -> List[str]:
+    dims = []
+    if row.compute_seconds_limit is not None and row.compute_seconds_used > row.compute_seconds_limit:
+        dims.append("compute_seconds")
+    if row.storage_bytes_limit is not None and row.storage_bytes_used > row.storage_bytes_limit:
+        dims.append("storage_bytes")
+    if row.step_limit is not None and row.steps_used > row.step_limit:
+        dims.append("steps")
+    return dims
+
+
+@app.post("/api/budgets/{budget_id}/consume")
+async def consume_budget(budget_id: str, request: Request, body: Dict[str, Any] = Body(...),
+                         db: AsyncSession = Depends(get_session)):
+    """Increments usage counters (never decrements — a budget is spent, not refunded) and
+    reports whether any limit is now exceeded, so `av budget consume`/an autonomous loop's
+    own auto-stop check can react in the SAME round trip that recorded the spend, rather
+    than a separate read-after-write that could race another consumer."""
+    row = (await db.execute(
+        select(DBBudget).where(DBBudget.id == budget_id).with_for_update()
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    row.compute_seconds_used += float(body.get("compute_seconds", 0) or 0)
+    row.storage_bytes_used += int(body.get("storage_bytes", 0) or 0)
+    row.steps_used += int(body.get("steps", 0) or 0)
+    row.updated_at = utcnow_naive()
+    exceeded = _budget_exceeded_dims(row)
+    _audit(db, _identity(request), "budget.consume", row.project_id,
+          {"budget_id": budget_id, "exceeded": exceeded}, status_code=200)
+    await db.commit()
+    return {**_budget_to_dict(row), "exhausted": bool(exceeded), "exceeded_dims": exceeded}
+
+
+# --- Scheduler hooks (todo.md D.20) --------------------------------------------
+
+@app.post("/api/runs/{run_id}/stop")
+async def stop_run(run_id: str, request: Request, body: Dict[str, Any] = Body(default={}),
+                   db: AsyncSession = Depends(get_session)):
+    """External stop (a scheduler, an auto-stop check) — distinct from `/complete`/`/fail`:
+    `status` becomes `"stopped"` (not `"failed"`) and `stop_reason` records why, so a
+    dashboard/lineage query can tell "the training genuinely failed" apart from "something
+    outside the run decided to end it" (plateau, divergence, NaN, canary failure, budget)."""
+    r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Run not found")
+    reason = (body or {}).get("reason")
+    r.status = "stopped"
+    r.stop_reason = reason
+    r.completed_at = utcnow_naive()
+    r.updated_at = r.completed_at
+    await _emit_event(db, r.project_id, "run", {"action": "stopped", "run_id": run_id, "reason": reason})
+    _audit(db, _identity(request), "run.stopped", r.project_id, {"run_id": run_id, "reason": reason},
+          status_code=200)
+    await db.commit()
+    return {"status": "stopped", "id": run_id, "stop_reason": reason}
+
+
+@app.get("/api/scheduler/queue")
+async def scheduler_queue(project_id: Optional[str] = None, limit: int = 100,
+                          db: AsyncSession = Depends(get_session)):
+    """The live set of running runs a scheduler can act on — same fields as
+    `GET /api/runs` but purpose-named so a scheduler doesn't have to guess which generic
+    listing endpoint models "what's currently in flight"."""
+    stmt = select(DBRun).where(DBRun.status == "running").order_by(DBRun.created_at.asc())
+    if project_id:
+        stmt = stmt.where(DBRun.project_id == project_id)
+    rows = (await db.execute(stmt.limit(limit))).scalars().all()
+    return {"queue": [_run_to_dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# RSI R4 (v1.3.1, migration 0009): causal graphs, strategy memory, distilled lessons,
+# cross-run search, reviewer gate, critiques, shared blackboard. See
+# development/architecture.md's Multi-Agent & Strategy Memory Contract section.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/causal-links")
+async def create_causal_link(request: Request, body: Dict[str, Any] = Body(...),
+                             db: AsyncSession = Depends(get_session)):
+    project_id = body.get("project_id")
+    cause_type = body.get("cause_type")
+    cause_ref = body.get("cause_ref")
+    effect_metric = body.get("effect_metric")
+    if not project_id or cause_type not in ("change_set", "commit") or not cause_ref or not effect_metric:
+        raise HTTPException(status_code=422,
+                            detail="project_id, cause_type ('change_set'|'commit'), "
+                                   "cause_ref, and effect_metric are required")
+    row = DBCausalLink(project_id=project_id, cause_type=cause_type, cause_ref=cause_ref,
+                       effect_metric=effect_metric, effect_delta=body.get("effect_delta"),
+                       verified=bool(body.get("verified")), created_by=_identity(request),
+                       created_at=utcnow_naive())
+    db.add(row)
+    await db.flush()
+    _audit(db, _identity(request), "causal_link.create", project_id, {"causal_link_id": row.id},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": row.id}
+
+
+@app.get("/api/causal-links")
+async def list_causal_links(project_id: Optional[str] = None, cause_ref: Optional[str] = None,
+                            db: AsyncSession = Depends(get_session)):
+    stmt = select(DBCausalLink).order_by(DBCausalLink.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBCausalLink.project_id == project_id)
+    if cause_ref:
+        stmt = stmt.where(DBCausalLink.cause_ref == cause_ref)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"causal_links": [
+        {"id": r.id, "project_id": r.project_id, "cause_type": r.cause_type,
+         "cause_ref": r.cause_ref, "effect_metric": r.effect_metric,
+         "effect_delta": r.effect_delta, "verified": r.verified, "created_by": r.created_by,
+         "created_at": r.created_at.isoformat() if r.created_at else None}
+        for r in rows]}
+
+
+# --- Strategy memory -----------------------------------------------------------
+
+@app.post("/api/strategy")
+async def create_strategy_entry(request: Request, body: Dict[str, Any] = Body(...),
+                                db: AsyncSession = Depends(get_session)):
+    project_id = body.get("project_id")
+    technique = body.get("technique")
+    outcome = body.get("outcome")
+    if not project_id or not technique or outcome not in ("worked", "failed", "inconclusive"):
+        raise HTTPException(status_code=422,
+                            detail="project_id, technique, and outcome "
+                                   "('worked'|'failed'|'inconclusive') are required")
+    entry_id = body.get("id") or _new_uuid()
+    row = DBStrategyEntry(id=entry_id, project_id=project_id, technique=technique,
+                          hyperparameters=body.get("hyperparameters"), data_mix=body.get("data_mix"),
+                          outcome=outcome, run_ids=body.get("run_ids") or [],
+                          created_by=_identity(request), created_at=utcnow_naive())
+    db.add(row)
+    _audit(db, _identity(request), "strategy.add", project_id, {"strategy_id": entry_id},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": entry_id}
+
+
+def _strategy_to_dict(r: DBStrategyEntry) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "technique": r.technique,
+            "hyperparameters": r.hyperparameters, "data_mix": r.data_mix,
+            "outcome": r.outcome, "run_ids": r.run_ids or [], "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/strategy")
+async def search_strategy(project_id: Optional[str] = None, technique: Optional[str] = None,
+                          outcome: Optional[str] = None, q: Optional[str] = None,
+                          limit: int = 50, db: AsyncSession = Depends(get_session)):
+    """`q` does a simple case-insensitive substring match over `technique` — the
+    "searchable store" todo.md E.22 asks for, without pulling in a full-text engine for
+    what is, in practice, a small table an agent skims rather than fuzzy-searches."""
+    stmt = select(DBStrategyEntry).order_by(DBStrategyEntry.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBStrategyEntry.project_id == project_id)
+    if technique:
+        stmt = stmt.where(DBStrategyEntry.technique == technique)
+    if outcome:
+        stmt = stmt.where(DBStrategyEntry.outcome == outcome)
+    if q:
+        stmt = stmt.where(DBStrategyEntry.technique.ilike(f"%{q}%"))
+    rows = (await db.execute(stmt.limit(limit))).scalars().all()
+    return {"entries": [_strategy_to_dict(r) for r in rows]}
+
+
+# --- Distilled lessons -----------------------------------------------------------
+
+@app.post("/api/lessons")
+async def create_lessons(request: Request, body: Dict[str, Any] = Body(...),
+                         db: AsyncSession = Depends(get_session)):
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
+    if not await _object_exists(db, object_id):
+        raise HTTPException(status_code=422,
+                            detail="object_id must reference an already-uploaded object")
+    lessons_id = body.get("id") or _new_uuid()
+    row = DBLessons(id=lessons_id, project_id=project_id, object_id=object_id,
+                    created_by=_identity(request), created_at=utcnow_naive())
+    db.add(row)
+    _audit(db, _identity(request), "lessons.update", project_id, {"lessons_id": lessons_id},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": lessons_id}
+
+
+def _lessons_to_dict(r: DBLessons) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "object_id": r.object_id,
+            "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/lessons/latest")
+async def get_latest_lessons(project_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(
+        select(DBLessons).where(DBLessons.project_id == project_id)
+        .order_by(DBLessons.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="No lessons object published for this project")
+    return _lessons_to_dict(row)
+
+
+@app.get("/api/lessons/{lessons_id}")
+async def get_lessons(lessons_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBLessons).where(DBLessons.id == lessons_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Lessons object not found")
+    return _lessons_to_dict(row)
+
+
+# --- Reviewer gate + critiques (todo.md H.34/H.35) --------------------------------
+
+async def _reviewable_target(target_type: str, target_id: str, db: AsyncSession):
+    """Returns (project_id, proposer_identity) for a change_set or improver target, or
+    raises 404/422. `proposer_identity` is who self-review is checked against."""
+    if target_type == "change_set":
+        row = (await db.execute(select(DBChangeSet).where(DBChangeSet.id == target_id))).scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Change set not found")
+        return row.project_id, row.created_by
+    if target_type == "improver":
+        row = await _fetch_improver(db, target_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Improver version not found")
+        return row.project_id, row.created_by
+    raise HTTPException(status_code=422, detail="target_type must be 'change_set' or 'improver'")
+
+
+@app.post("/api/reviews", dependencies=[Depends(require_scope("review"))])
+async def create_review(request: Request, body: Dict[str, Any] = Body(...),
+                        db: AsyncSession = Depends(get_session)):
+    """Requires the `review` scope. The reviewer must NOT be the target's own proposer —
+    a self-review is rejected with 422, not silently accepted, so "another agent (or
+    human) must approve" (todo.md H.34) is an enforced fact, not a convention.
+    `target_type` ∈ {"change_set","improver"}: `av improver promote`'s dual gate checks
+    reviews against the CANDIDATE IMPROVER id directly (target_type="improver"), since one
+    improver version can be the eventual promotion target regardless of which change set
+    (if any) produced it; change-set-targeted reviews exist for earlier-stage sign-off."""
+    decision = body.get("decision")
+    target_type = body.get("target_type")
+    target_id = body.get("target_id")
+    if decision not in ("approve", "reject"):
+        raise HTTPException(status_code=422, detail="decision must be 'approve' or 'reject'")
+    if not target_id:
+        raise HTTPException(status_code=422, detail="target_id is required")
+    project_id, proposer = await _reviewable_target(target_type, target_id, db)
+    reviewer = _identity(request)
+    if reviewer is not None and reviewer == proposer:
+        raise HTTPException(status_code=422, detail="A target's own proposer cannot review it")
+    review_id = _new_uuid()
+    row = DBReview(id=review_id, project_id=project_id, target_type=target_type,
+                   target_id=target_id, reviewer=reviewer, decision=decision,
+                   comment=body.get("comment"), created_at=utcnow_naive())
+    db.add(row)
+    await _emit_event(db, project_id, "review",
+                      {"action": decision, "target_type": target_type, "target_id": target_id,
+                       "review_id": review_id})
+    _audit(db, reviewer, f"review.{decision}", project_id,
+          {"target_type": target_type, "target_id": target_id, "review_id": review_id},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": review_id, "decision": decision}
+
+
+@app.get("/api/reviews")
+async def list_reviews(target_type: Optional[str] = None, target_id: Optional[str] = None,
+                       db: AsyncSession = Depends(get_session)):
+    stmt = select(DBReview).order_by(DBReview.created_at.desc())
+    if target_type:
+        stmt = stmt.where(DBReview.target_type == target_type)
+    if target_id:
+        stmt = stmt.where(DBReview.target_id == target_id)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"reviews": [
+        {"id": r.id, "target_type": r.target_type, "target_id": r.target_id,
+         "reviewer": r.reviewer, "decision": r.decision, "comment": r.comment,
+         "created_at": r.created_at.isoformat() if r.created_at else None}
+        for r in rows]}
+
+
+@app.post("/api/critiques")
+async def create_critique(request: Request, body: Dict[str, Any] = Body(...),
+                          db: AsyncSession = Depends(get_session)):
+    objection = body.get("objection")
+    target_type = body.get("target_type")
+    target_id = body.get("target_id")
+    if not objection:
+        raise HTTPException(status_code=422, detail="objection is required")
+    project_id, _proposer = await _reviewable_target(target_type, target_id, db)
+    critique_id = _new_uuid()
+    now = utcnow_naive()
+    row = DBCritique(id=critique_id, project_id=project_id, target_type=target_type,
+                     target_id=target_id, author=_identity(request), objection=objection,
+                     status="open", created_at=now, updated_at=now)
+    db.add(row)
+    await _emit_event(db, project_id, "review",
+                      {"action": "critiqued", "target_type": target_type, "target_id": target_id,
+                       "critique_id": critique_id})
+    _audit(db, _identity(request), "critique.raise", project_id,
+          {"target_type": target_type, "target_id": target_id, "critique_id": critique_id},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": critique_id}
+
+
+def _critique_to_dict(r: DBCritique) -> dict:
+    return {"id": r.id, "target_type": r.target_type, "target_id": r.target_id,
+            "author": r.author, "objection": r.objection, "status": r.status,
+            "resolution": r.resolution,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/critiques")
+async def list_critiques(target_type: Optional[str] = None, target_id: Optional[str] = None,
+                         status: Optional[str] = None, db: AsyncSession = Depends(get_session)):
+    stmt = select(DBCritique).order_by(DBCritique.created_at.desc())
+    if target_type:
+        stmt = stmt.where(DBCritique.target_type == target_type)
+    if target_id:
+        stmt = stmt.where(DBCritique.target_id == target_id)
+    if status:
+        stmt = stmt.where(DBCritique.status == status)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"critiques": [_critique_to_dict(r) for r in rows]}
+
+
+async def _set_critique_status(critique_id: str, new_status: str, request: Request,
+                               body: dict, db: AsyncSession):
+    row = (await db.execute(select(DBCritique).where(DBCritique.id == critique_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Critique not found")
+    if row.status != "open":
+        raise HTTPException(status_code=409, detail=f"Critique is already '{row.status}'")
+    row.status = new_status
+    row.resolution = body.get("resolution")
+    row.updated_at = utcnow_naive()
+    _audit(db, _identity(request), f"critique.{new_status}", row.project_id,
+          {"critique_id": critique_id}, status_code=200)
+    await db.commit()
+    return _critique_to_dict(row)
+
+
+@app.post("/api/critiques/{critique_id}/resolve")
+async def resolve_critique(critique_id: str, request: Request, body: Dict[str, Any] = Body(default={}),
+                           db: AsyncSession = Depends(get_session)):
+    return await _set_critique_status(critique_id, "resolved", request, body, db)
+
+
+@app.post("/api/critiques/{critique_id}/waive", dependencies=[Depends(require_scope("review"))])
+async def waive_critique(critique_id: str, request: Request, body: Dict[str, Any] = Body(default={}),
+                         db: AsyncSession = Depends(get_session)):
+    """Waiving (as opposed to resolving) means the objection stands but is deliberately
+    overridden — requires the `review` scope, and (like every other mutation) is audited,
+    so a waiver is always a visible, attributable decision, never a silent bypass."""
+    return await _set_critique_status(critique_id, "waived", request, body, db)
+
+
+# --- Shared blackboard (todo.md H.36) ----------------------------------------------
+
+@app.post("/api/blackboard")
+async def post_blackboard_entry(request: Request, body: Dict[str, Any] = Body(...),
+                                db: AsyncSession = Depends(get_session)):
+    project_id = body.get("project_id")
+    claim = body.get("claim")
+    if not project_id or not claim:
+        raise HTTPException(status_code=422, detail="project_id and claim are required")
+    entry_id = _new_uuid()
+    now = utcnow_naive()
+    row = DBBlackboardEntry(id=entry_id, project_id=project_id, claim=claim,
+                            author=_identity(request), evidence=body.get("evidence") or [],
+                            status="open", created_at=now, updated_at=now)
+    db.add(row)
+    await _emit_event(db, project_id, "blackboard", {"action": "posted", "entry_id": entry_id})
+    _audit(db, _identity(request), "blackboard.post", project_id, {"entry_id": entry_id},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": entry_id}
+
+
+def _blackboard_to_dict(r: DBBlackboardEntry) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "claim": r.claim, "author": r.author,
+            "evidence": r.evidence or [], "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/blackboard")
+async def list_blackboard(project_id: Optional[str] = None, status: Optional[str] = None,
+                          db: AsyncSession = Depends(get_session)):
+    stmt = select(DBBlackboardEntry).order_by(DBBlackboardEntry.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBBlackboardEntry.project_id == project_id)
+    if status:
+        stmt = stmt.where(DBBlackboardEntry.status == status)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"entries": [_blackboard_to_dict(r) for r in rows]}
+
+
+@app.post("/api/blackboard/{entry_id}/resolve")
+async def resolve_blackboard_entry(entry_id: str, request: Request,
+                                   db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(
+        select(DBBlackboardEntry).where(DBBlackboardEntry.id == entry_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Blackboard entry not found")
+    row.status = "resolved"
+    row.updated_at = utcnow_naive()
+    _audit(db, _identity(request), "blackboard.resolve", row.project_id, {"entry_id": entry_id},
+          status_code=200)
+    await db.commit()
+    return _blackboard_to_dict(row)
+
+
+# --- Cross-run search (todo.md E.24) ------------------------------------------------
+
+@app.get("/api/search/runs")
+async def search_runs(project_id: Optional[str] = None, metric: str = "",
+                      direction: str = "up", min_delta: float = 0.0, limit: int = 50,
+                      db: AsyncSession = Depends(get_session)):
+    """A structured (not free-text) predicate: runs whose `metric` moved `direction`
+    ("up"|"down") by at least `min_delta` relative to their PARENT run's latest value for
+    that same metric — e.g. "all runs where eval_acc rose after the change that produced
+    them." Deterministic, no LLM, no external index: a bounded scan over one project's
+    runs plus one parent lookup each, which is exactly the shape `av search runs` needs
+    for a project sized like the ones this tool targets."""
+    if not metric:
+        raise HTTPException(status_code=422, detail="metric is required")
+    if direction not in ("up", "down"):
+        raise HTTPException(status_code=422, detail="direction must be 'up' or 'down'")
+    stmt = select(DBRun).order_by(DBRun.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBRun.project_id == project_id)
+    rows = (await db.execute(stmt.limit(500))).scalars().all()  # bounded scan window
+
+    matches = []
+    for r in rows:
+        val = (r.metrics_summary or {}).get(metric)
+        if not isinstance(val, (int, float)) or not r.parent_run_id:
+            continue
+        parent = await _fetch_run(db, r.parent_run_id)
+        if not parent:
+            continue
+        parent_val = (parent.metrics_summary or {}).get(metric)
+        if not isinstance(parent_val, (int, float)):
+            continue
+        delta = val - parent_val
+        if (direction == "up" and delta >= min_delta) or (direction == "down" and -delta >= min_delta):
+            matches.append({"run_id": r.id, "parent_run_id": r.parent_run_id, "metric": metric,
+                            "value": val, "parent_value": parent_val, "delta": delta})
+        if len(matches) >= limit:
+            break
+    return {"matches": matches}
+
+
+# ---------------------------------------------------------------------------
+# RSI R5 (v1.3.1, migration 0010): sandbox jobs, tool manifests, action logs. See
+# development/architecture.md's Sandbox Execution Contract section.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/sandbox/jobs", dependencies=[Depends(require_scope("improver:write"))])
+async def create_sandbox_job(request: Request, body: Dict[str, Any] = Body(...),
+                             db: AsyncSession = Depends(get_session)):
+    """Records a job submission — the driver itself (see `python/av_cli/sandbox/`)
+    already started (or ran) the real job by the time this is called; this is the
+    server-side index/audit row, not the execution itself."""
+    job_id = body.get("id")
+    project_id = body.get("project_id")
+    driver = body.get("driver")
+    if not job_id or not project_id or driver not in ("local", "docker", "kubernetes", "slurm"):
+        raise HTTPException(status_code=422,
+                            detail="id, project_id, and a valid driver are required")
+    exists = (await db.execute(select(DBSandboxJob).where(DBSandboxJob.id == job_id))).scalar_one_or_none()
+    if exists:
+        return {"status": "exists", "id": job_id}
+    now = utcnow_naive()
+    row = DBSandboxJob(id=job_id, project_id=project_id, improver_id=body.get("improver_id"),
+                       driver=driver, state=body.get("state", "pending"),
+                       command=body.get("command"), created_by=_identity(request),
+                       created_at=now, updated_at=now)
+    db.add(row)
+    await _emit_event(db, project_id, "sandbox",
+                      {"action": "submitted", "job_id": job_id, "driver": driver})
+    _audit(db, _identity(request), "sandbox.submit", project_id, {"job_id": job_id, "driver": driver},
+          status_code=201)
+    await db.commit()
+    return {"status": "created", "id": job_id}
+
+
+def _sandbox_job_to_dict(r: DBSandboxJob) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "improver_id": r.improver_id,
+            "driver": r.driver, "state": r.state, "exit_code": r.exit_code,
+            "command": r.command, "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.post("/api/sandbox/jobs/{job_id}/status", dependencies=[Depends(require_scope("improver:write"))])
+async def update_sandbox_job_status(job_id: str, request: Request, body: Dict[str, Any] = Body(...),
+                                    db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBSandboxJob).where(DBSandboxJob.id == job_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sandbox job not found")
+    new_state = body.get("state")
+    if new_state not in ("pending", "running", "succeeded", "failed", "cancelled"):
+        raise HTTPException(status_code=422, detail="invalid state")
+    row.state = new_state
+    row.exit_code = body.get("exit_code")
+    row.updated_at = utcnow_naive()
+    if new_state in ("succeeded", "failed", "cancelled"):
+        await _emit_event(db, row.project_id, "sandbox",
+                          {"action": new_state, "job_id": job_id})
+    _audit(db, _identity(request), "sandbox.status", row.project_id,
+          {"job_id": job_id, "state": new_state}, status_code=200)
+    await db.commit()
+    return _sandbox_job_to_dict(row)
+
+
+@app.get("/api/sandbox/jobs/{job_id}")
+async def get_sandbox_job(job_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBSandboxJob).where(DBSandboxJob.id == job_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sandbox job not found")
+    return _sandbox_job_to_dict(row)
+
+
+@app.get("/api/sandbox/jobs")
+async def list_sandbox_jobs(project_id: Optional[str] = None, state: Optional[str] = None,
+                            limit: int = 50, db: AsyncSession = Depends(get_session)):
+    stmt = select(DBSandboxJob).order_by(DBSandboxJob.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBSandboxJob.project_id == project_id)
+    if state:
+        stmt = stmt.where(DBSandboxJob.state == state)
+    rows = (await db.execute(stmt.limit(limit))).scalars().all()
+    return {"jobs": [_sandbox_job_to_dict(r) for r in rows]}
+
+
+@app.post("/api/sandbox/jobs/{job_id}/cancel", dependencies=[Depends(require_scope("improver:write"))])
+async def cancel_sandbox_job_record(job_id: str, request: Request,
+                                    db: AsyncSession = Depends(get_session)):
+    """Records that a cancellation was requested/performed — the actual cancel() call
+    against the driver happens client-side (`av sandbox cancel`) before this is called;
+    same "driver executes, server indexes" split as job creation above."""
+    row = (await db.execute(select(DBSandboxJob).where(DBSandboxJob.id == job_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Sandbox job not found")
+    row.state = "cancelled"
+    row.updated_at = utcnow_naive()
+    await _emit_event(db, row.project_id, "sandbox", {"action": "cancelled", "job_id": job_id})
+    _audit(db, _identity(request), "sandbox.cancel", row.project_id, {"job_id": job_id}, status_code=200)
+    await db.commit()
+    return _sandbox_job_to_dict(row)
+
+
+# --- Tool permission manifests -------------------------------------------------
+
+@app.post("/api/tool-manifests", dependencies=[Depends(require_scope("improver:write"))])
+async def create_tool_manifest(request: Request, body: Dict[str, Any] = Body(...),
+                               db: AsyncSession = Depends(get_session)):
+    project_id = body.get("project_id")
+    improver_id = body.get("improver_id")
+    if not project_id or not improver_id:
+        raise HTTPException(status_code=422, detail="project_id and improver_id are required")
+    object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
+    if not await _object_exists(db, object_id):
+        raise HTTPException(status_code=422,
+                            detail="object_id must reference an already-uploaded object")
+    manifest_id = body.get("id") or _new_uuid()
+    row = DBToolManifest(id=manifest_id, project_id=project_id, improver_id=improver_id,
+                         object_id=object_id, created_by=_identity(request), created_at=utcnow_naive())
+    db.add(row)
+    _audit(db, _identity(request), "tools.manifest_set", project_id,
+          {"manifest_id": manifest_id, "improver_id": improver_id}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": manifest_id}
+
+
+def _tool_manifest_to_dict(r: DBToolManifest) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "improver_id": r.improver_id,
+            "object_id": r.object_id, "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/tool-manifests/latest")
+async def get_latest_tool_manifest(project_id: str, improver_id: str,
+                                   db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(
+        select(DBToolManifest)
+        .where(DBToolManifest.project_id == project_id, DBToolManifest.improver_id == improver_id)
+        .order_by(DBToolManifest.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="No tool manifest published for this improver version")
+    return _tool_manifest_to_dict(row)
+
+
+@app.get("/api/tool-manifests/{manifest_id}")
+async def get_tool_manifest(manifest_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBToolManifest).where(DBToolManifest.id == manifest_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Tool manifest not found")
+    return _tool_manifest_to_dict(row)
+
+
+# --- Action logs (deterministic replay, todo.md G.31) --------------------------
+
+@app.post("/api/action-logs")
+async def create_action_log(request: Request, body: Dict[str, Any] = Body(...),
+                            db: AsyncSession = Depends(get_session)):
+    project_id = body.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=422, detail="project_id is required")
+    object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
+    if not await _object_exists(db, object_id):
+        raise HTTPException(status_code=422,
+                            detail="object_id must reference an already-uploaded object")
+    log_id = body.get("id") or _new_uuid()
+    row = DBActionLog(id=log_id, project_id=project_id, run_id=body.get("run_id"),
+                      object_id=object_id, created_by=_identity(request), created_at=utcnow_naive())
+    db.add(row)
+    _audit(db, _identity(request), "action_log.publish", project_id,
+          {"action_log_id": log_id, "run_id": row.run_id}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": log_id}
+
+
+def _action_log_to_dict(r: DBActionLog) -> dict:
+    return {"id": r.id, "project_id": r.project_id, "run_id": r.run_id,
+            "object_id": r.object_id, "created_by": r.created_by,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+@app.get("/api/action-logs/{log_id}")
+async def get_action_log(log_id: str, db: AsyncSession = Depends(get_session)):
+    row = (await db.execute(select(DBActionLog).where(DBActionLog.id == log_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Action log not found")
+    return _action_log_to_dict(row)
+
+
+@app.get("/api/action-logs")
+async def list_action_logs(project_id: Optional[str] = None, run_id: Optional[str] = None,
+                           db: AsyncSession = Depends(get_session)):
+    stmt = select(DBActionLog).order_by(DBActionLog.created_at.desc())
+    if project_id:
+        stmt = stmt.where(DBActionLog.project_id == project_id)
+    if run_id:
+        stmt = stmt.where(DBActionLog.run_id == run_id)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {"action_logs": [_action_log_to_dict(r) for r in rows]}
 
 
 def _parse_iso_dt(value: str, field: str) -> datetime:
