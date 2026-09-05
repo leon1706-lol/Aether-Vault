@@ -37,7 +37,23 @@ jobs:
         run: pip install -e .[dev,watch]
 
       - name: Run test suite
-        run: pytest --cov=python --cov-report=term-missing tests/
+        # v1.3.3.9: output additionally tee'd to a log file so the freshness check below
+        # can re-parse this SAME run's summary line rather than running pytest a second
+        # time. `exit $LASTEXITCODE` is required, not decorative: once pytest is piped
+        # into Tee-Object it is no longer the last command PowerShell's step wrapper
+        # inspects, so without this line a failing test run would silently report this
+        # step (and the job) as green.
+        run: |
+          pytest --cov=python --cov-report=term-missing tests/ 2>&1 | Tee-Object -FilePath pytest_output.log
+          exit $LASTEXITCODE
+
+      # v1.3.3.9: closes the one gap `av test`'s own local README-sync path can't cover
+      # on its own -- this job runs bare `pytest`, never `av test`, so nothing here ever
+      # re-checked the test-count badge/prose against reality. Runs on one matrix leg
+      # only (like the speedcheck capture below) since both legs collect the same tests.
+      - name: Check README test-count freshness
+        if: matrix.python-version == '3.14'
+        run: python scripts/check_readme_test_freshness.py pytest_output.log
 
       # v1.3.0 (todo.md item 22): captures this run's perf numbers as a workflow artifact —
       # trends survive artifact expiry via `scripts/append_perf_history.py`'s SEPARATE,
@@ -860,12 +876,28 @@ jobs:
         # step ran against containers that no longer existed and silently dumped nothing.
         # This job's own final "Tear down" step (`if: always()`) is what actually cleans
         # up now, regardless of KEEP_HA_STACK.
+        # v1.3.3.8: a dedicated STEP timeout, well under the job's own 30 minutes -- a
+        # real, healthy run finishes phases 0-4 in under 10 minutes every time this has
+        # been observed; capping this step at 15 lets a genuine hang cancel (and dump
+        # diagnostics, see below) with time left in the job budget to spare, instead of
+        # silently burning the entire 30-minute job timeout on one stuck step.
+        timeout-minutes: 15
         run: KEEP_HA_STACK=1 bash scripts/ha_drill.sh
 
       - name: Dump engine logs on failure
-        if: failure()
+        # v1.3.3.8 fix (found live): `if: failure()` never fires when the drill hits this
+        # JOB's own 30-minute timeout -- GitHub Actions marks a timeout-killed step
+        # `cancelled`, not `failed`, so this step was silently SKIPPED on every one of
+        # the timeout hangs this whole investigation has been chasing, leaving zero
+        # diagnostics for exactly the failure mode that mattered most. `cancelled()`
+        # covers that case too; `always()` isn't used instead specifically so this stays
+        # silent on a genuine pass, matching every other job's "only dump logs when
+        # something actually needs explaining" convention.
+        if: failure() || cancelled()
         run: |
-          docker compose -f docker-compose.ha.yml -p aether-vault-ha logs --tail=200 || true
+          docker compose -f docker-compose.ha.yml -p aether-vault-ha logs --tail=500 || true
+          echo "--- container states ---"
+          docker compose -f docker-compose.ha.yml -p aether-vault-ha ps -a || true
 
       - name: Tear down (in case the drill's own trap didn't run)
         if: always()

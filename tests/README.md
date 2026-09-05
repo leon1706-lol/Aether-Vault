@@ -1,6 +1,6 @@
 # tests
 
-Owns Aether-Vault's pytest suite: ~950 tests across 40+ files covering the CLI, the
+Owns Aether-Vault's pytest suite: 1,474 tests across 64 files covering the CLI, the
 C++ bindings, the live registry server, the plugins, and the webui logic. Run with
 `pytest tests/ -q` (or `av test`); the skip-summary hook prints WHY anything skipped.
 
@@ -46,6 +46,11 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
   hand-authored benchmark tables against drifting out of sync with the real
   `benchmarks/bench_*.py` count, and against an unfilled "capture pending"-style
   placeholder surviving past the run that should have replaced it.
+- `test_readme_test_count_freshness.py` - guards this file's own opening line and
+  README.md's test-count mentions against the real `tests/test_*.py` file count; the
+  companion check on the actual test *counts* (which need a real run, not just
+  collection) lives in `scripts/check_readme_test_freshness.py`, wired into the `test`
+  CI job instead (v1.3.3.9).
 
 ## Conventions
 

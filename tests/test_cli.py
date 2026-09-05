@@ -1230,6 +1230,72 @@ def test_update_readme_test_badge_is_a_noop_without_a_parsed_total(tmp_path, mon
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == _FAKE_BADGE_README
 
 
+def test_update_readme_test_badge_also_syncs_prose_counts_and_tests_readme(tmp_path, monkeypatch):
+    """v1.3.3.x: the badge used to be the ONLY thing this function kept honest — the
+    module-table row, the Test Suite section's own prose, and tests/README.md's opening
+    line were separate hand-typed numbers that silently drifted (found live: 492/492 vs
+    a real collected count of 1,471 across 63 files). All four now come from one call."""
+    import python.av_cli.main as main_module
+
+    readme_text = (
+        _FAKE_BADGE_README + "\n"
+        '| `tests/` | ~950-test suite across 40+ files | [README](tests/README.md) |\n'
+        "The full suite runs ~950 tests across 40+ files covering everything.\n"
+    )
+    (tmp_path / "README.md").write_text(readme_text, encoding="utf-8")
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    for i in range(3):
+        (tests_dir / f"test_fake_{i}.py").write_text("", encoding="utf-8")
+    (tests_dir / "README.md").write_text("Owns the suite: ~950 tests across 40+ files.\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+
+    main_module._update_readme_test_badge(173, 0)
+
+    readme_after = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "173-test suite across 3 files" in readme_after
+    assert "173 tests across 3 files" in readme_after
+    tests_readme_after = (tests_dir / "README.md").read_text(encoding="utf-8")
+    assert "173 tests across 3 files" in tests_readme_after
+
+
+def test_sync_readme_perf_ratio_rewrites_from_a_real_capture(tmp_path, monkeypatch):
+    """Found live: README said '~15x slower than Git LFS' while the actual latest
+    capture in development/BENCHMARKS.md put it at ~63x — nothing had ever re-derived
+    README's copy of that ratio from a real benchmark run."""
+    import python.av_cli.main as main_module
+    from python.av_cli.cmd_devtools import _sync_readme_perf_ratio
+
+    (tmp_path / "README.md").write_text(
+        "- Perf #4 — ~15x slower than Git LFS at interpreter startup.\n"
+        "| 4 | No-Op `status`/`add` | ~15x slower than Git LFS | open finding |\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+
+    row = type("Row", (), {"values": {"av": 13023.1, "git-lfs": 206.0}})()
+    result = type("Result", (), {"name": "noop_status_speed", "rows": [row]})()
+    _sync_readme_perf_ratio([result])
+
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert text.count("~63x slower than Git LFS") == 2
+
+
+def test_sync_readme_perf_ratio_leaves_readme_alone_without_a_real_git_lfs_number(tmp_path, monkeypatch):
+    import python.av_cli.main as main_module
+    from python.av_cli.cmd_devtools import _sync_readme_perf_ratio
+
+    original = "- Perf #4 — ~15x slower than Git LFS at interpreter startup.\n"
+    (tmp_path / "README.md").write_text(original, encoding="utf-8")
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+
+    row = type("Row", (), {"values": {"av": 13023.1, "git-lfs": None}})()  # git-lfs not installed
+    result = type("Result", (), {"name": "noop_status_speed", "rows": [row]})()
+    _sync_readme_perf_ratio([result])
+
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == original
+
+
 def test_test_command_updates_readme_badge_from_pytest_summary(tmp_path, monkeypatch):
     (tmp_path / "tests").mkdir()
     (tmp_path / "README.md").write_text(_FAKE_BADGE_README, encoding="utf-8")

@@ -66,9 +66,26 @@ wait_ready() {
   # loop indefinitely on ONE of its 60 tries, well past this job's own CI timeout,
   # rather than cycling through retries and failing cleanly via the `return 1` below.
   # `--connect-timeout 5 --max-time 10` bounds every single attempt.
-  local url="$1" tries=60
+  #
+  # v1.3.3.8 fix (found live): the flags above did NOT actually bound the CI hang --
+  # phase 4's identical call still hung for 24 STRAIGHT minutes of total zero output
+  # (job's own 30-minute timeout killed it, `curl`'s own 10s max-time never visibly
+  # fired). Whether that's a curl/libcurl edge case this box's version has (a stalled
+  # phase --max-time's event loop doesn't poll, a resolver call that blocks outside
+  # curl's own cancellable I/O) or something else entirely is still unknown -- so this
+  # wraps the whole attempt in coreutils `timeout`, an OS-level deadline enforced by
+  # SIGTERM/SIGKILL from OUTSIDE curl's own process, independent of whatever curl-
+  # internal mechanism did not fire. Belt-and-suspenders over belt alone.
+  # Also logs progress every 10 tries (~24s) so a genuine future hang leaves a visible
+  # timestamped trail in the live job log instead of total silence until cancellation --
+  # every prior investigation of this exact hang had NOTHING to go on between the last
+  # "waiting for..." line and the timeout kill.
+  local url="$1" tries=60 start_tries=60
   while (( tries-- > 0 )); do
-    if curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then return 0; fi
+    if timeout 12 curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then return 0; fi
+    if (( tries % 10 == 0 )); then
+      log "  ...still waiting on $url ($((start_tries - tries)) attempts so far)"
+    fi
     sleep 2
   done
   return 1
@@ -245,7 +262,7 @@ wait_ready "$API/api/ready" || die "engines never became ready again after apply
 CODES="$WORK/ratelimit_codes.txt"
 : > "$CODES"
 for i in $(seq 1 20); do
-  curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
+  timeout 12 curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
 done
 wait
 

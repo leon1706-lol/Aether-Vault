@@ -21,7 +21,7 @@ Served from the engine container's standalone bundle or plainly via `npm run dev
   every panel reads it and renders a distinct error state with retry (v1.3.0).
 - `src/hooks/useIncrementalReveal.ts` - progressive layer reveal for WeightHeatmap /
   LayerDriftChart (v1.3.0), replacing the old hard `MAX_RENDERED_LAYERS` truncation.
-- `__tests__/` - Vitest + React Testing Library suites (165 tests, 24 files).
+- `__tests__/` - Vitest + React Testing Library suites (180 tests, 27 files). Run `npm test` for the current count — not auto-synced here the way `av test`'s own pytest count is (see `python/av_cli/cmd_devtools.py::_update_readme_test_badge`), since `av test --webui` streams Vitest's output live via `subprocess.run` rather than capturing it for parsing; a deliberate, stated scope limit, not an oversight.
 - `__benchmarks__/speed.bench.ts` - bench suite exercised by `av test --speed --webui`.
 - `e2e/` - Playwright specs + `seed_data.py` (pushes real commits via the real CLI).
 

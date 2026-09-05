@@ -7,10 +7,6 @@
 </p>
 
 <p align="center">
-  <sub>C++17 · pybind11 · Click · FastAPI · Next.js · PostgreSQL · RedisBloom · GitHub Actions · Alembic</sub>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC-0097E8?style=flat-square&labelColor=1A1A1A" alt="PolyForm Noncommercial">
   <img src="https://img.shields.io/badge/tests-492%2F492%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="492 of 492 tests passing">
@@ -18,12 +14,23 @@
   <img src="https://img.shields.io/badge/docker-aether--vault--engine-2496ED?style=flat-square&labelColor=1A1A1A&logo=docker&logoColor=white" alt="Docker">
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/C%2B%2B17-4B5563?style=flat-square&labelColor=1A1A1A&logo=cplusplus&logoColor=white" alt="C++17">
+  <img src="https://img.shields.io/badge/pybind11-4B5563?style=flat-square&labelColor=1A1A1A" alt="pybind11">
+  <img src="https://img.shields.io/badge/Click-4B5563?style=flat-square&labelColor=1A1A1A" alt="Click">
+  <img src="https://img.shields.io/badge/FastAPI-4B5563?style=flat-square&labelColor=1A1A1A&logo=fastapi&logoColor=white" alt="FastAPI">
+  <img src="https://img.shields.io/badge/Next.js-4B5563?style=flat-square&labelColor=1A1A1A&logo=nextdotjs&logoColor=white" alt="Next.js">
+  <img src="https://img.shields.io/badge/PostgreSQL-4B5563?style=flat-square&labelColor=1A1A1A&logo=postgresql&logoColor=white" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/RedisBloom-4B5563?style=flat-square&labelColor=1A1A1A&logo=redis&logoColor=white" alt="RedisBloom">
+  <img src="https://img.shields.io/badge/GitHub%20Actions-4B5563?style=flat-square&labelColor=1A1A1A&logo=githubactions&logoColor=white" alt="GitHub Actions">
+  <img src="https://img.shields.io/badge/Alembic-4B5563?style=flat-square&labelColor=1A1A1A" alt="Alembic">
+</p>
+
 Aether-Vault is not git for big files. It is version control purpose-built for machine-learning work: **code + weights + datasets** in one atomic commit that checks out identically on any machine. Throughput comes from a **C++17 core** that hashes multi-gigabyte files in parallel and splits safetensors into per-layer shards. Storage is **deduplicated by construction** — identical layers across fine-tune epochs and identical chunks across saves store once, locally and on the registry alike. The **FastAPI registry** serves any number of independent projects from a single Dockerized engine, backed by **PostgreSQL** Merkle trees and **RedisBloom** O(1) existence checks. Agents are first-class operators: stable **JSON envelopes**, a single-writer **Python SDK**, resumable **event streams**, and **.avh v2 context memory** so the next agent inherits intent without API calls. Start at [AGENTS.md](AGENTS.md).
 
 ## Known Limitations
 
-- **Perf #4 (no-op status/add)** — ~15x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
-- **Legacy image aliases — removed in v1.3.0.** The historical `aether-vault-server`/`-webui` image tags stopped publishing as of this release (see `VERSIONING.md`'s "Removed in v1.3.0" entry). If you're still pinned to them, see `docs/migrate-engine-image.md` (or run `av doctor --compose PATH` for an automated rewrite) — already-pulled legacy images keep working via the entrypoint's auto-detect, only new pulls under the old names 404.
+- **Perf #4 (no-op status/add)** — ~63x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
 
 ## Table of Contents
 
@@ -195,7 +202,7 @@ and how it's wired in, this table is the index.
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
 | `python/av_plugins/` | Lightning / Transformers / MLflow auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
-| `tests/` | ~1,340-test suite across 60+ files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
+| `tests/` | 1,474-test suite across 64 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
@@ -270,7 +277,7 @@ av import-mlflow <run_id> --tag backfill   # requires: pip install aether-vault[
 | 1 | Hashing Throughput at Scale | ~2–3x faster than Git LFS, up to 17x faster than DVC | fastest at every size tested (10–200 MB) |
 | 2 | Safetensors Layer-Dedup | **63% smaller** | 47 MB vs. 126 MB after 6 fine-tune commits |
 | 3 | Commit + Push Latency | push ~70% faster · commit ~6x slower *(by design, vs. DVC)* | av uploads during commit; DVC defers to a separate push |
-| 4 | No-Op `status`/`add` | ~15x slower than Git LFS | open finding — interpreter/import startup cost |
+| 4 | No-Op `status`/`add` | ~63x slower than Git LFS | open finding — interpreter/import startup cost |
 | 5 | Cold Clone / First Pull | ~1.5x faster than Git LFS, ~2x faster than DVC | fresh checkout of a project someone else already pushed |
 | 6 | Partial-Checkpoint Fetch | unique capability | only tool that can fetch a single layer instead of the whole file |
 | 7 | Storage Footprint Curve | **63% smaller**, gap widens every commit | same dedup advantage as #2, sustained over time |
@@ -283,7 +290,7 @@ For full methodology, every raw number, and the rating legend, see [`development
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs ~1,340 tests across 60+ files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the v1.3.1 RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge in sync with the real result — it parses pytest's summary line and rewrites the badge (and turns it red if anything failed) so the count is never manually edited. A `-k`-scoped run never touches it.
+The full suite (`av test` or `pytest tests/ -q`) runs 1,474 tests across 64 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the v1.3.1 RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
 
 ```bash
 av test                  # full suite
@@ -977,20 +984,14 @@ No open items — shipped milestones (clone/pull, log, merge, chunk dedup, Alemb
 
 ## Enterprise Roadmap (Commercial Variant)
 
-For enterprise research teams and institutional algorithmic trading firms:
+**Disclaimer:** the enterprise surface shipped to date (SSO, SCIM, RBAC, hard multi-tenancy, audit chain, HA, DR, metrics — full detail in the [CHANGELOG](development/CHANGELOG.md)) is a functional demo of the architecture, not a sold or operated commercial product. What's left to become one:
 
 | Feature | Description |
 |---|---|
-| **Enterprise Login (SSO)** ✅ shipped (v1.3.3) | OIDC (authorization-code + PKCE, JWKS-verified ID tokens) and SAML 2.0 (via `pysaml2`, an optional extra) — `av login`/`logout`/`whoami`, `av idp add\|list\|show\|test\|remove`. JIT provisioning and IdP-group→role mapping are per-provider and opt-in. `av init --mode enterprise` now genuinely logs in. Verified against this server's own routes; not yet driven end-to-end against a live external IdP (Keycloak/Okta/Entra) in this environment — see `VERSIONING.md`'s v1.3.3 section |
-| **SCIM provisioning** ✅ shipped (v1.3.3) | RFC 7643/7644 under `/scim/v2` — Users/Groups CRUD, filter+pagination, PATCH deprovisioning (`active: false` suspends, never hard-deletes), idempotent-safe create (409 on retry). `av scim status`, `av scim token create\|revoke` mints the dedicated `scim`-scoped credential an IdP connector authenticates with |
-| **Multi-User Collaboration** | The OSS baseline shipped in v1.1.1 (`av clone`/`av pull`/`av merge`, per-project refs). |
-| **RBAC** ✅ shipped (v1.3.2) | DB-backed roles/role-bindings/tokens, remotely administrable — `av role`, `av token`, `av user`, `av tenant`. 6 built-in roles (`owner`/`admin`/`maintainer`/`trainer`/`reviewer`/`reader`); see [CLI Reference](#cli-reference) |
-| **Hard multi-tenancy** ✅ shipped (v1.3.2/v1.3.3) | Per-tenant data isolation: an application-level guard plus Postgres row-level security enforced via a dedicated non-superuser DB role (`av_app`, migration `0015`), gated behind `AV_TENANCY_ENFORCE` (off by default). Per-tenant *physical* CAS storage separation now shipped too (`AV_CAS_ISOLATION=isolated`, migration `0014`+v1.3.3 — off by default; the real cost is losing cross-tenant dedup, intra-tenant dedup is unaffected) |
-| **Audit Logging** ✅ shipped (v1.3.3) | Every row is hash-chained (`chain_hash`, migration `0016`) — tampering or deleting a row breaks verification from that point forward. `av audit verify` (± `--export` for genuinely offline/independent verification). Optional ed25519 signing (`AV_AUDIT_SIGNING_KEY_PATH`) adds non-repudiation |
-| **High Availability** ✅ shipped (v1.3.2) | `docker-compose.ha.yml` (nginx LB + N engine replicas + Postgres primary/streaming-replica + Redis primary/replica) and a Helm chart (`deploy/helm/aether-vault/`, schema-verified via `helm template \| kubeconform`, not yet drilled on a real cluster). `scripts/ha_drill.sh` is a real, locally-run drill proving zero failed requests and zero double webhook delivery across a killed replica |
-| **Disaster recovery** ✅ shipped (v1.3.2) | `av admin backup create/verify/restore` (Postgres + CAS objects, hash-verified manifest) — see [`docs/dr.md`](docs/dr.md) for the real destroy-and-restore drill and the measured-RTO/stated-RPO distinction |
-| **Metrics** ✅ shipped (v1.3.3) | `GET /api/metrics` — hand-rolled Prometheus text exposition (request counts/latency histogram, webhook queue depth, DB pool state, per-tenant request counts). Per-process only; see [`docs/slo.md`](docs/slo.md) |
-| **Cloud Connectors** | AWS IAM, GCP Cloud Storage, Azure Blob Storage with automated cold-storage tiering |
+| **Infrastructure-as-code (OpenTofu/Terraform)** | A provider/module to declaratively stand up and manage a tenant's stack. Today, deployment is manual (`docker compose`, `helm template`) |
+| **Kubernetes** | The Helm chart (`deploy/helm/aether-vault/`) is schema-verified only (`helm template \| kubeconform`), never drilled on a real cluster — no operator, no automated upgrade/rollback, no live multi-tenant cluster story |
+| **Cloud** | A managed/hosted offering (marketplace listing or first-party SaaS) — today the product is self-hosted only |
+| **Billing** | Usage metering, plan enforcement, invoicing — none exists; every feature is a flag an operator sets themselves, with no metered cost attached |
 
 ---
 

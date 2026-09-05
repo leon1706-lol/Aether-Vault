@@ -48,35 +48,112 @@ def _print_synthetic_speed_check() -> None:
         click.echo(f"{label:<28} {elapsed_ms:>7.1f} ms")
 
 
+def _rewrite_test_count_prose(text: str, total_str: str, file_count: int) -> str:
+    """Applied to both README.md and tests/README.md — the same two hand-typed-count
+    shapes ("N-test suite across M files" / "N tests across M files") appear in each,
+    stating the identical underlying fact about the same `tests/` directory, so both get
+    resynced from the one real count rather than tracked as two independent numbers."""
+    updated, _n1 = re.subn(
+        r"~?[\d,]+-test suite across \d+\+? files",
+        f"{total_str}-test suite across {file_count} files",
+        text, count=1,
+    )
+    updated, _n2 = re.subn(
+        r"~?[\d,]+ tests across \d+\+? files",
+        f"{total_str} tests across {file_count} files",
+        updated, count=1,
+    )
+    return updated
+
+
 def _update_readme_test_badge(passed: int, failed: int) -> None:
-    """Keep README.md's `tests-N%2FM passing` badge in sync with the real pytest results.
+    """Keep every test-count figure in README.md and tests/README.md honest, in one
+    pass: the `tests-N%2FM passing` badge, the `tests/` row in the module table, the
+    Test Suite section's own prose, and tests/README.md's own opening line — all
+    previously separate hand-typed numbers that could (and did — found live: the badge
+    said 492/492 while the real collected count was 1,471 across 63 files, and each
+    prose mention guessed a different approximate number from each other AND from the
+    badge, including tests/README.md's own "~950 tests across 40+ files") silently
+    drift apart the moment the suite grew and nobody happened to re-type every one of
+    them by hand.
 
     Only called after a full, unfiltered `av test` run (no `-k`) — a scoped subset would
-    overwrite the badge with a misleadingly small total otherwise.
+    overwrite these with a misleadingly small total otherwise.
     """
     total = passed + failed
     if total == 0:
-        return  # parse failed or nothing collected — leave the badge alone rather than zero it out
+        return  # parse failed or nothing collected — leave the numbers alone rather than zero them out
     source_root = _root._find_source_root()
     readme_path = source_root / "README.md"
     if not readme_path.is_file():
         return
     text = readme_path.read_text(encoding="utf-8")
     color = "brightgreen" if failed == 0 else "red"
-    pattern = re.compile(
+    badge_pattern = re.compile(
         r'https://img\.shields\.io/badge/tests-\d+%2F\d+%20passing-[a-z]+(\?[^"]*)"\s+alt="\d+ of \d+ tests passing"'
     )
 
-    def _replace(m: "re.Match[str]") -> str:
+    def _replace_badge(m: "re.Match[str]") -> str:
         return (
             f'https://img.shields.io/badge/tests-{passed}%2F{total}%20passing-{color}{m.group(1)}"'
             f' alt="{passed} of {total} tests passing"'
         )
 
-    updated = pattern.sub(_replace, text, count=1)
+    updated = badge_pattern.sub(_replace_badge, text, count=1)
+
+    # The file count is real, not parsed from pytest's own summary (which reports test
+    # counts, not file counts) — counted directly off disk, the same set `av test`
+    # itself just ran (only ever meaningful for the full, unscoped run this function is
+    # already gated on above).
+    tests_dir = source_root / "tests"
+    file_count = sum(1 for _ in tests_dir.glob("test_*.py")) if tests_dir.is_dir() else 0
+    total_str = f"{total:,}"
+    if file_count:
+        updated = _rewrite_test_count_prose(updated, total_str, file_count)
+
     if updated != text:
         atomic_write_text(readme_path, updated)
-        click.secho(f"Updated README.md test badge: {passed}/{total} passing", fg="cyan")
+        click.secho(f"Updated README.md test counts: {passed}/{total} passing, {file_count} files", fg="cyan")
+
+    tests_readme_path = tests_dir / "README.md"
+    if file_count and tests_readme_path.is_file():
+        tr_text = tests_readme_path.read_text(encoding="utf-8")
+        tr_updated = _rewrite_test_count_prose(tr_text, total_str, file_count)
+        if tr_updated != tr_text:
+            atomic_write_text(tests_readme_path, tr_updated)
+            click.secho(f"Updated tests/README.md test counts: {total_str} tests across {file_count} files", fg="cyan")
+
+
+def _sync_readme_perf_ratio(results: list) -> None:
+    """Keeps README.md's "~Nx slower than Git LFS" mentions (Known Limitations bullet +
+    Benchmark Comparison table row) in sync with the No-Op status/add benchmark's own
+    just-captured numbers — found live: README said "~15x" while the real latest capture
+    in `development/BENCHMARKS.md` (2026-09-03) put it at ~63x, because nothing ever
+    re-derived README's copy of that ratio from a real run; it was hand-typed once and
+    never revisited as the gap widened.
+
+    Only called when `--markdown` was passed (a genuine regeneration, not a scoped
+    `--only` spot-check) and only rewrites anything when the noop benchmark actually ran
+    with a real Git LFS number to compare against — a missing/uninstalled competitor
+    leaves README's existing figure untouched rather than overwriting it with garbage.
+    """
+    noop = next((r for r in results if r.name == "noop_status_speed"), None)
+    if noop is None or not noop.rows:
+        return
+    row = noop.rows[0]
+    av_value, lfs_value = row.values.get("av"), row.values.get("git-lfs")
+    if not av_value or not lfs_value:
+        return
+    source_root = _root._find_source_root()
+    readme_path = source_root / "README.md"
+    if not readme_path.is_file():
+        return
+    ratio = av_value / lfs_value
+    text = readme_path.read_text(encoding="utf-8")
+    updated, n = re.subn(r"~[\d.]+x slower than Git LFS", f"~{ratio:.0f}x slower than Git LFS", text)
+    if n and updated != text:
+        atomic_write_text(readme_path, updated)
+        click.secho(f"Updated README.md perf ratio: ~{ratio:.0f}x slower than Git LFS (no-op status/add)", fg="cyan")
 
 
 @click.command(name="test")
@@ -294,6 +371,7 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_
         Path(markdown_out).write_text(doc, encoding="utf-8")
         if not json_mode:
             click.echo(f"\nWrote {markdown_out}")
+        _sync_readme_perf_ratio(results)
 
     if save_json_out:
         Path(save_json_out).write_text(json.dumps(results_to_json(results), indent=2), encoding="utf-8")
