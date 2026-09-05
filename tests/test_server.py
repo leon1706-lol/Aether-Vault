@@ -18,7 +18,7 @@ import os
 import socket
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from fastapi import HTTPException
@@ -42,6 +42,29 @@ AV_TEST_REDIS_URL = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/
 # CASStorage is constructed at import time too (AV_DATA_DIR). Explicit assignment (not
 # setdefault) so a real dev DATABASE_URL already exported in the shell never leaks in here.
 os.environ["DATABASE_URL"] = AV_TEST_DATABASE_URL
+def _as_app_user_url(db_url: str) -> str:
+    """Rewrites `db_url`'s userinfo to `av_app:av_app_password`, whatever the ORIGINAL
+    username was. Previously a literal `.replace("av_user:av_password", ...)` -- correct
+    on Linux CI/local dev, where `AV_TEST_DATABASE_URL` really does connect as `av_user`
+    (docker-compose's own Postgres service container names it that), but a silent no-op
+    anywhere else: `server-tests-windows` connects as bare `postgres` (Chocolatey's
+    default superuser, no `av_user` role exists there at all), so the literal substring
+    never matched and `AV_TEST_APP_DATABASE_URL` ended up IDENTICAL to the superuser URL
+    -- meaning every "request-serving session routed through av_app" in this whole file
+    was actually still running as a superuser there, silently bypassing RLS entirely.
+    Found live: `TestHardTenancy::test_rls_actually_filters_now_for_the_non_superuser_role`
+    failed on Windows CI the first time it ever actually got to run (a separate, now-fixed
+    bug — the `av_user` role not existing at all — had made every test in this file ERROR
+    before reaching this one, masking this second bug completely until that first one was
+    fixed). `urlsplit`/`urlunsplit` parse the URL properly instead of guessing at its
+    literal text, so this is correct regardless of the base URL's own username."""
+    parts = urlsplit(db_url)
+    netloc = f"av_app:av_app_password@{parts.hostname}"
+    if parts.port:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 # v1.3.2 (migration 0015): route this whole file's request-serving sessions through the
 # non-superuser av_app role too, not just DATABASE_URL/av_user (which migrations and
 # system_session_factory keep using) -- the real fix for the RLS-superuser gap migration
@@ -53,7 +76,7 @@ os.environ["DATABASE_URL"] = AV_TEST_DATABASE_URL
 # Overridable like the other AV_TEST_* vars above for a differently-shaped test DB.
 AV_TEST_APP_DATABASE_URL = os.environ.get(
     "AV_TEST_APP_DATABASE_URL",
-    AV_TEST_DATABASE_URL.replace("av_user:av_password", "av_app:av_app_password"),
+    _as_app_user_url(AV_TEST_DATABASE_URL),
 )
 os.environ["AV_APP_DATABASE_URL"] = AV_TEST_APP_DATABASE_URL
 os.environ["REDIS_URL"] = AV_TEST_REDIS_URL

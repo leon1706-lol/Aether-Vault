@@ -69,12 +69,20 @@ wait_ready() {
 log "phase 0: bring up the HA stack (build if needed)"
 touch "$PROBE_LOG"
 
-# AV_RATE_LIMIT_DEFAULT is set for THIS run only (docker-compose.ha.yml leaves it unset
-# by default, matching the base compose's "unlimited data plane" posture) — 6/minute is
-# low enough that ~20 rapid requests through the LB provably crosses it once, but high
-# enough that phase 1/2's own pushes (well under 6 in quick succession per replica) don't
-# spuriously trip it.
-export AV_RATE_LIMIT_DEFAULT="6/minute"
+# v1.3.3.1 fix (found live): AV_RATE_LIMIT_DEFAULT used to be exported HERE, before phase
+# 0 even brings the stack up — meaning it applied to EVERY "default"-bucket route
+# (`bucket_class_for()`, rate_limit.py) for the ENTIRE drill, not just phase 4's own
+# dedicated rate-limit test below. `/api/objects/{hash}` and `/api/commits` (phases 1-3's
+# actual traffic) both fall in the SAME "default" bucket as `/api/refs` (phase 4's probe
+# route) and share the SAME client_key (every request arrives from the LB's own
+# connecting IP, `request.client.host` server-side) — so phase 1 alone (20 concurrent
+# pushes x 2 requests each = 40+ "default"-bucket hits within seconds, all in ONE 60s
+# fixed window) blew straight through a 6/minute cap before phase 4 ever ran, failing
+# EVERY baseline push with no fault injected. The data plane stays genuinely UNLIMITED
+# (this repo's own stated default) through phases 0-3 now; the limit is applied ONLY
+# right before phase 4 below, which is temporally well past 60s from here by the time it
+# runs (phase 3 alone can wait up to ~200s), so phase 4 starts its own fresh window with
+# nothing already counted against it.
 $COMPOSE up -d --build
 
 log "waiting for the LB + both engine replicas to report ready"
@@ -180,6 +188,16 @@ pass "exactly 3 webhook deliveries across 2 replicas' retry workers — no doubl
 
 # ---------------------------------------------------------------------------
 log "phase 4: Redis-backed rate limiter enforces ONE global limit across both replicas"
+
+# Applied HERE, not from phase 0 — see that section's own comment for why: phases 1-3's
+# legitimate traffic must never share this budget. `docker compose up -d` (no --build,
+# images are already built) detects the changed environment and recreates ONLY the two
+# engine containers with it, leaving the LB/Postgres/Redis containers (and their state —
+# the replication/webhook proof phases 0b/3 already established) completely undisturbed.
+export AV_RATE_LIMIT_DEFAULT="6/minute"
+$COMPOSE up -d
+log "waiting for both engine replicas to report ready again after the rate-limit env change"
+wait_ready "$API/api/ready" || die "engines never became ready again after applying AV_RATE_LIMIT_DEFAULT"
 
 CODES="$WORK/ratelimit_codes.txt"
 : > "$CODES"

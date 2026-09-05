@@ -854,7 +854,13 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Run the HA drill
-        run: bash scripts/ha_drill.sh
+        # v1.3.3.1 fix (found live): without KEEP_HA_STACK=1, ha_drill.sh's own `cleanup()`
+        # EXIT trap tears the whole stack down (`down -v`) BEFORE this job ever reaches
+        # the "Dump engine logs on failure" step below -- so on every real failure, that
+        # step ran against containers that no longer existed and silently dumped nothing.
+        # This job's own final "Tear down" step (`if: always()`) is what actually cleans
+        # up now, regardless of KEEP_HA_STACK.
+        run: KEEP_HA_STACK=1 bash scripts/ha_drill.sh
 
       - name: Dump engine logs on failure
         if: failure()
