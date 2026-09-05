@@ -80,9 +80,20 @@ wait_ready() {
   # timestamped trail in the live job log instead of total silence until cancellation --
   # every prior investigation of this exact hang had NOTHING to go on between the last
   # "waiting for..." line and the timeout kill.
+  #
+  # v1.3.3.9 fix (found live): the `timeout 12` wrapper above STILL didn't bound it --
+  # the next CI run hung again with ZERO progress log lines printed at all, meaning the
+  # very FIRST curl call never returned control even to `timeout` itself. Plain
+  # `timeout N CMD` only *sends* SIGTERM to CMD when N elapses; if CMD is wedged deep
+  # enough (blocked in a syscall that defers signal delivery) it can decline to die
+  # promptly, and `timeout` then waits for it to actually exit before returning --
+  # which means `timeout` inherits the exact same "no return" symptom it was added to
+  # prevent. `-k 5` (`--kill-after`) closes that gap: 5s after the SIGTERM, if the
+  # process is still alive, `timeout` escalates to an unmaskable SIGKILL instead of
+  # waiting on it indefinitely.
   local url="$1" tries=60 start_tries=60
   while (( tries-- > 0 )); do
-    if timeout 12 curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then return 0; fi
+    if timeout -k 5 12 curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then return 0; fi
     if (( tries % 10 == 0 )); then
       log "  ...still waiting on $url ($((start_tries - tries)) attempts so far)"
     fi
@@ -262,7 +273,7 @@ wait_ready "$API/api/ready" || die "engines never became ready again after apply
 CODES="$WORK/ratelimit_codes.txt"
 : > "$CODES"
 for i in $(seq 1 20); do
-  timeout 12 curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
+  timeout -k 5 12 curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
 done
 wait
 
