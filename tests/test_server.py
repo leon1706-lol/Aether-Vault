@@ -28,13 +28,34 @@ AV_TEST_DATABASE_URL = os.environ.get(
     "AV_TEST_DATABASE_URL",
     "postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test",
 )
-AV_TEST_REDIS_URL = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/0")
+# v1.3.2 fix (found live this session): the default used to be db 0 -- the SAME logical
+# Redis database `docker-compose.yml`'s own REDIS_URL points the real dev engine at.
+# A local `pytest tests/test_server.py` run with no env override shares its Bloom filter
+# and rate-limit/auth-spike keys with whatever real dev stack happens to be running on
+# this machine -- one contributing factor in this session's second infra incident (see
+# development/CHANGELOG.md Phase 60). Db 1 is still on localhost:6379 (no extra service
+# needed) but is a genuinely separate keyspace from the real stack's db 0.
+AV_TEST_REDIS_URL = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/1")
 
 # Point the server's own module-level config at the test instance *before* importing it â€”
 # database.py/redis_cache.py read DATABASE_URL/REDIS_URL at import time, and storage.py's
 # CASStorage is constructed at import time too (AV_DATA_DIR). Explicit assignment (not
 # setdefault) so a real dev DATABASE_URL already exported in the shell never leaks in here.
 os.environ["DATABASE_URL"] = AV_TEST_DATABASE_URL
+# v1.3.2 (migration 0015): route this whole file's request-serving sessions through the
+# non-superuser av_app role too, not just DATABASE_URL/av_user (which migrations and
+# system_session_factory keep using) -- the real fix for the RLS-superuser gap migration
+# 0013 documented only matters if it's actually exercised, and this is the one place
+# every existing route in this file already gets driven end-to-end. Deliberately the
+# SAME Postgres user (av_app) that docker-compose.yml wires the real engine to for
+# AV_APP_DATABASE_URL, just pointed at the test database -- migration 0015 grants it
+# there identically the first time `_apply_schema` runs against `aether_vault_test`.
+# Overridable like the other AV_TEST_* vars above for a differently-shaped test DB.
+AV_TEST_APP_DATABASE_URL = os.environ.get(
+    "AV_TEST_APP_DATABASE_URL",
+    AV_TEST_DATABASE_URL.replace("av_user:av_password", "av_app:av_app_password"),
+)
+os.environ["AV_APP_DATABASE_URL"] = AV_TEST_APP_DATABASE_URL
 os.environ["REDIS_URL"] = AV_TEST_REDIS_URL
 os.environ["AV_DATA_DIR"] = tempfile.mkdtemp(prefix="av-server-test-")
 # The periodic webhook-retry worker (server.py's _webhook_retry_worker) is created ONCE
@@ -95,13 +116,27 @@ async def _truncate_all() -> None:
         # runner with a brand-new ephemeral service container per run; guaranteed on any
         # persistent local Postgres re-run — exactly this session's setup, and exactly
         # why this had never been caught before this cycle's first-ever live pass.
+        # v1.3.2 (migration 0011): eight of the eleven new identity/tenancy tables join
+        # the truncate list (projects, users, user_identities, groups, group_members,
+        # role_bindings, api_tokens, sso_providers, sessions) — the same reasoning as the
+        # WP-44 fix above: a hardcoded-id test against any of them would otherwise
+        # collide with a previous local run's row.
+        #
+        # `tenants` and `roles` are DELIBERATELY excluded — unlike every other table
+        # here, both carry migration-time SEED data (the default tenant, the six
+        # built-in roles) that migration 0011 inserts exactly once, ever, not
+        # per-test-run data. Truncating them would silently delete that seed with
+        # nothing to reinsert it short of a full downgrade+upgrade, breaking every
+        # subsequent test in this file that expects the built-in roles to exist.
         await conn.execute(
             "TRUNCATE objects, trees, commits, refs, runs, run_commits, events,"
             " webhooks, webhook_deliveries, audit_log,"
             " improver_versions, change_sets, policy_packs, canary_results, project_freeze,"
             " eval_suites, eval_results, eval_adapters, tasks, plans, budgets,"
             " causal_links, strategy_entries, lessons, reviews, critiques, blackboard_entries,"
-            " sandbox_jobs, tool_manifests, action_logs CASCADE"
+            " sandbox_jobs, tool_manifests, action_logs,"
+            " projects, users, user_identities, groups, group_members, role_bindings,"
+            " api_tokens, sso_providers, sessions CASCADE"
         )
     finally:
         await conn.close()
@@ -915,7 +950,7 @@ def test_alembic_brings_schema_to_head(db):
             await conn.close()
 
     version, tables = asyncio.run(_probe())
-    assert version == "0010"  # current migration head — bump alongside new revisions
+    assert version == "0015"  # current migration head — bump alongside new revisions
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
@@ -923,6 +958,95 @@ def test_alembic_brings_schema_to_head(db):
     assert {"signature"} <= _pg_columns("commits")
     assert {"status_code"} <= _pg_columns("audit_log")
     assert "webhook_deliveries" in tables
+
+
+def test_migration_0011_seeds_default_tenant_and_builtin_roles(db):
+    """v1.3.2 (WP-1/WP-2): migration 0011's seed data — a default tenant and six
+    built-in roles expressed in the EXISTING require_scope() vocabulary — must be
+    present after any fresh boot, not just conceptually documented. `owner`'s
+    permissions being exactly `["*"]` is the load-bearing assertion: it is the same
+    wildcard `_scopes_for_identity()` already returns for AV_API_TOKEN and for any
+    legacy per-user token with no explicit scopes, which is what keeps this additive —
+    nothing that could already reach a route loses access under the new RBAC surface."""
+    import asyncpg
+
+    from python.av_server.models import DEFAULT_TENANT_ID
+
+    async def _probe():
+        conn = await asyncpg.connect(
+            AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+        )
+        try:
+            tenant = await conn.fetchrow(
+                "SELECT slug, status FROM tenants WHERE id = $1", DEFAULT_TENANT_ID
+            )
+            roles = await conn.fetch("SELECT name, permissions, builtin FROM roles")
+            return tenant, {r["name"]: (r["permissions"], r["builtin"]) for r in roles}
+        finally:
+            await conn.close()
+
+    tenant, roles = asyncio.run(_probe())
+    assert tenant is not None, "migration 0011 did not seed the default tenant"
+    assert tenant["slug"] == "default"
+    assert tenant["status"] == "active"
+
+    expected = {
+        "owner": ["*"],
+        "admin": ["admin", "improver:write", "policy:write", "eval:write", "review",
+                  "scorer", "token:write", "user:write", "scim"],
+        "maintainer": ["improver:write", "policy:write", "review"],
+        "trainer": ["improver:write", "scorer"],
+        "reviewer": ["review"],
+        "reader": ["read"],
+    }
+    assert set(roles) == set(expected), f"built-in role set drifted: {set(roles)}"
+    for name, perms in expected.items():
+        stored_perms, builtin = roles[name]
+        import json as _json
+        assert _json.loads(stored_perms) == perms, f"role {name} permissions drifted"
+        assert builtin is True, f"role {name} must be marked builtin"
+
+
+def test_migration_0011_enforces_tenant_scoped_uniqueness(db):
+    """`(tenant_id, username)` and `(tenant_id, email)` are unique per tenant (models.py
+    DBUser.__table_args__) — the same username/email may exist in two DIFFERENT tenants
+    (that's the whole point of tenant isolation) but never twice in the same one."""
+    import uuid
+
+    import asyncpg
+
+    from python.av_server.models import DEFAULT_TENANT_ID
+
+    async def _probe():
+        conn = await asyncpg.connect(
+            AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+        )
+        try:
+            uid1, uid2 = str(uuid.uuid4()), str(uuid.uuid4())
+            await conn.execute(
+                "INSERT INTO users (id, tenant_id, username, email, status, source) "
+                "VALUES ($1, $2, 'alice', 'alice@example.com', 'active', 'local')",
+                uid1, DEFAULT_TENANT_ID,
+            )
+            try:
+                dup_error = None
+                try:
+                    await conn.execute(
+                        "INSERT INTO users (id, tenant_id, username, email, status, source) "
+                        "VALUES ($1, $2, 'alice', 'alice2@example.com', 'active', 'local')",
+                        uid2, DEFAULT_TENANT_ID,
+                    )
+                except asyncpg.UniqueViolationError as exc:
+                    dup_error = str(exc)
+                return dup_error
+            finally:
+                await conn.execute("DELETE FROM users WHERE id = $1", uid1)
+        finally:
+            await conn.close()
+
+    dup_error = asyncio.run(_probe())
+    assert dup_error is not None, "duplicate (tenant_id, username) was not rejected"
+    assert "username" in dup_error
 
 
 def test_legacy_database_is_healed_and_stamped(db):
@@ -970,7 +1094,7 @@ def test_legacy_database_is_healed_and_stamped(db):
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "0010"  # stamps to CURRENT head, not a hardcoded rev
+    assert asyncio.run(_version()) == "0015"  # stamps to CURRENT head, not a hardcoded rev
 
 
 def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
@@ -984,7 +1108,7 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
     import asyncpg
     from alembic import command
 
-    from python.av_server.database import _alembic_config
+    from python.av_server.database import _alembic_config, app_engine, engine
 
     url_sync = AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
@@ -1018,7 +1142,7 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
         command.upgrade(cfg, "head")
 
         version = asyncio.run(_version_after())
-        assert version == "0010"
+        assert version == "0015"
         tables_at_head = asyncio.run(_tables())
         assert {"objects", "trees", "commits", "refs", "runs", "webhooks",
                 "audit_log", "webhook_deliveries", "events",
@@ -1028,7 +1152,10 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
                 "plans", "budgets",
                 "causal_links", "strategy_entries", "lessons", "reviews", "critiques",
                 "blackboard_entries",
-                "sandbox_jobs", "tool_manifests", "action_logs"} <= tables_at_head
+                "sandbox_jobs", "tool_manifests", "action_logs",
+                "tenants", "projects", "users", "user_identities", "groups",
+                "group_members", "roles", "role_bindings", "api_tokens",
+                "sso_providers", "sessions"} <= tables_at_head
         assert {"policy_outcome", "kind", "improver_id", "integrity_signals",
                 "plan_id", "budget_id", "stop_reason", "lessons_id"} <= _pg_columns("runs")
         assert {"signature", "env_snapshot_id"} <= _pg_columns("commits")
@@ -1037,6 +1164,28 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
         # every OTHER test in this session-scoped file assumes head. A failure partway
         # through this test must not corrupt the rest of the suite's fixture state.
         command.upgrade(cfg, "head")
+
+        # v1.3.2 fix (found live, running the FULL file rather than just this test in
+        # isolation): the drop-and-recreate above gives every table NEW Postgres OIDs.
+        # The existing "one-shot retry" dance below only ever heals the ONE connection
+        # THIS test's own two calls happen to check out (SQLAlchemy's pool is LIFO, so
+        # sequential same-test calls keep reusing that one) -- but by the time this test
+        # runs in a full suite, the pool can already hold SEVERAL distinct idle
+        # connections opened by earlier tests, each still caching prepared-statement
+        # plans against the OLD (now-dropped) OIDs. Any LATER test that happens to draw
+        # one of THOSE out of the pool hits a raw, unretried
+        # `InvalidCachedStatementError` -- confirmed live: a full `pytest
+        # tests/test_server.py` run failed 5 unrelated later tests this way, while this
+        # test in isolation always passed. `engine.dispose(close=False)` DROPS every
+        # currently-pooled connection reference outright (no attempt to close them
+        # over the wrong event loop, which is what previously made a plain `dispose()`
+        # break the TestClient's own anyio portal for the rest of the session, per the
+        # comment below) — every subsequent checkout, in this test and every later one,
+        # opens a genuinely fresh connection instead of possibly drawing a stale one.
+        # Verified live (a standalone repro script) that this does NOT break the portal.
+        engine.sync_engine.dispose(close=False)
+        if app_engine is not engine:
+            app_engine.sync_engine.dispose(close=False)
 
     # A downgrade all the way to `base` necessarily DROPS every table (that's what "no
     # schema at all" means) — the commit made before the round trip is gone by design,
@@ -2586,6 +2735,486 @@ class TestProjectFreeze:
 # uses (no new delivery path — proven by test_webhooks_cli.py/the webhook classes above;
 # these tests only need to prove the DETECTORS fire the event with the right payload).
 # ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tenancy_enforced():
+    """Flips AV_TENANCY_ENFORCE on for one test. Two module-level bindings, not one, are
+    patched -- `python.av_server.database.TENANCY_ENFORCE` (read by `_apply_tenant_guc`/
+    `_apply_bypass_rls`, the RLS GUC listeners) AND `python.av_server.server.TENANCY_ENFORCE`
+    (server.py's OWN name, bound via `from .database import TENANCY_ENFORCE` at import
+    time -- reassigning the database module's attribute does NOT retroactively change
+    server.py's already-bound copy of that name). Same two-module-identity class of bug
+    this codebase has hit before (Probleme.md #132) -- both are patched here so neither
+    half of tenancy enforcement is silently left off."""
+    from python.av_server import database as database_module
+
+    database_module.TENANCY_ENFORCE = True
+    server_module.TENANCY_ENFORCE = True
+    try:
+        yield
+    finally:
+        database_module.TENANCY_ENFORCE = False
+        server_module.TENANCY_ENFORCE = False
+
+
+@pytest.fixture
+def two_tenants(db):
+    """Two real tenants with one admin-scoped DB token each, created via the real HTTP
+    surface (not direct DB inserts) -- proves `av tenant create`/`av token create`'s own
+    routes work as the actual bootstrap path for a genuine multi-tenant test, not just a
+    fixture shortcut."""
+    import uuid
+
+    import python.av_server.identity as identity_module
+
+    headers_a = {"Authorization": "Bearer trainer-token-12345"}
+    slug_a = f"tenant-a-{uuid.uuid4().hex[:8]}"
+    slug_b = f"tenant-b-{uuid.uuid4().hex[:8]}"
+    created_a = db.post("/api/tenants", json={"slug": slug_a, "name": "Tenant A"},
+                        headers=headers_a)
+    created_b = db.post("/api/tenants", json={"slug": slug_b, "name": "Tenant B"},
+                        headers=headers_a)
+    assert created_a.status_code == 200 and created_b.status_code == 200
+    tenant_a_id, tenant_b_id = created_a.json()["id"], created_b.json()["id"]
+
+    # Direct inserts for the tokens themselves (not /api/tokens, which always mints
+    # under the CALLER's own tenant -- there is deliberately no route that lets one
+    # identity mint a token for a DIFFERENT tenant, which is exactly the property this
+    # fixture needs to route around to set up a clean two-tenant test at all).
+    async def _mint(tenant_id, name):
+        import asyncpg
+
+        conn = await asyncpg.connect(
+            AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+        )
+        try:
+            raw = f"tok-{uuid.uuid4().hex}"
+            await conn.execute(
+                "INSERT INTO api_tokens (id, tenant_id, name, token_hash, prefix, "
+                "created_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, now())",
+                f"id-{raw}", tenant_id, name, identity_module.hash_token(raw), raw[:8], "test",
+            )
+        finally:
+            await conn.close()
+        return raw
+
+    token_a = asyncio.run(_mint(tenant_a_id, "tenant-a-token"))
+    token_b = asyncio.run(_mint(tenant_b_id, "tenant-b-token"))
+    identity_module._principal_cache.clear()
+    return {
+        "tenant_a_id": tenant_a_id, "tenant_b_id": tenant_b_id,
+        "headers_a": {"Authorization": f"Bearer {token_a}"},
+        "headers_b": {"Authorization": f"Bearer {token_b}"},
+    }
+
+
+class TestHardTenancy:
+    """v1.3.2 — live proof of both enforcement layers together: the app-level guard
+    (`_enforce_project_tenant`, a clean 403/404) AND Postgres RLS (migration 0013, the
+    backstop) against a REAL two-tenant, real-Postgres setup. `scoped_users` is NOT used
+    here (unlike TestApiTokens/TestTenantsUsersRoles) -- these tokens carry no explicit
+    scopes at all (unrestricted `["*"]`, DB-token default), isolating tenancy as the only
+    variable under test rather than mixing it with scope enforcement."""
+
+    def test_unconfigured_server_is_byte_identical_with_enforcement_off(self, db):
+        """The single most important test in this class: with TENANCY_ENFORCE at its
+        real default (off, no fixture applied), a caller can push under ANY project_id,
+        read ANY project's data, and list every project -- exactly v1.3.1 behavior,
+        proving this whole phase adds nothing observable until explicitly turned on."""
+        obj_hash = _upload_object(db, b"unconfigured-proof")
+        resp = db.post("/api/commits", json={
+            "hash": "c" * 64, "message": "m", "root_tree_hash": "r" * 64,
+            "project_id": "anyone-can-use-this-project-id", "project_name": "p",
+        })
+        assert resp.status_code in (201, 409)
+        listed = db.get("/api/projects")
+        assert listed.status_code == 200  # never denied, never tenant-filtered
+
+    def test_write_under_a_foreign_project_id_is_denied_with_tenant_denied(
+        self, db, tenancy_enforced, two_tenants,
+    ):
+        t = two_tenants
+        first = db.post("/api/commits", json={
+            "hash": "d" * 64, "message": "m", "root_tree_hash": "r" * 64,
+            "project_id": "shared-name-proj", "project_name": "p",
+        }, headers=t["headers_a"])
+        assert first.status_code in (201, 409), first.text  # tenant A claims it
+
+        collide = db.post("/api/commits", json={
+            "hash": "e" * 64, "message": "m2", "root_tree_hash": "r" * 64,
+            "project_id": "shared-name-proj", "project_name": "p",
+        }, headers=t["headers_b"])
+        assert collide.status_code == 403, collide.text
+        assert collide.json()["detail"]["error"] == "tenant_denied"
+
+    def test_read_of_a_foreign_project_id_is_a_bare_404(self, db, tenancy_enforced, two_tenants):
+        t = two_tenants
+        db.post("/api/commits", json={
+            "hash": "f" * 64, "message": "m", "root_tree_hash": "r" * 64,
+            "project_id": "b-owns-this-one", "project_name": "p",
+        }, headers=t["headers_b"])
+
+        denied = db.get("/api/commits", params={"project_id": "b-owns-this-one"},
+                        headers=t["headers_a"])
+        assert denied.status_code == 404
+        assert "tenant_denied" not in denied.text  # not the write-path error shape
+
+    def test_unfiltered_list_routes_are_tenant_scoped(self, db, tenancy_enforced, two_tenants):
+        """An UNFILTERED list route (no project_id given at all) run by tenant A must
+        never show tenant B's rows. NOT an RLS test, despite what an earlier draft of
+        this test assumed and named itself after -- when this test was written, RLS was
+        live-verified INERT under this repo's own default docker-compose topology
+        (av_user connects as a Postgres SUPERUSER, which unconditionally bypasses
+        row-level security; see migration 0013's own docstring for the full finding).
+        Migration 0015 fixed that gap (see
+        test_rls_actually_filters_now_for_the_non_superuser_role below for its proof),
+        but this test is kept exactly as-is and un-renamed: it proves the explicit
+        application-level filters `list_commits`/`list_projects` (server.py) work in
+        their OWN right, which remains the correct thing to rely on regardless of which
+        Postgres role is in play -- defense in depth, not "RLS makes this redundant"."""
+        t = two_tenants
+        db.post("/api/commits", json={
+            "hash": "1" * 64, "message": "a-owns", "root_tree_hash": "r" * 64,
+            "project_id": "rls-proof-a", "project_name": "p",
+        }, headers=t["headers_a"])
+        db.post("/api/commits", json={
+            "hash": "2" * 64, "message": "b-owns", "root_tree_hash": "r" * 64,
+            "project_id": "rls-proof-b", "project_name": "p",
+        }, headers=t["headers_b"])
+
+        as_a = db.get("/api/commits", headers=t["headers_a"]).json()["commits"]
+        ids_a = {c["hash"] for c in as_a}
+        assert "1" * 64 in ids_a
+        assert "2" * 64 not in ids_a  # app-level filter excluded tenant B's row
+
+        as_b = db.get("/api/commits", headers=t["headers_b"]).json()["commits"]
+        ids_b = {c["hash"] for c in as_b}
+        assert "2" * 64 in ids_b
+        assert "1" * 64 not in ids_b
+
+        projects_a = {p["project_id"] for p in db.get("/api/projects", headers=t["headers_a"]).json()["projects"]}
+        assert "rls-proof-a" in projects_a
+        assert "rls-proof-b" not in projects_a
+
+    def test_rls_actually_filters_now_for_the_non_superuser_role(self, db, tenancy_enforced, two_tenants):
+        """v1.3.2 (migration 0015): the real backstop, proven at the SQL layer with the
+        app-level guard entirely out of the picture -- a raw `SELECT * FROM commits` with
+        NO WHERE clause at all, issued directly over asyncpg as `av_app` with only the
+        `app.tenant_id` GUC set (exactly what `after_begin` does, reproduced by hand
+        here), must return only that tenant's rows. This is what migration 0013's own
+        docstring said was missing ("the real fix is an infrastructure change... not
+        attempted here") -- 0015 is that infrastructure change, and this is its proof.
+        Also documents the flip side: connecting as `av_user` (still a superuser) is
+        UNAFFECTED and keeps seeing everything, which is exactly right -- it's the role
+        migrations and `system_session_factory`'s legitimately-cross-tenant background
+        workers still need."""
+        import asyncpg
+
+        t = two_tenants
+        db.post("/api/commits", json={
+            "hash": "4" * 64, "message": "a-owns-raw", "root_tree_hash": "r" * 64,
+            "project_id": "raw-sql-proof-a", "project_name": "p",
+        }, headers=t["headers_a"])
+        db.post("/api/commits", json={
+            "hash": "5" * 64, "message": "b-owns-raw", "root_tree_hash": "r" * 64,
+            "project_id": "raw-sql-proof-b", "project_name": "p",
+        }, headers=t["headers_b"])
+
+        async def _raw_select(dsn: str, tenant_id: str | None) -> set[str]:
+            conn = await asyncpg.connect(dsn)
+            try:
+                async with conn.transaction():
+                    if tenant_id is not None:
+                        await conn.execute(
+                            "SELECT set_config('app.tenant_id', $1, true)", tenant_id
+                        )
+                    rows = await conn.fetch(
+                        "SELECT hash FROM commits WHERE hash IN ($1, $2)", "4" * 64, "5" * 64
+                    )
+                    return {r["hash"] for r in rows}
+            finally:
+                await conn.close()
+
+        app_dsn = AV_TEST_APP_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+        superuser_dsn = AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+
+        as_app_for_a = asyncio.run(_raw_select(app_dsn, t["tenant_a_id"]))
+        assert as_app_for_a == {"4" * 64}, \
+            f"av_app + app.tenant_id=A must see ONLY A's row via raw SQL, got {as_app_for_a}"
+
+        as_app_for_b = asyncio.run(_raw_select(app_dsn, t["tenant_b_id"]))
+        assert as_app_for_b == {"5" * 64}, \
+            f"av_app + app.tenant_id=B must see ONLY B's row via raw SQL, got {as_app_for_b}"
+
+        as_app_no_guc = asyncio.run(_raw_select(app_dsn, None))
+        assert "4" * 64 not in as_app_no_guc and "5" * 64 not in as_app_no_guc, \
+            "av_app with NO tenant GUC set must fall back to the default tenant, not see A/B's rows"
+
+        # The documented, permanent flip side: a superuser connection (av_user, what
+        # migrations and system_session_factory use) is NOT filtered by RLS no matter
+        # what GUC is set -- Postgres exempts superusers unconditionally, FORCE included.
+        as_superuser = asyncio.run(_raw_select(superuser_dsn, t["tenant_a_id"]))
+        assert as_superuser == {"4" * 64, "5" * 64}, \
+            "av_user (superuser) must still see both tenants' rows -- this is expected, not a bug"
+
+    def test_rls_survives_a_mid_request_commit_boundary(self, db, tenancy_enforced, two_tenants):
+        """The hard part the design explicitly called out: a one-shot SET LOCAL at
+        session creation would silently stop applying after any commit inside the same
+        request. `DELETE /api/admin/audit` (prune_audit_log) commits TWICE in one
+        request (the delete itself, then its own _audit() row) -- proving RLS/tenant
+        scoping still correctly applies to that SECOND transaction, not just the first,
+        is the direct live proof `after_begin`'s per-transaction re-application actually
+        works, not just reads correctly in isolation."""
+        t = two_tenants
+        admin_a = {"Authorization": "Bearer trainer-token-12345"}  # unrestricted; admin scope
+        # A tenant-A-scoped audit row to prune.
+        db.post("/api/commits", json={
+            "hash": "3" * 64, "message": "prune-me", "root_tree_hash": "r" * 64,
+            "project_id": "prune-proof-a", "project_name": "p",
+        }, headers=t["headers_a"])
+
+        pruned = db.delete("/api/admin/audit", params={"before_days": 0}, headers=admin_a)
+        assert pruned.status_code == 200, pruned.text
+        # Reaching here without an error/hang across the delete's two internal commits
+        # IS the assertion -- a regression here would surface as a DatatypeMismatch-style
+        # exception or a silently-wrong second transaction, not a clean denial.
+
+
+class TestTenantsUsersRoles:
+    """v1.3.2 — /api/tenants, /api/users, /api/roles, /api/role-bindings. Proves the
+    ROLE-BINDING-derived permission path specifically (identity.py::_permissions_for_subject)
+    -- TestApiTokens below only ever exercises a token's own explicit `scopes` list, never
+    a role granted via a binding, which is a materially different code path
+    (resolve_db_token's role_scopes union) that needs its own live proof."""
+
+    def test_tenants_me_defaults_to_default_tenant_in_anonymous_mode(self, db):
+        from python.av_server.models import DEFAULT_TENANT_ID
+
+        resp = db.get("/api/tenants/me")
+        assert resp.status_code == 200
+        assert resp.json()["id"] == DEFAULT_TENANT_ID
+        assert resp.json()["slug"] == "default"
+
+    def test_list_roles_includes_all_six_builtins(self, db):
+        resp = db.get("/api/roles")
+        assert resp.status_code == 200
+        names = {r["name"] for r in resp.json()["roles"]}
+        assert names == {"owner", "admin", "maintainer", "trainer", "reviewer", "reader"}
+        owner = next(r for r in resp.json()["roles"] if r["name"] == "owner")
+        assert owner["permissions"] == ["*"]
+        assert owner["builtin"] is True
+
+    def test_create_user_requires_user_write_scope(self, db, scoped_users):
+        denied = db.post("/api/users", json={"username": "alice"},
+                         headers={"Authorization": "Bearer reader-token-12345"})
+        assert denied.status_code == 403
+        assert denied.json()["detail"]["required_scope"] == "user:write"
+
+        allowed = db.post("/api/users", json={"username": "alice"},
+                          headers={"Authorization": "Bearer trainer-token-12345"})
+        assert allowed.status_code == 200
+        assert allowed.json()["status"] == "created"
+
+    def test_role_binding_grants_effective_permission_to_a_db_token(self, db, scoped_users):
+        """The core proof: a DB token with NO explicit scopes of its own, whose SUBJECT
+        (the token itself, subject_type='token') is granted the 'reviewer' role via a
+        binding, ends up with EXACTLY reviewer's permissions (['review']) — not the
+        unrestricted default a scopeless token would otherwise carry. This is
+        identity.py::resolve_db_token's role_scopes union path, specifically."""
+        admin_headers = {"Authorization": "Bearer trainer-token-12345"}
+
+        # Mint a token with NO explicit scopes -- it should carry whatever its role
+        # bindings grant, once one exists (server.py::create_api_token: "an unrestricted
+        # token... [that] carries exactly its role-derived scopes").
+        minted = db.post("/api/tokens", json={"name": "bound-token"}, headers=admin_headers)
+        assert minted.status_code == 200
+        token_id = minted.json()["id"]
+        raw_token = minted.json()["token"]
+        bound_headers = {"Authorization": f"Bearer {raw_token}"}
+
+        roles = {r["name"]: r["id"]
+                for r in db.get("/api/roles", headers=admin_headers).json()["roles"]}
+
+        # A real, reviewable change set — created_by defaults to the admin identity
+        # (trainer), so the bound token (a different subject entirely) reviewing it can
+        # never trip the self-review rejection this route also enforces.
+        obj_hash = _upload_object(db, b'{"diff":"reviewable"}', headers=admin_headers)
+        cs = db.post("/api/change-sets",
+                    json={"id": "cs-rb-proof", "project_id": "prb", "object_id": obj_hash},
+                    headers=admin_headers)
+        assert cs.status_code == 200, cs.text
+
+        # Before any binding: a scopeless token has no role-derived scopes at all, so it
+        # falls back to identity.py::resolve_db_token's minimal `["read"]` default --
+        # 'review' must NOT yet be reachable.
+        pre_bind = db.post("/api/reviews",
+                           json={"project_id": "prb", "target_type": "change_set",
+                                 "target_id": "cs-rb-proof", "decision": "approve"},
+                           headers=bound_headers)
+        assert pre_bind.status_code == 403
+
+        grant = db.post("/api/role-bindings",
+                        json={"subject_type": "token", "subject_id": token_id,
+                              "role_id": roles["reviewer"]},
+                        headers=admin_headers)
+        assert grant.status_code == 200, grant.text
+
+        from python.av_server import identity as identity_module
+        identity_module._principal_cache.clear()  # the pre_bind call above cached "no role"
+
+        post_bind = db.post("/api/reviews",
+                            json={"project_id": "prb", "target_type": "change_set",
+                                  "target_id": "cs-rb-proof", "decision": "approve"},
+                            headers=bound_headers)
+        assert post_bind.status_code == 200, post_bind.text
+
+        # And still restricted to exactly what 'reviewer' grants -- token:write (a
+        # DIFFERENT permission) must stay denied for this same token.
+        still_denied = db.post("/api/tokens", json={"name": "x"}, headers=bound_headers)
+        assert still_denied.status_code == 403
+
+    def test_suspend_user_revokes_their_tokens_and_sessions(self, db, scoped_users):
+        admin_headers = {"Authorization": "Bearer trainer-token-12345"}
+        created = db.post("/api/users", json={"username": "bob"}, headers=admin_headers)
+        user_id = created.json()["id"]
+
+        # A token explicitly minted FOR this user (user_id set), not a bare service
+        # token. Uses a RAW asyncpg connection (matching _truncate_all()'s own pattern
+        # above), never the app's `async_session_factory()` from inside a fresh
+        # asyncio.run() call here — that pool's connections are bound to the TestClient's
+        # own lifespan event loop, and reusing them from a separate loop hangs rather
+        # than raising cleanly (found live: this exact mistake in an earlier draft of
+        # this test hung for 8+ minutes with near-zero CPU, not a clean traceback).
+        import asyncpg
+
+        from python.av_server.models import DEFAULT_TENANT_ID
+        import python.av_server.identity as identity_module_direct
+
+        async def _mint_for_user():
+            conn = await asyncpg.connect(
+                AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+            )
+            try:
+                raw = "manual-user-token-abc123"
+                await conn.execute(
+                    "INSERT INTO api_tokens (id, tenant_id, user_id, name, token_hash, "
+                    "prefix, created_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, now())",
+                    "tok-bob", DEFAULT_TENANT_ID, user_id, "bob-token",
+                    identity_module_direct.hash_token(raw), raw[:8], "test",
+                )
+            finally:
+                await conn.close()
+            return raw
+
+        raw_token = asyncio.run(_mint_for_user())
+        identity_module_direct._principal_cache.clear()
+        bob_headers = {"Authorization": f"Bearer {raw_token}"}
+        assert db.get("/api/freeze/suspend-proof", headers=bob_headers).status_code == 200
+
+        suspended = db.post(f"/api/users/{user_id}/suspend", headers=admin_headers)
+        assert suspended.status_code == 200
+
+        identity_module_direct._principal_cache.clear()
+        after = db.get("/api/freeze/suspend-proof-2", headers=bob_headers)
+        assert after.status_code == 401
+
+
+class TestApiTokens:
+    """v1.3.2 — DB-backed `/api/tokens*` (identity.py's Principal resolution). Run under
+    `scoped_users` (Protected mode via _AUTH_USERS) specifically so an unrecognized/
+    revoked token genuinely 401s rather than falling through Anonymous mode's blanket
+    "an unrecognized token is treated as no credential at all" permissiveness — that
+    fallback is real and correct (see server.py::require_token's own comment), but it
+    would mask the exact behavior this class needs to prove: a DB token authenticates,
+    and gets ITS OWN scopes enforced, independent of whichever env-based identity minted
+    it."""
+
+    def _create_token(self, db, headers, name="ci-bot", scopes=None, expires_in_days=None):
+        body = {"name": name}
+        if scopes is not None:
+            body["scopes"] = scopes
+        if expires_in_days is not None:
+            body["expires_in_days"] = expires_in_days
+        resp = db.post("/api/tokens", json=body, headers=headers)
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_create_requires_token_write_scope(self, db, scoped_users):
+        # 'trainer' is the pre-v1.3.1 unrestricted default (no explicit scopes ->
+        # ["*"]) -- token creation must stay reachable for it, same additive guarantee
+        # every other scoped route already carries.
+        headers = {"Authorization": "Bearer trainer-token-12345"}
+        created = self._create_token(db, headers)
+        assert created["status"] == "created"
+        assert created["token"] and len(created["token"]) > 20
+        assert created["prefix"] == created["token"][:8]
+
+        # 'reader' (explicit ["read"] only) must be denied -- token:write is not read.
+        denied = db.post("/api/tokens", json={"name": "nope"},
+                         headers={"Authorization": "Bearer reader-token-12345"})
+        assert denied.status_code == 403
+        assert denied.json()["detail"]["required_scope"] == "token:write"
+
+    def test_minted_token_authenticates_standalone_with_its_own_scopes(self, db, scoped_users):
+        """The core proof: a token minted here authenticates with NO other credential
+        present, and the SCOPES ENFORCED are the token's own declared list -- not the
+        wildcard the identity that minted it happened to carry.
+
+        Minted using 'trainer' (scoped_users: bare-string entry -> unrestricted ["*"],
+        the pre-v1.3.1 default) rather than 'root' (scoped_users: literal scope
+        ["admin"]) deliberately -- the env-based scope model is a flat string match with
+        no hierarchy (the SAME reason /api/freeze's admin-only route checks for the
+        literal string "admin", not a role), so a token whose only declared scope is the
+        STRING "admin" does not, and should not, also satisfy require_scope("token:write")."""
+        admin_headers = {"Authorization": "Bearer trainer-token-12345"}
+        minted = self._create_token(db, admin_headers, name="narrow", scopes=["read"])
+        narrow_headers = {"Authorization": f"Bearer {minted['token']}"}
+
+        # The minting admin has ["admin"], but the MINTED token only ever declared
+        # ["read"] -- using it to create a second token must be denied.
+        denied = db.post("/api/tokens", json={"name": "should-fail"}, headers=narrow_headers)
+        assert denied.status_code == 403
+        assert denied.json()["detail"]["required_scope"] == "token:write"
+
+        # A route needing no scope at all still works with this token -- it DOES
+        # authenticate, it's just restricted.
+        assert db.get("/api/freeze/tok-proof", headers=narrow_headers).status_code == 200
+
+    def test_list_never_leaks_the_hash_and_revoke_takes_effect(self, db, scoped_users):
+        from python.av_server import identity as identity_module
+
+        admin_headers = {"Authorization": "Bearer trainer-token-12345"}
+        minted = self._create_token(db, admin_headers, name="throwaway")
+        token_id = minted["id"]
+        raw_headers = {"Authorization": f"Bearer {minted['token']}"}
+
+        listed = db.get("/api/tokens", headers=admin_headers)
+        assert listed.status_code == 200
+        rows = listed.json()["tokens"]
+        assert any(r["id"] == token_id for r in rows)
+        assert all("token_hash" not in r and "hash" not in r for r in rows)
+        matching = next(r for r in rows if r["id"] == token_id)
+        assert matching["prefix"] == minted["token"][:8]
+
+        # Confirm the token authenticates before revoking (a real, working credential).
+        assert db.get("/api/freeze/tok-revoke-proof", headers=raw_headers).status_code == 200
+
+        revoked = db.post(f"/api/tokens/{token_id}/revoke", headers=admin_headers)
+        assert revoked.status_code == 200
+        # The TTL cache (identity.py::AUTH_CACHE_TTL_SECS) means a revoke's effect on an
+        # ALREADY-cached resolution is bounded, not immediate -- documented explicitly in
+        # identity.py::invalidate_cached_token's docstring. Clearing it here proves the
+        # revoke itself is real and permanent (the next, uncached resolution correctly
+        # sees it), not that the cache never exists.
+        identity_module._principal_cache.clear()
+        after_revoke = db.get("/api/freeze/tok-revoke-proof-2", headers=raw_headers)
+        assert after_revoke.status_code == 401
+
+    def test_revoke_of_unknown_or_foreign_token_is_404(self, db, scoped_users):
+        headers = {"Authorization": "Bearer trainer-token-12345"}
+        resp = db.post("/api/tokens/does-not-exist/revoke", headers=headers)
+        assert resp.status_code == 404
+
 
 @pytest.fixture
 def clean_auth_window():

@@ -1,0 +1,104 @@
+# Default values for the aether-vault chart.
+# See README.md in this directory for the honest verification status: this chart is
+# `helm template | kubeconform -strict` schema-verified in CI (helm-lint job), NOT
+# drilled against a real running cluster on this machine — see docker-compose.ha.yml /
+# scripts/ha_drill.sh for the topology that IS genuinely drilled locally.
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/leon1706/aether-vault-engine
+  tag: "1.3.2"
+  pullPolicy: IfNotPresent
+
+engine:
+  role: all
+  port: 8000
+  webuiPort: 3000
+  # Matches AV_ENGINE_STOP_GRACE_SECS' default (engine-entrypoint.sh drains up to 25s
+  # before SIGKILL) plus a margin — see infrastructure.md's own "Drain on rolling
+  # update" note, mirrored here so the chart and the compose files agree.
+  stopGraceSecs: 25
+  terminationGracePeriodSeconds: 30
+
+service:
+  type: ClusterIP
+  apiPort: 8000
+  webuiPort: 3000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: aether-vault.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Database/Redis connection strings — left empty by default (must be supplied via
+# --set or a values override, or via existingSecret below). This chart does NOT deploy
+# Postgres/Redis itself (out of scope for a single application chart) — bring your own
+# managed instance or a separate chart (e.g. bitnami/postgresql, bitnami/redis).
+database:
+  # If existingSecret is set, url/appUrl are ignored and the secret's own keys
+  # (databaseUrl / appDatabaseUrl) are used instead.
+  url: ""
+  # v1.3.2 (migration 0015): optional non-superuser role connection string for
+  # request-serving sessions -- see database.py's AV_APP_DATABASE_URL docstring and
+  # migration 0015's own docstring for what this closes. Leave empty to fall back to
+  # `url` for everything (byte-identical pre-v1.3.2 behavior).
+  appUrl: ""
+  existingSecret: ""
+
+redis:
+  url: ""
+  existingSecret: ""
+
+auth:
+  # AV_API_TOKEN / AV_AUTH_USERS — left empty (Anonymous mode) by default. Set via
+  # --set or an existingSecret in production.
+  apiToken: ""
+  authUsers: ""
+  existingSecret: ""
+
+tenancy:
+  enforce: false
+
+rateLimit:
+  backend: memory   # "redis" recommended once replicaCount > 1
+  default: ""
+  gc: "10/minute"
+
+authSpike:
+  backend: memory
+
+migrationJob:
+  enabled: true
+  # Runs `python -m alembic upgrade head` (via the image's own entrypoint, AV_ENGINE_ROLE
+  # not relevant here) as a Helm pre-upgrade/pre-install hook Job, so schema is at head
+  # BEFORE any replica of the new Deployment starts serving traffic.
+  backoffLimit: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

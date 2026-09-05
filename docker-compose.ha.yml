@@ -1,0 +1,175 @@
+# ============================================================================
+# HA topology (v1.3.2, WP-25) -- a SEPARATE compose file from docker-compose.yml, run
+# alongside it with `-f docker-compose.ha.yml` (it reuses docker-compose.yml's build
+# context/image via `extends`-free duplication below, kept intentionally explicit rather
+# than layered with `-f docker-compose.yml -f docker-compose.ha.yml` merge semantics --
+# an HA topology changes so much service-by-service, from host-port mapping to which
+# database each engine talks to, that a partial override file would be harder to read
+# correctly than one self-contained file).
+#
+# Shape: nginx least-conn load balancer in front of 2 stateless engine replicas, a
+# Postgres primary + real streaming-replication standby, and a Redis primary + replica.
+# `scripts/ha_drill.sh` is the actual proof this is more than YAML -- it drives concurrent
+# pushes through the LB, kills one engine replica and one Postgres/Redis node mid-run, and
+# asserts zero failed pushes, zero double webhook deliveries, and globally-correct rate
+# limiting (see WP-24's RedisWindowRateLimiter/AV_RATE_LIMIT_BACKEND, which this topology
+# is the reason to actually turn on).
+#
+# Run it:
+#   docker compose -f docker-compose.ha.yml up -d --build
+#   ./scripts/ha_drill.sh
+#   docker compose -f docker-compose.ha.yml down -v
+# ============================================================================
+# Explicit project name -- keeps this topology's network/volumes/container namespace
+# entirely separate from docker-compose.yml's default "aether-vault" project, so both can
+# run side by side on this machine without any name collision (they were colliding on
+# the shared default network before this was added, found via `docker compose -f
+# docker-compose.ha.yml config`).
+name: aether-vault-ha
+
+services:
+  lb:
+    image: nginx:1.27-alpine
+    container_name: aether-vault-ha-lb
+    ports:
+      - '8000:8000'
+      - '3000:3000'
+    volumes:
+      - ./docker/ha/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      engine-1:
+        condition: service_healthy
+      engine-2:
+        condition: service_healthy
+    restart: unless-stopped
+
+  engine-1: &engine
+    build:
+      context: .
+      target: engine
+    container_name: aether-vault-ha-engine-1
+    volumes:
+      - ha_vault_data:/data
+    environment: &engine_env
+      - AV_DATA_DIR=/data
+      - AV_ENGINE_ROLE=all
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NODE_ENV=production
+      - WEBUI_PORT=3000
+      - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db-primary:5432/aether_vault
+      # v1.3.2 (migration 0015): request-serving sessions use the non-superuser role in
+      # the HA topology too, same as docker-compose.yml -- see database.py's
+      # APP_DATABASE_URL docstring.
+      - AV_APP_DATABASE_URL=postgresql+asyncpg://av_app:av_app_password@db-primary:5432/aether_vault
+      - REDIS_URL=redis://redis-primary:6379/0
+      - AV_API_TOKEN=${AV_API_TOKEN:-}
+      - AV_AUTH_USERS=${AV_AUTH_USERS:-}
+      # v1.3.2 (WP-24): opt IN to the cross-replica-safe Redis-backed rate limiter and
+      # auth-spike counter -- the whole reason this topology exists is >1 replica, and
+      # the in-process defaults are actively wrong under N replicas (see rate_limit.py's
+      # own module docstring). This is the one place in the repo where turning these on
+      # is the CORRECT default, not merely an option -- a single-instance compose
+      # (docker-compose.yml) rightly leaves them off.
+      - AV_RATE_LIMIT_BACKEND=redis
+      - AV_AUTH_SPIKE_BACKEND=redis
+      # Left unset (today's "unlimited data plane" default, rate_limit.py's own
+      # documented posture) unless the caller opts in -- scripts/ha_drill.sh sets this
+      # for its own run only, to prove the Redis backend enforces ONE global limit
+      # across replicas rather than N independent ones, without baking a restrictive
+      # default into this topology for every other use of it.
+      - AV_RATE_LIMIT_DEFAULT=${AV_RATE_LIMIT_DEFAULT:-}
+    depends_on:
+      db-primary:
+        condition: service_healthy
+      redis-primary:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck: &engine_healthcheck
+      test: ['CMD-SHELL', 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/ready\").read()" && node -e "fetch(\"http://localhost:3000/\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
+      interval: 10s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+
+  engine-2:
+    <<: *engine
+    container_name: aether-vault-ha-engine-2
+
+  db-primary:
+    image: postgres:15-alpine
+    container_name: aether-vault-ha-db-primary
+    environment:
+      POSTGRES_USER: av_user
+      POSTGRES_PASSWORD: av_password
+      POSTGRES_DB: aether_vault
+    command: >
+      postgres -c wal_level=replica -c max_wal_senders=10
+               -c max_replication_slots=10 -c hot_standby=on
+    volumes:
+      - ha_postgres_primary_data:/var/lib/postgresql/data
+      - ./docker/ha/postgres-primary-init.sh:/docker-entrypoint-initdb.d/00-primary-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U av_user -d aether_vault"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  db-replica:
+    image: postgres:15-alpine
+    container_name: aether-vault-ha-db-replica
+    entrypoint: ["/bin/bash", "/docker-ha/postgres-replica-entrypoint.sh"]
+    volumes:
+      - ha_postgres_replica_data:/var/lib/postgresql/data
+      - ./docker/ha/postgres-replica-entrypoint.sh:/docker-ha/postgres-replica-entrypoint.sh:ro
+    depends_on:
+      db-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U av_user -d aether_vault"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  redis-primary:
+    image: redis/redis-stack-server:latest
+    container_name: aether-vault-ha-redis-primary
+    volumes:
+      - ha_redis_primary_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis-replica:
+    image: redis/redis-stack-server:latest
+    container_name: aether-vault-ha-redis-replica
+    command: ["--replicaof", "redis-primary", "6379"]
+    volumes:
+      - ha_redis_replica_data:/data
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  ha_vault_data:
+    driver: local
+  ha_postgres_primary_data:
+    driver: local
+  ha_postgres_replica_data:
+    driver: local
+  ha_redis_primary_data:
+    driver: local
+  ha_redis_replica_data:
+    driver: local

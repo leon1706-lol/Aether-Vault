@@ -1,0 +1,25 @@
+Aether-Vault ({{ .Chart.AppVersion }}) has been deployed as "{{ .Release.Name }}".
+
+API:   http://{{ include "aether-vault.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.apiPort }}
+WebUI: http://{{ include "aether-vault.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.webuiPort }}
+
+{{- if not .Values.database.url }}
+{{- if not .Values.database.existingSecret }}
+
+WARNING: values.database.url is empty and no existingSecret was given -- the engine
+will fail its readiness probe (DB connectivity check) until you set one, e.g.:
+  helm upgrade {{ .Release.Name }} . --set database.url=postgresql+asyncpg://user:pass@host:5432/db
+{{- end }}
+{{- end }}
+
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- if ne .Values.rateLimit.backend "redis" }}
+
+NOTE: replicaCount > 1 with rateLimit.backend=memory -- each replica enforces its OWN
+independent rate limit window (N times the configured limit in practice). Set
+--set rateLimit.backend=redis for correct behavior across replicas (see
+development/infrastructure.md and rate_limit.py's own docstring).
+{{- end }}
+{{- end }}
+
+See deploy/helm/aether-vault/README.md in the repo for this chart's verification status.

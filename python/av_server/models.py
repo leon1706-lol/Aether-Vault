@@ -19,9 +19,19 @@ def utcnow_naive() -> datetime:
 
 
 class DBObject(Base):
-    """Represents a stored CAS blob (model weights, dataset shard, code file)."""
+    """Represents a stored CAS blob (model weights, dataset shard, code file).
+
+    v1.3.2 (migration 0014): `tenant_id` joins the primary key — `(tenant_id, hash)`, not
+    bare `hash` — the schema prerequisite for a future genuinely-separate per-tenant
+    object store. Every existing row's `tenant_id` is the same `DEFAULT_TENANT_ID` every
+    other table backfills to, so the composite key behaves identically to the old
+    bare-`hash` key today — zero behavioral change. Physical per-tenant storage
+    separation itself (a real second dedup domain, plus the matching Bloom-filter split)
+    is NOT implemented yet — see migration 0014's own docstring for why that is
+    deliberately scoped out of this schema change rather than half-shipped."""
     __tablename__ = "objects"
 
+    tenant_id = Column(String, ForeignKey("tenants.id"), primary_key=True)
     hash = Column(String, primary_key=True)
     # BigInteger, not Integer: ML weights/datasets routinely exceed the 2.1 GB INT4 ceiling.
     size = Column(BigInteger, nullable=False)
@@ -31,11 +41,13 @@ class DBObject(Base):
 class DBTree(Base):
     """
     One row per entry inside a Merkle tree node.
-    tree_hash + path_name form a composite primary key.
+    (tenant_id, tree_hash, path_name) form a composite primary key — see DBObject's own
+    docstring for why `tenant_id` joined this PK in migration 0014.
     Either child_tree_hash (sub-directory) or object_hash (leaf blob) is set.
     """
     __tablename__ = "trees"
 
+    tenant_id = Column(String, ForeignKey("tenants.id"), primary_key=True)
     tree_hash = Column(String, primary_key=True)
     path_name = Column(String, primary_key=True)
     child_tree_hash = Column(String, nullable=True)
@@ -62,6 +74,11 @@ class DBCommit(Base):
     metrics → JSONB dict of float/int experiment metrics.
     """
     __tablename__ = "commits"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     hash = Column(String, primary_key=True)
     message = Column(String, nullable=False)
@@ -105,6 +122,11 @@ class DBCommit(Base):
 class DBRef(Base):
     """Branch / tag reference pointing to a commit hash."""
     __tablename__ = "refs"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     name = Column(String, primary_key=True)
     commit_hash = Column(String, ForeignKey("commits.hash"), nullable=False)
@@ -129,6 +151,11 @@ class DBRun(Base):
     parent_run_id enables 'this fine-tune descended from that run' chains.
     """
     __tablename__ = "runs"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -186,6 +213,11 @@ class DBRun(Base):
 class DBRunCommit(Base):
     """Join table: which commits belong to which run (a run usually spans many)."""
     __tablename__ = "run_commits"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     run_id = Column(String, ForeignKey("runs.id"), primary_key=True)
     commit_hash = Column(String, ForeignKey("commits.hash"), primary_key=True)
@@ -199,6 +231,11 @@ class DBEvent(Base):
     (?since=<last seen id> returns strictly newer events in id order).
     """
     __tablename__ = "events"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     ts = Column(DateTime, default=utcnow_naive, nullable=False)
@@ -212,6 +249,11 @@ class DBEvent(Base):
 class DBWebhook(Base):
     """A subscriber URL that receives signed POSTs for matching events."""
     __tablename__ = "webhooks"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     url = Column(String, nullable=False)
@@ -237,6 +279,11 @@ class DBWebhook(Base):
 class DBAuditLog(Base):
     """Immutable who-did-what trail for mutating API calls (trust/enterprise surface)."""
     __tablename__ = "audit_log"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     ts = Column(DateTime, default=utcnow_naive, nullable=False)
@@ -271,6 +318,11 @@ class DBWebhookDelivery(Base):
     been retention-swept from `events`.
     """
     __tablename__ = "webhook_deliveries"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     webhook_id = Column(String, ForeignKey("webhooks.id"), nullable=False, index=True)
@@ -303,6 +355,11 @@ class DBImproverVersion(Base):
     content-addressed via `manifest_object_id`. `parent_id` (no FK — see module-level
     rationale) forms the improver lineage graph `GET /api/improvers/{id}/lineage` walks."""
     __tablename__ = "improver_versions"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -316,6 +373,11 @@ class DBChangeSet(Base):
     """A structured self-edit proposal (diff + rationale + predicted risk) against an
     improver version. `object_id` is the CAS id of the actual proposal document."""
     __tablename__ = "change_sets"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -338,6 +400,11 @@ class DBPolicyPack(Base):
     (`python/av_cli/signing.py`). `object_id` is the CAS id of the actual pack document
     (see `.av/policies.json`'s `policy_version: 2` shape, `cmd_policy.py`)."""
     __tablename__ = "policy_packs"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -354,6 +421,11 @@ class DBCanaryResult(Base):
     """One capability-canary run's outcome for a given improver version — the mandatory
     pass gate `av improver promote` checks before allowing an improver promotion."""
     __tablename__ = "canary_results"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     project_id = Column(String, nullable=False, index=True)
@@ -372,6 +444,11 @@ class DBEvalSuite(Base):
     results against this suite are score-redacted for any reader without the `scorer`
     scope until explicitly revealed (`DBEvalResult.revealed`)."""
     __tablename__ = "eval_suites"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -391,6 +468,11 @@ class DBEvalResult(Base):
     scoring); a blind suite's results are created with `revealed=False` and only flipped
     by `POST /api/eval/results/{id}/reveal` (also `scorer`-scoped)."""
     __tablename__ = "eval_results"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     project_id = Column(String, nullable=False, index=True)
@@ -409,6 +491,11 @@ class DBEvalAdapter(Base):
     failed scoring (see `av eval adapter run`), so success can't be silently redefined
     in-tree by whatever's currently checked in."""
     __tablename__ = "eval_adapters"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -421,6 +508,11 @@ class DBEvalAdapter(Base):
 class DBTask(Base):
     """A curriculum task/difficulty-ramp proposal (todo.md B.8)."""
     __tablename__ = "tasks"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -437,6 +529,11 @@ class DBPlan(Base):
     """An experiment plan (hypotheses, ablations, budget, stop rules) — content-addressed
     like every other RSI artifact (todo.md D.16)."""
     __tablename__ = "plans"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -451,6 +548,11 @@ class DBBudget(Base):
     `av budget consume` does an atomic `UPDATE ... SET x_used = x_used + :delta`, never a
     read-modify-write race between two processes consuming the same budget concurrently."""
     __tablename__ = "budgets"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -471,6 +573,11 @@ class DBCausalLink(Base):
     """An agent-authored (or verified) claim: this change CAUSED that metric delta
     (todo.md E.21) — explicit, beyond `parent_run_id`'s bare lineage pointer."""
     __tablename__ = "causal_links"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     project_id = Column(String, nullable=False, index=True)
@@ -487,6 +594,11 @@ class DBStrategyEntry(Base):
     """A searchable record of what worked/failed across lineages (todo.md E.22) — beyond
     `.avh` context-memory notes, which are per-repo and not cross-run-queryable."""
     __tablename__ = "strategy_entries"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -505,6 +617,11 @@ class DBLessons(Base):
     resolves the current version), same pattern as `policy_packs` minus the hash-chain
     (lessons revise freely; they are not a tamper-evident policy log)."""
     __tablename__ = "lessons"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -520,6 +637,11 @@ class DBReview(Base):
     version can be the eventual promotion target regardless of which change set (if any)
     produced it."""
     __tablename__ = "reviews"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -536,6 +658,11 @@ class DBCritique(Base):
     H.35) — must be resolved or explicitly waived before promotion clears; a waiver is
     itself audited. Same target_type/target_id generalization as `DBReview`."""
     __tablename__ = "critiques"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -553,6 +680,11 @@ class DBBlackboardEntry(Base):
     """A durable shared claim with authors and evidence links (todo.md H.36) — beyond the
     ordered event stream, a place for hypotheses that outlive any one event."""
     __tablename__ = "blackboard_entries"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -570,6 +702,11 @@ class DBProjectFreeze(Base):
     (`_AuthRetryGroup.invoke()`) and here, so a compromised/rogue local client can't just
     skip the check."""
     __tablename__ = "project_freeze"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     project_id = Column(String, primary_key=True)
     frozen = Column(Boolean, nullable=False, default=False)
@@ -593,6 +730,11 @@ class DBSandboxJob(Base):
     sandbox queue` list jobs across drivers/machines without every driver needing its own
     listing capability (a `local` job on a laptop has none at all)."""
     __tablename__ = "sandbox_jobs"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True)  # the caller-assigned job_id (see sandbox.base.JobSpec)
     project_id = Column(String, nullable=False, index=True)
@@ -611,6 +753,11 @@ class DBToolManifest(Base):
     G.30) — append-only version history, `/latest` resolved by `created_at`, same pattern
     as `DBLessons`/`DBPolicyPack` minus the hash-chain."""
     __tablename__ = "tool_manifests"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)
@@ -620,11 +767,231 @@ class DBToolManifest(Base):
     created_at = Column(DateTime, default=utcnow_naive)
 
 
+# ---------------------------------------------------------------------------
+# v1.3.2 — Enterprise identity & tenancy (migration 0011). Additive: every table here is
+# NEW, and every pre-existing tenant-scoped table gains a `tenant_id` column across two
+# follow-up migrations (0012 adds it nullable + backfills, 0013 makes it NOT NULL and
+# enables row-level security) rather than one fat migration, to avoid a single long lock
+# across add-column + backfill + NOT-NULL + RLS-enable on tables the size `audit_log`/
+# `events` can reach in a live deployment. See development/architecture.md's Tenancy
+# Isolation contract section for the full design.
+#
+# DEFAULT_TENANT_ID is a fixed, well-known UUID (not `_new_uuid()`) so it can be a literal
+# in the RLS policy's COALESCE fallback (see migration 0013) and in this module — every
+# pre-existing row across every table backfills to exactly this tenant, which is what
+# makes an unconfigured deployment behave byte-identically to pre-v1.3.2 (VERSIONING.md:
+# "if an upgrade would make a previously working script, repo, or client stop working,
+# it's MAJOR" — this feature is a MINOR, so it must not).
+# ---------------------------------------------------------------------------
+
+DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
+
+
+class DBTenant(Base):
+    """A billing/isolation boundary. `slug` is the human-facing identifier (`av tenant
+    show <slug>`); `id` is the UUID every tenant-scoped row's `tenant_id` FK's to."""
+    __tablename__ = "tenants"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    slug = Column(String, nullable=False, unique=True, index=True)
+    name = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="active")  # active | suspended
+    settings = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBProject(Base):
+    """The tenant that owns a `project_id`. Was purely virtual before v1.3.2 — `av init`
+    mints `project_id` client-side and no server-side row ever existed for it (`GET
+    /api/projects` was a `GROUP BY DBCommit.project_id`, see server.py::list_projects).
+    `id` reuses the existing free-text project_id string verbatim — no rename anywhere
+    else in the schema. First writer for an unseen project_id claims it for their tenant
+    (`_enforce_project_tenant()`, server.py) — this table is lazily populated, not
+    pre-provisioned, matching `av init`'s zero-ceremony flow."""
+    __tablename__ = "projects"
+
+    id = Column(String, primary_key=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+    archived_at = Column(DateTime, nullable=True)
+
+
+class DBUser(Base):
+    """A durable identity — local, SSO-provisioned, or SCIM-provisioned (`source`).
+    Replaces nothing: `AV_API_TOKEN`/`AV_AUTH_USERS` (server.py's `.env`-based identities)
+    keep working completely unchanged and resolve to DEFAULT_TENANT_ID at runtime — this
+    table is the additive path for real multi-user/multi-tenant deployments."""
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    username = Column(String, nullable=False)
+    email = Column(String, nullable=True)
+    display_name = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="active")  # active | suspended
+    source = Column(String, nullable=False, default="local")  # local | sso | scim
+    external_id = Column(String, nullable=True, index=True)  # SCIM externalId
+    created_at = Column(DateTime, default=utcnow_naive)
+    updated_at = Column(DateTime, default=utcnow_naive, onupdate=utcnow_naive)
+    last_login_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_users_tenant_username", "tenant_id", "username", unique=True),
+        Index("ix_users_tenant_email", "tenant_id", "email", unique=True),
+    )
+
+
+class DBUserIdentity(Base):
+    """One external-IdP identity linked to a local `DBUser` — a user may hold identities
+    at more than one provider (an OIDC `sub` from one IdP, a SAML NameID from another)."""
+    __tablename__ = "user_identities"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    provider_id = Column(String, nullable=False, index=True)
+    issuer = Column(String, nullable=False)
+    subject = Column(String, nullable=False)
+    email = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+    __table_args__ = (
+        Index("ix_user_identities_provider_subject", "provider_id", "subject", unique=True),
+    )
+
+
+class DBGroup(Base):
+    """An IdP/SCIM group, mapped to roles via `role_bindings` (`subject_type="group"`)."""
+    __tablename__ = "groups"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    external_id = Column(String, nullable=True, index=True)  # SCIM externalId
+    source = Column(String, nullable=False, default="local")  # local | sso | scim
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBGroupMember(Base):
+    __tablename__ = "group_members"
+
+    group_id = Column(String, ForeignKey("groups.id"), primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"), primary_key=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBRole(Base):
+    """A named bundle of permissions expressed in the EXISTING v1.3.1 scope vocabulary
+    (`require_scope()`'s scope strings), not a parallel permission system — so every
+    existing `Depends(require_scope("..."))` call site keeps working unchanged, and a
+    role binding is just a different, DB-backed way to arrive at the same `scopes` list
+    `_scopes_for_identity()` already resolves for an `.env`-based token. `tenant_id` NULL
+    marks a built-in role (`owner`/`admin`/`maintainer`/`trainer`/`reviewer`/`reader`,
+    seeded by migration 0011) shared by every tenant; non-null is a tenant's own custom
+    role."""
+    __tablename__ = "roles"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    permissions = Column(JSON, nullable=False, default=list)  # ["improver:write", "review", ...]
+    builtin = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+    __table_args__ = (Index("ix_roles_tenant_name", "tenant_id", "name", unique=True),)
+
+
+class DBRoleBinding(Base):
+    """Grants a role to a user/group/token, at tenant or project scope. The permission
+    resolver (`identity.py::resolve_principal`) unions every binding's role's
+    `permissions` that apply to the resolved subject."""
+    __tablename__ = "role_bindings"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    subject_type = Column(String, nullable=False)  # user | group | token
+    subject_id = Column(String, nullable=False)
+    role_id = Column(String, ForeignKey("roles.id"), nullable=False)
+    scope_type = Column(String, nullable=False, default="tenant")  # tenant | project
+    scope_id = Column(String, nullable=True)  # a project_id when scope_type == "project"
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+    __table_args__ = (
+        Index("ix_role_bindings_subject", "tenant_id", "subject_type", "subject_id"),
+    )
+
+
+class DBApiToken(Base):
+    """A DB-backed bearer token — the remote-administrable alternative to
+    `AV_AUTH_USERS` (which requires `docker compose` shell access to the host running the
+    stack to create/rotate/revoke, cmd_auth.py). Only `token_hash` (sha256) is ever
+    stored; the plaintext token is shown exactly once, at creation (`av token create`),
+    exactly like `av registry keygen`'s private key never round-trips back out."""
+    __tablename__ = "api_tokens"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id"), nullable=True)  # null = service token
+    name = Column(String, nullable=False)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    prefix = Column(String, nullable=False)  # first 8 chars, for display in `av token list`
+    scopes = Column(JSON, nullable=True)  # explicit scopes; null = role-derived only
+    expires_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBSsoProvider(Base):
+    """An OIDC or SAML identity provider configured for a tenant. `config` holds the
+    provider-specific JSON (issuer/client_id/jwks_uri for OIDC; entity_id/sso_url/cert for
+    SAML); any client secret inside it is Fernet-encrypted at rest under `AV_SECRET_KEY`
+    (`python/av_server/sso_crypto.py`) — creation is refused with a clear error when that
+    key is unset rather than ever storing a secret in plaintext."""
+    __tablename__ = "sso_providers"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    kind = Column(String, nullable=False)  # oidc | saml
+    name = Column(String, nullable=False)
+    config = Column(JSON, nullable=False)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=utcnow_naive)
+
+
+class DBSession(Base):
+    """A logged-in session (`av login`, or the webui's browser flow) — distinct from
+    `api_tokens`: a session comes from an interactive SSO login and carries a shorter,
+    refreshable lifetime; a token is a long-lived credential minted directly. Only hashes
+    are stored, matching `api_tokens`."""
+    __tablename__ = "sessions"
+
+    id = Column(String, primary_key=True, default=_new_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    refresh_hash = Column(String, nullable=True, unique=True, index=True)
+    issued_at = Column(DateTime, default=utcnow_naive)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    ip = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+
+
 class DBActionLog(Base):
     """A published, content-addressed snapshot of `.av/actions.jsonl` (todo.md G.31) —
     `av replay-actions` fetches this alongside a run's env snapshot to reconstruct not
     just the training code but the AGENT'S DECISIONS."""
     __tablename__ = "action_logs"
+    # v1.3.2 (migration 0012/0013): tenant boundary. Auto-populated on insert
+    # by database.py's before_flush listener (session.info["tenant_id"], falling
+    # back to DEFAULT_TENANT_ID) -- no call site that constructs this model needs
+    # to set it explicitly. RLS-enforced (migration 0013) once AV_TENANCY_ENFORCE=1.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
 
     id = Column(String, primary_key=True, default=_new_uuid)
     project_id = Column(String, nullable=False, index=True)

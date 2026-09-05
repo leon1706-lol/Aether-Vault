@@ -98,6 +98,16 @@ def _set_freeze(repo_root, frozen: bool, reason: str | None) -> dict:
             detail = resp.json().get("detail", {})
         except Exception:
             pass
+        # v1.3.2: this route can now also 403 with {"error": "tenant_denied"} from
+        # `server.py::_enforce_project_tenant`'s global dependency (AV_TENANCY_ENFORCE=1
+        # only) — the caller authenticated fine and even had the admin scope, they just
+        # don't own cfg['project_id']. Distinct remediation from "your token lacks a
+        # scope", so it gets its own error code/exit status (22) rather than being
+        # folded into scope_denied's.
+        if detail.get("error") == "tenant_denied":
+            fail(None, "tenant_denied",
+                 f"This registry's tenant boundary rejected the request — your "
+                 f"credential does not own project '{cfg['project_id']}'.")
         fail(None, "scope_denied",
              f"Token lacks the 'admin' scope required to "
              f"{'freeze' if frozen else 'unfreeze'} this project "

@@ -866,6 +866,45 @@ hash-chained policy-as-code; publishing a new pack is itself an audited, version
 loop end to end through `av_sdk.Repo` — propose → sandbox-apply → canary → dual-gate
 promotion (denied, then reviewed and allowed) → lessons → a budget that stops itself.
 
+#### `av tenant` / `av user` / `av role` / `av token` (v1.3.2)
+
+DB-backed identity and RBAC, administrable remotely (no shell access to the registry
+host needed) — the enterprise-path counterpart to `av auth`'s `.env`-based tokens, which
+keep working unchanged alongside these.
+
+```bash
+av tenant create <slug> <name>                       # provision a new tenant (admin-scoped)
+av tenant show                                       # the tenant your current credential resolves to
+av user create <username> --email <email>            # create a user in your tenant
+av user list                                         # list users in your tenant
+av user suspend <user-id>                            # suspend a user, revoking their tokens/sessions
+av role list                                         # the 6 built-in roles + any custom ones
+av role grant user <user-id> <role-id>               # bind a role to a subject (user/group/token)
+av role bindings                                     # list active role bindings
+av role revoke <binding-id>                          # remove a role binding
+av token create <name>                               # mint a DB-backed API token (remote, revocable)
+av token list                                        # list this tenant's tokens (hash never shown)
+av token revoke <token-id>                           # revoke immediately
+```
+
+Hard multi-tenancy (`tenant_id` on every project-scoped table, an application-level
+guard, and Postgres row-level security enforced via a dedicated non-superuser DB role) is
+gated behind `AV_TENANCY_ENFORCE` (server-side env var, off by default) — see
+`development/architecture.md`'s Tenancy Isolation section.
+
+#### `av admin backup` (v1.3.2)
+
+Operator-facing disaster recovery — not repo-scoped, run against infrastructure
+directly. See [`docs/dr.md`](docs/dr.md) for the full picture, including the real
+destroy-and-restore drill and why this command never auto-detects "the local docker
+stack" the way `av auth` does.
+
+```bash
+av admin backup create OUTPUT_DIR --database-url URL --data-dir PATH
+av admin backup verify BACKUP_DIR
+av admin backup restore BACKUP_DIR --database-url URL --data-dir PATH --force
+```
+
 ---
 
 ## Release Process
@@ -912,12 +951,14 @@ For enterprise research teams and institutional algorithmic trading firms:
 
 | Feature | Description |
 |---|---|
-| **Enterprise Login** (not yet built) | A stable `EnterpriseAuthProvider` seam exists (`python/av_cli/enterprise.py`); the mode is deliberately hidden from interactive `av init` until the real account-based login ships |
-| **Multi-User Collaboration** | The OSS baseline shipped in v1.1.1 (`av clone`/`av pull`/`av merge`, per-project refs). Enterprise tier adds server-side branch protection, review/approval flows, and quota management |
-| **RBAC** | Fine-grained read/write permissions for teams, users, and repositories |
-| **SSO** | OAuth2, SAML, and Active Directory integration |
-| **Audit Logging** | Immutable, cryptographically signed logs for regulatory compliance |
-| **High Availability** | Multi-node horizontal scaling for the FastAPI registry and distributed Postgres/Redis |
+| **Enterprise Login (SSO)** (not yet built) | A stable `EnterpriseAuthProvider` seam exists (`python/av_cli/enterprise.py`); OIDC/SAML against a real IdP has not shipped — the mode is deliberately hidden from interactive `av init` until it does |
+| **SCIM provisioning** (not yet built) | No code yet |
+| **Multi-User Collaboration** | The OSS baseline shipped in v1.1.1 (`av clone`/`av pull`/`av merge`, per-project refs). |
+| **RBAC** ✅ shipped (v1.3.2) | DB-backed roles/role-bindings/tokens, remotely administrable — `av role`, `av token`, `av user`, `av tenant`. 6 built-in roles (`owner`/`admin`/`maintainer`/`trainer`/`reviewer`/`reader`); see [CLI Reference](#cli-reference) |
+| **Hard multi-tenancy** ✅ shipped (v1.3.2) | Per-tenant data isolation: an application-level guard plus Postgres row-level security enforced via a dedicated non-superuser DB role, gated behind `AV_TENANCY_ENFORCE` (off by default). Per-tenant *physical* CAS storage separation (vs. today's shared, deduplicated store) is not yet built |
+| **Audit Logging** | Plain, unsigned audit rows today (`audit_log` table, queryable via `av audit`). Cryptographic hash-chaining/signing (matching the pattern `av policy pack` already uses) has not shipped |
+| **High Availability** ✅ shipped (v1.3.2) | `docker-compose.ha.yml` (nginx LB + N engine replicas + Postgres primary/streaming-replica + Redis primary/replica) and a Helm chart (`deploy/helm/aether-vault/`, schema-verified via `helm template \| kubeconform`, not yet drilled on a real cluster). `scripts/ha_drill.sh` is a real, locally-run drill proving zero failed requests and zero double webhook delivery across a killed replica |
+| **Disaster recovery** ✅ shipped (v1.3.2) | `av admin backup create/verify/restore` (Postgres + CAS objects, hash-verified manifest) — see [`docs/dr.md`](docs/dr.md) for the real destroy-and-restore drill and the measured-RTO/stated-RPO distinction |
 | **Cloud Connectors** | AWS IAM, GCP Cloud Storage, Azure Blob Storage with automated cold-storage tiering |
 
 ---

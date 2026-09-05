@@ -215,6 +215,56 @@ per-surface "RSI R1"–"RSI R6" contract sections for the full design reasoning.
   pinned model-gate contract stays untouched) and `.av/tool_manifests/<improver_id>.json`
   (per-improver-version sandbox permissions, fails closed when absent).
 
+## v1.3.2 additive surfaces (in progress — see development/CHANGELOG.md Phase 60)
+
+This release is IN PROGRESS: the sections below describe what has actually shipped code
+for so far (E0/E1/E4 core, three of E5's cross-replica fixes), not the whole enterprise
+roadmap `todo.md` scoped for the version. Every surface below follows the same
+additive-only rules this page defines — nothing here changes existing behavior for a
+deployment that sets none of the new env vars.
+
+- **HTTP API**: ~15 new routes across identity/tenancy — `/api/tokens*`, `/api/tenants*`,
+  `/api/users*`, `/api/roles`, `/api/role-bindings*`. All new paths, no existing
+  endpoint's shape changed. Six previously-unscoped admin routes (`/api/admin/gc`,
+  `/api/admin/audit*`, `/api/admin/webhook-deliveries*`) now require the `admin` scope —
+  a documented **fix**, not additive: a token with an EXPLICIT scope list that does not
+  include `admin` (never the common unrestricted default) loses access to these six
+  routes specifically. Flagged here per this page's own rule of thumb ("if an upgrade
+  would make a previously working script stop working, it's MAJOR") — accepted as a
+  deliberate, narrow exception because the prior state was a genuine, undocumented
+  security gap (any authenticated token, however narrowly scoped, could trigger GC or
+  read/prune the audit trail), the same class of judgment call v1.2.5's exit-code fix
+  made for a pre-existing contract violation.
+- **New exit code**: `tenant_denied` (22), additive to the 10–20 registry. Exit code 21
+  (`login_required`) is reserved but deliberately NOT yet registered anywhere (no real
+  caller exists until `av login`/SSO sessions ship).
+- **CLI**: 4 new command groups — `av token create/list/revoke`, `av tenant create/show`,
+  `av user create/list/suspend`, `av role list/grant/bindings/revoke`. `av auth *` is
+  completely unchanged and remains the documented `.env`-based path; these are the
+  DB-backed, remote-administrable alternative alongside it, not a replacement.
+- **DB schema**: migrations `0011`–`0014`. `0011` adds eleven new tables (tenants,
+  projects, users, user_identities, groups, group_members, roles, role_bindings,
+  api_tokens, sso_providers, sessions), seeding a default tenant and six built-in roles.
+  `0012`/`0013` add `tenant_id` to 28 pre-existing tables (nullable+backfilled, then NOT
+  NULL+FK+row-level-security) — every pre-existing row backfills to the same seeded
+  default tenant, so an unconfigured deployment's data is untouched in substance. `0014`
+  widens `objects`/`trees`' primary keys to include `tenant_id` — a schema prerequisite
+  only; no runtime behavior change ships with it. Each has a real, tested `downgrade()`.
+- **Config/env vars**: `AV_TENANCY_ENFORCE` (default off — row-level security and the
+  application-layer tenancy guard are both fully inert until set), `AV_RATE_LIMIT_BACKEND`
+  and `AV_AUTH_SPIKE_BACKEND` (default `memory` — opt into a Redis-backed counter for
+  correctness under multiple server replicas; both fail open on a Redis error),
+  `AV_AUTH_CACHE_TTL_SECS` (default 30 — the DB-backed-token resolution cache window).
+- **Python SDK**: `av_sdk.exceptions.TenantDeniedError`, additive to the existing
+  exception set.
+- **Known, disclosed limitation, not a contract change**: Postgres unconditionally
+  exempts superuser roles from row-level security, and this repo's own default
+  `docker-compose.yml` connects as a superuser — so the RLS backstop (migration `0013`)
+  is currently inert under the shipped default topology, verified live rather than
+  assumed. The application-layer guard is unaffected (plain code, not a database
+  privilege). See migration `0013`'s own docstring for the full finding and the real fix
+  (a non-superuser connection role — infrastructure work, not shipped this pass).
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades

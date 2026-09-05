@@ -110,8 +110,11 @@ def test_at_least_one_command_was_found_in_each_doc_file():
     found_docs = {doc for doc, _, _ in ALL_DOC_COMMANDS}
     all_docs = {p.name for p in DOCS_DIR.glob("*.md")}
     # README.md is a pure index; contracts.md/avattributes.md are reference docs about a
-    # schema/syntax, not CLI walkthroughs — none of the three has `av` examples of its own.
-    NO_COMMANDS_EXPECTED = {"README.md", "contracts.md", "avattributes.md"}
+    # schema/syntax, not CLI walkthroughs. slo.md/sla.md (v1.3.2) are policy/measurement
+    # documents, not CLI walkthroughs either — none of the five has `av` examples of its
+    # own (support.md, the third new v1.3.2 doc, DOES use `av support-bundle` and needs
+    # no exemption).
+    NO_COMMANDS_EXPECTED = {"README.md", "contracts.md", "avattributes.md", "slo.md", "sla.md"}
     expected_with_commands = all_docs - NO_COMMANDS_EXPECTED
     missing = expected_with_commands - found_docs
     assert not missing, f"no `av` commands found in: {missing} — check the fence-parsing regex"

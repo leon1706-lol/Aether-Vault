@@ -1,0 +1,47 @@
+{{- if .Values.migrationJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "aether-vault.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "aether-vault.labels" . | nindent 4 }}
+  annotations:
+    # Runs BEFORE the upgraded Deployment's new pods start (weight -5, before the
+    # default-weight resources) so schema is at head before any replica serves traffic —
+    # the same ordering guarantee docker-compose.yml gets for free from init_db() running
+    # inside app startup, made explicit here since a Job is a separate resource from the
+    # Deployment. hook-succeeded delete-policy keeps completed migration Jobs from piling
+    # up across releases; before-hook-creation cleans up a job stuck from a failed
+    # previous attempt before this one runs.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrationJob.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "aether-vault.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Runs the SAME `init_db()` entry point av_server's own app-startup lifespan
+          # calls (database.py) -- not a separate script that could drift from what the
+          # real server actually does at boot. Deliberately does NOT set
+          # AV_APP_DATABASE_URL here: migrations always need the DDL-capable role
+          # (DATABASE_URL), matching database.py's own documented split.
+          command:
+            - python
+            - -c
+            - "import asyncio; from av_server.database import init_db; asyncio.run(init_db())"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aether-vault.secretName" . }}
+                  key: databaseUrl
+{{- end }}

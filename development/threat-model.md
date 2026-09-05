@@ -17,6 +17,10 @@ SECURITY.md) whenever a mitigation changes, and log the annual pass at the botto
 | Commit signing private keys | `.av/keys/signing.pem` (0600), archived copies under `.av/keys/archive/` | Proves payload integrity for signed commits |
 | Audit log | `audit_log` table | Who-did-what-with-what-outcome — itself a security-relevant record |
 | Run/metrics metadata | `runs`, `run_commits` tables | Experiment provenance; not usually sensitive alone, but reveals project shape |
+| DB-backed API tokens / sessions (v1.3.2) | `api_tokens.token_hash`, `sessions.token_hash`/`refresh_hash` (sha256, never the raw token) | The enterprise-path credential store — independent of `.env`, remotely administrable (`av token`) |
+| The tenant boundary itself (v1.3.2) | `tenant_id` column + Postgres RLS policy on 28 tables, enforced when `AV_TENANCY_ENFORCE=1` | What separates one customer's data from another's on a shared registry — the asset a multi-tenant deployment's entire trust model rests on |
+| Backup artifacts (v1.3.2) | `db.dump` + `objects.tar.gz` written by `av admin backup create`, wherever the operator points `OUTPUT_DIR` | A full, UNENCRYPTED copy of the database and every CAS object — as sensitive as the live system, and easier to accidentally leave somewhere less protected (a laptop, an unencrypted bucket) |
+| The `av_app` non-superuser DB role's credential (v1.3.2) | A fixed literal in `docker-compose.yml` (matching the existing `av_password` posture for `av_user`) | The identity RLS actually enforces against — see T15 below |
 
 ## Actors
 
@@ -33,6 +37,17 @@ SECURITY.md) whenever a mitigation changes, and log the annual pass at the botto
 - **Passive network observer** — can see traffic between client and registry (relevant
   only where TLS termination is the operator's own responsibility — see SECURITY.md's
   "put TLS termination in front of uvicorn" recommendation).
+- **Tenant admin (v1.3.2)** — holds the `admin` permission via a role binding SCOPED to
+  one tenant (or one project within it) — distinct from a registry operator, who has
+  infrastructure-level access regardless of any tenant boundary.
+- **Cross-tenant attacker (v1.3.2)** — an authenticated identity belonging to tenant B,
+  attempting to read or write tenant A's projects/commits/runs on the same shared
+  registry. The threat model's newest actor, and the one the tenancy guard + RLS backstop
+  (T14) exist specifically for.
+- **Backup operator (v1.3.2)** — whoever runs `av admin backup create/restore`; needs
+  either direct Postgres client-tool access or `docker exec` rights into the DB/engine
+  containers, and ends up holding a full, unencrypted copy of the database and CAS tree
+  on their own machine.
 
 ## Trust boundaries
 
@@ -70,6 +85,11 @@ or replayed if the mitigation on that edge fails.
 | T11 | Audit log tampering/deletion by a privileged attacker | `av audit prune` is admin-scoped (same auth as every other admin route) and, since v1.3.0, supports `--dry-run` so an operator can review before an irreversible delete; every mutating route is enforced-covered by `tests/test_audit_coverage.py`'s CI matrix | The audit log itself is a normal DB table with no separate immutability guarantee (no WORM storage, no external log shipping) — a compromised registry credential with admin scope can delete audit history. Enterprise-tier "cryptographically signed, immutable" audit logging (SECURITY.md) is the stated future mitigation |
 | T12 | Path traversal via a crafted ref name reaching the filesystem CAS fallback | `validate_ref_name()` rejects traversal-shaped names before any filesystem path is built; `CASStorage._safe_ref_path()` additionally resolves and checks the result stays under `refs_dir` (defense in depth — two independent checks, not just one) | None identified — both layers were exercised by the existing signing/registry test suite |
 | T13 | Registry export/restore archive tampering | Every object is hash-re-verified on both export (download) and restore (before upload) — a corrupted or tampered archive shard is rejected rather than silently re-ingested | An attacker with write access to an export archive on disk between export and restore could still substitute a *valid* (hash-matching) but different snapshot's shard for one whose hash they also control — outside this threat model's scope (that's a filesystem trust boundary, not a protocol one) |
+| T14 | Cross-tenant data access via a route that forgets its own tenant guard (v1.3.2) | Two independent layers: an application-level guard (`_enforce_project_tenant`, a GLOBAL FastAPI dependency — every route gets it by construction, not opt-in per route) AND Postgres row-level security enforced by the non-superuser `av_app` role (migration `0015`) as a genuine backstop, live-verified via a raw SQL probe with the application layer entirely bypassed. Both gated behind `AV_TENANCY_ENFORCE` (off by default — MINOR-release additive guardrail) | RLS's bypass is GUC-based (`app.bypass_rls`, for the two legitimately cross-tenant background workers), which is a SOFTWARE boundary, not a hard privilege boundary — it defends against an application bug, not a fully compromised app process with arbitrary SQL execution. Per-tenant CAS object storage isolation is NOT built (schema prerequisite only, migration `0014`) — identical content uploaded by two tenants currently still dedups globally, which is a deliberate, documented scope decision, not an oversight |
+| T15 | `av_app`/`av_user` DB credential exposure | Same posture this repo already accepts for `av_password` (a fixed literal in `docker-compose.yml`, this repo's own reference dev topology) — `av_app` is additionally the LOW-PRIVILEGE role (no DDL, no superuser, no BYPASSRLS), so its compromise alone cannot escalate to schema changes or an RLS bypass the way `av_user`'s always could | A real production deployment is expected to rotate both passwords the same way it would rotate any other database credential (`ALTER ROLE ... WITH PASSWORD`) — this repo's dev compose file, like `av_password` before it, ships a placeholder, not a secret-manager-issued value |
+| T16 | Backup artifact theft (v1.3.2) | `av admin backup create` requires an explicit, operator-chosen `OUTPUT_DIR` — never a predictable or auto-selected location | Neither `db.dump` nor `objects.tar.gz` is encrypted by this tool — a full, plaintext copy of the database and every CAS object. `docs/dr.md` states plainly that encrypting `OUTPUT_DIR` before it leaves the host (e.g., before shipping off to cold storage) is the operator's own responsibility |
+| T17 | Stale DB-backed token/session after revocation (v1.3.2) | `identity.py`'s principal-resolution TTL cache (`AV_AUTH_CACHE_TTL_SECS`, default 30s) trades a small, bounded revocation-latency window for avoiding a DB round trip on every single request | A token revoked via `av token revoke` can still successfully authenticate for up to the cache TTL on any replica that already cached it — documented, bounded, not silent |
+| T18 | `av admin backup restore` targeting the wrong database (v1.3.2) | No auto-detection of "the local docker stack" (unlike `av auth`) — every invocation requires an explicit `--database-url`/`--db-container`, and `restore` additionally refuses a non-empty target without `--force`. This design choice exists BECAUSE this exact incident class (an auto-detecting mutating command silently hitting the wrong stack) happened once during this feature's own development — see `development/CHANGELOG.md` Phase 60 | An operator who manually copy-pastes the wrong `--database-url` and also passes `--force` can still overwrite the wrong database — the same residual risk any destructive admin tool has once a human explicitly overrides its one safety check |
 
 ## Out of scope (see SECURITY.md's own "Out of scope" section)
 
@@ -86,3 +106,4 @@ current code, add new threats introduced by new features, and record the pass he
 | Date | Reviewer | Notes |
 |---|---|---|
 | 2026-09-02 | Claude Sonnet 5 (v1.3.0 depth pass) | Initial version of this document — threats T1–T13 derived from the current codebase (auth middleware, ref CAS, webhook signing, commit signing, audit coverage, registry export/restore) and cross-checked against SECURITY.md's existing plain-language statements for consistency. |
+| 2026-09-05 | Claude Sonnet 5 (v1.3.2 enterprise-readiness pass) | Added T14–T18 for the new surfaces shipped this pass: hard multi-tenancy (app guard + RLS via the new non-superuser `av_app` role, migration `0015`), DB-backed tokens/sessions, and `av admin backup`. T11's "future mitigation" (signed/hash-chained audit logs) is still NOT built this pass — remains open. SSO/SCIM introduce no new threats here because they introduce no code here — zero lines shipped this pass. |

@@ -31,6 +31,18 @@ services:
       - NODE_ENV=production
       - WEBUI_PORT=3000
       - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db:5432/aether_vault
+      # v1.3.2 (migration 0015): closes the RLS-superuser gap migration 0013 documented —
+      # av_user above is a Postgres SUPERUSER (the postgres image grants that to whatever
+      # POSTGRES_USER names) and superusers unconditionally bypass row-level security.
+      # av_app is an ordinary, non-superuser role migration 0015 creates and grants only
+      # SELECT/INSERT/UPDATE/DELETE — request-serving sessions use it (database.py's
+      # app_engine) so RLS (behind AV_TENANCY_ENFORCE=1) is a real backstop in THIS
+      # repo's own default topology, not just in deployments that already happened to
+      # connect as a restricted role. Migrations and the two cross-tenant background
+      # workers keep using DATABASE_URL/av_user above, unchanged — they need DDL rights
+      # and the GUC-based bypass respectively. Unset this var entirely to fall back to
+      # today's exact single-role behavior.
+      - AV_APP_DATABASE_URL=postgresql+asyncpg://av_app:av_app_password@db:5432/aether_vault
       - REDIS_URL=redis://redis:6379/0
       # Optional shared-secret gate ("Protected" mode) — empty/unset means every route behaves
       # exactly as before ("Anonymous"). Set via `av auth set-token`, which writes this to a

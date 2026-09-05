@@ -1026,13 +1026,166 @@ without filtering the full event stream itself. No new table, no new delivery me
 
 **Detectors never fail the mutation they're inspecting** — `_detect_commit_anomalies()`
 wraps its own body in a bare `except Exception` (logged, not raised): a detector bug must
-never turn into a failed commit. The auth-spike counter (`_AUTH_FAILURE_WINDOW`) is
-**deliberately in-process, not Redis-backed** — it is a single-process best-effort "this
-process just saw a burst" signal, not a durable security record (the audit log via
-`_audit()` already *is* the durable per-denial record; this only decides when a BURST of
-denials is itself worth one dedicated event). The window clears the moment it trips, so
-one burst raises exactly one anomaly rather than one per subsequent failure — a consumer
-wanting a per-request feed already has the audit log for that.
+never turn into a failed commit. The auth-spike counter (`_AUTH_FAILURE_WINDOW`) defaults
+to **in-process** — a single-process best-effort "this process just saw a burst" signal,
+not a durable security record (the audit log via `_audit()` already *is* the durable
+per-denial record; this only decides when a BURST of denials is itself worth one
+dedicated event). **v1.3.2 update**: under N replicas the in-process counter is wrong by
+construction (each replica sees only its own share of the burst) — `AV_AUTH_SPIKE_BACKEND=redis`
+(default `memory`, byte-identical to this original design) switches to a Redis-backed
+atomic counter for exactly that topology; see the HA Contract below. The window clears
+the moment it trips, so one burst raises exactly one anomaly rather than one per
+subsequent failure — a consumer wanting a per-request feed already has the audit log for
+that.
+
+## Identity & Session Contract (v1.3.2, migration 0011)
+
+Identity moves from a `.env` JSON blob (`AV_API_TOKEN`/`AV_AUTH_USERS`, still fully
+supported, unchanged) into the database — `tenants`/`users`/`user_identities`/`groups`/
+`roles`/`role_bindings`/`api_tokens`/`sessions`/`sso_providers` (migration `0011`, 6
+built-in roles seeded with `tenant_id=NULL`/`builtin=True`). `identity.py::Principal` is
+the one resolved-identity object every code path downstream uses; `resolve_db_token()`/
+`resolve_session()` look up `sha256(token)` against `api_tokens`/`sessions` — the raw
+credential is NEVER stored, only its hash. A small TTL cache (`AUTH_CACHE_TTL_SECS`,
+default 30s) avoids a DB round trip on every request; a revoked token can still
+authenticate on a replica that already cached it until that TTL expires (documented
+residual risk, `development/threat-model.md` T17).
+
+**Additive by construction**: an unconfigured deployment (no DB tokens ever minted) is
+byte-identical to pre-v1.3.2 — `.env`-based auth resolves first and is untouched;
+`identity.py` only activates for a bearer value that doesn't match `AV_API_TOKEN`/
+`AV_AUTH_USERS` and DOES hash-match a live `api_tokens`/`sessions` row.
+
+**Verified:** `tests/test_rbac.py` (all 5 resolution paths, cache TTL/invalidation),
+live 403/revocation proofs in `tests/test_server.py::TestApiTokens`.
+
+## RBAC Contract (v1.3.2)
+
+`require_scope()` (v1.3.0, unchanged) keeps working exactly as before — every existing
+call site, every existing token. `identity.Principal.scopes` for a DB-backed token is the
+UNION of the token's own explicit `scopes` and every permission granted by its
+`role_bindings` (tenant-scoped or project-scoped). Remote admin surface: `/api/tenants*`,
+`/api/users*`, `/api/roles*`, `/api/role-bindings*`, `/api/tokens*` (all `admin`-scoped),
+and the CLI groups `av tenant`/`av user`/`av role`/`av token` — the thing that removes
+"you need shell access to the Docker host to add a user," which the OSS `av auth` path
+still requires by design.
+
+Six previously-UNSCOPED admin routes (`POST /api/admin/gc`, `GET`/`DELETE
+/api/admin/audit`, `/api/admin/audit/export`, `/api/admin/webhook-deliveries*`) now
+require `admin` — a real, pre-existing gap closed this pass, additive-safe because a
+token with no explicit `scopes` still resolves to `["*"]` (the same trick v1.3.1's own
+scope rollout used, so no already-working token loses access).
+
+**Verified:** `tests/test_server.py::TestTenantsUsersRoles`/`TestApiTokens` (live, real
+Postgres) — role-binding-derived permissions, token-explicit-scope permissions, revoked/
+suspended-user cascades, `test_admin_routes_still_open_for_legacy_tokens`.
+
+## Tenancy Isolation Contract (v1.3.2, migrations 0012–0015)
+
+Master switch: `AV_TENANCY_ENFORCE` (server env var, default `0`) — off, every route
+behaves exactly as pre-v1.3.2, no exceptions. Three independent layers when on:
+
+1. **Application guard** — `_enforce_project_tenant`, a GLOBAL FastAPI dependency
+   (`app = FastAPI(..., dependencies=[Depends(_enforce_project_tenant)])`) rather than a
+   per-route one — chosen after finding live that `BaseHTTPMiddleware` sees an EMPTY
+   `request.path_params` before routing (so it can't resolve a path-parameter
+   `project_id` there), while a global dependency runs after routing with path params
+   populated. Unknown project + write → claimed for the caller's tenant (first writer
+   owns it, preserving `av init`'s zero-ceremony flow). Known project, foreign tenant,
+   write → `403 tenant_denied` (exit 22) — never a silent 404, which would risk losing
+   staged work under offline-resilience semantics. Known project, foreign tenant, read →
+   bare `404` (a 403 would be an enumeration oracle).
+2. **Postgres row-level security** — the backstop for a route that forgets its own
+   guard. `tenant_id = COALESCE(NULLIF(current_setting('app.tenant_id', true), ''),
+   '<default-tenant-uuid>')` on every RLS-enabled table (fail-CLOSED: an unset GUC reads
+   as the default tenant, never "no filter"). The GUC is re-applied via a SQLAlchemy
+   `after_begin` listener — NOT a one-shot `SET LOCAL` at session creation — because a
+   single HTTP request can open more than one Postgres transaction (`update_ref`'s
+   lost-race commit-and-raise, `prune_audit_log`'s two commits), and a one-shot `SET
+   LOCAL` would silently stop applying after the first of those.
+3. **The `av_app` non-superuser role (migration `0015`)** — the reason layer 2 is a REAL
+   backstop and not just a documented aspiration. Postgres unconditionally exempts
+   SUPERUSERS from row-level security, `FORCE ROW LEVEL SECURITY` included — and
+   `av_user` (this repo's own `docker-compose.yml` role) is one, simply because the
+   official `postgres` image grants superuser to whatever `POSTGRES_USER` names.
+   `AV_APP_DATABASE_URL` (optional, additive) routes ordinary request-serving sessions
+   through `av_app` instead — granted exactly SELECT/INSERT/UPDATE/DELETE, nothing more.
+   Migrations and the two legitimately cross-tenant background workers
+   (`_webhook_retry_worker`, `run_garbage_collection`) keep using `DATABASE_URL`/
+   `av_user` (DDL rights, and the GUC-based `app.bypass_rls` escape hatch — a software
+   boundary, not a second Postgres role, since a real managed Postgres app user won't
+   always hold `CREATEROLE`). **Live-verified**, not just unit-tested: a raw SQL probe
+   connected AS `av_app` with only `app.tenant_id` set, no application code involved at
+   all, sees exactly one tenant's rows — see `tests/test_server.py::TestHardTenancy::
+   test_rls_actually_filters_now_for_the_non_superuser_role`.
+
+**Known, explicitly out of scope this pass**: per-tenant CAS object storage
+isolation — migration `0014` widens `objects`/`trees`' primary keys to include
+`tenant_id` (the schema prerequisite), but physical per-tenant storage separation and a
+per-tenant Bloom filter are NOT built; cross-tenant content-addressed deduplication still
+happens today (`AV_CAS_ISOLATION=shared`, the only mode that exists). Building the
+storage-separation half without ALSO fixing the global existence-check/Bloom-filter/GC
+sweep together risked real data loss (tenant B's upload silently skipped because tenant
+A's identical-content object already "exists" globally) — see that migration's own
+docstring.
+
+**Verified:** `tests/test_server.py::TestHardTenancy` (5 live tests against real
+Postgres, two real tenants provisioned via the real `/api/tenants`+`/api/tokens` routes,
+not fixture shortcuts) plus `tests/test_tenancy_coverage.py` (static: the dependency is
+genuinely global, takes no eager DB param so `/api/health` stays DB-free, and
+`AV_TENANCY_ENFORCE` defaults off).
+
+## High Availability Contract (v1.3.2)
+
+Three in-process-state hazards fixed, each opt-in (default `memory`, byte-identical to
+pre-v1.3.2 under N=1 replica):
+
+| Hazard | Fix | Flag |
+|---|---|---|
+| Webhook retry worker double-delivers the same due row across replicas | `.with_for_update(skip_locked=True)` on the due-deliveries claim query (the same pattern the ref-update path already uses) | Always on (no flag — a correctness fix, not a trade-off) |
+| Rate limiter enforces its configured limit N× under N replicas (each has its own in-process dict) | `RedisWindowRateLimiter` — one atomic `INCR`+`EXPIRE` Lua script, fails OPEN on a Redis error (same posture as the Bloom filter's own fail-open design) | `AV_RATE_LIMIT_BACKEND=redis` |
+| Auth-spike counter is per-process, so a distributed burst never trips the threshold | Same Lua-script counter pattern | `AV_AUTH_SPIKE_BACKEND=redis` |
+
+`docker-compose.ha.yml` — nginx least-conn LB (passive health checks via `max_fails`/
+`fail_timeout`; OSS nginx has no active-check module, stated plainly rather than implied)
+in front of 2 stateless engine replicas, a real Postgres primary + streaming-replica
+(`pg_basebackup -R`, genuine hot standby — not a second independent database), and a
+Redis primary + replica. `scripts/ha_drill.sh` is the real, locally-run proof: concurrent
+pushes through the LB, `docker kill` one replica mid-batch, assert zero failed pushes;
+a webhook target that fails its first 2 attempts proves EXACTLY 3 total deliveries across
+both replicas' retry-worker loops (not 4+, which would mean `SKIP LOCKED` regressed); 20
+rapid requests against a `6/minute` limit prove the Redis backend caps at 6 successes
+total, not up to 12 (2 replicas × 6).
+
+A Helm chart (`deploy/helm/aether-vault/`) ships alongside — `helm template | kubeconform
+-strict` schema-verified (CI job `helm-lint`) across 4 representative value
+permutations, honestly labeled as NOT drilled against a real running cluster (a stated
+scope decision, not an oversight — see the chart's own README).
+
+**Verified:** `scripts/ha_drill.sh` (real, run locally against the actual HA compose
+topology — not simulated) plus `tests/test_rate_limit.py`'s `RedisWindowRateLimiter`
+suite (7 tests against a fake async Redis client).
+
+## Backup & Disaster Recovery Contract (v1.3.2)
+
+`av admin backup create/verify/restore` (`cmd_admin.py`) — `pg_dump -Fc` + a gzip'd CAS
+objects tar + a `backup-manifest-1.0` manifest (sha256/bytes of both parts, alembic head,
+tenant list, approximate row counts via `pg_stat_user_tables.n_live_tup`, never a
+COUNT(*) sweep). Deliberately requires an EXPLICIT `--database-url`/`--db-container` —
+no auto-detection of "the local docker stack" the way `av auth` does, because an
+auto-detecting DESTRUCTIVE command (`restore` can overwrite a real database) is exactly
+the incident class this repo hit once already (see `development/CHANGELOG.md` Phase 60).
+`restore` refuses a non-empty target without `--force`, then runs the same schema-healing
+path (`init_db()`'s own `_apply_schema`) the server's own boot uses, so a backup taken on
+an older migration chain still lands at the current build's head.
+
+**Verified:** `scripts/e2e_scenario.sh` Phase U (gated `AV_E2E_DR=1`) — a REAL destroy
+(`DROP SCHEMA public CASCADE` + wiping the CAS directory) and restore, asserting the
+pre-destruction commit and its ref both read back byte-identical, with the actual
+wall-clock restore time printed as this run's measured RTO. `tests/test_cmd_admin.py`
+covers argument validation, manifest tamper-detection, and the force-refusal contract
+with mocked subprocess calls (no Postgres/Docker needed for that layer). See
+[`docs/dr.md`](../docs/dr.md) for the measured-RTO/stated-RPO distinction.
 
 **Stop:** `mass_rewrite`'s file-count-based heuristic and `metric_jump`'s fixed ratio are
 both context-free (a canary suite's own thresholds are far more precise, per-metric

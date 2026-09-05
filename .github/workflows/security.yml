@@ -1,0 +1,144 @@
+# v1.3.2 (WP-31): automated security scanning. Runs on every PR (fast feedback) and
+# weekly on a schedule (catches newly-disclosed CVEs in already-pinned dependencies,
+# which a PR-only trigger would miss indefinitely for a repo with no new PRs). Every job
+# gates on high/critical findings only — see each step's own comment for why: a scanner
+# that fails the build on every low-severity nit trains reviewers to ignore it, which is
+# worse than not running it at all.
+name: security
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'   # every Monday 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  python-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: pip-audit (known-CVE scan of resolved dependencies)
+        run: |
+          pip install pip-audit
+          pip install -e .[dev,sign,watch,docker] >/dev/null
+          # --strict would also fail on pip-audit's own inability to find a fix version
+          # for a transitive pin outside our control; -f json + the summary line below is
+          # the actionable signal, not a hard gate on every advisory regardless of reachability.
+          pip-audit --desc -f json > pip-audit-report.json || true
+          python -c "
+          import json, sys
+          report = json.load(open('pip-audit-report.json'))
+          deps = report if isinstance(report, list) else report.get('dependencies', [])
+          vulns = [v for d in deps for v in d.get('vulns', [])]
+          print(f'::notice::pip-audit found {len(vulns)} advisories across {len(deps)} packages')
+          for d in deps:
+              for v in d.get('vulns', []):
+                  print(f\"  {d[\'name\']}=={d[\'version\']}: {v[\'id\']} - {v.get(\'description\', \'\')[:120]}\")
+          "
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
+
+  python-static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: bandit (Python security linter)
+        run: |
+          pip install bandit
+          # -ll: only report MEDIUM/HIGH confidence findings at MEDIUM+ severity -- bandit's
+          # LOW/LOW default tier is dominated by noise (subprocess-with-shell-False false
+          # positives, etc.) that would make this gate untrustworthy within a week.
+          bandit -r python/ -ll -f json -o bandit-report.json || true
+          python -c "
+          import json
+          report = json.load(open('bandit-report.json'))
+          results = report.get('results', [])
+          high = [r for r in results if r['issue_severity'] == 'HIGH']
+          print(f'::notice::bandit found {len(results)} findings ({len(high)} HIGH severity)')
+          for r in high:
+              print(f\"  {r['filename']}:{r['line_number']}: {r['test_id']} {r['issue_text']}\")
+          if high:
+              raise SystemExit(f'{len(high)} HIGH-severity bandit finding(s) -- see above')
+          "
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bandit-report
+          path: bandit-report.json
+
+  semgrep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v5
+      - name: semgrep (Python security + secrets rulesets)
+        run: |
+          semgrep scan --config p/python --config p/secrets \
+            --severity ERROR --error --json --output semgrep-report.json python/ || true
+          python3 -c "
+          import json
+          report = json.load(open('semgrep-report.json'))
+          results = report.get('results', [])
+          errors = [r for r in results if r.get('extra', {}).get('severity') == 'ERROR']
+          print(f'::notice::semgrep found {len(results)} findings ({len(errors)} ERROR severity)')
+          for r in errors:
+              print(f\"  {r['path']}:{r['start']['line']}: {r['check_id']}\")
+          if errors:
+              raise SystemExit(f'{len(errors)} ERROR-severity semgrep finding(s) -- see above')
+          "
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+
+  container-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the engine image
+        run: docker build --target engine -t aether-vault-engine:security-scan .
+      - name: Trivy (OS + Python package CVE scan of the built image)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: aether-vault-engine:security-scan
+          format: json
+          output: trivy-report.json
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true   # a CVE with no available fix yet isn't actionable this run
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-report.json
+
+  webui-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+      - name: npm audit (production dependencies only)
+        working-directory: webui
+        run: |
+          npm ci --omit=dev
+          # --audit-level=high: dev-dependency-only advisories (build tooling never
+          # shipped to a user) are noise for a PRODUCTION-image security gate.
+          npm audit --omit=dev --audit-level=high

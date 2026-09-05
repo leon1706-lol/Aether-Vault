@@ -137,3 +137,83 @@ def build_limiter_from_env(env: dict[str, str] | None = None) -> WindowRateLimit
             "default": parse_limit(env.get("AV_RATE_LIMIT_DEFAULT", "")),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# v1.3.2 (HA — E5): a Redis-backed counter, opt-in via AV_RATE_LIMIT_BACKEND=redis,
+# for exactly one reason: WindowRateLimiter's in-process dict (`_buckets` above) is
+# correct at N=1 replica and silently WRONG at N>1 — its own module docstring already
+# names the assumption that breaks ("atomic under asyncio's single-threaded
+# interleaving"), which is a per-PROCESS guarantee, not a per-deployment one. Under N
+# replicas behind a load balancer, each replica enforces its own independent window, so
+# a client round-robined across replicas effectively gets N times every configured
+# limit. This class fixes that FOR DEPLOYMENTS THAT OPT IN — the default stays the
+# in-process limiter above, byte-identical to pre-v1.3.2 behavior, unconfigured.
+# ---------------------------------------------------------------------------
+
+# INCR then EXPIRE on first increment, as ONE atomic round trip — not two separate Redis
+# calls — specifically to avoid the window where a process dies between an INCR that
+# succeeds and an EXPIRE that never runs, which would leave a key with no TTL, silently
+# never resetting again. Lua scripts execute as one unit server-side in Redis, so there
+# is no gap between the two operations for a crash to land in.
+_INCR_AND_EXPIRE_LUA = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return count
+"""
+
+
+class RedisWindowRateLimiter:
+    """Same fixed-window semantics as `WindowRateLimiter`, same injectable-clock
+    testability contract (the clock decides which window BUCKET a key falls into; the
+    physical Redis key TTL is cleanup only, not part of the correctness path — a
+    fake/frozen clock in a test still produces deterministic bucket boundaries even
+    though the real Redis TTL keeps ticking in wall-clock time). `check()` is async
+    (a real Redis round trip) unlike its sync sibling — the one call site
+    (`server.py::limit_request_rate`) awaits it only when this backend is selected."""
+
+    def __init__(self, redis_client, limits: dict[str, Limit | None], now_fn=time.time):
+        self._redis = redis_client
+        self._limits = limits
+        self._now_fn = now_fn
+
+    async def check(self, client_key: str, bucket_class: str) -> int | None:
+        limit = self._limits.get(bucket_class)
+        if limit is None:
+            return None
+        window_id = int(self._now_fn() // limit.window_seconds)
+        key = f"av:ratelimit:{bucket_class}:{client_key}:{window_id}"
+        try:
+            count = await self._redis.eval(_INCR_AND_EXPIRE_LUA, 1, key, limit.window_seconds)
+        except Exception:
+            # Fails OPEN, identical posture to redis_cache.py's check_hash_exists() —
+            # a degraded/unreachable Redis must never become an outage for every other
+            # request. A missed rate-limit enforcement window is far cheaper than that.
+            return None
+        if count > limit.max_requests:
+            try:
+                ttl = await self._redis.ttl(key)
+            except Exception:
+                ttl = limit.window_seconds
+            return max(1, ttl if ttl and ttl > 0 else limit.window_seconds)
+        return None
+
+    def reset(self) -> None:
+        raise NotImplementedError(
+            "RedisWindowRateLimiter has no in-process state to clear — tests should use "
+            "a real or fake Redis client scoped to the test instead (e.g. flushdb)."
+        )
+
+
+def build_redis_limiter_from_env(redis_client, env: dict[str, str] | None = None) -> RedisWindowRateLimiter:
+    """Same env vars, same defaults as `build_limiter_from_env` — only the backend
+    (and therefore the cross-replica correctness property) differs."""
+    env = os.environ if env is None else env
+    return RedisWindowRateLimiter(
+        redis_client,
+        limits={
+            "gc": parse_limit(env.get("AV_RATE_LIMIT_GC", "10/minute")),
+            "events": parse_limit(env.get("AV_RATE_LIMIT_EVENTS", "")),
+            "default": parse_limit(env.get("AV_RATE_LIMIT_DEFAULT", "")),
+        },
+    )

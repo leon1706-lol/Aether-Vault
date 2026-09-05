@@ -43,8 +43,14 @@ widen) and the destructive GC endpoint is rate-limited by default (`AV_RATE_LIMI
 `10/minute`) — both shipped in the v1.1.x hardening cycle. Per-user access tokens
 (`AV_AUTH_USERS` via `av auth add-user`, v1.1.8) now exist alongside the owner's shared
 secret — each teammate revokes/rotates independently and commits attribute to their username.
-Still on the enterprise tier: RBAC (per-route/per-branch permissions), SSO, and audit
-logging. Reports about the shipped defaults are still welcome — reference them so we can
+**Shipped as of v1.3.2**: DB-backed RBAC (roles/role-bindings, `av role`/`av token`/
+`av user`/`av tenant`), hard multi-tenancy (an application-level guard plus Postgres
+row-level security enforced via a dedicated non-superuser DB role — both gated behind
+`AV_TENANCY_ENFORCE`, off by default), and `av admin backup`/`restore` for disaster
+recovery. **Still not shipped**: SSO (OIDC/SAML), SCIM provisioning, and
+cryptographically signed/hash-chained audit logs — `audit_log` rows are plain, unsigned
+database rows today (unlike `policy_packs`, which already uses the hash-chain pattern a
+future audit-signing feature would reuse). Reports about the shipped defaults are still welcome — reference them so we can
 link.
 
 **Out of scope:** social engineering, brute-force against deployments you don't own,

@@ -20,10 +20,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .database import async_session_factory, get_session, init_db
+from .database import (
+    TENANCY_ENFORCE,
+    async_session_factory,
+    get_session,
+    get_system_session,
+    init_db,
+    system_session_factory,
+)
+from . import identity as identity_module
 from . import rate_limit
 from .models import (
     DBActionLog,
+    DBApiToken,
     DBAuditLog,
     DBBlackboardEntry,
     DBBudget,
@@ -36,23 +45,31 @@ from .models import (
     DBEvalResult,
     DBEvalSuite,
     DBEvent,
+    DBGroup,
+    DBGroupMember,
     DBImproverVersion,
     DBLessons,
     DBObject,
     DBPlan,
     DBPolicyPack,
+    DBProject,
     DBProjectFreeze,
     DBRef,
     DBReview,
+    DBRole,
+    DBRoleBinding,
     DBRun,
     DBRunCommit,
     DBSandboxJob,
     DBStrategyEntry,
     DBTask,
+    DBTenant,
     DBToolManifest,
     DBTree,
+    DBUser,
     DBWebhook,
     DBWebhookDelivery,
+    DEFAULT_TENANT_ID,
     _new_uuid,
     utcnow_naive,
 )
@@ -104,7 +121,14 @@ async def lifespan(app: FastAPI):
             await worker
 
 
-app = FastAPI(title="Aether-Vault Server", version="1.4.0", lifespan=lifespan)
+# app = FastAPI(...) itself is constructed further down (right before the middleware
+# pipeline registration), not here — v1.3.2's `_enforce_project_tenant` global
+# dependency (search for that name) must exist BEFORE the constructor call that
+# references it (`dependencies=[Depends(_enforce_project_tenant)]`), and that function
+# is defined after the auth/scope machinery it depends on (`_principal`, `require_scope`).
+# Nothing between here and that constructor call references the module-level `app` name
+# itself (verified: no `@app.` decorator or `app.` attribute access anywhere in between)
+# so moving the construction site is safe.
 
 # --- Authentication ("Protected" mode) ------------------------------------------
 # Two credential sources, both optional, both read once at process start (matching
@@ -255,22 +279,63 @@ def _scopes_for_identity(username: str | None) -> list[str]:
     return ["*"]
 
 
+async def _deny_401(request: Request) -> JSONResponse:
+    client_host = request.client.host if request.client else "unknown"
+    if await _note_auth_failure(f"401:{client_host}"):
+        asyncio.create_task(_emit_auth_spike_anomaly(client_host, "unauthenticated"))
+    return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
+
+
 async def require_token(request: Request, call_next):
     if request.url.path in _AUTH_EXEMPT_PATHS:
         return await call_next(request)
-    if not AV_API_TOKEN and not _AUTH_USERS:
-        return await call_next(request)  # Anonymous mode
 
     scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
-    identity = _resolve_identity(supplied) if scheme.lower() == "bearer" and supplied else None
-    if identity is None:
-        client_host = request.client.host if request.client else "unknown"
-        if _note_auth_failure(f"401:{client_host}"):
-            asyncio.create_task(_emit_auth_spike_anomaly(client_host, "unauthenticated"))
-        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API token"})
-    request.state.username = identity
-    request.state.scopes = _scopes_for_identity(identity)
-    return await call_next(request)
+    has_bearer = scheme.lower() == "bearer" and bool(supplied)
+    protected_mode = bool(AV_API_TOKEN or _AUTH_USERS)
+
+    if not has_bearer:
+        # No credential presented at all: Anonymous mode's exact pre-v1.3.2 behavior —
+        # zero extra work, zero DB round trips, request.state untouched. Protected mode
+        # keeps rejecting outright, same as always. (No tenancy check either: with no
+        # principal at all, `_enforce_project_tenant`'s own global-dependency no-op
+        # covers this — this early return just skips the middleware call entirely.)
+        return await call_next(request) if not protected_mode else await _deny_401(request)
+
+    # A Bearer token WAS presented — resolve it through every credential source before
+    # deciding, in both Anonymous and Protected mode. This is deliberate: v1.3.2's
+    # DB-backed `api_tokens`/`sessions` (identity.py) are meant to work on a server that
+    # has never touched AV_API_TOKEN/AV_AUTH_USERS at all — `av token create` should not
+    # require also flipping the server into `.env`-based Protected mode first. A
+    # deployment that has never created a DB token pays nothing extra beyond this one
+    # branch: the two DB lookups below only ever run when a Bearer token is actually on
+    # the request, and TTL-cache a "not found" result too, so a repeated bad/foreign
+    # token doesn't re-query every request either (identity.py::AUTH_CACHE_TTL_SECS).
+    identity = _resolve_identity(supplied)
+    if identity is not None:
+        scopes = _scopes_for_identity(identity)
+        request.state.username = identity
+        request.state.scopes = scopes
+        request.state.principal = identity_module.env_principal(identity, DEFAULT_TENANT_ID, scopes)
+        return await call_next(request)
+
+    principal = None
+    async with async_session_factory() as db:
+        principal = await identity_module.resolve_db_token(db, supplied)
+        if principal is None:
+            principal = await identity_module.resolve_session(db, supplied)
+
+    if principal is not None:
+        request.state.username = principal.username
+        request.state.scopes = principal.scopes
+        request.state.principal = principal
+        return await call_next(request)
+
+    # No source recognized this token. Protected mode rejects, exactly as always.
+    # Anonymous mode does NOT reject on an unrecognized token — an unknown/garbage Bearer
+    # value must not turn an otherwise-open server into a 401 wall; it behaves exactly as
+    # if no credential had been presented (today's Anonymous-mode contract).
+    return await _deny_401(request) if protected_mode else await call_next(request)
 
 
 def require_scope(scope: str):
@@ -297,7 +362,7 @@ def require_scope(scope: str):
         identity = getattr(request.state, "username", None)
         _audit(db, identity, "scope.denied", None,
                {"required_scope": scope, "path": request.url.path}, status_code=403)
-        if _note_auth_failure(f"403:{identity or 'unknown'}"):
+        if await _note_auth_failure(f"403:{identity or 'unknown'}"):
             await _emit_event(db, None, "anomaly", {
                 "type": "auth_spike", "identifier": identity or "unknown",
                 "reason": "scope_denied", "threshold": AV_ANOMALY_AUTH_SPIKE_THRESHOLD,
@@ -309,6 +374,128 @@ def require_scope(scope: str):
             detail={"error": "scope_denied", "required_scope": scope},
         )
     return _dependency
+
+
+def _principal(request: Request) -> identity_module.Principal:
+    """v1.3.2: the resolved Principal for this request (`require_token`'s new third
+    state attribute) — every identity source (env token, DB token, session) sets this
+    alongside the pre-existing `.username`/`.scopes`. Anonymous mode with no matching
+    credential leaves it unset, same as `.username`/`.scopes` — callers use the returned
+    anonymous Principal (`tenant_id=None`) rather than crashing on a missing attribute.
+    """
+    return getattr(request.state, "principal", None) or identity_module.anonymous_principal()
+
+
+async def _enforce_project_tenant(
+    request: Request,
+) -> Optional[str]:
+    """v1.3.2 (hard multi-tenancy) — the application-layer guard, wired as a GLOBAL
+    FastAPI dependency (`app = FastAPI(..., dependencies=[Depends(_enforce_project_tenant)])`
+    immediately below) rather than added to ~80 individual route decorators.
+
+    Two designs were tried, in order, before this one:
+    1. Per-route `dependencies=[Depends(_enforce_project_tenant)]` on every project_id-
+       taking route — rejected once the actual count of such routes (~80, found by
+       running the anti-drift sweep test against an empty exempt list) made that many
+       hand-edited decorators an error-prone surface a shared mechanism avoids entirely.
+    2. Folded into `require_token`'s `BaseHTTPMiddleware` (which already runs for every
+       request) — rejected after verifying LIVE (not assumed) that `request.path_params`
+       is EMPTY inside `BaseHTTPMiddleware.dispatch()` before `call_next()`: Starlette
+       only populates path params once routing actually matches a route, which for a
+       `BaseHTTPMiddleware`-wrapped app happens INSIDE `call_next()`, not before it. A
+       middleware-based check could only ever see query/body project_id, never a path
+       param one (`/api/freeze/{project_id}` and friends) — silently incomplete.
+
+    A global FastAPI dependency is the one shape that is both centralized (zero per-route
+    wiring) AND runs at the right point in the stack: FastAPI resolves `dependencies=[]`
+    passed to the `FastAPI()`/`APIRouter()` constructor as part of EVERY route's own
+    dependency graph, which executes AFTER routing has matched the route and populated
+    `request.path_params` — verified live the same way the middleware approach was ruled
+    out, not assumed. `require_scope()` already proves the pattern works for
+    `request.state` set by the earlier `require_token` middleware; this is the same
+    shape, reading `request.state.principal` the same way.
+
+    Postgres row-level security (migration 0013) is the BACKSTOP behind this, not the
+    reverse: RLS catches a genuinely missed case (a future refactor that bypasses this
+    global dependency somehow); this is what actually shapes the HTTP response (a clean
+    403/404) for the normal case — an RLS mismatch alone would otherwise surface as an
+    opaque empty result set or a bare integrity failure.
+
+    Gated on `TENANCY_ENFORCE` and a real resolved tenant — genuinely a no-op (zero
+    queries attempted) whenever either is absent, matching `database.py`'s own
+    `_apply_tenant_guc` no-op contract for the exact same reasons (VERSIONING.md's
+    MINOR-release, byte-identical-when-unconfigured guarantee).
+
+    Resolves `project_id` from path → query → JSON body, in that order — all three
+    shapes exist across this codebase's project_id-taking routes (a path param on
+    `/api/freeze/{project_id}`, a query param on ~15 list endpoints, a JSON body field on
+    `push_commit` and most POST/PUT/PATCH routes). `request.json()` is safe to call ahead
+    of a route's own `Body(...)` parse — Starlette caches the raw body internally after
+    the first read, so this never double-consumes the stream.
+
+    An UNSEEN `project_id` is lazily claimed for the caller's tenant (first writer wins)
+    — `project_id` has never been server-side pre-registered (`av init` mints it
+    client-side with zero ceremony), so "unknown" cannot mean reject; it means "first
+    time this tenant has used it." A project already owned by a DIFFERENT tenant is
+    denied: a WRITE gets 403 `tenant_denied` (a write must never silently 404 — the
+    caller has to learn its work did not land, or offline-queue semantics would quietly
+    lose it, AGENTS.md non-negotiable #3); a READ gets a bare 404 (a 403 would confirm
+    the project exists under some tenant, turning the route into a cross-tenant
+    enumeration oracle — the same information-hiding tradeoff `/api/tokens/{id}/revoke`
+    already applies to a foreign token id).
+
+    Deliberately does NOT take `db: AsyncSession = Depends(get_session)` as a parameter,
+    even though every other route dependency in this file does — because this one is
+    now GLOBAL, that would make FastAPI eagerly open a real DB session for `/api/health`
+    on every single call, silently breaking that route's own documented "DB-free,
+    always green" liveness contract (`_AUTH_EXEMPT_PATHS`'s existing rationale; found
+    live while wiring this up, not anticipated). A session is opened by hand, via
+    `async_session_factory()`, and ONLY on the path that actually needs one — after
+    every earlier no-op check (TENANCY_ENFORCE off, no tenant, no project_id) has
+    already returned, which every exempt/irrelevant route hits before this point.
+    """
+    if not TENANCY_ENFORCE:
+        return None
+    principal = _principal(request)
+    tenant_id = principal.tenant_id
+    if tenant_id is None:
+        return None
+
+    project_id = request.path_params.get("project_id") or request.query_params.get("project_id")
+    if project_id is None and request.method in ("POST", "PUT", "PATCH"):
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            project_id = body.get("project_id")
+    if not project_id or not isinstance(project_id, str):
+        return None  # route doesn't target a single project (e.g. list_projects)
+
+    async with async_session_factory() as db:
+        project = (await db.execute(
+            select(DBProject).where(DBProject.id == project_id)
+        )).scalar_one_or_none()
+        if project is None:
+            db.add(DBProject(id=project_id, tenant_id=tenant_id, name=project_id,
+                             created_at=utcnow_naive()))
+            await db.commit()
+            return project_id
+        if project.tenant_id != tenant_id:
+            is_write = request.method in ("POST", "PUT", "PATCH", "DELETE")
+            _audit(db, _identity(request), "tenant.denied", project_id,
+                   {"reason": "cross_tenant_project_id", "method": request.method},
+                   status_code=403 if is_write else 404)
+            await db.commit()
+            if is_write:
+                raise HTTPException(status_code=403,
+                                    detail={"error": "tenant_denied", "project_id": project_id})
+            raise HTTPException(status_code=404, detail="Project not found")
+        return project_id
+
+
+app = FastAPI(title="Aether-Vault Server", version="1.4.0", lifespan=lifespan,
+             dependencies=[Depends(_enforce_project_tenant)])
 
 
 # MIDDLEWARE PIPELINE — Starlette runs the LAST-added middleware OUTERMOST, so these
@@ -347,6 +534,17 @@ app.add_middleware(
 # plane in via AV_RATE_LIMIT_DEFAULT; see python/av_server/rate_limit.py.
 _RATE_LIMITER = rate_limit.build_limiter_from_env()
 
+# v1.3.2 (HA — E5): AV_RATE_LIMIT_BACKEND=redis switches to a Redis-backed counter
+# (rate_limit.RedisWindowRateLimiter) shared across every replica, instead of each
+# replica enforcing its own independent in-process window. Default ("memory", or unset)
+# is byte-identical to pre-v1.3.2 — this whole block only ever constructs the in-process
+# limiter above, which is exactly what every existing test/deployment already gets.
+_RATE_LIMIT_BACKEND = os.environ.get("AV_RATE_LIMIT_BACKEND", "memory")
+_REDIS_RATE_LIMITER = (
+    rate_limit.build_redis_limiter_from_env(cache._client)
+    if _RATE_LIMIT_BACKEND == "redis" else None
+)
+
 
 @app.middleware("http")
 async def limit_request_rate(request: Request, call_next):
@@ -354,7 +552,10 @@ async def limit_request_rate(request: Request, call_next):
     if bucket is None:
         return await call_next(request)
     client = request.client.host if request.client else "unknown"
-    retry_after = _RATE_LIMITER.check(client, bucket)
+    retry_after = (
+        await _REDIS_RATE_LIMITER.check(client, bucket) if _REDIS_RATE_LIMITER is not None
+        else _RATE_LIMITER.check(client, bucket)
+    )
     if retry_after is not None:
         return JSONResponse(
             status_code=429,
@@ -1064,8 +1265,8 @@ def _collect_alive_in_memory(
 
 
 
-@app.post("/api/admin/gc")
-async def run_garbage_collection(request: Request, db: AsyncSession = Depends(get_session)) -> dict:
+@app.post("/api/admin/gc", dependencies=[Depends(require_scope("admin"))])
+async def run_garbage_collection(request: Request, db: AsyncSession = Depends(get_system_session)) -> dict:
     """
     Mark-and-sweep GC:
     1. Walk every commit's Merkle Tree to collect live hashes.
@@ -1236,6 +1437,7 @@ async def check_objects_batch(hashes: List[str], db: AsyncSession = Depends(get_
 
 @app.get("/api/commits")
 async def list_commits(
+    request: Request,
     limit: int = 50,
     offset: int = 0,
     project_id: Optional[str] = None,
@@ -1247,6 +1449,21 @@ async def list_commits(
     Optionally scoped to a single project via ?project_id= — without it, commits from every
     project on this shared registry are returned (matches the dashboard's pre-existing
     behavior so it doesn't break for callers that don't know about projects yet).
+
+    v1.3.2: when TENANCY_ENFORCE is on, "every project" above narrows to "every project
+    THE CALLER'S TENANT owns". Filtered explicitly here — NOT left to RLS (migration
+    0013) alone — because this repo's own default docker-compose.yml connects as
+    `av_user`, which Postgres auto-creates as a SUPERUSER (the official postgres image's
+    POSTGRES_USER behavior); superusers unconditionally bypass row-level security, and
+    no `FORCE ROW LEVEL SECURITY` can override that (found live: a real two-tenant test
+    against this exact deployment topology, not a doc reference — RLS's own policy was
+    confirmed correctly defined and forced, and still did not filter). RLS remains real
+    defense-in-depth for any deployment that connects as a genuinely non-superuser role,
+    and still fully backstops every route with an explicit single `project_id` target
+    (`_enforce_project_tenant`'s own write/read checks, unaffected by this since those
+    denials happen in application code before RLS is ever relevant) — but an UNFILTERED
+    list route is exactly the shape that had no other protection under this topology,
+    so it gets one here directly, matching `list_projects`'s own fix.
 
     ?include_layers=true additionally resolves each returned commit's full tree (same shape
     GET /api/commits/{hash} already returns) in this single response — added specifically to
@@ -1264,6 +1481,11 @@ async def list_commits(
     if project_id:
         query = query.where(DBCommit.project_id == project_id)
         count_query = count_query.where(DBCommit.project_id == project_id)
+    if TENANCY_ENFORCE:
+        caller_tenant = _principal(request).tenant_id
+        if caller_tenant is not None:
+            query = query.where(DBCommit.tenant_id == caller_tenant)
+            count_query = count_query.where(DBCommit.tenant_id == caller_tenant)
 
     result = await db.execute(query.order_by(DBCommit.timestamp.desc()).limit(limit).offset(offset))
     commits = result.scalars().all()
@@ -1301,10 +1523,35 @@ async def list_commits(
 
 
 @app.get("/api/projects")
-async def list_projects(db: AsyncSession = Depends(get_session)) -> dict:
+async def list_projects(request: Request, db: AsyncSession = Depends(get_session)) -> dict:
     """Every project that has ever pushed a commit to this registry, for the Web UI's
-    Projects tab (lets a user discover and switch between local repos sharing this server)."""
-    result = await db.execute(
+    Projects tab (lets a user discover and switch between local repos sharing this server).
+
+    v1.3.2: a full-table enumeration with no single `project_id` to check ownership of —
+    exactly the shape `_enforce_project_tenant`'s docstring calls out as a legitimate
+    no-op (`return None  # route doesn't target a single project`), so it needs its own
+    explicit filter, applied directly below.
+
+    **This is NOT covered by RLS alone in this repo's own default deployment — verified
+    live, not assumed, and the assumption it WOULD be is exactly what a first draft of
+    this comment claimed before that live test caught it being wrong.** RLS (migration
+    0013) is correctly enabled, forced, and its policy correctly defined — confirmed
+    directly via `pg_class.relrowsecurity`/`relforcerowsecurity` and the rendered policy
+    expression — but Postgres unconditionally exempts SUPERUSERS from row-level security,
+    and no `FORCE ROW LEVEL SECURITY` can override that exemption. `docker-compose.yml`'s
+    `av_user` IS a superuser (the official `postgres` image auto-grants superuser to
+    whatever `POSTGRES_USER` names), so RLS is currently INERT for every query this app
+    issues under this repo's own shipped default topology. RLS still has real value as
+    defense-in-depth for any deployment that connects as a genuinely non-superuser role
+    (a real, common production pattern — e.g. a managed Postgres whose app user is
+    deliberately unprivileged) — but every list route in THIS deployment needs its own
+    explicit tenant filter to be correct, the same way this one and `list_commits` now
+    have. Flagged in this phase's own docs as a residual item: the remaining unfiltered
+    list routes this phase did not individually touch (`GET /api/runs`, `GET /api/events`,
+    and others) are NOT currently tenant-filtered under this topology, and a genuine fix
+    — connecting as a dedicated non-superuser role — is an infrastructure change, not a
+    migration, and is called out explicitly rather than silently left unfixed."""
+    stmt = (
         select(
             DBCommit.project_id,
             DBCommit.project_name,
@@ -1313,6 +1560,11 @@ async def list_projects(db: AsyncSession = Depends(get_session)) -> dict:
         ).group_by(DBCommit.project_id, DBCommit.project_name)
         .order_by(func.max(DBCommit.timestamp).desc())
     )
+    if TENANCY_ENFORCE:
+        principal = _principal(request)
+        if principal.tenant_id is not None:
+            stmt = stmt.where(DBCommit.tenant_id == principal.tenant_id)
+    result = await db.execute(stmt)
     return {
         "projects": [
             {
@@ -1416,10 +1668,45 @@ AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS = float(os.environ.get("AV_ANOMALY_AUTH_SPIKE_
 _AUTH_FAILURE_WINDOW: dict[str, list[float]] = {}
 
 
-def _note_auth_failure(key: str) -> bool:
+# v1.3.2 (HA — E5): AV_AUTH_SPIKE_BACKEND=redis makes the burst count itself accurate
+# across N replicas, for operators who want that specifically — the in-process default
+# above remains the deliberate choice for everyone else (its own comment's reasoning —
+# "a single-process best-effort signal, not a durable security record" — still holds;
+# this is the lowest-severity of the three cross-replica gaps this phase found, since an
+# under-counted burst degrades detection sensitivity, it does not cause wrong behavior
+# the way the webhook-duplicate-delivery bug did). Same Lua INCR+EXPIRE primitive and
+# fail-open posture as the rate limiter (rate_limit.py), reused rather than reinvented.
+_AUTH_SPIKE_BACKEND = os.environ.get("AV_AUTH_SPIKE_BACKEND", "memory")
+
+
+async def _note_auth_failure(key: str) -> bool:
     """Records one auth failure for `key`; returns True the moment this failure pushes
     the recent count (within the window) over the threshold — the caller emits an
-    anomaly exactly then, and only then."""
+    anomaly exactly then, and only then.
+
+    Now async (was sync) — both call sites already `await` it unconditionally, so the
+    default (in-process) path pays one coroutine-scheduling hop it didn't before; the
+    in-process branch itself does zero actual I/O either way, so this is not a
+    meaningfully different cost, and keeping ONE call shape for both backends (rather
+    than a sync/async split by backend) is simpler and less error-prone than the
+    alternative."""
+    if _AUTH_SPIKE_BACKEND == "redis":
+        try:
+            redis_key = f"av:authfail:{key}"
+            count = await cache._client.eval(
+                rate_limit._INCR_AND_EXPIRE_LUA, 1, redis_key,
+                int(AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS),
+            )
+        except Exception:
+            return False  # fail open — a missed anomaly beats a 500 on every login
+        if count >= AV_ANOMALY_AUTH_SPIKE_THRESHOLD:
+            try:
+                await cache._client.delete(redis_key)  # mirrors window.clear() below
+            except Exception:
+                pass
+            return True
+        return False
+
     import time as _time
 
     now = _time.monotonic()
@@ -1643,16 +1930,46 @@ async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict,
 
 async def process_due_webhook_deliveries() -> int:
     """Re-drives every due pending/failed delivery (called by the interval worker and
-    exposed to tests). Returns how many rows were re-attempted."""
+    exposed to tests). Returns how many rows were re-attempted.
+
+    v1.3.2: uses `system_session_factory`, not `async_session_factory` / `get_session` —
+    this worker is legitimately cross-tenant by design (every tenant's due deliveries
+    must be re-driven, not just one), so it needs the bypass-RLS session (see
+    database.py's own docstring on why bypass is GUC-based, not a second Postgres role).
+
+    v1.3.2 (HA — the E5 webhook-retry-worker fix): `.with_for_update(skip_locked=True)`
+    is the difference between this being safe under N replicas and not. Before this fix,
+    the plain SELECT here had no row-claiming at all — every replica's own interval
+    timer would independently select and re-deliver the SAME due rows, N-fold duplicate
+    webhook POSTs per tick. `SKIP LOCKED` makes this a claim-a-batch queue-consumer
+    pattern instead: N replicas processing DIFFERENT due rows in parallel, each row
+    delivered by exactly one replica. Chosen over leader election deliberately — this is
+    a claim-a-batch workload (independent rows, no single global decision to serialize),
+    not a single-decision one, so N replicas doing useful parallel work beats one elected
+    leader doing all of it serially, with no leader-crash/lock-timeout failure mode to
+    reason about. Degrades to exactly today's single-replica behavior at N=1. The same
+    `with_for_update()` pattern the ref-update path (`update_ref`) and budget spend
+    (`consume_budget`) already use elsewhere in this file — not a new idiom.
+
+    Deliberately the MINIMAL fix, not the full claim/deliver-split hardening a later
+    pass could add (a short claim transaction releasing its lock before the actual
+    outbound HTTP calls, versus holding the row lock across all 100 deliveries in this
+    batch as it does today) — `SKIP LOCKED` alone already closes the DUPLICATION bug,
+    which is the correctness-critical half; the lock-hold-duration concern is a
+    throughput/contention refinement, not a correctness one, and is explicitly flagged
+    here as unbuilt rather than silently implied.
+    """
     now = utcnow_naive()
     delivered = 0
-    async with async_session_factory() as db:
+    async with system_session_factory() as db:
+        db.info["bypass_rls"] = True
         rows = (await db.execute(
             select(DBWebhookDelivery)
             .where(DBWebhookDelivery.status.in_(["pending", "failed"]))
             .where((DBWebhookDelivery.next_retry_at.is_(None))
                    | (DBWebhookDelivery.next_retry_at <= now))
             .limit(100)
+            .with_for_update(skip_locked=True)
         )).scalars().all()
         for delivery in rows:
             hook = (await db.execute(
@@ -3894,7 +4211,7 @@ def _audit_row_dict(a: "DBAuditLog") -> dict:
             "status_code": a.status_code}
 
 
-@app.get("/api/admin/audit")
+@app.get("/api/admin/audit", dependencies=[Depends(require_scope("admin"))])
 async def get_audit_log(
     request: Request,
     limit: int = Query(50, ge=1, le=500),
@@ -3948,7 +4265,7 @@ async def get_audit_log(
             "limit": limit, "offset": offset, "next_cursor": next_cursor}
 
 
-@app.get("/api/admin/audit/export")
+@app.get("/api/admin/audit/export", dependencies=[Depends(require_scope("admin"))])
 async def export_audit_log(
     request: Request,
     format: str = Query("jsonl", pattern="^(jsonl|csv)$"),
@@ -4000,7 +4317,7 @@ async def export_audit_log(
     )
 
 
-@app.delete("/api/admin/audit")
+@app.delete("/api/admin/audit", dependencies=[Depends(require_scope("admin"))])
 async def prune_audit_log(request: Request, before_days: int = Query(AUDIT_RETENTION_DAYS, ge=0),
                           dry_run: bool = Query(False),
                           db: AsyncSession = Depends(get_session)):
@@ -4116,7 +4433,7 @@ def _delivery_row_dict(d: "DBWebhookDelivery") -> dict:
             "updated_at": d.updated_at.isoformat() if d.updated_at else None}
 
 
-@app.get("/api/admin/webhook-deliveries")
+@app.get("/api/admin/webhook-deliveries", dependencies=[Depends(require_scope("admin"))])
 async def list_webhook_deliveries(
     status: Optional[str] = None,
     webhook_id: Optional[str] = None,
@@ -4165,7 +4482,8 @@ async def list_webhook_deliveries(
             "limit": limit, "offset": offset, "next_cursor": next_cursor}
 
 
-@app.post("/api/admin/webhook-deliveries/{delivery_id}/replay")
+@app.post("/api/admin/webhook-deliveries/{delivery_id}/replay",
+          dependencies=[Depends(require_scope("admin"))])
 async def replay_webhook_delivery(delivery_id: int, request: Request,
                                   db: AsyncSession = Depends(get_session)):
     """v1.2.5: re-queues one failed/dead delivery for immediate retry — the CLI/admin
@@ -4189,3 +4507,334 @@ async def replay_webhook_delivery(delivery_id: int, request: Request,
            {"delivery_id": delivery_id, "webhook_id": row.webhook_id}, status_code=200)
     await db.commit()
     return {"status": "queued", "delivery": _delivery_row_dict(row)}
+
+
+# ---------------------------------------------------------------------------
+# v1.3.2 — Enterprise identity: DB-backed API tokens (`av token`). The remote-
+# administrable alternative to `AV_AUTH_USERS`, which requires `docker compose` shell
+# access on the host running the stack to create/rotate/revoke (`cmd_auth.py`). A token
+# minted here works from any machine that can reach this registry over HTTP, resolved by
+# `identity.py::resolve_db_token` inside `require_token` — see that module's docstring
+# for the full resolution order relative to `.env`-based credentials.
+#
+# `token:write` gates every mutation here (granted by the built-in `admin` role,
+# migration 0011) — creating/revoking a credential is itself an admin action, distinct
+# from whatever scopes the MINTED token ends up carrying.
+# ---------------------------------------------------------------------------
+
+def _token_row_dict(row: DBApiToken) -> dict:
+    return {
+        "id": row.id, "name": row.name, "prefix": row.prefix,
+        "user_id": row.user_id, "scopes": row.scopes,
+        "expires_at": row.expires_at.isoformat() if row.expires_at else None,
+        "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
+        "revoked_at": row.revoked_at.isoformat() if row.revoked_at else None,
+        "created_by": row.created_by,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@app.post("/api/tokens", dependencies=[Depends(require_scope("token:write"))])
+async def create_api_token(request: Request, body: Dict[str, Any] = Body(...),
+                           db: AsyncSession = Depends(get_session)):
+    """Mints a new DB-backed bearer token, scoped to the CALLER's own tenant — never a
+    tenant the caller merely names in the body, so a caller can only ever grow their own
+    tenant's credential surface, not someone else's (the tenant comes from the resolved
+    Principal, `_principal(request).tenant_id`, not from `body`).
+
+    The plaintext token is returned exactly once, here, and never again — only its
+    sha256 (`identity.py::hash_token`) and an 8-char display prefix are persisted
+    (models.py::DBApiToken's own docstring), matching `av registry keygen`'s "the
+    private key never round-trips back out" posture.
+    """
+    import secrets as secrets_module
+
+    principal = _principal(request)
+    # v1.3.2 fix (found by the mandatory manual real-CLI repro, AGENTS.md non-negotiable
+    # #5 — no live test caught this because every existing test exercised Protected mode
+    # via scoped_users): a genuinely Anonymous server (no AV_API_TOKEN/AV_AUTH_USERS at
+    # all — the overwhelmingly common single-operator OSS case) resolves EVERY caller to
+    # `anonymous_principal()`, `tenant_id=None`. The original code rejected that outright
+    # with a 422, which made `av token create` completely unusable on the exact
+    # deployment shape most likely to use it first — nobody could ever mint a first
+    # token to bootstrap into Protected-by-DB-tokens mode. Anonymous mode implicitly
+    # means "there is exactly one tenant" (the same reasoning `env_principal()` already
+    # applies to every `.env`-based identity, which always resolves to DEFAULT_TENANT_ID,
+    # never None) — so a token minted here with no resolved tenant falls back to the same
+    # default tenant, not a hard failure.
+    tenant_id = principal.tenant_id or DEFAULT_TENANT_ID
+
+    name = body.get("name")
+    if not name or not isinstance(name, str):
+        raise HTTPException(status_code=422, detail="name is required")
+    scopes = body.get("scopes")
+    if scopes is not None and not (isinstance(scopes, list) and all(isinstance(s, str) for s in scopes)):
+        raise HTTPException(status_code=422, detail="scopes must be a list of strings")
+    expires_at = None
+    if body.get("expires_in_days") is not None:
+        try:
+            expires_at = utcnow_naive() + timedelta(days=int(body["expires_in_days"]))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="expires_in_days must be an integer")
+
+    raw_token = secrets_module.token_urlsafe(32)
+    row = DBApiToken(
+        id=_new_uuid(), tenant_id=tenant_id, user_id=principal.user_id,
+        name=name, token_hash=identity_module.hash_token(raw_token),
+        prefix=raw_token[:8], scopes=scopes, expires_at=expires_at,
+        created_by=_identity(request), created_at=utcnow_naive(),
+    )
+    db.add(row)
+    _audit(db, _identity(request), "token.create", None,
+           {"token_id": row.id, "name": name, "scopes": scopes}, status_code=201)
+    await db.commit()
+    return {"status": "created", "id": row.id, "token": raw_token,
+            "prefix": row.prefix, "expires_at": expires_at.isoformat() if expires_at else None}
+
+
+@app.get("/api/tokens", dependencies=[Depends(require_scope("token:write"))])
+async def list_api_tokens(request: Request, db: AsyncSession = Depends(get_session)):
+    """Lists tokens for the CALLER's own tenant only — never another tenant's, and never
+    the token hash itself (only the display `prefix`, matching `av auth list-users`'
+    existing masked-token convention). Anonymous-mode callers (no resolved tenant) see
+    the default tenant's tokens — the same fallback `create_api_token` uses to mint
+    them in the first place; see that route's docstring for the full reasoning."""
+    principal = _principal(request)
+    tenant_id = principal.tenant_id or DEFAULT_TENANT_ID
+    rows = (await db.execute(
+        select(DBApiToken).where(DBApiToken.tenant_id == tenant_id)
+        .order_by(DBApiToken.created_at.desc())
+    )).scalars().all()
+    return {"tokens": [_token_row_dict(r) for r in rows]}
+
+
+@app.post("/api/tokens/{token_id}/revoke", dependencies=[Depends(require_scope("token:write"))])
+async def revoke_api_token(token_id: str, request: Request,
+                           db: AsyncSession = Depends(get_session)):
+    """Revokes immediately for any FUTURE resolution; a copy already cached by
+    `identity.py`'s TTL cache can outlive this by up to `AV_AUTH_CACHE_TTL_SECS` (default
+    30s) — see `identity_module.invalidate_cached_token`'s docstring for why an
+    admin-initiated revoke cannot clear that cache entry directly (the server never
+    stores the plaintext token the cache is keyed on)."""
+    principal = _principal(request)
+    tenant_id = principal.tenant_id or DEFAULT_TENANT_ID
+    row = (await db.execute(
+        select(DBApiToken).where(DBApiToken.id == token_id)
+    )).scalar_one_or_none()
+    if not row or row.tenant_id != tenant_id:
+        # 404, not 403: a token in another tenant is treated as not existing, not as a
+        # permission you lack — the same information-hiding tradeoff a later tenancy
+        # phase applies uniformly elsewhere (see development/architecture.md's Tenancy
+        # Isolation contract section).
+        raise HTTPException(status_code=404, detail="Token not found")
+    if row.revoked_at is None:
+        row.revoked_at = utcnow_naive()
+        _audit(db, _identity(request), "token.revoke", None,
+               {"token_id": token_id}, status_code=200)
+        await db.commit()
+    return {"status": "revoked", "id": token_id}
+
+
+# ---------------------------------------------------------------------------
+# v1.3.2 — Enterprise identity: tenants, users, roles, role bindings (`av tenant`/
+# `av user`/`av role`). Every route here that names a specific tenant to act on resolves
+# it from the CALLER's own Principal, exactly like `/api/tokens*` above — never from a
+# client-supplied tenant_id in the body — so a caller can only ever administer their own
+# tenant. There is deliberately no "platform superadmin can manage every tenant" surface
+# yet: that needs a real platform-operator identity concept this phase does not build,
+# and is called out honestly rather than faked with an implicit trust assumption.
+# ---------------------------------------------------------------------------
+
+def _effective_tenant_id(request: Request) -> str:
+    return _principal(request).tenant_id or DEFAULT_TENANT_ID
+
+
+@app.post("/api/tenants", dependencies=[Depends(require_scope("admin"))])
+async def create_tenant(request: Request, body: Dict[str, Any] = Body(...),
+                        db: AsyncSession = Depends(get_session)):
+    """Provisions a NEW tenant — a genuinely platform-level bootstrap operation (standing
+    up a fresh customer), deliberately left behind the same `admin` scope every other
+    admin route uses rather than inventing a separate "platform superadmin" identity
+    tier this phase doesn't otherwise build (see this section's own module-level note).
+    An operator's existing unrestricted owner/admin credential is what creates the
+    tenant a new customer's own admin then takes over."""
+    slug = body.get("slug")
+    name = body.get("name")
+    if not slug or not isinstance(slug, str) or not name or not isinstance(name, str):
+        raise HTTPException(status_code=422, detail="slug and name are required")
+    existing = (await db.execute(select(DBTenant).where(DBTenant.slug == slug))).scalar_one_or_none()
+    if existing:
+        return {"status": "exists", "id": existing.id, "slug": existing.slug}
+    row = DBTenant(id=_new_uuid(), slug=slug, name=name, status="active", created_at=utcnow_naive())
+    db.add(row)
+    _audit(db, _identity(request), "tenant.create", None, {"tenant_id": row.id, "slug": slug},
+           status_code=201)
+    await db.commit()
+    return {"status": "created", "id": row.id, "slug": slug}
+
+
+@app.get("/api/tenants/me")
+async def get_my_tenant(request: Request, db: AsyncSession = Depends(get_session)):
+    """The caller's own tenant — needs no scope beyond being authenticated at all
+    (or Anonymous mode's implicit default tenant), matching `/api/freeze/{id}`'s GET
+    precedent that reads need no scope even in Protected mode."""
+    tenant_id = _effective_tenant_id(request)
+    row = (await db.execute(select(DBTenant).where(DBTenant.id == tenant_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    return {"id": row.id, "slug": row.slug, "name": row.name, "status": row.status}
+
+
+def _user_row_dict(row: DBUser) -> dict:
+    return {"id": row.id, "username": row.username, "email": row.email,
+            "display_name": row.display_name, "status": row.status, "source": row.source,
+            "external_id": row.external_id,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "last_login_at": row.last_login_at.isoformat() if row.last_login_at else None}
+
+
+@app.post("/api/users", dependencies=[Depends(require_scope("user:write"))])
+async def create_user(request: Request, body: Dict[str, Any] = Body(...),
+                      db: AsyncSession = Depends(get_session)):
+    """Provisions a LOCAL user (source='local') directly — the manual counterpart to
+    JIT provisioning via SSO login or SCIM `POST /scim/v2/Users` (a later phase), for
+    operators who want to create accounts by hand."""
+    tenant_id = _effective_tenant_id(request)
+    username = body.get("username")
+    if not username or not isinstance(username, str):
+        raise HTTPException(status_code=422, detail="username is required")
+    existing = (await db.execute(
+        select(DBUser).where(DBUser.tenant_id == tenant_id, DBUser.username == username)
+    )).scalar_one_or_none()
+    if existing:
+        return {"status": "exists", "id": existing.id}
+    row = DBUser(
+        id=_new_uuid(), tenant_id=tenant_id, username=username,
+        email=body.get("email"), display_name=body.get("display_name"),
+        source="local", created_at=utcnow_naive(), updated_at=utcnow_naive(),
+    )
+    db.add(row)
+    _audit(db, _identity(request), "user.create", None, {"user_id": row.id, "username": username},
+           status_code=201)
+    await db.commit()
+    return {"status": "created", "id": row.id}
+
+
+@app.get("/api/users", dependencies=[Depends(require_scope("user:write"))])
+async def list_users(request: Request, db: AsyncSession = Depends(get_session)):
+    tenant_id = _effective_tenant_id(request)
+    rows = (await db.execute(
+        select(DBUser).where(DBUser.tenant_id == tenant_id).order_by(DBUser.created_at.desc())
+    )).scalars().all()
+    return {"users": [_user_row_dict(r) for r in rows]}
+
+
+@app.post("/api/users/{user_id}/suspend", dependencies=[Depends(require_scope("user:write"))])
+async def suspend_user(user_id: str, request: Request, db: AsyncSession = Depends(get_session)):
+    """Sets status='suspended' (never a hard delete — audit history and existing
+    commit/run authorship attribution must survive) and revokes every live session AND
+    api_token issued to this user, so a suspension takes effect immediately rather than
+    only on next token expiry."""
+    tenant_id = _effective_tenant_id(request)
+    row = (await db.execute(
+        select(DBUser).where(DBUser.id == user_id, DBUser.tenant_id == tenant_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    row.status = "suspended"
+    row.updated_at = utcnow_naive()
+    from .models import DBSession as _DBSession
+
+    now = utcnow_naive()
+    await db.execute(
+        DBApiToken.__table__.update()
+        .where(DBApiToken.user_id == user_id, DBApiToken.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    await db.execute(
+        _DBSession.__table__.update()
+        .where(_DBSession.user_id == user_id, _DBSession.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    _audit(db, _identity(request), "user.suspend", None, {"user_id": user_id}, status_code=200)
+    await db.commit()
+    return {"status": "suspended", "id": user_id}
+
+
+@app.get("/api/roles")
+async def list_roles(request: Request, db: AsyncSession = Depends(get_session)):
+    """Every role visible to the caller's tenant: the six built-in roles (`tenant_id`
+    NULL, shared by all tenants) plus any custom roles the tenant defined itself. Needs
+    no scope — seeing what roles EXIST is not itself a sensitive operation; granting one
+    (`POST /api/role-bindings`) is."""
+    tenant_id = _effective_tenant_id(request)
+    rows = (await db.execute(
+        select(DBRole).where(or_(DBRole.tenant_id.is_(None), DBRole.tenant_id == tenant_id))
+        .order_by(DBRole.builtin.desc(), DBRole.name)
+    )).scalars().all()
+    return {"roles": [{"id": r.id, "name": r.name, "description": r.description,
+                       "permissions": r.permissions, "builtin": r.builtin} for r in rows]}
+
+
+@app.post("/api/role-bindings", dependencies=[Depends(require_scope("user:write"))])
+async def create_role_binding(request: Request, body: Dict[str, Any] = Body(...),
+                              db: AsyncSession = Depends(get_session)):
+    """Grants ROLE to a user/group/token, at tenant or project scope — see
+    `identity.py::_permissions_for_subject` for how this is read back at auth time."""
+    tenant_id = _effective_tenant_id(request)
+    subject_type = body.get("subject_type")
+    subject_id = body.get("subject_id")
+    role_id = body.get("role_id")
+    if subject_type not in ("user", "group", "token") or not subject_id or not role_id:
+        raise HTTPException(status_code=422,
+                            detail="subject_type (user|group|token), subject_id, and "
+                                   "role_id are required")
+    role = (await db.execute(
+        select(DBRole).where(DBRole.id == role_id,
+                             or_(DBRole.tenant_id.is_(None), DBRole.tenant_id == tenant_id))
+    )).scalar_one_or_none()
+    if not role:
+        raise HTTPException(status_code=422, detail=f"Unknown role '{role_id}' for this tenant")
+    scope_type = body.get("scope_type", "tenant")
+    if scope_type not in ("tenant", "project"):
+        raise HTTPException(status_code=422, detail="scope_type must be 'tenant' or 'project'")
+    row = DBRoleBinding(
+        id=_new_uuid(), tenant_id=tenant_id, subject_type=subject_type, subject_id=subject_id,
+        role_id=role_id, scope_type=scope_type, scope_id=body.get("scope_id"),
+        created_by=_identity(request), created_at=utcnow_naive(),
+    )
+    db.add(row)
+    _audit(db, _identity(request), "role_binding.create", None,
+           {"subject_type": subject_type, "subject_id": subject_id, "role_id": role_id},
+           status_code=201)
+    await db.commit()
+    return {"status": "created", "id": row.id}
+
+
+@app.get("/api/role-bindings", dependencies=[Depends(require_scope("user:write"))])
+async def list_role_bindings(request: Request, subject_id: Optional[str] = None,
+                             db: AsyncSession = Depends(get_session)):
+    tenant_id = _effective_tenant_id(request)
+    stmt = select(DBRoleBinding).where(DBRoleBinding.tenant_id == tenant_id)
+    if subject_id:
+        stmt = stmt.where(DBRoleBinding.subject_id == subject_id)
+    rows = (await db.execute(stmt.order_by(DBRoleBinding.created_at.desc()))).scalars().all()
+    return {"bindings": [{"id": r.id, "subject_type": r.subject_type, "subject_id": r.subject_id,
+                          "role_id": r.role_id, "scope_type": r.scope_type,
+                          "scope_id": r.scope_id, "created_by": r.created_by} for r in rows]}
+
+
+@app.post("/api/role-bindings/{binding_id}/revoke", dependencies=[Depends(require_scope("user:write"))])
+async def revoke_role_binding(binding_id: str, request: Request,
+                              db: AsyncSession = Depends(get_session)):
+    tenant_id = _effective_tenant_id(request)
+    row = (await db.execute(
+        select(DBRoleBinding).where(DBRoleBinding.id == binding_id, DBRoleBinding.tenant_id == tenant_id)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="Role binding not found")
+    await db.execute(DBRoleBinding.__table__.delete().where(DBRoleBinding.id == binding_id))
+    _audit(db, _identity(request), "role_binding.revoke", None,
+           {"binding_id": binding_id}, status_code=200)
+    await db.commit()
+    return {"status": "revoked", "id": binding_id}

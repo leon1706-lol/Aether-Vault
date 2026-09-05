@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aether-vault.dev/schemas/backup-manifest-1.0.json",
+  "title": "Aether-Vault backup manifest (av admin backup create, v1.3.2)",
+  "description": "python/av_cli/cmd_admin.py::backup_create(). Written alongside db.dump and the objects archive by `av admin backup create`; read back by `av admin backup verify`/`restore`. See docs/dr.md.",
+  "type": "object",
+  "required": ["schema", "created_at", "av_version", "database", "objects"],
+  "properties": {
+    "schema": {"const": "backup-manifest-1.0"},
+    "created_at": {"type": "string", "description": "UTC, YYYY-MM-DDTHH:MM:SSZ."},
+    "av_version": {"type": "string"},
+    "alembic_head": {"type": ["string", "null"]},
+    "tenant_ids": {"type": "array", "items": {"type": "string"}},
+    "approx_row_counts": {
+      "type": "object",
+      "description": "table name -> pg_stat_user_tables.n_live_tup at backup time (approximate, not a live COUNT(*)).",
+      "additionalProperties": {"type": "integer"}
+    },
+    "database": {
+      "type": "object",
+      "required": ["file", "sha256", "bytes"],
+      "properties": {
+        "file": {"type": "string"},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "objects": {
+      "type": "object",
+      "required": ["file", "sha256", "bytes", "codec"],
+      "properties": {
+        "file": {"type": "string"},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "bytes": {"type": "integer", "minimum": 0},
+        "codec": {"type": "string", "description": "The archive codec ACTUALLY used (e.g. \"gzip\") -- never assume from the file extension alone."}
+      }
+    }
+  }
+}

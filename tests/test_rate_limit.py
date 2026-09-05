@@ -156,3 +156,109 @@ def test_build_limiter_from_env_overrides():
 def test_build_limiter_from_env_malformed_fails_loudly():
     with pytest.raises(ValueError):
         build_limiter_from_env(env={"AV_RATE_LIMIT_GC": "banana"})
+
+
+# ---------------------------------------------------------------------------
+# v1.3.2 (HA — E5): RedisWindowRateLimiter, the cross-replica-safe backend. A fake async
+# Redis client stands in for the real thing — same "pure logic, no network" philosophy
+# this file's own docstring states, extended to cover the Redis-backed class too. The
+# live TestClient-level proof (a real Redis, AV_RATE_LIMIT_BACKEND=redis end to end)
+# lives in tests/test_server.py behind the standard reachability skip, same convention
+# as the in-process limiter's own integration test.
+# ---------------------------------------------------------------------------
+
+import asyncio
+
+from python.av_server.rate_limit import RedisWindowRateLimiter, build_redis_limiter_from_env
+
+
+class _FakeAsyncRedis:
+    """Implements just enough of redis.asyncio.Redis's surface for
+    RedisWindowRateLimiter: EVAL (the INCR+EXPIRE script) and TTL. A real Lua INCR is
+    simulated directly in Python — the script's ATOMICITY is Redis's own guarantee, not
+    something a fake needs to re-prove; this fake only needs to produce the same
+    observable counts/TTLs a real server would for the same call sequence."""
+
+    def __init__(self):
+        self._counts: dict[str, int] = {}
+        self._ttls: dict[str, int] = {}
+        self.raise_on_eval = False
+
+    async def eval(self, script, numkeys, key, *args):
+        if self.raise_on_eval:
+            raise ConnectionError("simulated Redis outage")
+        self._counts[key] = self._counts.get(key, 0) + 1
+        if self._counts[key] == 1:
+            self._ttls[key] = int(args[0])
+        return self._counts[key]
+
+    async def ttl(self, key):
+        return self._ttls.get(key, -2)
+
+    async def delete(self, key):
+        self._counts.pop(key, None)
+        self._ttls.pop(key, None)
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_redis_limiter_allows_then_blocks_over_threshold():
+    fake = _FakeAsyncRedis()
+    limiter = RedisWindowRateLimiter(fake, limits={"gc": Limit(2, 60)}, now_fn=lambda: 1000.0)
+    assert _run(limiter.check("ip1", "gc")) is None
+    assert _run(limiter.check("ip1", "gc")) is None
+    retry_after = _run(limiter.check("ip1", "gc"))
+    assert retry_after is not None and retry_after > 0
+
+
+def test_redis_limiter_isolates_by_client_key_and_bucket():
+    fake = _FakeAsyncRedis()
+    limiter = RedisWindowRateLimiter(fake, limits={"gc": Limit(1, 60)}, now_fn=lambda: 1000.0)
+    assert _run(limiter.check("ip1", "gc")) is None
+    # A different client key, or a different bucket, must not share ip1's count.
+    assert _run(limiter.check("ip2", "gc")) is None
+    assert _run(limiter.check("ip1", "gc")) is not None
+
+
+def test_redis_limiter_disabled_bucket_never_calls_redis():
+    fake = _FakeAsyncRedis()
+    limiter = RedisWindowRateLimiter(fake, limits={"gc": None}, now_fn=lambda: 1000.0)
+    assert _run(limiter.check("ip1", "gc")) is None
+    assert fake._counts == {}  # no round trip attempted at all
+
+
+def test_redis_limiter_new_window_resets_the_count():
+    fake = _FakeAsyncRedis()
+    clock = {"t": 1000.0}
+    limiter = RedisWindowRateLimiter(fake, limits={"gc": Limit(1, 60)}, now_fn=lambda: clock["t"])
+    assert _run(limiter.check("ip1", "gc")) is None
+    assert _run(limiter.check("ip1", "gc")) is not None  # same 60s window, blocked
+    clock["t"] += 61  # a new window bucket
+    assert _run(limiter.check("ip1", "gc")) is None  # fresh window, allowed again
+
+
+def test_redis_limiter_fails_open_on_redis_error():
+    """The load-bearing safety property: a degraded/unreachable Redis must never turn
+    into an outage for every other request — same posture as redis_cache.py's
+    check_hash_exists()."""
+    fake = _FakeAsyncRedis()
+    fake.raise_on_eval = True
+    limiter = RedisWindowRateLimiter(fake, limits={"gc": Limit(1, 60)}, now_fn=lambda: 1000.0)
+    assert _run(limiter.check("ip1", "gc")) is None
+    assert _run(limiter.check("ip1", "gc")) is None  # still None -- never blocks on error
+
+
+def test_redis_limiter_reset_is_explicitly_unsupported():
+    fake = _FakeAsyncRedis()
+    limiter = RedisWindowRateLimiter(fake, limits={"gc": Limit(1, 60)})
+    with pytest.raises(NotImplementedError):
+        limiter.reset()
+
+
+def test_build_redis_limiter_from_env_same_defaults_as_memory_backend():
+    fake = _FakeAsyncRedis()
+    limiter = build_redis_limiter_from_env(fake, env={})
+    assert limiter._limits["gc"] == Limit(10, 60)
+    assert limiter._limits["default"] is None

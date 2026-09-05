@@ -29,7 +29,7 @@ def test_migration_chain_resolves_to_single_head():
 
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
-    assert heads == ["0010"], f"unexpected heads: {heads}"
+    assert heads == ["0015"], f"unexpected heads: {heads}"
     # walk_revisions() yields every revision reachable from head exactly once —
     # no dangling down_revisions, no surprise second branch. The chain is strictly
     # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline),
@@ -42,10 +42,18 @@ def test_migration_chain_resolves_to_single_head():
     # runs.plan_id/budget_id/stop_reason, plans, budgets) descends from 0007, 0009 (RSI
     # R4: runs.lessons_id, causal_links, strategy_entries, lessons, reviews, critiques,
     # blackboard_entries) descends from 0008, 0010 (RSI R5: sandbox_jobs, tool_manifests,
-    # action_logs) descends from 0009.
+    # action_logs) descends from 0009, 0011 (v1.3.2 enterprise identity: tenants,
+    # projects, users, user_identities, groups, group_members, roles, role_bindings,
+    # api_tokens, sso_providers, sessions) descends from 0010, 0012 (tenant scoping
+    # phase 1: nullable tenant_id + backfill on 28 existing tables) descends from 0011,
+    # 0013 (tenant scoping phase 2: NOT NULL + FK + row-level security on those same 28
+    # tables) descends from 0012, 0014 (per-tenant CAS schema prerequisite: objects/trees
+    # PK widening to include tenant_id) descends from 0013, 0015 (non-superuser av_app
+    # role + grants -- the real fix for the RLS-superuser gap 0013 documented) descends
+    # from 0014.
     walked = sorted(rev.revision for rev in script.walk_revisions())
     assert walked == ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008",
-                      "0009", "0010"]
+                      "0009", "0010", "0011", "0012", "0013", "0014", "0015"]
 
 
 def test_env_py_is_valid_python():
@@ -82,6 +90,20 @@ def test_legacy_columns_map_matches_models():
     model_class = {
         "commits": "DBCommit", "trees": "DBTree", "audit_log": "DBAuditLog",
         "webhooks": "DBWebhook", "runs": "DBRun",
+        "objects": "DBObject",  # v1.3.2 (migration 0014): tenant_id legacy-heal entry
+        # v1.3.2 (migrations 0012/0013): every tenant-scoped table needs an entry here
+        # too, once it gained a `tenant_id` legacy-heal DDL entry above.
+        "refs": "DBRef", "run_commits": "DBRunCommit", "events": "DBEvent",
+        "webhook_deliveries": "DBWebhookDelivery",
+        "improver_versions": "DBImproverVersion", "change_sets": "DBChangeSet",
+        "policy_packs": "DBPolicyPack", "canary_results": "DBCanaryResult",
+        "project_freeze": "DBProjectFreeze", "eval_suites": "DBEvalSuite",
+        "eval_results": "DBEvalResult", "eval_adapters": "DBEvalAdapter",
+        "tasks": "DBTask", "plans": "DBPlan", "budgets": "DBBudget",
+        "causal_links": "DBCausalLink", "strategy_entries": "DBStrategyEntry",
+        "lessons": "DBLessons", "reviews": "DBReview", "critiques": "DBCritique",
+        "blackboard_entries": "DBBlackboardEntry", "sandbox_jobs": "DBSandboxJob",
+        "tool_manifests": "DBToolManifest", "action_logs": "DBActionLog",
     }
     # If this ever assert-fails, the model class for a NEW `_LEGACY_COLUMNS` table entry
     # is missing from the map above — add it, don't skip the check.
@@ -112,23 +134,25 @@ def test_heal_legacy_columns_adds_only_missing_on_sqlite(tmp_path):
             " author VARCHAR, parent_hash VARCHAR, root_tree_hash VARCHAR NOT NULL)"
         )
         conn.exec_driver_sql("CREATE TABLE trees (tree_hash VARCHAR, path_name VARCHAR)")
-        # An unrelated table that shares a column name with the heal map:
-        conn.exec_driver_sql("CREATE TABLE objects (hash VARCHAR PRIMARY KEY)")
+        # A table genuinely absent from _LEGACY_COLUMNS entirely (v1.3.2: "objects" no
+        # longer qualifies for this role -- migration 0014 gave it a real tenant_id
+        # heal entry too, so using it here would test the wrong thing).
+        conn.exec_driver_sql("CREATE TABLE widgets (id VARCHAR PRIMARY KEY)")
 
     with engine.connect() as conn:
         before_commits = {c["name"] for c in sa.inspect(conn).get_columns("commits")}
         assert "extra_parents" not in before_commits
 
-        _heal_legacy_columns(conn, {"commits", "trees", "objects"})
+        _heal_legacy_columns(conn, {"commits", "trees", "widgets"})
 
         after_commits = {c["name"] for c in sa.inspect(conn).get_columns("commits")}
         after_trees = {c["name"] for c in sa.inspect(conn).get_columns("trees")}
-        after_objects = {c["name"] for c in sa.inspect(conn).get_columns("objects")}
+        after_widgets = {c["name"] for c in sa.inspect(conn).get_columns("widgets")}
     engine.dispose()
 
     assert "extra_parents" in after_commits
     assert "chunks" in after_trees
-    assert after_objects == {"hash"}  # untouched
+    assert after_widgets == {"id"}  # untouched -- not in _LEGACY_COLUMNS at all
 
 
 def test_heal_is_idempotent(tmp_path):
@@ -157,11 +181,15 @@ def test_heal_legacy_indexes_creates_only_whats_missing_on_sqlite(tmp_path):
     with engine.begin() as conn:
         # Same shape Base.metadata declares for audit_log, MINUS the two indexes this
         # heal function is responsible for adding — i.e. exactly what an adopted volume
-        # whose create_all() predates their declaration would look like.
+        # whose create_all() predates their declaration would look like. Includes
+        # tenant_id (v1.3.2) because in the REAL _ensure_schema_sync() sequence,
+        # _heal_legacy_columns() always runs BEFORE _heal_legacy_indexes() and would
+        # already have added it — this test exercises index-healing in isolation, so it
+        # simulates that precondition directly rather than re-running column-healing too.
         conn.exec_driver_sql(
             "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts DATETIME NOT NULL,"
             " username VARCHAR, action VARCHAR NOT NULL, project_id VARCHAR,"
-            " details JSON, status_code INTEGER)"
+            " details JSON, status_code INTEGER, tenant_id VARCHAR)"
         )
         conn.exec_driver_sql("CREATE INDEX ix_audit_ts ON audit_log (ts)")
 
@@ -186,10 +214,12 @@ def test_heal_legacy_indexes_creates_only_whats_missing_on_sqlite(tmp_path):
 def test_heal_legacy_indexes_is_idempotent(tmp_path):
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
     with engine.begin() as conn:
+        # tenant_id included -- see the sibling test above for why (_heal_legacy_columns
+        # always runs first in the real sequence this isolated test simulates a step of).
         conn.exec_driver_sql(
             "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts DATETIME NOT NULL,"
             " username VARCHAR, action VARCHAR NOT NULL, project_id VARCHAR,"
-            " details JSON, status_code INTEGER)"
+            " details JSON, status_code INTEGER, tenant_id VARCHAR)"
         )
     with engine.connect() as conn:
         _heal_legacy_indexes(conn, {"audit_log"})
@@ -298,6 +328,42 @@ def test_chain_renders_complete_postgres_ddl_offline():
     for col in ("effect_delta", "hyperparameters", "decision", "target_type", "objection", "claim"):
         assert col in ddl, f"offline DDL missing 0009 column {col}"
 
+    # v1.3.2 enterprise identity (0011): eleven new tables + seeded roles/tenant.
+    for table in ("tenants", "projects", "users", "user_identities", "groups",
+                  "group_members", "roles", "role_bindings", "api_tokens",
+                  "sso_providers", "sessions"):
+        assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
+    for col in ("token_hash", "permissions", "subject_type", "external_id", "refresh_hash"):
+        assert col in ddl, f"offline DDL missing 0011 column {col}"
+    assert "INSERT INTO roles" in ddl, "offline DDL missing 0011 built-in role seed"
+    assert "INSERT INTO tenants" in ddl, "offline DDL missing 0011 default tenant seed"
+
+    # v1.3.2 tenant scoping, phase 1 (0012): tenant_id added to every pre-existing
+    # tenant-scoped table plus the batched-backfill UPDATE.
+    assert "ADD COLUMN tenant_id" in ddl, "offline DDL missing 0012 tenant_id column adds"
+    assert "UPDATE commits SET tenant_id" in ddl, "offline DDL missing 0012 backfill"
+
+    # v1.3.2 tenant scoping, phase 2 (0013): NOT NULL + FK + RLS policy.
+    assert "ALTER TABLE commits ALTER COLUMN tenant_id SET NOT NULL" in ddl, \
+        "offline DDL missing 0013 NOT NULL constraint"
+    assert "ENABLE ROW LEVEL SECURITY" in ddl, "offline DDL missing 0013 RLS enable"
+    assert "FORCE ROW LEVEL SECURITY" in ddl, "offline DDL missing 0013 RLS force"
+    assert "CREATE POLICY tenant_isolation" in ddl, "offline DDL missing 0013 RLS policy"
+    assert "app.bypass_rls" in ddl, "offline DDL missing 0013 bypass GUC in the policy"
+
+    # v1.3.2 per-tenant CAS schema prerequisite (0014): objects/trees PK widening.
+    assert "objects_pkey" in ddl, "offline DDL missing 0014 objects PK constraint work"
+    assert "trees_pkey" in ddl, "offline DDL missing 0014 trees PK constraint work"
+    assert "CREATE INDEX ix_objects_hash" in ddl, "offline DDL missing 0014 objects.hash index"
+    assert "CREATE INDEX ix_trees_tree_hash" in ddl, "offline DDL missing 0014 trees.tree_hash index"
+
+    # v1.3.2 RLS-superuser-gap fix (0015): non-superuser av_app role + grants.
+    assert "CREATE ROLE av_app" in ddl, "offline DDL missing 0015 role creation"
+    assert "NOSUPERUSER" in ddl, "offline DDL missing 0015 NOSUPERUSER clause"
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public" in ddl, \
+        "offline DDL missing 0015 table grants"
+    assert "ALTER DEFAULT PRIVILEGES" in ddl, "offline DDL missing 0015 default-privilege grants"
+
     # Every table from 0001_baseline exists in the rendered schema.
     for table in ("objects", "trees", "commits", "refs"):
         assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
@@ -332,13 +398,24 @@ def test_chain_renders_downgrade_ddl_offline_for_every_revision():
     cfg.set_main_option("sqlalchemy.url", "postgresql://av_user:av_password@localhost/aether_vault")
     script = ScriptDirectory.from_config(cfg)
     chain = [rev.revision for rev in script.walk_revisions()]  # head -> base order
-    assert chain == ["0010", "0009", "0008", "0007", "0006", "0005", "0004", "0003",
-                     "0002", "0001"]
+    assert chain == ["0015", "0014", "0013", "0012", "0011", "0010", "0009", "0008", "0007",
+                     "0006", "0005", "0004", "0003", "0002", "0001"]
 
     # Revision-specific DDL each downgrade step must emit, in the order downgrade() drops
     # things — proves the rendered SQL is THIS revision's downgrade, not a no-op or a
     # copy-paste of the wrong one.
     expected_per_step = {
+        # No "DROP ROLE" here -- 0015's downgrade deliberately never drops the role
+        # (cluster-wide object, unsafe from a per-database migration); see that
+        # migration's own downgrade() docstring for the live finding.
+        "0015": ["REVOKE ALL PRIVILEGES ON ALL TABLES", "REVOKE USAGE ON SCHEMA public"],
+        "0014": ["DROP INDEX", "objects_pkey", "trees_pkey", "DROP COLUMN tenant_id"],
+        "0013": ["DROP POLICY", "NO FORCE ROW LEVEL SECURITY", "DISABLE ROW LEVEL SECURITY",
+                 "DROP CONSTRAINT"],
+        "0012": ["DROP COLUMN tenant_id"],
+        "0011": ["sessions", "sso_providers", "api_tokens", "role_bindings", "roles",
+                 "group_members", "groups", "user_identities", "users", "projects",
+                 "tenants"],
         "0010": ["action_logs", "tool_manifests", "sandbox_jobs"],
         "0009": ["blackboard_entries", "critiques", "reviews", "lessons",
                  "strategy_entries", "causal_links", "lessons_id"],

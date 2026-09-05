@@ -8,6 +8,11 @@
 | [`contracts.md`](contracts.md) | Every published, versioned JSON Schema (envelope, semantic diff, `.avh`, event, run, webhook payload) and where each is produced. |
 | [`avattributes.md`](avattributes.md) | `.avattributes` staging directives — forcing or suppressing chunking/layer-splitting for a specific path. |
 | [`migrate-engine-image.md`](migrate-engine-image.md) | Moving a pinned two-container (`aether-vault-server`/`aether-vault-webui`) compose file onto the consolidated `aether-vault-engine` image, or onto the new slim single-role images. |
+| [`dr.md`](dr.md) | Disaster recovery: `av admin backup create/verify/restore`, the real destroy-and-restore drill (Phase U), and the measured-RTO/stated-RPO distinction. |
+| [`enterprise-operator-guide.md`](enterprise-operator-guide.md) | Identity/RBAC/tenancy/DR continuous path: provision a tenant → create users → grant roles → mint a remote token → turn on tenant enforcement → back up and restore. States plainly what's NOT built (SSO/SCIM). |
+| [`support.md`](support.md) | Where to get help, `av support-bundle`, and links to `sla.md`/`slo.md`/`runbooks/`. |
+| [`slo.md`](slo.md) | Service level indicators/objectives and how each is actually measured today (honestly noting no live `/api/metrics` endpoint exists yet). |
+| [`sla.md`](sla.md) | A support/SLA policy TEMPLATE — fill in real tiers/contacts before using it as a live commitment. |
 
 For everything else — install, CLI reference, architecture, CI, benchmarks, the full
 build history — see the top-level [`README.md`](../README.md) and `development/` (start

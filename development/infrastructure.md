@@ -146,6 +146,26 @@ AV_ANOMALY_AUTH_SPIKE_THRESHOLD  5   (default)
                counter then resets so one burst raises exactly one event.
 AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS  60   (default)
                Sliding window the threshold above is measured over.
+AV_APP_DATABASE_URL  (empty/unset = request-serving sessions use DATABASE_URL, same as
+               pre-v1.3.2)
+               Optional second connection string for ORDINARY request-serving sessions
+               only — migrations and the two cross-tenant background workers keep using
+               DATABASE_URL unconditionally (they need DDL rights / the bypass-RLS GUC).
+               Point this at the non-superuser `av_app` role (migration 0015) for RLS to
+               actually filter anything — see architecture.md's Tenancy Isolation
+               Contract. docker-compose.yml sets this by default for its own topology.
+AV_TENANCY_ENFORCE  0 = off   (default)
+               1 = the application-level tenant guard + RLS GUC application activate.
+               Off means every route behaves byte-identically to pre-v1.3.2 regardless
+               of tenant_id columns existing on disk.
+AV_RATE_LIMIT_BACKEND  memory   (default)
+               memory = today's in-process WindowRateLimiter (correct at N=1 replica,
+               silently wrong under N>1 — see the HA Contract). redis = one shared,
+               atomically-incremented limit across every replica; fails OPEN on a Redis
+               error, same posture as the Bloom filter.
+AV_AUTH_SPIKE_BACKEND  memory   (default)
+               Same memory/redis choice as AV_RATE_LIMIT_BACKEND, for the auth-spike
+               anomaly counter specifically (AV_ANOMALY_AUTH_SPIKE_THRESHOLD above).
 ```
 
 **Caution:** `AV_DATA_DIR`'s `/data` default is container-oriented. Bare-metal uvicorn MUST point it at a writable directory, or every object upload fails with PermissionError while `/api/health` stays green — the most misleading failure mode in the project. This exact failure broke CI `webui-e2e` once: uploads 500ed, seed pushes queued offline, the dashboard rendered empty, Playwright failed on element-not-found. Documented in [CHANGELOG.md](CHANGELOG.md); the fix lives as explicit env vars on both uvicorn-starting CI jobs.
@@ -320,6 +340,9 @@ Every product surface and the workflow that guards it (Tests workflow unless not
 | Sdist compile-install smoke (Windows venv, MSVC path) | `smoke-sdist-windows` |
 | `:edge` images on master pushes | `docker-edge.yml` |
 | Wheels cp310–314 ×3 OS, PyPI, GitHub Release, GHCR | `release.yml` (tags) |
+| HA drill (v1.3.2): real 2-replica compose topology, killed replica mid-load, webhook double-delivery + rate-limit proofs | `ha-drill` (`scripts/ha_drill.sh`) |
+| Helm chart schema verification (v1.3.2): `helm template \| kubeconform -strict` across 4 value permutations — NOT a real cluster deploy | `helm-lint` |
+| Security scanning (v1.3.2): `pip-audit`, `bandit`, `semgrep`, `trivy` (built image), `npm audit` — PR + weekly cron | `security.yml` |
 
 Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` flow test, no macOS install smoke. Dependabot was removed (Phase 55, owner decision — config deleted, all open PRs closed); dependency freshness review is manual now.
 

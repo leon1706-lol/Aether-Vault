@@ -218,7 +218,7 @@ start_server legacy-C     # boot must detect the pre-Alembic shape, heal, stamp
 
 [[ "$(psqlq "SELECT count(*) FROM information_schema.columns WHERE table_name='commits' AND column_name='extra_parents'")" == "1" ]] \
   || die "legacy boot did not restore commits.extra_parents"
-[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0010" ]] || die "legacy boot did not stamp chain head (0010)"
+[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0015" ]] || die "legacy boot did not stamp chain head (0015)"
 [[ "$(psqlq "SELECT count(*) FROM commits")" == "$COMMITS_BEFORE" ]] || die "heal lost commit rows!"
 pass "Phase C: pre-Alembic volume healed + stamped zero-touch, data intact"
 
@@ -710,3 +710,81 @@ N_COUNT="$(curl -sf "$API/api/commits?limit=100&project_id=$(project_of "$WORK/r
 pass "Phase N: pending_push survived a SIGKILL mid-push intact; full drain on the next push"
 
 fi  # AV_E2E_CHAOS
+
+# ============================================================================
+# Phase U — DR: real backup -> destroy -> restore drill (v1.3.2, WP-30). Gated behind
+# AV_E2E_DR=1 (default off), same pattern as AV_E2E_CHAOS -- needs either `pg_dump`/
+# `pg_restore` on PATH, or a reachable Postgres CONTAINER named by E2E_DB_CONTAINER (this
+# repo's own docker-compose.yml names it "aether-vault-db"; unset it to force the
+# on-PATH client tools instead, which is what CI's dedicated job does). Destroys and
+# restores ONLY the e2e's own AV_TEST_DATABASE_URL database (never the real dev
+# `aether_vault` database, even when both live on the same shared local Postgres
+# container) and the e2e's own $WORK/data CAS directory -- never anything outside $WORK.
+#   AV_E2E_DR=1 AV_TEST_DATABASE_URL=... AV_TEST_REDIS_URL=... bash scripts/e2e_scenario.sh
+# ============================================================================
+if [[ "${AV_E2E_DR:-0}" == "1" ]]; then
+
+stop_server
+start_server dr-U-before
+
+log "Phase U — DR: backup -> destroy -> restore drill"
+
+mkdir -p "$WORK/repoU" && cd "$WORK/repoU"
+av . init --mode local --yes --no-repl >/dev/null
+echo "dr-drill payload $(date +%s)" > dr-file.txt
+av . add dr-file.txt >/dev/null
+av . commit -m "dr-drill commit" >/dev/null
+DR_HASH="$(cat .av/refs/heads/main)"
+cd "$REPO_ROOT"
+[[ "$(api_status "$API/api/commits/$DR_HASH")" == "200" ]] \
+  || die "Phase U: setup commit did not land on the server before the drill started"
+
+DB_CONTAINER_ARGS=()
+if [[ -n "${E2E_DB_CONTAINER:-aether-vault-db}" ]] \
+   && docker inspect "${E2E_DB_CONTAINER:-aether-vault-db}" >/dev/null 2>&1; then
+  DB_CONTAINER_ARGS=(--db-container "${E2E_DB_CONTAINER:-aether-vault-db}")
+elif ! command -v pg_dump >/dev/null 2>&1; then
+  die "Phase U: no pg_dump on PATH and no reachable \$E2E_DB_CONTAINER -- install postgresql-client or set E2E_DB_CONTAINER"
+fi
+
+BACKUP_DIR="$WORK/dr-backup"
+command av admin backup create "$BACKUP_DIR" \
+  --database-url "$DB_URL_ASYNC" --data-dir "$WORK/data" "${DB_CONTAINER_ARGS[@]}" \
+  >"$WORK/dr-backup-create.out" 2>&1 \
+  || { cat "$WORK/dr-backup-create.out" >&2; die "Phase U: av admin backup create failed"; }
+[[ -f "$BACKUP_DIR/manifest.json" ]] || die "Phase U: backup create did not write a manifest.json"
+pass "Phase U: backup created ($(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1))"
+
+command av admin backup verify "$BACKUP_DIR" >"$WORK/dr-backup-verify.out" 2>&1 \
+  || { cat "$WORK/dr-backup-verify.out" >&2; die "Phase U: av admin backup verify reported a bad backup"; }
+pass "Phase U: backup verified (hashes match manifest)"
+
+log "Phase U — destroying the e2e database schema and CAS objects (genuinely, not simulated)"
+stop_server
+psqlq "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null
+rm -rf "${WORK:?}/data"
+mkdir -p "$WORK/data"
+[[ "$(psqlq "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")" == "0" ]] \
+  || die "Phase U: schema destroy did not actually empty the database"
+pass "Phase U: e2e database schema and CAS objects genuinely destroyed"
+
+DR_RESTORE_START="$(date +%s)"
+command av admin backup restore "$BACKUP_DIR" \
+  --database-url "$DB_URL_ASYNC" --data-dir "$WORK/data" "${DB_CONTAINER_ARGS[@]}" --force \
+  >"$WORK/dr-backup-restore.out" 2>&1 \
+  || { cat "$WORK/dr-backup-restore.out" >&2; die "Phase U: av admin backup restore failed"; }
+DR_RESTORE_SECS="$(( $(date +%s) - DR_RESTORE_START ))"
+
+start_server dr-U-after
+[[ "$(api_status "$API/api/commits/$DR_HASH")" == "200" ]] \
+  || die "Phase U: the pre-destruction commit is not readable after restore"
+RESTORED_BODY="$(curl -sf "$API/api/commits/$DR_HASH")"
+echo "$RESTORED_BODY" | jsonget "d['hash']" | grep -q "$DR_HASH" \
+  || die "Phase U: restored commit hash does not match what was backed up"
+DR_PROJECT="$(project_of "$WORK/repoU")"
+DR_REF="$(curl -sf "$API/api/refs?project_id=$DR_PROJECT" | jsonget "d['$DR_PROJECT/main']")"
+[[ "$DR_REF" == "$DR_HASH" ]] \
+  || die "Phase U: restored refs/main ($DR_REF) does not resolve to the pre-destruction commit ($DR_HASH)"
+pass "Phase U: DR drill complete — real destroy + restore, pre-destruction commit and its ref read back byte-identical, restore took ${DR_RESTORE_SECS}s (this run's measured RTO — see docs/dr.md)"
+
+fi  # AV_E2E_DR

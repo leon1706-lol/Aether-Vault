@@ -1563,6 +1563,15 @@ EXIT_BUDGET_EXHAUSTED = 17        # a budget dimension is now exceeded (the spen
 EXIT_FROZEN = 18                  # project is frozen; promotions/self-edits are paused
 EXIT_REVIEW_REQUIRED = 19         # improver promotion needs reviewer approval / has open critiques
 EXIT_SCOPE_DENIED = 20            # token authenticated but lacks the required scope (server 403)
+# v1.3.2 (hard multi-tenancy): mirrors `scope_denied`'s shape exactly — the caller
+# authenticated fine, they just don't own the project_id they targeted
+# (server.py::_enforce_project_tenant's 403, `AV_TENANCY_ENFORCE=1` only). 21
+# (`login_required`) is deliberately NOT registered yet — no command produces it until
+# `av login`/SSO sessions actually exist (a later phase); registering an exit code with
+# no real caller is exactly the "documented but never raised" drift
+# test_contract_matrix.py's registry-parity test exists to catch, so this codebase's own
+# discipline is followed here rather than worked around.
+EXIT_TENANT_DENIED = 22
 
 _EXIT_CODES = {
     "not_a_repo": EXIT_NOT_A_REPO,
@@ -1576,6 +1585,7 @@ _EXIT_CODES = {
     "frozen": EXIT_FROZEN,
     "review_required": EXIT_REVIEW_REQUIRED,
     "scope_denied": EXIT_SCOPE_DENIED,
+    "tenant_denied": EXIT_TENANT_DENIED,
 }
 
 
@@ -1636,6 +1646,8 @@ _CONTRACT_SCHEMA_NAMES = (
     # v1.3.1 RSI additions
     "improver-1.0", "change-set-1.0", "policy-pack-1.0", "eval-suite-1.0",
     "tool-manifest-1.0", "action-log-1.0",
+    # v1.3.2 enterprise readiness additions
+    "backup-manifest-1.0",
 )
 
 

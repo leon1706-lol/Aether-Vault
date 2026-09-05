@@ -26,8 +26,9 @@ file defers to — treat it as part of this contract, not optional extra credit.
    `_materialize_tree()`.
 3. **Offline resilience is sacred.** Any network failure must queue work
    (`.av/pending_push`), never lose it. `unreachable_queued` = safe, not an error.
-4. **Contracts are versioned.** JSON envelope shapes, exit codes 10–20 (17-20 added
-   v1.3.1), `.avh` (`avh_version`), and HTTP payloads are user-facing contracts. Additive
+4. **Contracts are versioned.** JSON envelope shapes, exit codes 10–20 + 22 (17-20 added
+   v1.3.1, 22 added v1.3.2 — 21 is reserved, not yet registered; see docs/for-agents.md),
+   `.avh` (`avh_version`), and HTTP payloads are user-facing contracts. Additive
    changes only, with a MINOR bump + CHANGELOG entry.
 5. **Nothing is done until it's verified.** New behavior ships with its own tests
    (`pytest tests/ -q` green) *and* a manual, real-CLI repro in a scratch repo outside

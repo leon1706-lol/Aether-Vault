@@ -23,7 +23,8 @@ os.environ["DATABASE_URL"] = os.environ.get(
     "AV_TEST_DATABASE_URL",
     "postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test",
 )
-os.environ["REDIS_URL"] = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/0")
+# v1.3.2: db 1, not 0 -- see test_server.py's comment on this same default.
+os.environ["REDIS_URL"] = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/1")
 os.environ["AV_DATA_DIR"] = tempfile.mkdtemp(prefix="av-scopes-test-")
 
 import pytest  # noqa: E402

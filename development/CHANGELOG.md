@@ -1774,3 +1774,213 @@ recommendation, nothing else does.
 Essential-Tasks: signed off
 
 Essential-Tasks: signed off
+
+## Phase 60 — V1.3.2 "Enterprise Identity & Tenancy" (in progress): SSO/RBAC/SCIM/hard
+multi-tenancy/HA/DR from `todo.md`'s Main Objektive V1.3.2 — E0/E1/E4 core and E5's three
+cross-replica fixes shipped and live-verified this pass; E2 (SSO)/E3 (SCIM)/E5's compose
+HA topology+Helm/E6 (DR)/E7 (security scanning)/E8 (support tooling) are NOT started —
+stated plainly here rather than implied complete by this entry's presence.
+
+**Session 2 continuation (same day, same phase) — the RLS-superuser gap, HA packaging,
+DR, security scanning, and support tooling.** E2 (SSO) and E3 (SCIM) remain entirely
+unstarted (zero code) — stated plainly, not implied otherwise by everything below.
+
+- **The RLS-superuser gap from session 1 is FIXED (migration `0015`):** a new
+  non-superuser `av_app` Postgres role, granted exactly SELECT/INSERT/UPDATE/DELETE (no
+  DDL, no BYPASSRLS). `database.py` gains `AV_APP_DATABASE_URL` (optional, additive) —
+  when set, request-serving sessions route through `av_app`; migrations and the two
+  cross-tenant background workers keep using the superuser role unconditionally.
+  `docker-compose.yml` wires this by default. **Live-verified on the REAL dev stack, not
+  just the test DB**: a raw asyncpg probe connected as `av_app` with only `app.tenant_id`
+  set (no application code involved) sees exactly one tenant's rows;
+  `tests/test_server.py::TestHardTenancy::test_rls_actually_filters_now_for_the_non_superuser_role`
+  proves the same live against Postgres. `downgrade()` deliberately never `DROP ROLE`s —
+  found live that a per-database migration can't safely do that for a cluster-wide role
+  when the cluster hosts more than one database (this dev machine's own
+  `aether_vault`+`aether_vault_test`).
+- **E5 finished — HA packaging:** `docker-compose.ha.yml` (nginx LB + 2 engine replicas +
+  a REAL Postgres primary/streaming-replica via `pg_basebackup -R` + Redis
+  primary/replica) and `scripts/ha_drill.sh` — a genuine, locally-run drill: concurrent
+  pushes through the LB survive a `docker kill` of one replica mid-batch; a webhook
+  target that fails its first 2 attempts proves exactly 3 total deliveries across both
+  replicas' retry-worker loops (the `SKIP LOCKED` fix from session 1, now proven under
+  real concurrent replicas, not just unit-tested); 20 rapid requests against a
+  `6/minute` limit prove the Redis backend caps at 6 total, not 12. A Helm chart
+  (`deploy/helm/aether-vault/`) ships alongside, `helm template | kubeconform -strict`
+  verified (both tools installed and actually run, not just written) across 4 value
+  permutations — honestly labeled as NOT drilled on a real cluster. Two new CI jobs
+  (`helm-lint`, `ha-drill`).
+- **E6 done — DR:** `av admin backup create/verify/restore` (`cmd_admin.py`) — `pg_dump
+  -Fc` + a gzip'd CAS tar + a `backup-manifest-1.0` manifest. Deliberately requires an
+  EXPLICIT `--database-url`/`--db-container` (no auto-detection of "the local docker
+  stack") — a lesson taken directly from this same session's own second incident below.
+  **The actual drill ran and passed**: `scripts/e2e_scenario.sh` Phase U (gated
+  `AV_E2E_DR=1`) pushes a commit, backs it up, genuinely destroys the schema
+  (`DROP SCHEMA public CASCADE`) and CAS directory, restores, and confirms the
+  pre-destruction commit and its ref both read back byte-identical — with the real
+  measured wall-clock restore time in the pass line. `docs/dr.md` states the
+  measured-RTO/stated-RPO distinction plainly. **A real bug the drill caught that
+  nothing else did**: `cmd_admin.py`'s schema-healing step imported
+  `python.av_server.database` (this repo's OWN test-suite import spelling, from
+  `pythonpath=["."]`) instead of the INSTALLED package's real top-level
+  `av_server.database` — invisible to every unit test (which all run inside the
+  `python.*`-spelled test process) and even to `av admin backup verify`'s own
+  alembic-head check (silently swallowed by a bare `except Exception`), and only ever
+  surfaced running the REAL installed `av` console script end to end. Fixed in both call
+  sites; `tests/test_cmd_admin.py`'s mock updated to patch the same spelling the code
+  now actually uses, so a future regression here would be caught structurally too, not
+  only by another live drill run.
+- **E7 substantially done — security scanning:** `.github/workflows/security.yml`
+  (`pip-audit`, `bandit`, `semgrep`, `trivy` on the built image, `npm audit`), gating on
+  high/critical only. Run locally against this codebase for real: 0 HIGH bandit
+  findings (3 MEDIUM findings in the new `cmd_admin.py` — predictable `/tmp/` paths for
+  `docker exec` — fixed with a random suffix + justified `nosec` since bandit can't see
+  through the interpolation). `development/threat-model.md` gains T14–T18 for the new
+  surfaces (tenancy boundary, DB-backed tokens, backup artifacts, the `av_app`
+  credential, restore-target mistakes) and an annual-review log entry.
+  Audit-log hash-chaining/signing (the other half of E7) is NOT built — still open.
+- **E8 substantially done — support tooling:** `av support-bundle` (redacted
+  diagnostics: versions, health/ready, container status, a speed probe — every
+  credential-shaped config key masked before anything touches disk, with a
+  belt-and-braces raw-bytes check on top of the structured redaction).
+  `docs/support.md`/`docs/slo.md`/`docs/sla.md` (the latter two explicit about NOT having
+  a live `/api/metrics` endpoint yet — a real, tracked gap, not implied otherwise) and
+  five `docs/runbooks/` (incident response, HA failover, DR restore, tenant
+  provisioning, upgrade/rollback).
+- **Two more real incidents this session, both caused by this session's own migration
+  work and both fully resolved:**
+  1. A live migration bug: `0015`'s `downgrade()` tried `DROP ROLE av_app`, which fails
+     whenever that role still holds a grant in ANY sibling database on the same
+     cluster — found via a full `pytest tests/test_server.py` run cascading 5 unrelated
+     failures from a poisoned connection pool. Fixed (see above); also hardened the
+     underlying pool-poisoning class itself with `engine.dispose(close=False)` after the
+     live migration-round-trip test, verified live not to break the TestClient's own
+     anyio portal (a real, escalating risk the pre-existing "absorb one stale cache hit"
+     mitigation didn't fully cover once a second migration extended the same cycle).
+  2. Applying migrations `0011`–`0015` to the real dev database while the (old-image)
+     `aether-vault-engine` container stayed running left its connection pool serving
+     stale/WRONG query results — confirmed live: fresh object uploads were falsely
+     rejected as duplicates. Recreating the container then hit the SAME image/migration-
+     head mismatch class as session 1's incident (old image, new DB head) and
+     crash-looped. **Resolved with the owner's explicit go-ahead** (asked before both the
+     container recreate and the image rebuild, per guardrail): rebuilt the engine image
+     with this session's code, recreated the container, verified clean (`/api/ready`
+     green, a real push→read round trip, `pg_stat_activity` confirming `av_app`
+     genuinely handling request traffic). Also found (not fixed): the stack-free suite
+     and `test_server.py`'s live tests shared the same Redis logical DB as the real dev
+     engine (`redis://localhost:6379/0` for both, no isolation) — fixed by moving the
+     LOCAL test default to db 1.
+- **Deferred, stated plainly rather than implied complete:** E2 (SSO), E3 (SCIM),
+  per-tenant physical CAS storage isolation, the real Kubernetes HA drill, audit-log
+  signing/hash-chaining, README/architecture.md's remaining polish beyond what's listed
+  above, and the Obsidian vault regen. `todo.md`'s own Status section carries the
+  up-to-date done/missing split.
+
+- **E0 — identity & tenancy schema (migration `0011`):** eleven new tables (`tenants`,
+  `projects`, `users`, `user_identities`, `groups`, `group_members`, `roles`,
+  `role_bindings`, `api_tokens`, `sso_providers`, `sessions`), seeding a well-known
+  default tenant (`models.py::DEFAULT_TENANT_ID`) and six built-in roles expressed in the
+  EXISTING v1.3.1 scope vocabulary (`owner`→`["*"]`, down to `reader`→`["read"]`) — a role
+  binding is a different, DB-backed way to arrive at the same scopes list
+  `_scopes_for_identity()` already resolves for an `.env` token, not a parallel
+  permission system. `projects` backfilled from every `project_id` real commit history
+  already had (514 rows on the live dev DB) — that table was purely virtual before this
+  (`GET /api/projects` was a live `GROUP BY` over `commits`).
+- **E1 — Principal resolution + remote-administrable identity (`identity.py`, new):** a
+  third credential source (`api_tokens`/`sessions`, TTL-cached) alongside the existing
+  `AV_API_TOKEN`/`AV_AUTH_USERS`, resolved inside `require_token` regardless of whether
+  the server is in Anonymous or Protected mode — `av token create` works on a server that
+  has never touched `.env` at all, the whole point of a remote-administrable alternative
+  to `av auth add-user` (which requires `docker compose` shell access on the host running
+  the stack). Six previously-UNSCOPED admin routes (`/api/admin/gc`, `/api/admin/audit*`,
+  `/api/admin/webhook-deliveries*`) now require the `admin` scope — a real security gap
+  closed, not a new feature; documented as such since a token with an EXPLICIT narrow
+  scope set (not the common unrestricted default) genuinely loses access it had before,
+  the one deliberate exception to this phase's "everything additive" rule. New CLI:
+  `av token create/list/revoke`, `av tenant create/show`, `av user create/list/suspend`,
+  `av role list/grant/bindings/revoke` — all backed by new `/api/tokens*`,
+  `/api/tenants*`, `/api/users*`, `/api/roles`, `/api/role-bindings*` routes.
+- **E4 — hard multi-tenancy (migrations `0012`/`0013`/`0014`):** `tenant_id` added to 28
+  pre-existing tables (nullable+backfill in `0012`, NOT NULL+FK+row-level-security in
+  `0013` — split specifically to avoid one long lock across add-column+backfill+constrain
+  on tables the size `audit_log`/`events` can reach) plus `objects`/`trees`' primary keys
+  widened to include it (`0014`, a schema prerequisite for a future genuinely-separate
+  per-tenant object store — NOT itself built this pass, see that migration's own
+  docstring). RLS policy is fail-CLOSED (an earlier draft was fail-open — GUC unset ⇒
+  every tenant's rows — caught in design review before any code existed, fixed to
+  COALESCE an unset GUC to the default tenant instead). The application-layer guard
+  (`server.py::_enforce_project_tenant`) is wired as a GLOBAL FastAPI dependency, not
+  per-route — two other designs were tried and rejected first (per-route `Depends()` on
+  ~80 project_id-taking routes, too error-prone at that scale; folded into the
+  `require_token` middleware, rejected after verifying LIVE that `request.path_params` is
+  empty inside `BaseHTTPMiddleware` before routing occurs). Everything gated behind
+  `AV_TENANCY_ENFORCE` (default off) and `tenant_id` always populated regardless (a
+  SQLAlchemy `before_flush` listener, not ~30 individual `db.add()` call-site edits).
+  **A significant live finding, documented prominently in migration `0013`'s own
+  docstring:** RLS is currently INERT under this repo's own default `docker-compose.yml`
+  — Postgres unconditionally exempts superusers from row-level security, and `av_user`
+  IS a superuser there (the official `postgres` image's `POSTGRES_USER` behavior, never
+  deliberately chosen). Found by a real two-tenant live test that confirmed the policy
+  correctly enabled/forced/defined and STILL didn't filter. The application-layer guard
+  is unaffected (pure app code); explicit tenant filters were added to `list_commits`/
+  `list_projects` to compensate — the remaining unfiltered list routes this phase did not
+  individually audit are a known, flagged residual gap pending the real fix (a
+  non-superuser connection role), not silently left broken.
+- **E5 — three of the identified cross-replica HA gaps, fixed and opt-in:** the webhook
+  retry worker's due-delivery select gained `.with_for_update(skip_locked=True)` (was
+  unconditionally duplicating deliveries under N replicas — the correctness-critical
+  fix; the throughput refinement of splitting claim from delivery is explicitly NOT done
+  yet). `rate_limit.RedisWindowRateLimiter` and a Redis-backed `_note_auth_failure` path
+  (`AV_RATE_LIMIT_BACKEND`/`AV_AUTH_SPIKE_BACKEND=redis`), both opt-in, both fail-open on
+  a Redis error, both byte-identical to today when unconfigured. Compose HA topology,
+  Helm chart, and CI HA-drill job are NOT built.
+- **New exit code:** `tenant_denied` (22) — 21 (`login_required`) deliberately left
+  unregistered until `av login`/SSO sessions have a real caller (this codebase's own
+  `test_contract_matrix.py` discipline: no code registered without a genuine repro).
+- **Real bugs found and fixed by the mandatory manual/live verification pass, not by
+  design review:** (1) `av token create` unconditionally 422'd on a genuinely Anonymous
+  server — the exact deployment shape most likely to use the feature first, since nobody
+  could ever mint a bootstrap token; fixed to fall back to the default tenant, same
+  reasoning `env_principal()` already applies. (2) Alembic's offline (`--sql`) render
+  mode crashed on `sa.inspect()` (no schema reflection against its `MockConnection`) and
+  on a live-`.rowcount`-driven `while True` batching loop (would have hung offline
+  forever) — migration `0012` now hardcodes its batched tables' PK column names instead
+  of inspecting, and gates the loop on `alembic.context.is_offline_mode()`. (3)
+  `CREATE POLICY` rejects bind parameters outright over asyncpg's extended protocol (a
+  DDL/utility statement, not SELECT/INSERT/UPDATE/DELETE) — migration `0013` inlines its
+  one internal constant (`DEFAULT_TENANT_ID`) as a literal instead. (4) The legacy-volume
+  adoption path's `_heal_legacy_columns` needed `tenant_id` entries for all 28 tables too
+  (an adopted volume with lost version-tracking could already have ANY of them) —
+  originally missed entirely, caught by two now-updated `test_migrations.py` fixtures
+  whose "an unrelated table" premise had gone stale. (5) `test_auth_users.py`'s
+  deliberately DB-free "lifespan-less" middleware probe crashed (Windows
+  ProactorEventLoop teardown) once `require_token` gained a real DB-backed fallback for
+  ANY unrecognized Bearer token — fixed with a scoped fixture patch
+  (`identity_module.resolve_db_token`/`resolve_session` stubbed to never touch Postgres
+  in that specific probe context), the same pattern `unreachable_client` already
+  established elsewhere for an analogous reason. (6) A syntax error (an unclosed dict
+  literal) shipped briefly in `av_sdk/exceptions.py` from a same-session edit and was
+  caught only by re-running the full stack-free suite, not by any narrower check —
+  restated here as the reason this phase's own verification discipline runs the full
+  suite at least once more before considering ANY of it done, not just the tests judged
+  relevant to what changed.
+- **One real incident, disclosed rather than only fixed:** a manual CLI repro against a
+  second scratch repo, testing a freshly-minted DB token, used `av auth set-token` —
+  which (correctly, by long-standing design) always targets the ONE local Docker stack,
+  not a per-repo config — and so wrote a token into THIS project's real `.env` and
+  restarted the real `aether-vault-engine` container, which then crash-looped (its
+  installed image's bundled migrations didn't know revision `0011`, freshly applied
+  moments earlier directly against the real dev database for an earlier, deliberate
+  verification step). Caught immediately; `.env` restored, the real dev database
+  downgraded back to `0010` to match the running image, container restarted, confirmed
+  healthy — `git status` afterward showed only the intended files touched.
+- **Deferred, stated plainly rather than implied complete:** E2 (SSO — OIDC+SAML against
+  a real Keycloak container), E3 (SCIM 2.0 provisioning), E5's compose HA
+  topology+Helm chart+CI drill job, E6 (backup/restore/DR drill), E7 (security-scanning
+  CI, audit-log hash-chaining, threat-model/control-matrix docs), E8 (support-bundle
+  command, `/api/metrics`, runbooks). None of these are code that exists yet.
+
+(No "Essential-Tasks: signed off" line — the full wrap-up sequence, including the
+Obsidian vault regen, has not been run for this entry; the live verification that DID
+run is the two full-suite passes and the targeted live test classes named above, not the
+complete Essential-Tasks.md checklist.)

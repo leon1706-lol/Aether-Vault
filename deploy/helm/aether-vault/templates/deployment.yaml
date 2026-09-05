@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aether-vault.fullname" . }}
+  labels:
+    {{- include "aether-vault.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "aether-vault.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aether-vault.selectorLabels" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.engine.terminationGracePeriodSeconds }}
+      containers:
+        - name: engine
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.engine.port }}
+            - name: webui
+              containerPort: {{ .Values.engine.webuiPort }}
+          env:
+            - name: AV_ENGINE_ROLE
+              value: {{ .Values.engine.role | quote }}
+            - name: AV_ENGINE_STOP_GRACE_SECS
+              value: {{ .Values.engine.stopGraceSecs | quote }}
+            - name: NEXT_PUBLIC_API_URL
+              value: "http://localhost:{{ .Values.engine.port }}"
+            - name: NODE_ENV
+              value: production
+            - name: WEBUI_PORT
+              value: {{ .Values.engine.webuiPort | quote }}
+            - name: AV_TENANCY_ENFORCE
+              value: {{ .Values.tenancy.enforce | ternary "1" "0" | quote }}
+            - name: AV_RATE_LIMIT_BACKEND
+              value: {{ .Values.rateLimit.backend | quote }}
+            - name: AV_RATE_LIMIT_DEFAULT
+              value: {{ .Values.rateLimit.default | quote }}
+            - name: AV_RATE_LIMIT_GC
+              value: {{ .Values.rateLimit.gc | quote }}
+            - name: AV_AUTH_SPIKE_BACKEND
+              value: {{ .Values.authSpike.backend | quote }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aether-vault.secretName" . }}
+                  key: databaseUrl
+            - name: AV_APP_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aether-vault.secretName" . }}
+                  key: appDatabaseUrl
+                  optional: true
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aether-vault.secretName" . }}
+                  key: redisUrl
+            - name: AV_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aether-vault.secretName" . }}
+                  key: apiToken
+                  optional: true
+            - name: AV_AUTH_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "aether-vault.secretName" . }}
+                  key: authUsers
+                  optional: true
+          # See development/infrastructure.md's "Orchestrator readiness & liveness"
+          # section — these two probe stanzas are copied verbatim from there, the
+          # single documented source of truth for what each route means.
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

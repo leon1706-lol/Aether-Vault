@@ -25,7 +25,10 @@ os.environ["DATABASE_URL"] = os.environ.get(
     "AV_TEST_DATABASE_URL",
     "postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test",
 )
-os.environ["REDIS_URL"] = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/0")
+# v1.3.2: db 1, not 0 -- must stay identical to test_server.py's own default (see this
+# module's own comment above on import order); see that file's comment for why 0 is
+# unsafe (it's the same db docker-compose.yml's real dev engine uses).
+os.environ["REDIS_URL"] = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/1")
 os.environ["AV_DATA_DIR"] = tempfile.mkdtemp(prefix="av-auth-users-test-")
 
 import pytest  # noqa: E402
@@ -130,9 +133,28 @@ def test_bare_string_value_still_resolves(monkeypatch):
 
 @pytest.fixture
 def auth_state(monkeypatch):
-    """Both credential sources empty (= Anonymous), restorable per test."""
+    """Both credential sources empty (= Anonymous), restorable per test.
+
+    v1.3.2: also stubs out identity_module.resolve_db_token/resolve_session to return
+    None WITHOUT ever touching the database — this file's whole design point (see its
+    own module docstring: "every assertion here resolves BEFORE any route touches the
+    database") broke the moment require_token gained a real DB-backed fallback path for
+    ANY unrecognized Bearer token. Found live: test_middleware_rejects_wrong_and_
+    unknown_tokens_in_users_only_mode (a "Bearer tok-b matches nothing" case) started
+    intermittently crashing with a Windows ProactorEventLoop teardown error from the
+    module-level `async_session_factory`'s connection pool being touched by this
+    lifespan-less probe app, which never ran `init_db()` and was never meant to reach
+    Postgres at all. Same class of fix as `unreachable_client` elsewhere in this
+    codebase (tests/conftest.py) — patch the SPECIFIC boundary this file's design
+    depends on staying DB-free, not weaken require_token's real behavior."""
     monkeypatch.setattr(server_module, "AV_API_TOKEN", "")
     monkeypatch.setattr(server_module, "_AUTH_USERS", {})
+
+    async def _never_matches(db, raw_token):
+        return None
+
+    monkeypatch.setattr(server_module.identity_module, "resolve_db_token", _never_matches)
+    monkeypatch.setattr(server_module.identity_module, "resolve_session", _never_matches)
 
 
 def test_owner_shared_secret_resolves_to_owner(auth_state):

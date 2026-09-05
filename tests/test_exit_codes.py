@@ -457,6 +457,34 @@ def test_scope_denied_exits_20_json(repo, monkeypatch):
     assert env["error"]["code"] == "scope_denied"
 
 
+# ---------------------------------------------------------------------------
+# 22 — tenant_denied (v1.3.2): the server's 403 {"error":"tenant_denied"} from
+# `server.py::_enforce_project_tenant`'s global dependency (AV_TENANCY_ENFORCE=1 only)
+# maps to this exit code. Reuses the same `/api/freeze/{project_id}` route as
+# scope_denied's own repro above — that route can now produce EITHER 403 shape, and
+# cmd_freeze.py::_set_freeze branches on the response body's "error" field to tell them
+# apart (a caller with the right scope but the wrong tenant still needs a different
+# remediation message than one with the wrong scope).
+# ---------------------------------------------------------------------------
+
+def test_tenant_denied_exits_22(repo, monkeypatch):
+    _fake_registry_client(monkeypatch, post_response=(403, {
+        "detail": {"error": "tenant_denied", "project_id": "someone-elses-project"}}))
+    result = invoke("freeze", "on", "--reason", "test")
+    assert result.exit_code == 22, result.output
+    assert "tenant" in result.output.lower()
+
+
+def test_tenant_denied_exits_22_json(repo, monkeypatch):
+    _fake_registry_client(monkeypatch, post_response=(403, {
+        "detail": {"error": "tenant_denied", "project_id": "someone-elses-project"}}))
+    result = invoke_json("freeze", "on")
+    assert result.exit_code == 22, result.output
+    env = json.loads(result.output)
+    assert env["ok"] is False
+    assert env["error"]["code"] == "tenant_denied"
+
+
 def test_promote_dry_run_allow_exits_0_and_lands_nothing(repo):
     (repo / "m.txt").write_text("v1")
     invoke("add", "m.txt")

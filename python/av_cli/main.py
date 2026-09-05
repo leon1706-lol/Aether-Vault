@@ -142,6 +142,12 @@ from .cmd_history import (  # noqa: E402
 )
 from .cmd_sync import clone, merge, pull  # noqa: E402
 from .cmd_auth import auth, auth_add_user, auth_list_users, auth_remove_user  # noqa: E402
+from .cmd_token import token  # noqa: E402
+from .cmd_tenant import tenant  # noqa: E402
+from .cmd_user import user  # noqa: E402
+from .cmd_role import role  # noqa: E402
+from .cmd_admin import admin  # noqa: E402
+from .cmd_support import support_bundle  # noqa: E402
 from .cmd_maintenance import doctor, gc  # noqa: E402
 from .cmd_devtools import BENCHMARK_NAMES, benchmark, test_cmd  # noqa: E402
 from .cmd_devtools import _update_readme_test_badge  # noqa: F401,E402
@@ -265,6 +271,12 @@ cli.add_command(auth)
 cli.add_command(auth_add_user)
 cli.add_command(auth_list_users)
 cli.add_command(auth_remove_user)
+cli.add_command(token)
+cli.add_command(tenant)
+cli.add_command(user)
+cli.add_command(role)
+cli.add_command(admin)
+cli.add_command(support_bundle)
 cli.add_command(doctor)
 cli.add_command(test_cmd)
 cli.add_command(benchmark)

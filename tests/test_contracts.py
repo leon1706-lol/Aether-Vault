@@ -45,7 +45,9 @@ class TestLoadContractSchema:
                      # so live-document validation lives in test_server.py, not here; this
                      # only proves each schema FILE loads and is well-formed.
                      "improver-1.0", "change-set-1.0", "policy-pack-1.0",
-                     "eval-suite-1.0", "tool-manifest-1.0", "action-log-1.0"):
+                     "eval-suite-1.0", "tool-manifest-1.0", "action-log-1.0",
+                     # v1.3.2 enterprise readiness additions
+                     "backup-manifest-1.0"):
             schema = load_contract_schema(name)
             assert schema["$id"].startswith("https://aether-vault.dev/schemas/")
 

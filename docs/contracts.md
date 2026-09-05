@@ -21,6 +21,7 @@ checkout or an installed wheel — `importlib.resources` under the hood).
 | Eval suite (v1.3.1) | `eval-suite-1.0.schema.json` | `GET /api/eval/suites/{id}`, each row of `GET /api/eval/suites` |
 | Tool manifest (v1.3.1) | `tool-manifest-1.0.schema.json` | `GET /api/tool-manifests/{id}`, `.../latest` — the index row; the manifest document itself is the referenced CAS object |
 | Action log (v1.3.1) | `action-log-1.0.schema.json` | `GET /api/action-logs/{id}`, each row of `GET /api/action-logs` — the index row; the action list itself is the referenced CAS object |
+| Backup manifest (v1.3.2) | `backup-manifest-1.0.schema.json` | `av admin backup create`'s `manifest.json`, read back by `av admin backup verify`/`restore` |
 
 ## Loading a schema
 

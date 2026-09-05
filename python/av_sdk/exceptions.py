@@ -16,6 +16,7 @@ EXIT_CODES = {
     "frozen": 18,
     "review_required": 19,
     "scope_denied": 20,
+    "tenant_denied": 22,  # 21 (login_required) is deliberately unregistered -- see core.py
 }
 
 
@@ -89,6 +90,10 @@ class ScopeDeniedError(SDKError):
     code = "scope_denied"
 
 
+class TenantDeniedError(SDKError):
+    code = "tenant_denied"
+
+
 _CODE_TO_CLASS: dict[str, type[SDKError]] = {
     "not_a_repo": NotARepoError,
     "nothing_to_commit": NothingToCommitError,
@@ -101,6 +106,7 @@ _CODE_TO_CLASS: dict[str, type[SDKError]] = {
     "frozen": FrozenError,
     "review_required": ReviewRequiredError,
     "scope_denied": ScopeDeniedError,
+    "tenant_denied": TenantDeniedError,
 }
 
 
