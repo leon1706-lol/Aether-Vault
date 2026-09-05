@@ -288,13 +288,29 @@ $COMPOSE restart lb
 log "waiting for both engine replicas to report ready again after the rate-limit env change"
 wait_ready "$API/api/ready" || die "engines never became ready again after applying AV_RATE_LIMIT_DEFAULT"
 
+# v1.3.3.12 (found live): the v1.3.3.11 bounded-poll diagnostic below NEVER printed
+# either -- meaning execution froze before even reaching it, most likely inside the
+# for-loop's own burst of 20 near-simultaneous forks right after three straight rounds
+# of container churn (phase 2's kill+restart, phase 4's own recreate+restart). That
+# points at runner-level resource exhaustion (memory/process-table pressure making
+# fork() itself block), not curl/timeout at all -- a class of hang no shell-level
+# timeout could ever catch, since the INTERPRETER itself would be what's stuck, before
+# any of its own later code (including the v1.3.3.11 kill -9 diagnostics) gets a chance
+# to run. These are cheap, single-process, unconditional prints -- if the runner really
+# is under pressure at this exact point, this is what will finally show it directly.
+free -h 2>&1 || true
+echo "process count: $(ps aux 2>/dev/null | wc -l)"
+docker stats --no-stream 2>&1 || true
+
 CODES="$WORK/ratelimit_codes.txt"
 : > "$CODES"
 declare -a _rl_pids=()
 for i in $(seq 1 20); do
   timeout -k 5 12 curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
   _rl_pids+=("$!")
+  echo "launched probe $i/20 (pid $!)"
 done
+echo "all 20 probes launched, pids: ${_rl_pids[*]}"
 # v1.3.3.11 fix (found live): this exact `timeout -k 5 12 curl ...` guard -- the SAME
 # one that supposedly bounds wait_ready's own call -- hung here just as totally and
 # unkillably in the very next CI run after wait_ready itself hung (v1.3.3.10 traced
