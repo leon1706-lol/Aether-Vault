@@ -85,6 +85,11 @@ def _populate_tenant_id(session, flush_context, instances) -> None:
 # purpose so it can never contend with some unrelated advisory lock elsewhere.
 _AUDIT_CHAIN_LOCK_KEY = 881736452901
 
+# v1.3.3.2 (HA drill, found live): a SEPARATE fixed key for serializing schema
+# migrations across N replicas booting concurrently against the SAME fresh database --
+# see `_apply_schema`'s own docstring for the actual incident this fixes.
+_SCHEMA_MIGRATION_LOCK_KEY = 881736452902
+
 
 @event.listens_for(TenantScopedSession, "before_flush")
 def _chain_audit_log(session, flush_context, instances) -> None:
@@ -430,6 +435,25 @@ def _ensure_schema_sync(sync_conn, cfg) -> None:
     from alembic.runtime.migration import MigrationContext
     from alembic.script import ScriptDirectory
 
+    # v1.3.3.2 fix (found live via the HA drill, real Postgres, real concurrent boot —
+    # not a hypothetical): two engine replicas starting SIMULTANEOUSLY against the SAME
+    # brand-new database both raced into `alembic upgrade head` at once. Alembic's own
+    # `_ensure_version_table()` issues `CREATE TABLE IF NOT EXISTS alembic_version` --
+    # which is NOT safe against a concurrent CREATE of the same table: Postgres's
+    # existence check and the actual create are two separate steps, so two sessions can
+    # both see "doesn't exist" and both attempt to create it, with one losing to
+    # `UniqueViolationError: duplicate key value violates unique constraint
+    # "pg_type_typname_nsp_index"` (the table's own row TYPE collides in the shared
+    # `pg_type` catalog) — a startup crash, not a benign race. `pg_advisory_xact_lock`
+    # (auto-released at this transaction's commit/rollback, same pattern
+    # `_chain_audit_log` already uses for a different serialization need) forces every
+    # concurrent booter through this ENTIRE migration run one at a time: the second
+    # replica blocks here until the first's transaction commits, then runs its own
+    # `alembic upgrade head` against an already-current database, which is a real, cheap
+    # no-op — not skipped, genuinely verified current every time.
+    if sync_conn.dialect.name == "postgresql":
+        sync_conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _SCHEMA_MIGRATION_LOCK_KEY})
+
     script = ScriptDirectory.from_config(cfg)
     tables = set(sa.inspect(sync_conn).get_table_names())
 
@@ -477,6 +501,13 @@ async def _apply_schema(target_engine: AsyncEngine) -> None:
     and Postgres (unlike the pysqlite driver, whose DDL auto-commits) honours that —
     the v1.1.6–v1.1.8 CI runs executed every migration statement faithfully and then
     threw the whole schema away, silently. See Probleme.md #70.
+
+    v1.3.3.2: N replicas booting concurrently against the SAME fresh database (the HA
+    topology this repo actually ships, `docker-compose.ha.yml`) all reach this function
+    at once — `_ensure_schema_sync`'s own `pg_advisory_xact_lock` (held for this whole
+    `engine.begin()` transaction) is what serializes them, found live by the HA drill
+    crashing BOTH engine replicas on first real concurrent boot with
+    `UniqueViolationError` on `alembic_version`'s own catalog row.
     """
     cfg = _alembic_config()
     async with target_engine.begin() as conn:
