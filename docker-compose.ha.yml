@@ -48,6 +48,20 @@ services:
       context: .
       target: engine
     container_name: aether-vault-ha-engine-1
+    # v1.3.3.6 fix (found live): this file's own header comment claimed
+    # `host.docker.internal` needs no extra config "here" -- true only on Docker Desktop
+    # (Mac/Windows), the environment this compose file was apparently always drilled on
+    # before. `ha_drill.sh`'s phase 3 registers a webhook at
+    # `http://host.docker.internal:$PROBE_PORT/hook` to prove the retry worker actually
+    # delivers -- on a genuinely Linux Docker Engine host (this repo's own CI runner,
+    # ubuntu-latest), that hostname resolves to nothing without this explicit mapping,
+    # so every delivery attempt failed before ever reaching the probe: 0 requests
+    # recorded, not a retry-worker bug. `host-gateway` is Docker's own special value
+    # (Engine 20.10+) for "the host's gateway IP from inside this container", the
+    # standard portable fix -- harmless and already a no-op on Docker Desktop, which
+    # already resolves the name itself.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ha_vault_data:/data
     environment: &engine_env

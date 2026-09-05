@@ -12,9 +12,12 @@
 #   3. The Redis-backed rate limiter enforces ONE global limit across both replicas, not
 #      2x (what the in-process WindowRateLimiter would silently do under this topology).
 #
-# Requires Docker Desktop with `host.docker.internal` reachable from containers (true by
-# default on Windows/Mac; on Linux Engine this compose file would need
-# `extra_hosts: ["host.docker.internal:host-gateway"]` added, not needed here).
+# `host.docker.internal` (phase 3's webhook probe target) is resolvable from every
+# engine container on any Docker Engine (Linux CI runners included, not just Docker
+# Desktop) via `docker-compose.ha.yml`'s own `extra_hosts: host.docker.internal:
+# host-gateway` on the engine service -- v1.3.3.6 fix, found live: this comment used to
+# claim Linux "would need" that mapping without it actually being present, which is
+# exactly why phase 3 silently delivered zero webhooks in CI (ubuntu-latest) every time.
 #
 # Usage: ./scripts/ha_drill.sh            # full drill, tears the stack down after
 #        KEEP_HA_STACK=1 ./scripts/ha_drill.sh   # leaves it up for manual poking
