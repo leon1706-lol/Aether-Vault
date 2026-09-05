@@ -325,22 +325,29 @@ echo "all 20 probes launched, pids: ${_rl_pids[*]}"
 # I/O, immune to every signal including SIGKILL, which no shell-level timeout can ever
 # fix; anything else means a signal really should have reached it and didn't for some
 # other reason.
+echo "$(date -u +%H:%M:%S) entering the 30s poll loop over ${#_rl_pids[@]} pids"
 _rl_deadline=$(( $(date +%s) + 30 ))
+_rl_iter=0
 while (( $(date +%s) < _rl_deadline )); do
+  _rl_iter=$((_rl_iter + 1))
   _rl_alive=0
   for pid in "${_rl_pids[@]}"; do
     kill -0 "$pid" 2>/dev/null && _rl_alive=$((_rl_alive + 1))
   done
+  echo "$(date -u +%H:%M:%S) poll iter $_rl_iter: $_rl_alive/${#_rl_pids[@]} still alive"
   (( _rl_alive == 0 )) && break
   sleep 2
 done
+echo "$(date -u +%H:%M:%S) poll loop exited after $_rl_iter iterations, checking final states"
 for pid in "${_rl_pids[@]}"; do
   if kill -0 "$pid" 2>/dev/null; then
     log "  PID $pid still alive after a 30s deadline -- state: $(ps -o pid,stat,etime,cmd -p "$pid" 2>&1 | tail -1)"
     kill -9 "$pid" 2>/dev/null || true
   fi
 done
+echo "$(date -u +%H:%M:%S) about to call the final bare wait"
 wait 2>/dev/null || true
+echo "$(date -u +%H:%M:%S) final wait returned"
 
 OK_COUNT="$(grep -c '^200$' "$CODES" || true)"
 LIMITED_COUNT="$(grep -c '^429$' "$CODES" || true)"
