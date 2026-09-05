@@ -1038,6 +1038,13 @@ the moment it trips, so one burst raises exactly one anomaly rather than one per
 subsequent failure — a consumer wanting a per-request feed already has the audit log for
 that.
 
+**Stop:** `mass_rewrite`'s file-count-based heuristic and `metric_jump`'s fixed ratio are
+both context-free (a canary suite's own thresholds are far more precise, per-metric
+signals — this is a cheap, dependency-free coarse net over train/eval commits that never
+went through a canary at all). No statistical baseline/rolling-average model backs
+either; tightening them from a fixed constant to something adaptive is future work, not
+attempted this cycle.
+
 ## Identity & Session Contract (v1.3.2, migration 0011)
 
 Identity moves from a `.env` JSON blob (`AV_API_TOKEN`/`AV_AUTH_USERS`, still fully
@@ -1187,12 +1194,272 @@ covers argument validation, manifest tamper-detection, and the force-refusal con
 with mocked subprocess calls (no Postgres/Docker needed for that layer). See
 [`docs/dr.md`](../docs/dr.md) for the measured-RTO/stated-RPO distinction.
 
-**Stop:** `mass_rewrite`'s file-count-based heuristic and `metric_jump`'s fixed ratio are
-both context-free (a canary suite's own thresholds are far more precise, per-metric
-signals — this is a cheap, dependency-free coarse net over train/eval commits that never
-went through a canary at all). No statistical baseline/rolling-average model backs
-either; tightening them from a fixed constant to something adaptive is future work, not
-attempted this cycle.
+## Audit Log Hash-Chain Contract (v1.3.3, WP-32, migration 0016)
+
+Makes `SECURITY.md`'s audit-logging claim true. `audit_log` gains `chain_hash` (NOT
+NULL) and `signature` (nullable). Unlike `policy_packs`' `prev_id`+`chain_hash` (a
+CLIENT-chosen previous pack), audit rows have no `prev_id` column at all — they chain
+purely by `id`'s own natural monotonic order (an autoincrement primary key), computed
+by `audit_chain.compute_chain_hash(prev_hash, ts, username, action, project_id,
+status_code, details)` — a canonical, sort-keyed JSON hash, one function shared by the
+migration's historical backfill and the runtime listener so the two formulas can never
+drift apart.
+
+**Populated entirely by a `before_flush` listener** (`database.py::_chain_audit_log`),
+never by `_audit()`'s ~60 call sites themselves — the same "populate automatically
+without touching call sites" pattern `_populate_tenant_id` already established.
+`_audit()`'s only change is stamping a transient `_chain_seq` counter onto each new row
+at CREATION time, so multiple audit rows added within the SAME flush (a handful of
+routes audit twice in one request) chain against each other in the order they were
+actually created — `session.new` itself has no ordering guarantee.
+
+**Concurrency, solved explicitly, not left implicit.** Two concurrent requests both
+auditing at once could otherwise both read the same "last chain_hash" and both compute a
+hash chained from it — a genuine fork, reasoned through before writing the listener, not
+after finding it broken. `pg_advisory_xact_lock` (transaction-scoped, auto-released at
+commit/rollback) serializes ONLY that narrow read-then-chain-then-insert sequence across
+concurrent transactions; nothing else in either transaction is affected.
+
+**Historical backfill, and its honest limit.** Migration `0016` computes a real
+chain_hash for every pre-existing row by walking the table in `id` order — not a
+null/placeholder value. This does NOT and CANNOT prove a pre-existing row wasn't already
+tampered with before the migration ran (no retroactive backfill can prove that, for any
+scheme) — what it DOES establish is a complete, gap-free chain across the WHOLE table
+from that point forward, old rows included. A legacy volume adopted straight to head
+(never walking through `0016` itself) gets the identical backfill via
+`database.py::_heal_audit_chain_hash`, which reuses the SAME `compute_chain_hash`.
+
+**Signing is optional and additive** (`audit_signing.py`, deliberately SEPARATE from
+`av_cli/signing.py`'s per-repo commit-signing keys — this is one server-wide keypair,
+not one per repo). `AV_AUDIT_SIGNING_KEY_PATH` unset (default): every row's `signature`
+stays NULL, chain verification is unaffected. Set: the server generates a keypair on
+first boot (never regenerates over an existing one) and signs every new row's
+chain_hash. `GET /api/admin/audit/verify` (± `since_id` for incremental re-checks) walks
+the chain and reports the first break plus how many present signatures verify against
+`GET /api/admin/audit/public-key`; `av audit verify` is the CLI surface, and
+`av audit verify --export FILE` verifies OFFLINE from a local export — genuine
+independent verification using ONLY `av_server.audit_chain`'s dependency-free formula,
+never asking the server to grade its own homework.
+
+**Verified:** `tests/test_server.py::TestAuditChain`/`TestAuditSigning` (live, real
+Postgres) — an untampered chain verifies ok, a directly-tampered row is caught at the
+exact broken id, two audit rows written in the SAME flush still chain correctly, and a
+configured signing key produces signatures that verify against the published public key.
+
+## Metrics Contract (v1.3.3, WP-35)
+
+`GET /api/metrics` — hand-rolled Prometheus text exposition, the same "no new
+dependency" judgment call `rate_limit.py` already made for its own limiter
+(`metrics.py`). `admin`-scoped like every other observability route in this file; a
+Prometheus scrape config points `bearer_token`/`bearer_token_file` at an admin-scoped
+token from `av token create`.
+
+**Registered as the OUTERMOST middleware layer, deliberately** — `collect_metrics` is
+the LAST `@app.middleware("http")` registration in `server.py`, and Starlette applies
+these in REVERSE registration order (registration order documented at server.py's own
+"auth → CORS → rate limit" comment; runtime order is the reverse). Being outermost means
+it observes EVERY request end to end: a 429 from the rate limiter, a 401 from
+`require_token`, and every real route response all get timed and counted — a metrics
+layer that only saw successful routed requests would silently miss exactly the failure
+modes an operator most wants visibility into. It reads `response.status_code` and
+`request.scope.get("route")` (populated by Starlette's router DURING `call_next()`,
+visible by the time it returns) but never touches a header or the body, so it cannot
+interact with the auth/CORS header-ordering fragility this file's own comment already
+flags — purely read-only bookkeeping.
+
+Exposes: `av_http_requests_total` (by method/path-template/status-class),
+`av_http_request_duration_seconds` (a 9-bucket histogram), `av_requests_by_tenant_total`
+(only once a request's tenant is resolved), `av_webhook_queue_depth` (a live snapshot,
+not a counter), and `av_db_pool_checked_out` per pool. **Per-process only, honestly** —
+like the in-process rate limiter's own documented N-replica caveat, a real multi-replica
+deployment scrapes each replica independently; this file makes no attempt to aggregate
+across replicas. See `docs/slo.md` for what this does and does not yet back.
+
+**Verified:** `tests/test_server.py::TestMetrics` (live) — the endpoint renders valid
+Prometheus text, correctly counts a known number of requests by path/status, and reports
+webhook queue depth and DB pool state.
+
+## Per-Tenant CAS Isolation Contract (v1.3.3, WP-21)
+
+Completes the schema prerequisite migration `0014` shipped (widening `objects`/`trees`'
+primary keys to include `tenant_id`) with the actual feature: `AV_CAS_ISOLATION`
+(`shared` default / `isolated`) controls whether tenants share one dedup domain or get
+physically separate storage. **Shipped as one complete package, never partially** — the
+design review that scoped migration `0014` explicitly flagged that shipping physical
+separation WITHOUT also fixing the existence-check/Bloom-filter/GC-sweep pieces together
+would be a real data-loss bug (a global "already exists" check silently skipping a
+second tenant's upload); this contract is that complete package.
+
+**Shared mode (default) is untouched, byte-for-byte.** Every existence check
+(`upload_object`/`head_object`/`POST /api/sync/batch-objects`/`build_merkle_tree`/
+`_object_exists`, the last one shared by ~10 RSI-artifact routes) stays completely
+UNFILTERED by tenant — a global check across every tenant IS what "shared" means, and
+every pre-v1.3.3 deployment already depends on it for cross-tenant dedup. The
+`cas_tenant_id` each of these functions now threads through is simply `None` whenever
+`AV_CAS_ISOLATION != "isolated"`, which every storage/cache method treats as "do exactly
+what I always did."
+
+**Isolated mode** resolves `_cas_tenant_id(request)` (the caller's real tenant,
+`_principal(request).tenant_id or DEFAULT_TENANT_ID`) and threads it through:
+- **Storage** (`storage.py`): `objects_dir/<tenant_id>/xx/yyyy...` instead of the flat
+  `objects_dir/xx/yyyy...`. Reads check the tenant-scoped path FIRST, then fall back to
+  the flat legacy path — an object uploaded before a deployment (or a specific upload)
+  went isolated keeps serving with zero migration step, zero downtime.
+- **Bloom filter** (`redis_cache.py`): a per-tenant filter name
+  (`av:hash_filter:<tenant_id>`); existence checks consult the tenant's own filter first,
+  then the global one (same legacy-fallback reasoning as storage).
+- **DB existence checks**: every `select(DBObject)...where(hash==h)`-shaped query gains
+  a `tenant_id` predicate — audited exhaustively, not spot-checked, across
+  `upload_object`, `head_object`, `check_objects_batch`, `build_merkle_tree`'s
+  tree-exists check, and `_object_exists` (and therefore every one of its callers:
+  improver versions, change sets, policy packs, canary results, eval suites, plans,
+  lessons, tool manifests, action logs).
+- **GC** (`run_garbage_collection`): the mark phase ALWAYS computes per-tenant alive
+  sets now (`alive_by_tenant`), regardless of mode — shared mode's dead-computation uses
+  their UNION (mathematically identical to the pre-v1.3.3 flat computation, since a
+  tenant's own commits only ever reference trees that SAME tenant fully wrote, per the
+  single-materialization-path invariant); isolated mode's dead-computation uses each
+  row's OWN tenant's alive set specifically. Using the union for isolated-mode dead-
+  computation would be WRONG (could delete a row a different tenant still references);
+  using per-tenant sets for shared-mode dead-computation would ALSO be wrong (shared
+  mode's one DBObject row can be referenced by a tenant that isn't the row's own
+  `tenant_id`, since shared-mode dedup means only the first uploader's row exists at
+  all) — the two modes need genuinely different sweep logic, not a shared shortcut. The
+  physical sweep walks BOTH the flat layout (against the flat union) and the
+  tenant-scoped layout (against each tenant's own alive set) unconditionally — the
+  tenant-scoped glob simply matches nothing on a deployment that's never used isolated
+  mode.
+
+**Consequence, stated honestly:** isolated mode loses cross-tenant deduplication
+entirely — identical bytes held by *k* tenants are stored *k* times. Intra-tenant
+dedup — the product's actual headline claim (identical layers across fine-tune epochs,
+identical chunks across saves) — is completely unaffected in either mode.
+
+**Verified:** `tests/test_server.py::TestPerTenantCAS` (live, real Postgres, two real
+tenants) — identical content from two tenants both succeed (not a false 409) and stay
+independently readable and HEAD-able; a SECOND upload of the same content by the SAME
+tenant still correctly 409s (isolation doesn't weaken intra-tenant dedup); the two
+tenants' files are physically separate paths on disk; a batch-objects check correctly
+reports "missing" for a tenant that never uploaded the content; and — critically — a
+control test with NO isolation fixture applied proves shared mode's global dedup 409 is
+completely unchanged.
+
+## SSO Contract (v1.3.3, WP-10–WP-16)
+
+OIDC (authorization-code + PKCE) and SAML 2.0, converging on ONE shared provisioning path
+(`sso_common.py::upsert_user_from_claims`/`issue_session`) so JIT provisioning, group→role
+mapping, and session issuance exist once, not once per protocol. Each protocol's own
+module (`sso_oidc.py`/`sso_saml.py`) does only protocol mechanics — claim extraction,
+signature/replay validation — never policy.
+
+- **`sso_providers.config`** (migration 0011's own table, unused until now) holds
+  per-provider settings: `issuer`/`client_id`/`client_secret` (OIDC),
+  `idp_metadata_url`/`idp_metadata_xml` (SAML), `claims` (email/name/groups attribute
+  names), `jit_provisioning` (bool, default off), `group_role_map` (`{group_name:
+  role_name}`). `client_secret` is Fernet-encrypted at rest (`sso_crypto.py`, keyed by
+  `AV_SECRET_KEY`) — provider creation is REFUSED with a 422, not silently stored in
+  plaintext, when a secret is present and no key is configured.
+- **OIDC** (`sso_oidc.py`): `/login` builds a PKCE challenge + nonce, signs the round-trip
+  state into an HMAC-SHA256 cookie (`AV_SECRET_KEY`-keyed, 10-minute TTL — no server-side
+  session storage needed for the redirect itself). `/callback` validates cookie==query
+  state, exchanges the code, and validates the ID token FULLY: signature against the IdP's
+  live JWKS (`PyJWKClient`), issuer, audience, expiry, and nonce (replay protection for
+  this specific attempt) — every one of these is independently exploitable if skipped, not
+  a defense-in-depth nicety.
+- **Device-code flow** (`device_flow.py`): a browser redirect is the wrong UX for a
+  terminal (`av login`). Redis-backed (`av:device:*`, TTL'd), NOT a new DB table — a
+  device code is inherently short-lived and ephemeral, the same shape this codebase
+  already uses for the Bloom filter and rate-limit counters. Approval is single-use: a
+  successful poll deletes the Redis record immediately, so a session token can never be
+  collected twice even under a client retry.
+- **SAML 2.0** (`sso_saml.py`, `pysaml2`, the optional `[saml]` extra — imported at
+  MODULE level deliberately, so `server.py`'s `try/except ImportError` around mounting it
+  is the ONLY place absence is handled; a deployment without the extra simply never has
+  these routes mounted, a 404 not a crash). `parse_authn_request_response` gets signature
+  verification, `NotBefore`/`NotOnOrAfter` conditions, and audience restriction FOR FREE
+  from the library — the actual reason to use a real SAML library rather than hand-rolled
+  XML parsing. `allow_unsolicited=True` supports IdP-initiated login (the common
+  enterprise case — a user clicks a tile in their IdP's own dashboard, with no preceding
+  SP AuthnRequest to correlate against), which means pysaml2 has no InResponseTo to key
+  replay protection off of — a Redis-backed assertion-ID dedup (`SET NX`, the atomic
+  test-and-set that makes it a real guard, not a check-then-set race) is this module's own
+  addition on top.
+- **JIT provisioning** is opt-in PER PROVIDER: off means an unknown (provider_id, subject)
+  pair is rejected outright (`SsoProvisioningError("jit_disabled", ...)`) rather than
+  silently creating a user — exactly the fail-closed default an enterprise buyer expects.
+- **Group→role mapping** (`sync_groups_and_role_bindings`): mirrors the IdP's CURRENT
+  group list onto `groups`/`group_members` wholesale on every login — a group the user is
+  no longer in has its membership row removed immediately, which (see the RBAC fix below)
+  means their effective permissions shrink on next resolution, not just their group list.
+
+**A real, load-bearing fix shipped alongside this contract, not a new feature of it:**
+`identity.py::_permissions_for_subject` never actually expanded through group membership
+for a `subject_type == "user"` principal — `DBRoleBinding`'s own docstring always promised
+"unions every binding's role's permissions that apply to the resolved subject", but a
+group-typed binding was silently inert unless the SUBJECT resolving permissions was itself
+the group (never true for an actual login). This made the entire group→role mapping above
+— and SCIM's group sync below — inert by construction before this fix landed. Fixed by
+adding a `subject_type == "user"` branch that additionally resolves through
+`DBGroupMember` via a live subquery, so a group a user is removed from stops granting its
+role's permissions on the very next request, with no separate role-binding cleanup needed.
+
+**Verified:** `tests/test_server.py::TestGroupRoleBindingGrantsUserPermission` (live, real
+Postgres) — a user with NO explicit scopes and NO direct role binding of their own
+inherits `reviewer`'s permission entirely through a group SCIM put them in and a role
+bound to that group; removing them from the group via SCIM's own PATCH immediately
+revokes it. `TestSsoCrypto` — secret encrypt/decrypt/mask round trip, and a live proof
+the plaintext secret never appears in the `sso_providers` row on disk. `TestDeviceFlow` —
+create/approve/poll round trip and single-use collection. OIDC/SAML protocol handling
+itself (PKCE, JWKS verification, SAML signature/conditions) is implemented and exercised
+against this server's own routes; NOT yet driven end-to-end against a live external IdP
+in this environment — see `VERSIONING.md`'s v1.3.3 section for the honest scope of that
+gap.
+
+## SCIM 2.0 Contract (v1.3.3, WP-17)
+
+`/scim/v2/*` (RFC 7643/7644) — deliberately its own module (`scim.py`), imported at
+module level (no optional dependency; it uses only core, already-required packages)
+mounted the same defensive `try/except ImportError` way as `sso_saml.py` for consistency,
+though that branch should never actually fire for this module.
+
+- **Auth**: a dedicated `api_tokens` row carrying the `scim` scope (`av scim token
+  create`) — a provisioning credential, deliberately separate from any human session.
+  Resolved by the SAME `require_token` middleware/`Principal` machinery as every other
+  scope in this codebase; `scim.py` does not reach back into `server.py` for this (would
+  be a circular import, since `server.py` imports `scim.py` at the bottom of its own
+  file) — it mirrors `require_scope()`'s exact wildcard/no-scopes-means-`"*"` posture
+  locally instead.
+- **Error envelope**: the SCIM standard shape
+  (`urn:ietf:params:scim:api:messages:2.0:Error`), deliberately NOT this codebase's own
+  `av` JSON envelope — a documented exemption from that convention, since SCIM is a
+  foreign, versioned wire format an IdP parses by spec.
+- **Deprovisioning is a suspend, never a hard delete** — both `PATCH {"active": false}`
+  (the shape Okta/Entra actually send) and a literal `DELETE` — matching
+  `server.py::suspend_user`'s own established convention: audit history and
+  commit/run authorship attribution must survive a deprovisioned user. Sessions are
+  revoked immediately either way, so a deprovision takes effect at once, not on next
+  token expiry.
+- **Idempotent-safe create**: a repeat `POST` for an existing `userName` returns 409
+  `uniqueness`, never a silent duplicate or a silent 200 — the standard SCIM client
+  behavior on 409 is to fall back to GET+PATCH, which is what makes an IdP's own retried
+  provisioning sync converge on one row.
+- **Filter support**: `<attr> eq "value"` only (`userName`, `externalId`, `emails.value`
+  for Users; `displayName`, `externalId` for Groups) — the two attributes SCIM's own spec
+  calls out as required-to-support, and what real IdPs actually send. Full SCIM filter
+  grammar (`and`/`or`, `ne`/`co`/`sw`) is NOT implemented.
+- **Audit coverage**: every mutating SCIM route calls a LOCAL `_audit()` helper (same
+  shape as `server.py`'s own, duplicated rather than imported for the same circular-import
+  reason as the scope check above) — `tests/test_audit_coverage.py`'s sweep, which looks
+  for the literal `_audit(` substring in a mutating route's own source, covers these
+  routes exactly like every other one in this codebase, not via a documented exemption.
+
+**Verified:** `tests/test_server.py::TestScim` (live, real Postgres) — ServiceProviderConfig/
+ResourceTypes discovery, User create/get/list/filter, 409-on-duplicate-create,
+PATCH-active-false-suspends-not-deletes, PUT-reactivate, DELETE-suspends-not-deletes,
+Group create/PATCH-add/PATCH-remove-members/delete, and scope enforcement (a
+`read`-only token is denied). `TestGroupRoleBindingGrantsUserPermission` above is SCIM's
+own most important integration proof — a group SCIM creates and populates actually grants
+its bound role's permissions to its members, end to end.
 
 ## Testing And Verification Map
 

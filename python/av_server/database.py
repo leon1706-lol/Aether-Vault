@@ -52,7 +52,7 @@ TENANCY_ENFORCE: bool = os.environ.get("AV_TENANCY_ENFORCE", "0") == "1"
 
 
 class TenantScopedSession(Session):
-    """A dedicated Session subclass (not the bare `Session` class) so the two event
+    """A dedicated Session subclass (not the bare `Session` class) so the event
     listeners below are scoped to av_server's own session factories only — never firing
     for some other SQLAlchemy Session that might exist in-process (a test harness's
     own, for instance)."""
@@ -78,6 +78,62 @@ def _populate_tenant_id(session, flush_context, instances) -> None:
     for obj in session.new:
         if hasattr(obj, "tenant_id") and getattr(obj, "tenant_id", None) is None:
             obj.tenant_id = tenant_id
+
+
+# v1.3.3 (WP-32, migration 0016): a fixed, arbitrary lock key -- any stable int works,
+# this one has no special meaning. Scopes `pg_advisory_xact_lock` to exactly this one
+# purpose so it can never contend with some unrelated advisory lock elsewhere.
+_AUDIT_CHAIN_LOCK_KEY = 881736452901
+
+
+@event.listens_for(TenantScopedSession, "before_flush")
+def _chain_audit_log(session, flush_context, instances) -> None:
+    """Hash-chains every new `DBAuditLog` row about to be flushed — see
+    `audit_chain.py` for the formula and migration `0016`'s docstring for the full
+    design (why there's no `prev_id` column, and the advisory-lock concurrency story).
+
+    `_audit()` (server.py) stamps a transient `_chain_seq` on each row at CREATION time
+    (not flush time) so multiple audit rows added within the same flush chain against
+    EACH OTHER in the order they were created, not `session.new`'s unordered iteration —
+    a single request that calls `_audit()` twice (a handful of routes do) must not
+    silently chain them in the wrong order.
+
+    Real, not hypothetical, concurrency risk this specifically guards against: two
+    separate requests both auditing at once could otherwise both read the same "last
+    chain_hash" and both compute a hash chained from it — a genuine fork. The advisory
+    transaction lock (`pg_advisory_xact_lock`, auto-released at commit/rollback) forces
+    any two concurrent transactions doing this to serialize for exactly this read-then-
+    chain-then-insert sequence, and nothing else in either transaction is affected.
+    """
+    from .audit_chain import compute_chain_hash
+    from .models import DBAuditLog, utcnow_naive
+
+    new_rows = [obj for obj in session.new if isinstance(obj, DBAuditLog)]
+    if not new_rows:
+        return
+    new_rows.sort(key=lambda r: getattr(r, "_chain_seq", 0))
+
+    conn = session.connection()
+    if conn.dialect.name == "postgresql":
+        conn.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _AUDIT_CHAIN_LOCK_KEY})
+    prev_row = conn.execute(
+        text("SELECT chain_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+    ).first()
+    prev_hash = prev_row[0] if prev_row else None
+
+    for row in new_rows:
+        if row.ts is None:
+            row.ts = utcnow_naive()
+        chain_hash = compute_chain_hash(
+            prev_hash, row.ts, row.username, row.action, row.project_id,
+            row.status_code, row.details,
+        )
+        row.chain_hash = chain_hash
+        if row.signature is None:
+            from . import audit_signing
+
+            row.signature = audit_signing.sign(chain_hash)
+        prev_hash = chain_hash
 
 
 @event.listens_for(TenantScopedSession, "after_begin")
@@ -184,7 +240,13 @@ _LEGACY_COLUMNS = {
     "refs": {"tenant_id": _TENANT_ID_DDL},
     "run_commits": {"tenant_id": _TENANT_ID_DDL},
     "events": {"tenant_id": _TENANT_ID_DDL},
-    "audit_log": {"status_code": "INTEGER", "tenant_id": _TENANT_ID_DDL},
+    # chain_hash healed NULLABLE here (unlike migration 0016's real NOT NULL) --
+    # _heal_audit_chain_hash() below runs the real backfill computation right after this
+    # ADD COLUMN, then sets NOT NULL itself. A bare DDL default (like _TENANT_ID_DDL's
+    # constant) cannot express "each row's own computed hash", so this map only gets the
+    # column INTO existence; the actual values come from that dedicated heal step.
+    "audit_log": {"status_code": "INTEGER", "tenant_id": _TENANT_ID_DDL,
+                  "chain_hash": "VARCHAR", "signature": "VARCHAR"},
     "webhooks": {
         "last_success_at": "TIMESTAMP",
         "last_failure_at": "TIMESTAMP",
@@ -256,6 +318,57 @@ def _heal_legacy_columns(sync_conn, tables: set[str]) -> None:
         for col, ddl in cols.items():
             if col not in present:
                 sync_conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+
+def _heal_audit_chain_hash(sync_conn, tables: set[str]) -> None:
+    """Runs the SAME backfill migration `0016` runs, for a legacy volume adopted
+    straight to head (never walking through `0016` itself). `_heal_legacy_columns`
+    above only gets `audit_log.chain_hash` INTO existence (nullable, no computed
+    values) — this fills every row for real using the one shared formula
+    (`audit_chain.compute_chain_hash`), then sets NOT NULL, matching what a real
+    step-by-step migration run would have produced. A no-op (fast column-presence
+    check only) on any volume that already has every row populated."""
+    import sqlalchemy as sa
+
+    from .audit_chain import compute_chain_hash
+
+    if "audit_log" not in tables:
+        return
+    inspector = sa.inspect(sync_conn)
+    columns = {c["name"] for c in inspector.get_columns("audit_log")}
+    if "chain_hash" not in columns:
+        return  # pre-migration-0016 shape entirely; nothing to backfill yet
+    unpopulated = sync_conn.execute(
+        sa.text("SELECT count(*) FROM audit_log WHERE chain_hash IS NULL")
+    ).scalar_one()
+    if not unpopulated:
+        return
+
+    rows = sync_conn.execute(
+        sa.text(
+            "SELECT id, ts, username, action, project_id, status_code, details "
+            "FROM audit_log ORDER BY id ASC"
+        )
+    ).fetchall()
+    prev_hash = None
+    for row in rows:
+        chain_hash = compute_chain_hash(
+            prev_hash, row.ts, row.username, row.action, row.project_id,
+            row.status_code, row.details,
+        )
+        sync_conn.execute(
+            sa.text("UPDATE audit_log SET chain_hash = :chain_hash WHERE id = :row_id"),
+            {"chain_hash": chain_hash, "row_id": row.id},
+        )
+        prev_hash = chain_hash
+    # SET NOT NULL syntax is Postgres-specific (SQLite has no equivalent ALTER COLUMN
+    # form) -- this codebase's real deployments are always Postgres; SQLite here is
+    # only ever this test file's isolated healing-logic harness, never a serving DB, so
+    # skipping the constraint tightening there (column stays nullable at the SQLite
+    # level, values are still all populated) is a safe, honest trade-off, not a gap that
+    # matters in practice.
+    if sync_conn.dialect.name == "postgresql":
+        sync_conn.exec_driver_sql("ALTER TABLE audit_log ALTER COLUMN chain_hash SET NOT NULL")
 
 
 def _heal_legacy_indexes(sync_conn, tables: set[str]) -> None:
@@ -336,7 +449,11 @@ def _ensure_schema_sync(sync_conn, cfg) -> None:
         # Tables the healing above just created (via create_all) already have their
         # indexes — re-inspect so this only ever considers indexes on tables that
         # already existed before adoption ran (create_all already made the rest).
-        _heal_legacy_indexes(sync_conn, set(sa.inspect(sync_conn).get_table_names()))
+        healed_tables = set(sa.inspect(sync_conn).get_table_names())
+        _heal_legacy_indexes(sync_conn, healed_tables)
+        # v1.3.3 (migration 0016): real per-row backfill, not a static DDL default --
+        # must run AFTER _heal_legacy_columns put the (nullable) column in place.
+        _heal_audit_chain_hash(sync_conn, healed_tables)
         MigrationContext.configure(sync_conn).stamp(script, script.get_current_head())
 
     cfg.attributes["connection"] = sync_conn

@@ -169,6 +169,92 @@ def export_entries(action: str | None, action_prefix: str | None, project_id: st
     click.echo(resp.content.decode("utf-8", errors="replace"), nl=False)
 
 
+@audit.command("verify")
+@click.option("--since-id", default=0, type=int,
+              help="Only re-verify rows after this id (from a previous check's last_id). "
+                   "Default 0 verifies the WHOLE chain from the beginning.")
+@click.option("--export", "export_path", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="Verify OFFLINE against a local jsonl export instead of asking the "
+                   "server — genuine independent verification: no server access is used "
+                   "at all beyond fetching the public key once (or pass --public-key to "
+                   "skip that too).")
+@click.option("--public-key", "public_key_hex", default=None,
+              help="Hex-encoded ed25519 public key for --export mode. Without it, "
+                   "--export fetches the key from the server once (still not trusting "
+                   "the server's own verify computation, just its published key).")
+def verify_chain(since_id: int, export_path: str | None, public_key_hex: str | None) -> None:
+    """Verify the audit log's hash chain is intact (v1.3.3, WP-32) — reports the first
+    broken row, if any, and whether present signatures verify."""
+    repo_root = ensure_repo()
+    client = _client(repo_root)
+
+    if export_path:
+        _verify_export_offline(client, export_path, public_key_hex)
+        return
+
+    try:
+        resp = client.session.get(f"{client.server_url}/api/admin/audit/verify",
+                                  params={"since_id": since_id})
+    except Exception:
+        fail(None, "unreachable_queued", "Registry unreachable — audit chain not verifiable right now.")
+    if resp.status_code != 200:
+        fail(None, "validation", f"Verify failed: HTTP {resp.status_code} {resp.text[:200]}")
+
+    body = resp.json()
+    if current_output_mode() == "json":
+        emit_json(None, "audit verify", data=body)
+        return
+    if body["ok"]:
+        click.secho(f"[OK] Chain intact — {body['checked']} row(s) verified "
+                   f"(last_id={body['last_id']}).", fg="green")
+    else:
+        click.secho(f"[FAIL] Chain broken at audit_log.id={body['broken_at_id']} "
+                   f"({body['checked']} row(s) verified before the break).", fg="red")
+        raise SystemExit(15)
+    sig = body["signature_checks"]
+    if sig["verified"] or sig["failed"]:
+        click.echo(f"  Signatures: {sig['verified']} verified, {sig['failed']} FAILED, "
+                  f"{sig['absent']} unsigned.")
+        if sig["failed"]:
+            raise SystemExit(15)
+
+
+def _verify_export_offline(client, export_path: str, public_key_hex: str | None) -> None:
+    """The genuinely-independent path: recomputes the chain entirely locally from a
+    jsonl export (`av audit export --format jsonl`), never asking the server to grade
+    its own homework. The only server round trip (if any) is fetching the PUBLIC key,
+    which reveals nothing an attacker could use to forge a signature."""
+    from .audit_chain_verify import verify_export
+
+    if public_key_hex is None:
+        try:
+            resp = client.session.get(f"{client.server_url}/api/admin/audit/public-key")
+            if resp.status_code == 200:
+                public_key_hex = resp.json().get("public_key")
+        except Exception:
+            pass  # chain verification still works with no public key; just skips signatures
+
+    with open(export_path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+
+    result = verify_export(rows, public_key_hex)
+    if current_output_mode() == "json":
+        emit_json(None, "audit verify", data=result)
+        return
+    if result["ok"]:
+        click.secho(f"[OK] Chain intact (offline, {result['checked']} row(s), "
+                   f"no server trust required for the chain itself).", fg="green")
+    else:
+        click.secho(f"[FAIL] Chain broken at audit_log.id={result['broken_at_id']}.", fg="red")
+        raise SystemExit(15)
+    sig = result["signature_checks"]
+    if sig["verified"] or sig["failed"]:
+        click.echo(f"  Signatures: {sig['verified']} verified, {sig['failed']} FAILED, "
+                  f"{sig['absent']} unsigned.")
+        if sig["failed"]:
+            raise SystemExit(15)
+
+
 @audit.command("prune")
 @click.option("--before-days", default=None, type=int,
               help="Delete entries older than this many days (default: the registry's "

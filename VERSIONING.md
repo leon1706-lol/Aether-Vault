@@ -215,13 +215,13 @@ per-surface "RSI R1"–"RSI R6" contract sections for the full design reasoning.
   pinned model-gate contract stays untouched) and `.av/tool_manifests/<improver_id>.json`
   (per-improver-version sandbox permissions, fails closed when absent).
 
-## v1.3.2 additive surfaces (in progress — see development/CHANGELOG.md Phase 60)
+## v1.3.2 additive surfaces (see development/CHANGELOG.md Phase 60)
 
-This release is IN PROGRESS: the sections below describe what has actually shipped code
-for so far (E0/E1/E4 core, three of E5's cross-replica fixes), not the whole enterprise
-roadmap `todo.md` scoped for the version. Every surface below follows the same
-additive-only rules this page defines — nothing here changes existing behavior for a
-deployment that sets none of the new env vars.
+E0/E1/E4 core, E5 (HA), E6 (DR), E7 (security scanning), and E8 (support tooling)
+shipped under this version. E2 (SSO) and E3 (SCIM) did NOT ship under v1.3.2 — tracked
+separately (see the v1.3.3 section below and `todo.md`). Every surface below follows the
+same additive-only rules this page defines — nothing here changes existing behavior for
+a deployment that sets none of the new env vars.
 
 - **HTTP API**: ~15 new routes across identity/tenancy — `/api/tokens*`, `/api/tenants*`,
   `/api/users*`, `/api/roles`, `/api/role-bindings*`. All new paths, no existing
@@ -257,13 +257,68 @@ deployment that sets none of the new env vars.
   `AV_AUTH_CACHE_TTL_SECS` (default 30 — the DB-backed-token resolution cache window).
 - **Python SDK**: `av_sdk.exceptions.TenantDeniedError`, additive to the existing
   exception set.
-- **Known, disclosed limitation, not a contract change**: Postgres unconditionally
-  exempts superuser roles from row-level security, and this repo's own default
-  `docker-compose.yml` connects as a superuser — so the RLS backstop (migration `0013`)
-  is currently inert under the shipped default topology, verified live rather than
-  assumed. The application-layer guard is unaffected (plain code, not a database
-  privilege). See migration `0013`'s own docstring for the full finding and the real fix
-  (a non-superuser connection role — infrastructure work, not shipped this pass).
+- **The RLS-superuser gap is fixed** (migration `0015`) — a new non-superuser `av_app`
+  Postgres role, granted exactly SELECT/INSERT/UPDATE/DELETE. `AV_APP_DATABASE_URL`
+  (optional, additive) routes ordinary request-serving sessions through it instead of
+  the superuser role migrations still use; `docker-compose.yml` sets this by default,
+  closing the gap in this repo's own reference topology specifically. Live-verified: a
+  raw SQL probe connected as `av_app` with only `app.tenant_id` set sees exactly one
+  tenant's rows, with no application code involved at all.
+
+## v1.3.3 additive surfaces
+
+Closes every enterprise-readiness gap deliberately deferred out of v1.3.2 as "too large
+for one pass": audit-log hash-chaining/signing, `/api/metrics`, per-tenant CAS storage
+isolation, SSO (OIDC + SAML 2.0), and SCIM 2.0 provisioning. Every surface below is
+additive and off-by-default (an SSO/SCIM route simply has nothing configured to act on
+until an admin runs `av idp add`/mints a `scim` token; `pysaml2` absent just means the
+SAML routes aren't mounted, not a startup failure).
+
+- **HTTP API**: `GET /api/admin/audit/verify` (± `since_id`), `GET
+  /api/admin/audit/public-key`, `GET /api/metrics`, `GET /api/auth/whoami`. SSO:
+  `/api/sso-providers*` (CRUD), `/api/auth/oidc/{id}/login|callback`,
+  `/api/auth/device/code|verify|token`, `/api/auth/saml/{id}/metadata|acs|sls`. SCIM:
+  the full `/scim/v2/*` surface (RFC 7643/7644). All `admin`-scoped (SSO/SCIM CRUD) or
+  gated by a dedicated `scim`-scoped token (the SCIM data routes themselves) — never
+  reachable by a token that predates this release without an operator deliberately
+  minting a new one.
+- **DB schema**: migration `0016` adds `audit_log.chain_hash` (NOT NULL, backfilled for
+  every pre-existing row) and `audit_log.signature` (nullable). No new migration for
+  SSO/SCIM — every table they need (`sso_providers`, `user_identities`, `groups`,
+  `group_members`, `sessions`) already exists from migration `0011`. A real, tested
+  `downgrade()` for `0016`.
+- **Config/env vars**: `AV_AUDIT_SIGNING_KEY_PATH` (default unset — chain-hashing works
+  regardless; signing is additionally on once set), `AV_CAS_ISOLATION` (default
+  `shared`), `AV_SECRET_KEY` (already existed for commit signing; now also required to
+  create an SSO provider with a client secret, or to issue OIDC state cookies — refused
+  with a clear error when unset, never stored/sent in plaintext), `AV_SESSION_TTL_SECS`
+  (default 8h), `AV_DEVICE_CODE_TTL_SECS` (default 600), `AV_PUBLIC_URL`/`AV_WEBUI_URL`
+  (already existed; now also used to build OIDC/SAML redirect URIs).
+- **CLI**: `av audit verify` (± `--since-id`, `--export`/`--public-key`), `av
+  login`/`logout`/`whoami`, `av idp add|list|show|test|remove`, `av scim
+  status`/`token create|revoke`. `av init --mode enterprise` now genuinely logs in (was a
+  stub through v1.3.2) — zero call-site changes needed in `cmd_repo.py`, since
+  `enterprise.py`'s `EnterpriseAuthProvider` Protocol never changed.
+- **Exit codes**: `login_required` (21) is now a real, produced code (`av login`'s
+  device-code flow timing out) — it sat reserved-but-unregistered since v1.3.2
+  specifically until a real caller existed; see `docs/for-agents.md`.
+- **Behavior note, not a contract break**: `_audit_row_dict`'s JSON shape (list/export
+  routes) gained two new keys (`chain_hash`, `signature`) — additive per this page's own
+  rule (existing keys unchanged, consumers that read specific fields are unaffected; a
+  consumer doing an exact-key-set comparison would need updating, but no such consumer
+  exists in this codebase's own test suite, checked directly rather than assumed).
+- **A real fix, not new surface**: `identity.py::_permissions_for_subject` now actually
+  expands a user's effective permissions through their group memberships — `role_bindings`'
+  own docstring always promised this, but it was silently inert for a `subject_type ==
+  "user"` principal before this release. SSO's group→role mapping and SCIM's group sync
+  both depend on this; it was untested before this release closed the gap.
+- **Known, disclosed limitation**: SSO is verified end-to-end against a genuinely
+  standards-conformant IdP is the intended verification path, but this release ships
+  without a live Keycloak compose overlay — the protocol code (PKCE, ID-token/JWKS
+  validation, SAML assertion signature/conditions via `pysaml2`, replay protection) is
+  real and unit/integration-tested against this server's own routes, but has not yet been
+  driven end-to-end against a real external IdP in this environment. Treat OIDC/SAML as
+  implemented-and-locally-tested, not yet field-verified against Okta/Entra/Keycloak.
 
 ## Database schema compatibility
 

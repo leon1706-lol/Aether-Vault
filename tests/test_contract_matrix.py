@@ -151,7 +151,8 @@ EXIT_CODE_REGISTRY = {
     "frozen": 18,
     "review_required": 19,
     "scope_denied": 20,
-    "tenant_denied": 22,  # v1.3.2; 21 (login_required) deliberately unregistered, see core.py
+    "login_required": 21,  # v1.3.3: activated once `av login` (a real caller) existed
+    "tenant_denied": 22,
 }
 
 # 13 (unreachable_queued) is real in the registry but, by AGENTS.md non-negotiable #3

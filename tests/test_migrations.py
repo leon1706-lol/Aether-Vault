@@ -29,7 +29,7 @@ def test_migration_chain_resolves_to_single_head():
 
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
-    assert heads == ["0015"], f"unexpected heads: {heads}"
+    assert heads == ["0016"], f"unexpected heads: {heads}"
     # walk_revisions() yields every revision reachable from head exactly once —
     # no dangling down_revisions, no surprise second branch. The chain is strictly
     # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline),
@@ -50,10 +50,11 @@ def test_migration_chain_resolves_to_single_head():
     # tables) descends from 0012, 0014 (per-tenant CAS schema prerequisite: objects/trees
     # PK widening to include tenant_id) descends from 0013, 0015 (non-superuser av_app
     # role + grants -- the real fix for the RLS-superuser gap 0013 documented) descends
-    # from 0014.
+    # from 0014, 0016 (v1.3.3: audit_log hash-chaining -- chain_hash/signature columns +
+    # a full historical backfill) descends from 0015.
     walked = sorted(rev.revision for rev in script.walk_revisions())
     assert walked == ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008",
-                      "0009", "0010", "0011", "0012", "0013", "0014", "0015"]
+                      "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016"]
 
 
 def test_env_py_is_valid_python():
@@ -364,6 +365,14 @@ def test_chain_renders_complete_postgres_ddl_offline():
         "offline DDL missing 0015 table grants"
     assert "ALTER DEFAULT PRIVILEGES" in ddl, "offline DDL missing 0015 default-privilege grants"
 
+    # v1.3.3 audit-log hash-chaining (0016): the backfill loop is Python-side control
+    # flow gated on is_offline_mode() (nothing to render offline, by design -- see that
+    # migration's own comment), but the column DDL itself always renders.
+    assert "ADD COLUMN chain_hash" in ddl, "offline DDL missing 0016 chain_hash column"
+    assert "ADD COLUMN signature" in ddl, "offline DDL missing 0016 signature column"
+    assert "ALTER TABLE audit_log ALTER COLUMN chain_hash SET NOT NULL" in ddl, \
+        "offline DDL missing 0016 chain_hash NOT NULL constraint"
+
     # Every table from 0001_baseline exists in the rendered schema.
     for table in ("objects", "trees", "commits", "refs"):
         assert f"CREATE TABLE {table}" in ddl, f"offline DDL missing table {table}"
@@ -398,13 +407,14 @@ def test_chain_renders_downgrade_ddl_offline_for_every_revision():
     cfg.set_main_option("sqlalchemy.url", "postgresql://av_user:av_password@localhost/aether_vault")
     script = ScriptDirectory.from_config(cfg)
     chain = [rev.revision for rev in script.walk_revisions()]  # head -> base order
-    assert chain == ["0015", "0014", "0013", "0012", "0011", "0010", "0009", "0008", "0007",
+    assert chain == ["0016", "0015", "0014", "0013", "0012", "0011", "0010", "0009", "0008", "0007",
                      "0006", "0005", "0004", "0003", "0002", "0001"]
 
     # Revision-specific DDL each downgrade step must emit, in the order downgrade() drops
     # things — proves the rendered SQL is THIS revision's downgrade, not a no-op or a
     # copy-paste of the wrong one.
     expected_per_step = {
+        "0016": ["DROP COLUMN signature", "DROP COLUMN chain_hash"],
         # No "DROP ROLE" here -- 0015's downgrade deliberately never drops the role
         # (cluster-wide object, unsafe from a per-database migration); see that
         # migration's own downgrade() docstring for the live finding.

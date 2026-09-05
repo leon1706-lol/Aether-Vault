@@ -72,6 +72,7 @@ Every failure — CLI exit code, JSON envelope `error.code`, and (v1.3.0+) a mat
 | `frozen` | 18 | `FrozenError` | v1.3.1: project is frozen (`av freeze on`) — `av promote`/`av improver register\|propose\|apply`/`av policy pack publish` are paused |
 | `review_required` | 19 | `ReviewRequiredError` | v1.3.1: `av improver promote`'s `require_review` gate denied — nobody has approved this candidate yet (distinct from `policy_denied`: "get it reviewed" is a different remediation than "the metrics/signature don't qualify") |
 | `scope_denied` | 20 | `ScopeDeniedError` | v1.3.1: token authenticated but lacks the required scope — the server returned 403 (e.g. `av freeze on/off` needs the `admin` scope) |
+| `login_required` | 21 | `LoginRequiredError` | v1.3.3: `av login`'s SSO device-code flow timed out with no approval — distinct from `auth_failed` (12), which is a *rejected* credential, not a missing one |
 | `tenant_denied` | 22 | `TenantDeniedError` | v1.3.2: your credential authenticated fine but doesn't own the target `project_id` — the server returned 403 (`AV_TENANCY_ENFORCE=1` deployments only; enforcement is off by default) |
 | — | 0 | — | Success, **including a queued commit** — see below |
 | — | 2 | — | Click's own usage error (missing/bad CLI argument) — not part of this registry |

@@ -146,6 +146,9 @@ from .cmd_token import token  # noqa: E402
 from .cmd_tenant import tenant  # noqa: E402
 from .cmd_user import user  # noqa: E402
 from .cmd_role import role  # noqa: E402
+from .cmd_login import login, logout, whoami  # noqa: E402
+from .cmd_idp import idp  # noqa: E402
+from .cmd_scim import scim  # noqa: E402
 from .cmd_admin import admin  # noqa: E402
 from .cmd_support import support_bundle  # noqa: E402
 from .cmd_maintenance import doctor, gc  # noqa: E402
@@ -275,6 +278,11 @@ cli.add_command(token)
 cli.add_command(tenant)
 cli.add_command(user)
 cli.add_command(role)
+cli.add_command(login)
+cli.add_command(logout)
+cli.add_command(whoami)
+cli.add_command(idp)
+cli.add_command(scim)
 cli.add_command(admin)
 cli.add_command(support_bundle)
 cli.add_command(doctor)

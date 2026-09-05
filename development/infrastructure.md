@@ -166,6 +166,18 @@ AV_RATE_LIMIT_BACKEND  memory   (default)
 AV_AUTH_SPIKE_BACKEND  memory   (default)
                Same memory/redis choice as AV_RATE_LIMIT_BACKEND, for the auth-spike
                anomaly counter specifically (AV_ANOMALY_AUTH_SPIKE_THRESHOLD above).
+AV_CAS_ISOLATION  shared   (default)
+               shared = one global CAS dedup domain, byte-identical to every pre-v1.3.3
+               deployment. isolated = physically separate objects/trees per tenant on
+               disk AND in the Bloom filter — real cost: cross-tenant dedup is lost
+               entirely (intra-tenant dedup is unaffected). See architecture.md's
+               Per-Tenant CAS Isolation Contract before flipping this on a deployment
+               with existing data.
+AV_AUDIT_SIGNING_KEY_PATH  (empty/unset = chain-hashing only, no signing)
+               Path to (or where to generate) this server's ed25519 audit-signing
+               keypair. Once set, every NEW audit row is additionally signed;
+               pre-existing rows and any row written while unset simply have
+               signature=NULL, which never blocks chain verification.
 ```
 
 **Caution:** `AV_DATA_DIR`'s `/data` default is container-oriented. Bare-metal uvicorn MUST point it at a writable directory, or every object upload fails with PermissionError while `/api/health` stays green — the most misleading failure mode in the project. This exact failure broke CI `webui-e2e` once: uploads 500ed, seed pushes queued offline, the dashboard rendered empty, Playwright failed on element-not-found. Documented in [CHANGELOG.md](CHANGELOG.md); the fix lives as explicit env vars on both uvicorn-starting CI jobs.

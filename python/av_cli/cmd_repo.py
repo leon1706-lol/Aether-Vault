@@ -20,7 +20,7 @@ def _reconnect_existing_repo(repo_root: Path, cfg: dict) -> None:
     if login_mode == "enterprise":
         from . import enterprise
 
-        enterprise.run_enterprise_login_flow()
+        enterprise.run_enterprise_login_flow(repo_root)
         return
 
     from . import docker_runtime
@@ -165,10 +165,12 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
     if not json_mode:
         ui.print_banner("Aether-Vault", "version control for ML models & datasets")
 
-    # Enterprise mode is intentionally not offered interactively yet (the account-login flow
-    # is unbuilt; selecting it today just falls back to Local) — the choice stays reachable
-    # only via the explicit `--mode enterprise` flag so scripts keep working and the
-    # enterprise.py seam stays wired for the real implementation.
+    # v1.3.3: enterprise.py's real SSO device-code login (WP-14) replaced the stub this
+    # comment used to describe as "unbuilt" -- --mode enterprise now genuinely logs in
+    # against the registry's configured OIDC provider. Still not offered by an
+    # interactive picker here (no such picker exists in this wizard today, local vs.
+    # enterprise was never actually prompted for, only ever reachable via this flag) --
+    # left that way rather than inventing a new prompt beyond what was asked.
     if mode is not None:
         login_mode = mode
     else:
@@ -181,7 +183,7 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
     if login_mode == "enterprise":
         from . import enterprise
 
-        established = enterprise.run_enterprise_login_flow()
+        established = enterprise.run_enterprise_login_flow(repo_root)
         if not established:
             login_mode = "local"
 

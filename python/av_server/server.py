@@ -1,11 +1,13 @@
 import asyncio
 import contextlib
 import hashlib
+import itertools
 import json
 import logging
 import os
 import re
 import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,7 +30,9 @@ from .database import (
     init_db,
     system_session_factory,
 )
+from . import audit_signing
 from . import identity as identity_module
+from . import metrics
 from . import rate_limit
 from .models import (
     DBActionLog,
@@ -61,6 +65,7 @@ from .models import (
     DBRun,
     DBRunCommit,
     DBSandboxJob,
+    DBSsoProvider,
     DBStrategyEntry,
     DBTask,
     DBTenant,
@@ -112,6 +117,14 @@ async def lifespan(app: FastAPI):
     # Replaces the deprecated @app.on_event("startup") hook.
     await init_db()
     await cache.init_filter()
+    # v1.3.3 (WP-32): generates the server's audit-signing keypair on first boot if
+    # AV_AUDIT_SIGNING_KEY_PATH is set and no key exists there yet -- never regenerates
+    # over an existing one (see audit_signing.ensure_keypair's own docstring). A no-op,
+    # not a startup failure, when the env var is unset or `cryptography` isn't installed.
+    try:
+        audit_signing.ensure_keypair()
+    except Exception:
+        logger.exception("audit signing keypair setup failed -- continuing without it")
     worker = asyncio.create_task(_webhook_retry_worker(WEBHOOK_RETRY_INTERVAL_SECS))
     try:
         yield
@@ -565,8 +578,64 @@ async def limit_request_rate(request: Request, call_next):
     return await call_next(request)
 
 
+# v1.3.3 (WP-35): registered LAST among the four `http` middlewares, which Starlette's
+# `add_middleware`/`@app.middleware("http")` both apply in REVERSE registration order —
+# this is deliberately the OUTERMOST layer (runs first on the way in, last on the way
+# out), so it observes EVERY request end to end: a 429 from the rate limiter above, a
+# 401 from `require_token` below, and every real route response, all get timed and
+# counted. Adds no response header and never touches the body, so it cannot interact
+# with the auth/CORS header ordering this file's own comment already flags as fragile —
+# purely read-only bookkeeping around `call_next`.
+@app.middleware("http")
+async def collect_metrics(request: Request, call_next):
+    start = time.monotonic()
+    response = await call_next(request)
+    duration = time.monotonic() - start
+
+    # Starlette's router sets `scope["route"]` DURING route resolution, which happens
+    # inside the `call_next()` call above -- by the time it returns, this is populated
+    # for anything that actually reached a route. An early rejection (429/401 before
+    # routing) never sets it; falling back to the raw path there is an accepted, bounded
+    # cardinality risk (401s cluster on the paths clients actually try, not arbitrary
+    # user input) rather than silently mislabeling those requests as some other route.
+    route = request.scope.get("route")
+    path_template = route.path if route is not None else request.url.path
+
+    principal = getattr(request.state, "principal", None)
+    tenant_id = principal.tenant_id if principal is not None else None
+
+    metrics.record_request(request.method, path_template, response.status_code, duration, tenant_id)
+    return response
+
+
 DATA_DIR = Path(os.environ.get("AV_DATA_DIR", "/data"))
 storage = CASStorage(DATA_DIR)
+
+# v1.3.3 (WP-21): physical per-tenant CAS object storage separation — OFF by default
+# ("shared", byte-identical to every pre-v1.3.3 deployment: one global dedup domain, the
+# exact behavior "shared" mode has always had). "isolated" physically separates every
+# tenant's objects/trees on disk AND in the Bloom filter, at a real, stated cost:
+# cross-tenant content-addressed deduplication is lost entirely (identical bytes held by
+# k tenants are stored k times) — intra-tenant dedup, the product's actual headline
+# claim, is completely unaffected either way. See development/architecture.md's Tenancy
+# Isolation Contract for the full design and why shipping storage separation WITHOUT
+# also fixing the existence-check/Bloom-filter/GC-sweep pieces together would have been
+# a real data-loss bug (a global "already exists" check silently skipping a second
+# tenant's upload) — this switch only ever ships as the complete WP-21 package.
+CAS_ISOLATION: str = os.environ.get("AV_CAS_ISOLATION", "shared")
+if CAS_ISOLATION not in ("shared", "isolated"):
+    raise RuntimeError(f"AV_CAS_ISOLATION must be 'shared' or 'isolated', got {CAS_ISOLATION!r}")
+
+
+def _cas_tenant_id(request: Request) -> str | None:
+    """The tenant_id CAS storage/cache/DB-existence-checks should scope to for THIS
+    request — `None` under the default `shared` isolation mode (every call site's
+    existing behavior, completely unchanged) or the caller's real tenant (falling back
+    to DEFAULT_TENANT_ID, matching every other tenant-resolution call site in this file)
+    once an operator opts into `AV_CAS_ISOLATION=isolated`."""
+    if CAS_ISOLATION != "isolated":
+        return None
+    return _principal(request).tenant_id or DEFAULT_TENANT_ID
 
 # --- Request size guards for push_commit (reject hostile/oversized payloads early) ---
 MAX_TREE_ENTRIES = 100_000
@@ -608,11 +677,19 @@ def validate_ref_name(ref_name: str) -> str:
 # Merkle Tree builder
 # ---------------------------------------------------------------------------
 
-async def build_merkle_tree(db: AsyncSession, tree_data: Dict[str, Any]) -> str:
+async def build_merkle_tree(db: AsyncSession, tree_data: Dict[str, Any],
+                            cas_tenant_id: str | None = None) -> str:
     """
     Recursively converts the flat path→info dict (from a commit) into a
     content-addressed Merkle Tree stored in DBTree rows.
     Returns the root tree hash.
+
+    `cas_tenant_id` (v1.3.3, WP-21): None under the default `shared` isolation mode —
+    the "does this tree already exist" check below stays global, exactly as before.
+    Under `AV_CAS_ISOLATION=isolated`, scoped to the caller's own tenant so tenant B
+    never skips creating ITS OWN tree rows just because tenant A happens to have
+    identical (content-addressed, so identically-hashed) tree content — the same class
+    of cross-tenant existence-check bug WP-21's design review caught for objects.
     """
     nodes: Dict[str, Any] = {}
     for path, info in tree_data.items():
@@ -628,7 +705,7 @@ async def build_merkle_tree(db: AsyncSession, tree_data: Dict[str, Any]) -> str:
     entries = []
     for name, node in sorted(nodes.items()):
         if node["is_dir"]:
-            child_hash = await build_merkle_tree(db, node["children"])
+            child_hash = await build_merkle_tree(db, node["children"], cas_tenant_id)
             entries.append(
                 {"name": name, "child_hash": child_hash, "obj_hash": None, "type": "tree", "size": 0}
             )
@@ -653,9 +730,10 @@ async def build_merkle_tree(db: AsyncSession, tree_data: Dict[str, Any]) -> str:
     tree_content = json.dumps(entries, sort_keys=True)
     tree_hash = hashlib.sha256(tree_content.encode()).hexdigest()
 
-    result = await db.execute(
-        select(DBTree).where(DBTree.tree_hash == tree_hash).limit(1)
-    )
+    tree_exists_stmt = select(DBTree).where(DBTree.tree_hash == tree_hash)
+    if cas_tenant_id is not None:
+        tree_exists_stmt = tree_exists_stmt.where(DBTree.tenant_id == cas_tenant_id)
+    result = await db.execute(tree_exists_stmt.limit(1))
     if not result.first():
         for entry in entries:
             db.add(
@@ -730,6 +808,40 @@ async def readiness_check(db: AsyncSession = Depends(get_session)) -> Response:
                     status_code=200 if ready else 503)
 
 
+@app.get("/api/metrics", dependencies=[Depends(require_scope("admin"))])
+async def get_metrics(db: AsyncSession = Depends(get_session)) -> Response:
+    """v1.3.3 (WP-35): Prometheus text-exposition metrics. `admin`-scoped like every
+    other observability surface in this file — a real Prometheus scrape config points
+    `bearer_token`/`bearer_token_file` at an admin-scoped token (`av token create ...
+    --scope admin`), the same credential an operator already uses for `/api/admin/*`.
+
+    Per-process counters ONLY (see metrics.py's own docstring) — the two numbers below
+    (webhook queue depth, DB pool state) are live snapshots at scrape time, not
+    counters; everything else is this process's own running totals since it started.
+    """
+    from .database import app_engine, engine
+
+    try:
+        queue_depth = (await db.execute(
+            select(func.count()).select_from(DBWebhookDelivery)
+            .where(DBWebhookDelivery.status.in_(["pending", "failed"]))
+        )).scalar_one()
+    except Exception:
+        queue_depth = None
+
+    pool_stats = {}
+    for name, target_engine in (("primary", engine), ("app", app_engine)):
+        if name == "app" and target_engine is engine:
+            continue  # AV_APP_DATABASE_URL unset -- app_engine IS engine, don't double-report
+        try:
+            pool_stats[name] = {"checked_out": target_engine.pool.checkedout()}
+        except Exception:
+            pass
+
+    body = metrics.render_prometheus_text(webhook_queue_depth=queue_depth, db_pool_stats=pool_stats)
+    return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Objects (CAS blobs)
 # ---------------------------------------------------------------------------
@@ -741,27 +853,39 @@ async def upload_object(
     if not re.match(r"^[a-f0-9]{64}$", hash):
         raise HTTPException(status_code=400, detail="Invalid hash format")
 
+    cas_tenant_id = _cas_tenant_id(request)
+
     # Fast path: Bloom Filter check before hitting DB
-    might_exist = await cache.check_hash_exists(hash)
+    might_exist = await cache.check_hash_exists(hash, cas_tenant_id)
     if might_exist:
-        result = await db.execute(select(DBObject).where(DBObject.hash == hash))
+        stmt = select(DBObject).where(DBObject.hash == hash)
+        # Isolated mode ONLY: scope the existence check to the caller's own tenant, so
+        # tenant B never sees a 409 for content only tenant A has ever uploaded (the
+        # exact data-loss shape WP-21's own design review caught -- see CAS_ISOLATION's
+        # module comment). Shared mode (default) deliberately does NOT add this filter:
+        # a global existence check across every tenant IS what "shared" means, and
+        # every pre-v1.3.3 deployment already depends on that for cross-tenant dedup.
+        if cas_tenant_id is not None:
+            stmt = stmt.where(DBObject.tenant_id == cas_tenant_id)
+        result = await db.execute(stmt)
         if result.scalar_one_or_none():
             return Response(status_code=409, content="Object already exists")
 
     try:
-        path = await storage.store_object(hash, request.stream())
+        path = await storage.store_object(hash, request.stream(), cas_tenant_id)
         size = path.stat().st_size
         db.add(DBObject(hash=hash, size=size))
         await db.commit()
-        await cache.add_hash(hash)
+        await cache.add_hash(hash, cas_tenant_id)
         return Response(status_code=201)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except IntegrityError:
-        # A concurrent upload of the same hash inserted the row first. CAS is idempotent
-        # (identical content), so treat the duplicate as success rather than a 500.
+        # A concurrent upload of the same hash (same tenant, same hash -- the composite
+        # PK is (tenant_id, hash)) inserted the row first. CAS is idempotent (identical
+        # content), so treat the duplicate as success rather than a 500.
         await db.rollback()
-        await cache.add_hash(hash)
+        await cache.add_hash(hash, cas_tenant_id)
         return Response(status_code=409, content="Object already exists")
     except Exception as exc:
         await db.rollback()
@@ -769,10 +893,10 @@ async def upload_object(
 
 
 @app.get("/api/objects/{hash}")
-def download_object(hash: str) -> StreamingResponse:
+def download_object(hash: str, request: Request) -> StreamingResponse:
     if not re.match(r"^[a-f0-9]{64}$", hash):
         raise HTTPException(status_code=400, detail="Invalid hash format")
-    obj_path = storage.get_object_path(hash)
+    obj_path = storage.get_object_path(hash, _cas_tenant_id(request))
     if not obj_path:
         raise HTTPException(status_code=404, detail="Object not found")
 
@@ -786,20 +910,24 @@ def download_object(hash: str) -> StreamingResponse:
 
 @app.head("/api/objects/{hash}")
 async def head_object(
-    hash: str, db: AsyncSession = Depends(get_session)
+    hash: str, request: Request, db: AsyncSession = Depends(get_session)
 ) -> Response:
     if not re.match(r"^[a-f0-9]{64}$", hash):
         raise HTTPException(status_code=400, detail="Invalid hash format")
 
-    might_exist = await cache.check_hash_exists(hash)
+    cas_tenant_id = _cas_tenant_id(request)
+    might_exist = await cache.check_hash_exists(hash, cas_tenant_id)
     if might_exist:
-        result = await db.execute(select(DBObject).where(DBObject.hash == hash))
+        stmt = select(DBObject).where(DBObject.hash == hash)
+        if cas_tenant_id is not None:
+            stmt = stmt.where(DBObject.tenant_id == cas_tenant_id)
+        result = await db.execute(stmt)
         obj = result.scalar_one_or_none()
         if obj:
             return Response(status_code=200, headers={"Content-Length": str(obj.size)})
     else:
         # Bloom says no → quick fallback to filesystem for safety
-        size = storage.get_object_size(hash)
+        size = storage.get_object_size(hash, cas_tenant_id)
         if size is not None:
             return Response(status_code=200, headers={"Content-Length": str(size)})
 
@@ -872,7 +1000,7 @@ async def push_commit(
             commit_ts = None
 
     try:
-        root_tree_hash = await build_merkle_tree(db, raw_tree)
+        root_tree_hash = await build_merkle_tree(db, raw_tree, _cas_tenant_id(request))
         parents: List[str] = commit_data.get("parents", [])
         # Merge commits carry parents[1:] in extra_parents (JSON string); parent_hash stays
         # parents[0] for backward compatibility with every existing consumer (webui graph,
@@ -1281,31 +1409,69 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
     try:
         gc_cutoff = utcnow_naive() - timedelta(seconds=GC_GRACE_SECONDS)
 
-        # --- Mark phase: load all trees once, traverse in memory (no N+1) ---
+        # --- Mark phase: PER-TENANT trees/marks always (v1.3.3, WP-21) — a single query
+        # shape that serves both isolation modes without two divergent implementations.
+        # `alive_hashes`/`visited_trees` (the union across every tenant) are what SHARED
+        # mode's dead-computation and the LEGACY flat-directory sweep use below —
+        # mathematically identical to this route's pre-v1.3.3 flat computation, because
+        # each tenant's own commits only ever reference trees THAT SAME tenant fully
+        # wrote (the single-materialization-path invariant guarantees a referenced tree
+        # is never partially written) — merging per-tenant sets back into one flat set
+        # loses nothing a truly-flat walk would have found.
         all_trees = (await db.execute(select(DBTree))).scalars().all()
-        tree_map: Dict[str, list] = {}
+        trees_by_tenant: Dict[str, Dict[str, list]] = {}
         for entry in all_trees:
-            tree_map.setdefault(entry.tree_hash, []).append(entry)
+            trees_by_tenant.setdefault(entry.tenant_id, {}).setdefault(entry.tree_hash, []).append(entry)
 
-        alive_hashes: set = set()
-        visited_trees: set = set()
+        alive_by_tenant: Dict[str, set] = {}
+        visited_by_tenant: Dict[str, set] = {}
         for commit in (await db.execute(select(DBCommit))).scalars().all():
-            _collect_alive_in_memory(commit.root_tree_hash, tree_map, visited_trees, alive_hashes)
+            t_alive = alive_by_tenant.setdefault(commit.tenant_id, set())
+            t_visited = visited_by_tenant.setdefault(commit.tenant_id, set())
+            _collect_alive_in_memory(commit.root_tree_hash, trees_by_tenant.get(commit.tenant_id, {}),
+                                     t_visited, t_alive)
+
+        alive_hashes: set = set().union(*alive_by_tenant.values()) if alive_by_tenant else set()
+        visited_trees: set = set().union(*visited_by_tenant.values()) if visited_by_tenant else set()
+        all_tree_hashes = {th for tenant_map in trees_by_tenant.values() for th in tenant_map}
 
         # --- Sweep DB objects (protect recently-created rows via grace period) ---
-        obj_rows = (await db.execute(select(DBObject.hash, DBObject.created_at))).all()
-        dead_hashes = {
-            h for (h, created_at) in obj_rows
-            if h not in alive_hashes and (created_at is None or created_at < gc_cutoff)
-        }
-
-        dead_list = list(dead_hashes)
-        for i in range(0, len(dead_list), _GC_DELETE_BATCH):
-            batch = dead_list[i : i + _GC_DELETE_BATCH]
-            await db.execute(delete(DBObject).where(DBObject.hash.in_(batch)))
+        obj_rows = (await db.execute(select(DBObject.tenant_id, DBObject.hash, DBObject.created_at))).all()
+        if CAS_ISOLATION == "isolated":
+            # Tenant-scoped: a row is dead only if ITS OWN tenant's commit history no
+            # longer references it. Using the flat union here would be WRONG under
+            # isolated mode specifically -- see this route's own module-level design
+            # note (CAS_ISOLATION) for the cross-tenant scenario this would otherwise
+            # mishandle. Safe under isolated mode precisely because uploads/dedup never
+            # cross the tenant boundary there, so each row's tenant_id is authoritative.
+            dead_pairs = {
+                (t, h) for (t, h, created_at) in obj_rows
+                if h not in alive_by_tenant.get(t, set()) and (created_at is None or created_at < gc_cutoff)
+            }
+            dead_pairs_list = list(dead_pairs)
+            for i in range(0, len(dead_pairs_list), _GC_DELETE_BATCH):
+                batch = dead_pairs_list[i : i + _GC_DELETE_BATCH]
+                for t, h in batch:
+                    await db.execute(delete(DBObject).where(DBObject.tenant_id == t, DBObject.hash == h))
+        else:
+            # Shared mode (default): a hash is dead only if NO tenant's commit history
+            # references it anywhere -- the flat union, exactly this route's pre-v1.3.3
+            # behavior. A per-tenant check here would be wrong: in shared mode, tenant B
+            # can reference an object whose ONE DBObject row happens to carry tenant A's
+            # id (A uploaded it first; B's identical-content upload was correctly
+            # rejected as a duplicate) -- checking only against A's own alive set could
+            # delete a row B still needs.
+            dead_hashes = {
+                h for (_t, h, created_at) in obj_rows
+                if h not in alive_hashes and (created_at is None or created_at < gc_cutoff)
+            }
+            dead_list = list(dead_hashes)
+            for i in range(0, len(dead_list), _GC_DELETE_BATCH):
+                batch = dead_list[i : i + _GC_DELETE_BATCH]
+                await db.execute(delete(DBObject).where(DBObject.hash.in_(batch)))
 
         if visited_trees:
-            dead_trees = [th for th in tree_map if th not in visited_trees]
+            dead_trees = [th for th in all_tree_hashes if th not in visited_trees]
             for i in range(0, len(dead_trees), _GC_DELETE_BATCH):
                 batch = dead_trees[i : i + _GC_DELETE_BATCH]
                 await db.execute(delete(DBTree).where(DBTree.tree_hash.in_(batch)))
@@ -1324,24 +1490,51 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
 
         def purge_orphans():
             count = 0
+            # Legacy flat layout (objects_dir/xx/yyyy...) -- exists in BOTH modes (an
+            # isolated deployment can still be serving objects uploaded before it
+            # switched, per storage.py's own fallback-read design) and is always swept
+            # against the FLAT union, matching how content there was originally written.
             for obj_path in storage.objects_dir.glob("*/*"):
                 if obj_path.is_file():
                     h = obj_path.parent.name + obj_path.name
                     if h in alive_hashes:
                         continue
-                    # Never delete a shard written during/after the grace window — its
-                    # commit may still be on its way from the client.
                     if obj_path.stat().st_mtime >= grace_ts:
                         continue
                     obj_path.unlink()
                     count += 1
+            # Tenant-scoped layout (objects_dir/<tenant_id>/xx/yyyy...) -- only ever
+            # populated under isolated mode, but the walk is harmless (finds nothing) if
+            # a deployment has never used it. `*/*/*` requires exactly 3 path segments
+            # under objects_dir, which the flat layout's own `*/*` glob above can never
+            # match (2 segments) -- the two globs are naturally disjoint, no double-sweep.
+            for obj_path in storage.objects_dir.glob("*/*/*"):
+                if not obj_path.is_file():
+                    continue
+                tenant_id = obj_path.parents[1].name
+                h = obj_path.parent.name + obj_path.name
+                if h in alive_by_tenant.get(tenant_id, set()):
+                    continue
+                if obj_path.stat().st_mtime >= grace_ts:
+                    continue
+                obj_path.unlink()
+                count += 1
             return count
 
         deleted_count = await loop.run_in_executor(None, purge_orphans)
 
-        # Rebuild Bloom Filter from the surviving set
+        # Rebuild the Bloom Filter(s) from the surviving set(s). Shared mode: just the
+        # global filter, from the flat union (unchanged pre-v1.3.3 behavior). Isolated
+        # mode: the global filter too (still needed for the legacy flat directory) PLUS
+        # each tenant's own filter, from that tenant's own alive set.
         await cache.reset_filter()
         await cache.init_filter()
+        if CAS_ISOLATION == "isolated":
+            for tenant_id, tenant_alive in alive_by_tenant.items():
+                await cache.reset_filter(tenant_id)
+                await cache.init_filter(tenant_id)
+                for h in tenant_alive:
+                    await cache.add_hash(h, tenant_id)
         for h in alive_hashes:
             await cache.add_hash(h)
 
@@ -1401,20 +1594,26 @@ async def sync_refs(limit: int = 1000, offset: int = 0, db: AsyncSession = Depen
     }
 
 @app.post("/api/sync/batch-objects")
-async def check_objects_batch(hashes: List[str], db: AsyncSession = Depends(get_session)):
+async def check_objects_batch(hashes: List[str], request: Request, db: AsyncSession = Depends(get_session)):
     """Check existence of multiple objects at once for faster synchronization."""
     found = []
     definitely_missing = []
     might_exist = []
-    
+    cas_tenant_id = _cas_tenant_id(request)
+
     for h in hashes:
-        if await cache.check_hash_exists(h):
+        if await cache.check_hash_exists(h, cas_tenant_id):
             might_exist.append(h)
         else:
             definitely_missing.append(h)
-            
+
     if might_exist:
-        result = await db.execute(select(DBObject.hash).where(DBObject.hash.in_(might_exist)))
+        stmt = select(DBObject.hash).where(DBObject.hash.in_(might_exist))
+        # Same shared-vs-isolated distinction as upload_object/head_object above --
+        # shared mode's global batch existence check is deliberately unfiltered.
+        if cas_tenant_id is not None:
+            stmt = stmt.where(DBObject.tenant_id == cas_tenant_id)
+        result = await db.execute(stmt)
         db_found = list(result.scalars().all())
     else:
         db_found = []
@@ -2021,15 +2220,29 @@ async def _deliver_webhooks(db: AsyncSession, hooks: list, event: dict) -> None:
         await _deliver_one(hook, delivery, event, db)
 
 
+# v1.3.3 (WP-32): a monotonic counter stamped onto each new DBAuditLog row at CREATION
+# time, read (not written) by database.py's `_chain_audit_log` before_flush listener to
+# chain multiple rows added within the SAME flush in the order `_audit()` was actually
+# called — `session.new` itself has no ordering guarantee. Module-level, not per-request,
+# since ordering only needs to be locally consistent within one flush, and a single
+# ever-increasing counter trivially guarantees that regardless of which request created
+# which row.
+_audit_seq_counter = itertools.count()
+
+
 def _audit(db: AsyncSession, username: str | None, action: str,
            project_id: str | None, details: dict | None = None,
            status_code: int | None = None):
     """Records one mutation. v1.2.2: `status_code` captures the HTTP outcome the caller
-    is about to return, so the trail answers "did it land?" — not just "was it tried"."""
+    is about to return, so the trail answers "did it land?" — not just "was it tried".
+    v1.3.3: the row's `chain_hash`/`signature` are populated later, by database.py's
+    `before_flush` listener — never here — see that listener's own docstring."""
     if AUDIT_ENABLED:
-        db.add(DBAuditLog(username=username, action=action,
-                          project_id=project_id, details=details,
-                          status_code=status_code))
+        row = DBAuditLog(username=username, action=action,
+                         project_id=project_id, details=details,
+                         status_code=status_code)
+        row._chain_seq = next(_audit_seq_counter)
+        db.add(row)
 
 
 # v1.2.5: (method, path) pairs for mutating routes DELIBERATELY not audited, each with
@@ -2048,6 +2261,15 @@ AUDIT_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset({
     # before uploading) — never creates, deletes, or mutates anything itself. Same
     # high-frequency rationale as object upload.
     ("POST", "/api/sync/batch-objects"),
+    # v1.3.3 (WP-12): both device-code endpoints (sso_oidc.py) mutate only an ephemeral
+    # Redis record (a pending/polled device code, minutes-lived) -- never a `DBAuditLog`-
+    # backed row. The security-relevant event is the login itself, which IS audited
+    # (`auth.oidc_login`, added in `oidc_callback`'s own body) once the device-code flow
+    # actually succeeds; auditing "someone started a login attempt" and "a CLI polled"
+    # separately would add noise with no attribution value the eventual login row
+    # doesn't already carry.
+    ("POST", "/api/auth/device/code"),
+    ("POST", "/api/auth/device/token"),
 })
 
 
@@ -2622,9 +2844,11 @@ async def link_run_avh(run_id: str, request: Request,
     r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=404, detail="Run not found")
-    exists = (await db.execute(
-        select(DBObject.hash).where(DBObject.hash == avh_object_id)
-    )).scalar_one_or_none()
+    avh_exists_stmt = select(DBObject.hash).where(DBObject.hash == avh_object_id)
+    cas_tenant_id = _cas_tenant_id(request)
+    if cas_tenant_id is not None:
+        avh_exists_stmt = avh_exists_stmt.where(DBObject.tenant_id == cas_tenant_id)
+    exists = (await db.execute(avh_exists_stmt)).scalar_one_or_none()
     if not exists:
         raise HTTPException(status_code=422,
                             detail="avh_object_id must reference an already-uploaded object "
@@ -2675,10 +2899,16 @@ async def _finish_run(run_id: str, request: Request, status: str, body: dict, db
 # `link_run_avh()`'s existing "must already exist" check above, not a new pattern.
 # ---------------------------------------------------------------------------
 
-async def _object_exists(db: AsyncSession, object_id: str) -> bool:
-    return bool((await db.execute(
-        select(DBObject.hash).where(DBObject.hash == object_id)
-    )).scalar_one_or_none())
+async def _object_exists(db: AsyncSession, object_id: str, cas_tenant_id: str | None = None) -> bool:
+    """`cas_tenant_id` (v1.3.3, WP-21): None under `shared` isolation (default) — every
+    call site's original, unscoped behavior. Under `isolated` mode, scoped to the
+    caller's own tenant so a caller can't "prove" they hold an object merely because
+    SOME OTHER tenant uploaded identical content — every one of this helper's ~11 call
+    sites passes `_cas_tenant_id(request)` for exactly this reason."""
+    stmt = select(DBObject.hash).where(DBObject.hash == object_id)
+    if cas_tenant_id is not None:
+        stmt = stmt.where(DBObject.tenant_id == cas_tenant_id)
+    return bool((await db.execute(stmt)).scalar_one_or_none())
 
 
 def _require_uploaded_object_id(field: str, object_id: Optional[str]) -> str:
@@ -2704,7 +2934,7 @@ async def create_improver_version(request: Request, body: Dict[str, Any] = Body(
     )).scalar_one_or_none()
     if exists:
         return {"status": "exists", "id": exists.id}
-    if not await _object_exists(db, manifest_object_id):
+    if not await _object_exists(db, manifest_object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="manifest_object_id must reference an already-uploaded "
                                    "object (POST /api/objects/{hash} first)")
@@ -2805,7 +3035,7 @@ async def create_change_set(request: Request, body: Dict[str, Any] = Body(...),
     exists = (await db.execute(select(DBChangeSet).where(DBChangeSet.id == cs_id))).scalar_one_or_none()
     if exists:
         return {"status": "exists", "id": exists.id}
-    if not await _object_exists(db, object_id):
+    if not await _object_exists(db, object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="object_id must reference an already-uploaded object "
                                    "(POST /api/objects/{hash} first)")
@@ -2919,7 +3149,7 @@ async def create_policy_pack(request: Request, body: Dict[str, Any] = Body(...),
     exists = (await db.execute(select(DBPolicyPack).where(DBPolicyPack.id == pack_id))).scalar_one_or_none()
     if exists:
         return {"status": "exists", "id": exists.id}
-    if not await _object_exists(db, object_id):
+    if not await _object_exists(db, object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="object_id must reference an already-uploaded object "
                                    "(POST /api/objects/{hash} first)")
@@ -3000,7 +3230,7 @@ async def report_canary_result(request: Request, body: Dict[str, Any] = Body(...
     suite_object_id = _require_uploaded_object_id("suite_object_id", body.get("suite_object_id"))
     if not project_id or not improver_id:
         raise HTTPException(status_code=422, detail="project_id and improver_id are required")
-    if not await _object_exists(db, suite_object_id):
+    if not await _object_exists(db, suite_object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="suite_object_id must reference an already-uploaded "
                                    "object (POST /api/objects/{hash} first)")
@@ -3111,7 +3341,7 @@ async def create_eval_suite(request: Request, body: Dict[str, Any] = Body(...),
     exists = (await db.execute(select(DBEvalSuite).where(DBEvalSuite.id == suite_id))).scalar_one_or_none()
     if exists:
         return {"status": "exists", "id": exists.id}
-    if not await _object_exists(db, object_id):
+    if not await _object_exists(db, object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="object_id must reference an already-uploaded object "
                                    "(POST /api/objects/{hash} first)")
@@ -3172,7 +3402,7 @@ async def update_eval_suite(suite_id: str, request: Request, body: Dict[str, Any
         raise HTTPException(status_code=409, detail="Eval suite is frozen and cannot be modified")
     if "object_id" in body:
         object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
-        if not await _object_exists(db, object_id):
+        if not await _object_exists(db, object_id, _cas_tenant_id(request)):
             raise HTTPException(status_code=422,
                                 detail="object_id must reference an already-uploaded object")
         row.object_id = object_id
@@ -3396,7 +3626,7 @@ async def create_plan(request: Request, body: Dict[str, Any] = Body(...),
     exists = (await db.execute(select(DBPlan).where(DBPlan.id == plan_id))).scalar_one_or_none()
     if exists:
         return {"status": "exists", "id": exists.id}
-    if not await _object_exists(db, object_id):
+    if not await _object_exists(db, object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="object_id must reference an already-uploaded object")
     row = DBPlan(id=plan_id, project_id=project_id, object_id=object_id,
@@ -3665,7 +3895,7 @@ async def create_lessons(request: Request, body: Dict[str, Any] = Body(...),
     if not project_id:
         raise HTTPException(status_code=422, detail="project_id is required")
     object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
-    if not await _object_exists(db, object_id):
+    if not await _object_exists(db, object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="object_id must reference an already-uploaded object")
     lessons_id = body.get("id") or _new_uuid()
@@ -4056,7 +4286,7 @@ async def create_tool_manifest(request: Request, body: Dict[str, Any] = Body(...
     if not project_id or not improver_id:
         raise HTTPException(status_code=422, detail="project_id and improver_id are required")
     object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
-    if not await _object_exists(db, object_id):
+    if not await _object_exists(db, object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="object_id must reference an already-uploaded object")
     manifest_id = body.get("id") or _new_uuid()
@@ -4105,7 +4335,7 @@ async def create_action_log(request: Request, body: Dict[str, Any] = Body(...),
     if not project_id:
         raise HTTPException(status_code=422, detail="project_id is required")
     object_id = _require_uploaded_object_id("object_id", body.get("object_id"))
-    if not await _object_exists(db, object_id):
+    if not await _object_exists(db, object_id, _cas_tenant_id(request)):
         raise HTTPException(status_code=422,
                             detail="object_id must reference an already-uploaded object")
     log_id = body.get("id") or _new_uuid()
@@ -4208,7 +4438,10 @@ def _apply_audit_filters(stmt, *, project_id, action, action_prefix, username,
 def _audit_row_dict(a: "DBAuditLog") -> dict:
     return {"id": a.id, "ts": a.ts.isoformat() if a.ts else None, "username": a.username,
             "action": a.action, "project_id": a.project_id, "details": a.details,
-            "status_code": a.status_code}
+            "status_code": a.status_code,
+            # v1.3.3 (WP-32): exported/listed alongside everything else so an offline
+            # `av audit verify --export` has what it needs without a second round trip.
+            "chain_hash": a.chain_hash, "signature": a.signature}
 
 
 @app.get("/api/admin/audit", dependencies=[Depends(require_scope("admin"))])
@@ -4301,7 +4534,8 @@ async def export_audit_log(
     else:
         buf = io.StringIO()
         writer = csv.DictWriter(
-            buf, fieldnames=["id", "ts", "username", "action", "project_id", "details", "status_code"]
+            buf, fieldnames=["id", "ts", "username", "action", "project_id", "details",
+                            "status_code", "chain_hash", "signature"]
         )
         writer.writeheader()
         for a in rows:
@@ -4339,6 +4573,83 @@ async def prune_audit_log(request: Request, before_days: int = Query(AUDIT_RETEN
            {"deleted": result.rowcount, "before_days": before_days}, status_code=200)
     await db.commit()
     return {"deleted": result.rowcount, "dry_run": False}
+
+
+@app.get("/api/admin/audit/verify", dependencies=[Depends(require_scope("admin"))])
+async def verify_audit_chain(
+    since_id: int = Query(0, ge=0),
+    limit: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_session),
+):
+    """v1.3.3 (WP-32): walks the hash chain from `since_id` (exclusive) forward,
+    recomputing each row's chain_hash and comparing against the stored value — the
+    FIRST mismatch is reported as a break (everything after it is definitionally
+    suspect too, but the first break is where an investigation starts). `since_id=0`
+    (default) verifies the WHOLE table from the beginning; passing a previous check's
+    `last_id` lets a repeat caller only re-verify what's new since then. `limit=0`
+    (default) means no cap — verify everything from `since_id` to the end.
+
+    Also reports how many rows in the checked range carry a signature and whether it
+    verifies against this server's OWN public key (`GET .../public-key`) — a
+    self-consistency check, not independent third-party verification (a real external
+    verifier needs their own recomputation using an exported copy of the log plus the
+    public key, which is exactly what `av audit verify` is for)."""
+    from .audit_chain import compute_chain_hash
+
+    prev_hash = None
+    if since_id:
+        prev_row = (await db.execute(
+            select(DBAuditLog.chain_hash).where(DBAuditLog.id == since_id)
+        )).first()
+        if prev_row is None:
+            raise HTTPException(status_code=404, detail=f"no audit row with id {since_id}")
+        prev_hash = prev_row[0]
+
+    stmt = select(DBAuditLog).where(DBAuditLog.id > since_id).order_by(DBAuditLog.id.asc())
+    if limit:
+        stmt = stmt.limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    signature_checks = {"verified": 0, "failed": 0, "absent": 0}
+    pub_key = audit_signing.public_key_hex()
+    checked = 0
+    for row in rows:
+        expected = compute_chain_hash(
+            prev_hash, row.ts, row.username, row.action, row.project_id,
+            row.status_code, row.details,
+        )
+        if expected != row.chain_hash:
+            return {
+                "ok": False, "broken_at_id": row.id, "checked": checked,
+                "signature_checks": signature_checks,
+            }
+        if row.signature:
+            if pub_key and audit_signing.verify(row.chain_hash, row.signature, pub_key):
+                signature_checks["verified"] += 1
+            else:
+                signature_checks["failed"] += 1
+        else:
+            signature_checks["absent"] += 1
+        prev_hash = row.chain_hash
+        checked += 1
+
+    return {
+        "ok": True, "checked": checked,
+        "last_id": rows[-1].id if rows else (since_id or None),
+        "signature_checks": signature_checks,
+    }
+
+
+@app.get("/api/admin/audit/public-key", dependencies=[Depends(require_scope("admin"))])
+async def audit_signing_public_key():
+    """The server's audit-signing public key, hex-encoded — what an external verifier
+    (or `av audit verify --export`) checks signatures against. 404 when
+    AV_AUDIT_SIGNING_KEY_PATH isn't configured; chain-hash verification above works
+    regardless of whether signing is configured at all."""
+    key = audit_signing.public_key_hex()
+    if key is None:
+        raise HTTPException(status_code=404, detail="audit signing is not configured on this server")
+    return {"public_key": key}
 
 
 # --- webhook management ------------------------------------------------------
@@ -4838,3 +5149,155 @@ async def revoke_role_binding(binding_id: str, request: Request,
            {"binding_id": binding_id}, status_code=200)
     await db.commit()
     return {"status": "revoked", "id": binding_id}
+
+
+@app.get("/api/auth/whoami")
+async def auth_whoami(request: Request) -> Dict[str, Any]:
+    """`av whoami`'s data source, and what `av login` calls right after a device-code
+    flow completes to report who it just logged in as. No scope required -- the whole
+    point is telling ANY caller, including a genuinely anonymous one, what identity (if
+    any) the server resolved them as."""
+    principal = _principal(request)
+    return {
+        "username": principal.username,
+        "tenant_id": principal.tenant_id,
+        "auth_method": principal.auth_method,
+        "scopes": principal.scopes,
+        "role_names": principal.role_names,
+        "user_id": principal.user_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# v1.3.3 — SSO providers (`av idp add/list/show/test/remove`). CRUD only here; the
+# actual OIDC/SAML protocol handlers (login/callback/ACS/device-code) live in
+# `sso_oidc.py`/`sso_saml.py`, mounted below via `include_router` — kept in their own
+# modules since they need `authlib`/`pyjwt`/`pysaml2` (the optional `[sso]`/`[saml]`
+# extras), which this file itself must never require just to define these CRUD routes.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/sso-providers", dependencies=[Depends(require_scope("admin"))])
+async def create_sso_provider(request: Request, body: Dict[str, Any] = Body(...),
+                              db: AsyncSession = Depends(get_session)):
+    from .sso_crypto import SecretsUnavailable, encrypt_config
+
+    kind = body.get("kind")
+    if kind not in ("oidc", "saml"):
+        raise HTTPException(status_code=422, detail="kind must be 'oidc' or 'saml'")
+    name = body.get("name")
+    config = body.get("config") or {}
+    if not name or not isinstance(config, dict):
+        raise HTTPException(status_code=422, detail="name and config are required")
+
+    try:
+        stored_config = encrypt_config(config)
+    except SecretsUnavailable as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    tenant_id = _effective_tenant_id(request)
+    row = DBSsoProvider(tenant_id=tenant_id, kind=kind, name=name, config=stored_config,
+                       enabled=body.get("enabled", True))
+    db.add(row)
+    _audit(db, _identity(request), "sso_provider.create", None,
+          {"provider_id": row.id, "kind": kind, "name": name}, status_code=201)
+    await db.commit()
+    return {"id": row.id, "kind": kind, "name": name, "enabled": row.enabled}
+
+
+@app.get("/api/sso-providers", dependencies=[Depends(require_scope("admin"))])
+async def list_sso_providers(request: Request, db: AsyncSession = Depends(get_session)):
+    from .sso_crypto import mask_config
+
+    tenant_id = _effective_tenant_id(request)
+    rows = (await db.execute(
+        select(DBSsoProvider).where(DBSsoProvider.tenant_id == tenant_id)
+    )).scalars().all()
+    return {"providers": [
+        {"id": r.id, "kind": r.kind, "name": r.name, "enabled": r.enabled,
+         "config": mask_config(r.config)} for r in rows
+    ]}
+
+
+@app.get("/api/sso-providers/{provider_id}", dependencies=[Depends(require_scope("admin"))])
+async def get_sso_provider(provider_id: str, request: Request, db: AsyncSession = Depends(get_session)):
+    from .sso_crypto import mask_config
+
+    tenant_id = _effective_tenant_id(request)
+    row = (await db.execute(
+        select(DBSsoProvider).where(DBSsoProvider.id == provider_id, DBSsoProvider.tenant_id == tenant_id)
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="SSO provider not found")
+    return {"id": row.id, "kind": row.kind, "name": row.name, "enabled": row.enabled,
+            "config": mask_config(row.config)}
+
+
+@app.delete("/api/sso-providers/{provider_id}", dependencies=[Depends(require_scope("admin"))])
+async def delete_sso_provider(provider_id: str, request: Request, db: AsyncSession = Depends(get_session)):
+    tenant_id = _effective_tenant_id(request)
+    row = (await db.execute(
+        select(DBSsoProvider).where(DBSsoProvider.id == provider_id, DBSsoProvider.tenant_id == tenant_id)
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="SSO provider not found")
+    await db.execute(DBSsoProvider.__table__.delete().where(DBSsoProvider.id == provider_id))
+    _audit(db, _identity(request), "sso_provider.delete", None,
+          {"provider_id": provider_id}, status_code=200)
+    await db.commit()
+    return {"status": "deleted", "id": provider_id}
+
+
+@app.get("/api/sso-providers/{provider_id}/test", dependencies=[Depends(require_scope("admin"))])
+async def test_sso_provider(provider_id: str, request: Request, db: AsyncSession = Depends(get_session)):
+    """`av idp test` — reachability only (fetches the IdP's own metadata document), never
+    a full login round trip (that needs a real human/browser). Reports what it can
+    verify without one: the issuer/metadata endpoint is reachable and well-formed."""
+    tenant_id = _effective_tenant_id(request)
+    row = (await db.execute(
+        select(DBSsoProvider).where(DBSsoProvider.id == provider_id, DBSsoProvider.tenant_id == tenant_id)
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="SSO provider not found")
+
+    from .sso_crypto import decrypt_config
+
+    config = decrypt_config(row.config)
+    if row.kind == "oidc":
+        try:
+            from .sso_oidc import _oidc_metadata
+
+            metadata = await _oidc_metadata(config["issuer"])
+            return {"ok": True, "issuer": config["issuer"],
+                    "authorization_endpoint": metadata.get("authorization_endpoint"),
+                    "token_endpoint": metadata.get("token_endpoint")}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    else:
+        return {"ok": bool(config.get("idp_metadata_url") or config.get("idp_metadata_xml")),
+                "note": "SAML providers are verified via a real ACS round trip "
+                        "(av idp test only confirms config is present for SAML)."}
+
+
+try:
+    from . import sso_oidc
+
+    app.include_router(sso_oidc.router)
+except ImportError:  # pragma: no cover -- httpx/pyjwt are core deps, this should never fire
+    pass
+
+try:
+    from . import sso_saml
+
+    app.include_router(sso_saml.router)
+except ImportError:
+    # pysaml2 (the [saml] extra) is not installed -- SAML routes simply don't exist on
+    # this server, matching every other optional-dependency pattern in this codebase
+    # (av watch/av doctor --compose/etc.): a 404 for an unmounted route, not a crash.
+    logger.info("pysaml2 not installed -- SAML SSO routes are not mounted")
+
+try:
+    from . import scim as scim_module
+
+    app.include_router(scim_module.router)
+except ImportError:  # pragma: no cover
+    pass

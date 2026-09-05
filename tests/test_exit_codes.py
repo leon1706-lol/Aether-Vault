@@ -458,6 +458,74 @@ def test_scope_denied_exits_20_json(repo, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 21 — login_required (v1.3.3): `av login`'s device-code flow (cmd_login.py) timed out
+# with no browser approval -- distinct from auth_failed (12), a REJECTED credential, not
+# a missing one. `requests.post` is monkeypatched directly (not via `_fake_registry_client`,
+# which only fakes `VaultClient` -- `cmd_login.py` talks to the registry with a bare
+# `requests` call since it has no session/token yet to construct a VaultClient with).
+# `expires_in: 0` makes the poll loop's deadline already-past on its first check, so the
+# repro runs instantly rather than actually waiting out a real timeout.
+# ---------------------------------------------------------------------------
+
+def test_login_required_exits_21(monkeypatch):
+    import requests as requests_module
+
+    class _FakeResp:
+        def __init__(self, status_code, body):
+            self.status_code = status_code
+            self._body = body
+            self.headers = {"content-type": "application/json"}
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, json=None, timeout=None):
+        assert url.endswith("/api/auth/device/code")
+        return _FakeResp(200, {
+            "device_code": "dc-1", "user_code": "ABCD-1234",
+            "verification_uri": "http://fake-registry/api/auth/device/verify?user_code=ABCD-1234",
+            "verification_uri_complete": "http://fake-registry/api/auth/device/verify?user_code=ABCD-1234",
+            "expires_in": 0, "interval": 1,
+        })
+
+    monkeypatch.setattr(requests_module, "post", fake_post)
+    result = invoke("login", "--provider", "test-provider", "--url", "http://fake-registry",
+                    "--no-browser")
+    assert result.exit_code == 21, result.output
+    assert "not completed in time" in result.output.lower()
+
+
+def test_login_required_exits_21_json(monkeypatch):
+    import requests as requests_module
+
+    class _FakeResp:
+        def __init__(self, status_code, body):
+            self.status_code = status_code
+            self._body = body
+            self.headers = {"content-type": "application/json"}
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, json=None, timeout=None):
+        return _FakeResp(200, {
+            "device_code": "dc-1", "user_code": "ABCD-1234",
+            "verification_uri": "http://fake-registry/api/auth/device/verify?user_code=ABCD-1234",
+            "verification_uri_complete": "http://fake-registry/api/auth/device/verify?user_code=ABCD-1234",
+            "expires_in": 0, "interval": 1,
+        })
+
+    monkeypatch.setattr(requests_module, "post", fake_post)
+    result = invoke_json("login", "--provider", "test-provider", "--url", "http://fake-registry",
+                         "--no-browser")
+    assert result.exit_code == 21, result.output
+    env = json.loads(result.output)
+    assert env["ok"] is False
+    assert env["error"]["code"] == "login_required"
+    assert env["error"]["data"]["user_code"] == "ABCD-1234"
+
+
+# ---------------------------------------------------------------------------
 # 22 — tenant_denied (v1.3.2): the server's 403 {"error":"tenant_denied"} from
 # `server.py::_enforce_project_tenant`'s global dependency (AV_TENANCY_ENFORCE=1 only)
 # maps to this exit code. Reuses the same `/api/freeze/{project_id}` route as

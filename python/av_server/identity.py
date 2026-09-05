@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 # See models.py::DEFAULT_TENANT_ID's own docstring: a fixed, well-known UUID (not
 # _new_uuid()) so it can appear as a literal in the RLS policy fallback (a later phase)
@@ -131,18 +131,47 @@ async def _permissions_for_subject(
     """Every role bound to (subject_type, subject_id) within tenant_id, unioned into one
     scopes list plus the role names themselves (surfaced for `av whoami`/audit detail).
     `role.tenant_id IS NULL` includes the six built-in roles (migration 0011), which are
-    shared by every tenant rather than duplicated per-tenant."""
-    from .models import DBRole
+    shared by every tenant rather than duplicated per-tenant.
 
-    rows = (await db.execute(
-        select(DBRole.name, DBRole.permissions)
-        .join(DBRoleBinding, DBRoleBinding.role_id == DBRole.id)
-        .where(
-            DBRoleBinding.tenant_id == tenant_id,
-            DBRoleBinding.subject_type == subject_type,
-            DBRoleBinding.subject_id == subject_id,
+    v1.3.3 (WP-16/WP-18, SSO group→role mapping / SCIM group sync): for `subject_type
+    == "user"`, ALSO includes every role bound to any GROUP that user belongs to
+    (`group_members`) — `DBRoleBinding`'s own docstring already promised this
+    ("unions every binding's role's permissions that apply to the resolved subject"),
+    but this function only ever resolved the exact (subject_type, subject_id) pair
+    given, silently never expanding through group membership. Found live while wiring
+    up SSO's group→role mapping: a user placed in a group bound to `reviewer` got
+    NO extra permissions at all until this fix — group-based role bindings were
+    completely inert for actual permission resolution. Fixed here, once, so both the
+    SSO and SCIM group-membership paths (and any future one) benefit without each
+    needing its own copy of this logic."""
+    from .models import DBGroupMember, DBRole
+
+    conditions = [
+        DBRoleBinding.tenant_id == tenant_id,
+        DBRoleBinding.subject_type == subject_type,
+        DBRoleBinding.subject_id == subject_id,
+    ]
+    if subject_type == "user":
+        group_ids_subq = (
+            select(DBGroupMember.group_id).where(DBGroupMember.user_id == subject_id)
         )
-    )).all()
+        rows = (await db.execute(
+            select(DBRole.name, DBRole.permissions)
+            .join(DBRoleBinding, DBRoleBinding.role_id == DBRole.id)
+            .where(
+                DBRoleBinding.tenant_id == tenant_id,
+                or_(
+                    and_(DBRoleBinding.subject_type == "user", DBRoleBinding.subject_id == subject_id),
+                    and_(DBRoleBinding.subject_type == "group", DBRoleBinding.subject_id.in_(group_ids_subq)),
+                ),
+            )
+        )).all()
+    else:
+        rows = (await db.execute(
+            select(DBRole.name, DBRole.permissions)
+            .join(DBRoleBinding, DBRoleBinding.role_id == DBRole.id)
+            .where(*conditions)
+        )).all()
     scopes: set[str] = set()
     role_names: list[str] = []
     for name, permissions in rows:

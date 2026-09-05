@@ -218,7 +218,7 @@ start_server legacy-C     # boot must detect the pre-Alembic shape, heal, stamp
 
 [[ "$(psqlq "SELECT count(*) FROM information_schema.columns WHERE table_name='commits' AND column_name='extra_parents'")" == "1" ]] \
   || die "legacy boot did not restore commits.extra_parents"
-[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0015" ]] || die "legacy boot did not stamp chain head (0015)"
+[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0016" ]] || die "legacy boot did not stamp chain head (0016)"
 [[ "$(psqlq "SELECT count(*) FROM commits")" == "$COMMITS_BEFORE" ]] || die "heal lost commit rows!"
 pass "Phase C: pre-Alembic volume healed + stamped zero-touch, data intact"
 

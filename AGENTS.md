@@ -77,10 +77,14 @@ codes `10–16` respectively (`0` ok, `2` usage). `unreachable_queued` means the
 SAFE — persisted locally and queued for `av push`. v1.3.1 adds `budget_exhausted` (17,
 `av budget consume` over a limit), `frozen` (18, `av freeze on` pauses promotions/
 self-edits), `review_required` (19, `av improver promote`'s reviewer gate denied), and
-`scope_denied` (20, a server-side token-scope 403) to the same registry — see
-`docs/for-agents.md`'s full table.
+`scope_denied` (20, a server-side token-scope 403) to the same registry. v1.3.2 adds
+`tenant_denied` (22, a credential authenticated fine but doesn't own the target
+`project_id` — `AV_TENANCY_ENFORCE=1` deployments only). v1.3.3 activates `login_required`
+(21, `av login`'s SSO device-code flow timed out with no approval — distinct from
+`auth_failed`, which is a *rejected*, not missing, credential). See `docs/for-agents.md`'s
+full table.
 
-Supported commands (v1.3.1): every CLI command supports `--output json` except `watch`
+Supported commands: every CLI command supports `--output json` except `watch`
 (streams one envelope per auto-commit — NDJSON, not one envelope per invocation) and the
 dev-only `test`/`benchmark`/`webui` (see `docs/contracts.md`'s leakage-exemption list for
 why). Originally-agent-facing core: status · add · commit · push · diff · run
@@ -93,10 +97,15 @@ register/freeze/score/reveal/adapter · task propose/accept/reject · plan creat
 validate · budget set/consume · scheduler queue · review approve/reject · critique add/
 resolve/waive · lineage link/show · search runs · strategy add/search · lessons update/
 show · blackboard post/resolve · sandbox run/status/cancel/logs/queue ·
-replay-actions · tools manifest show/set/verify · policy pack publish/show/log/verify. A
-generic anti-leakage test (`tests/test_contract_matrix.py`) walks every command and
-asserts `--output json` never mixes human text with the envelope — see that file before
-adding a new command.
+replay-actions · tools manifest show/set/verify · policy pack publish/show/log/verify.
+**v1.3.2 enterprise readiness** (see `docs/enterprise-operator-guide.md`): tenant
+create/list/show/update/suspend · user list/show/create/suspend/delete · role
+list/show/create/grant/revoke · token create/list/revoke · admin backup
+create/verify/restore. **v1.3.3** (SSO/SCIM/audit integrity): login/logout/whoami · idp
+add/list/show/test/remove · scim status/token create/revoke · audit verify. A generic
+anti-leakage test (`tests/test_contract_matrix.py`) walks every command and asserts
+`--output json` never mixes human text with the envelope — see that file before adding a
+new command.
 
 ### Python SDK — `from av_sdk import Repo`
 

@@ -1984,3 +1984,225 @@ unstarted (zero code) — stated plainly, not implied otherwise by everything be
 Obsidian vault regen, has not been run for this entry; the live verification that DID
 run is the two full-suite passes and the targeted live test classes named above, not the
 complete Essential-Tasks.md checklist.)
+
+## Phase 61 — V1.3.3 "Audit Chain, Metrics, Per-Tenant CAS": closing v1.3.2's three
+deferred items (migration `0016`) — SSO (E2) and SCIM (E3) remain entirely unstarted,
+stated plainly rather than implied complete by this entry's presence.
+
+- **Audit log hash-chaining + optional signing (migration `0016`):** `audit_log` gains
+  `chain_hash` (NOT NULL — a REAL historical backfill for every pre-existing row, not a
+  placeholder) and `signature` (nullable). Chains purely by `id`'s own natural
+  autoincrement order — deliberately no `prev_id` column, unlike `policy_packs`, since
+  audit rows have no client-chosen publish order to begin with. One canonical formula
+  (`audit_chain.py::compute_chain_hash`, dependency-free stdlib) shared by three call
+  sites that must never drift apart: the migration's backfill, the legacy-volume
+  adoption heal path (`database.py::_heal_audit_chain_hash`), and the runtime
+  `before_flush` listener (`_chain_audit_log`) that populates every NEW row without
+  touching any of `_audit()`'s ~60 call sites. Concurrency solved explicitly, reasoned
+  through BEFORE writing the listener, not discovered broken after: two concurrent
+  requests both auditing at once could otherwise both read the same "last chain_hash"
+  and both compute a hash chained from it — a genuine fork — so the listener wraps the
+  read-then-chain-then-insert sequence in `pg_advisory_xact_lock` (transaction-scoped,
+  auto-released at commit/rollback), serializing only that narrow section. Optional
+  ed25519 signing via a NEW `audit_signing.py` — a server-WIDE keypair
+  (`AV_AUDIT_SIGNING_KEY_PATH`), deliberately separate from `av_cli/signing.py`'s
+  per-repo commit-signing keys, since audit rows are server-generated and server-wide,
+  not per-repo. New `GET /api/admin/audit/verify` (± `since_id` for incremental
+  re-checks) and `.../public-key`; new `av audit verify` CLI, including a genuinely
+  independent `--export FILE` offline-verification path (`av_cli/audit_chain_verify.py`)
+  that recomputes the chain locally from a jsonl export using the SAME dependency-free
+  formula, never asking the server to grade its own homework.
+- **`/api/metrics` (hand-rolled Prometheus text exposition, `metrics.py`):** the same
+  "no new dependency" judgment call `rate_limit.py` already made. Registered as the
+  OUTERMOST of the four `http` middlewares — deliberately, after actually re-reading
+  `server.py`'s own documented auth/CORS/rate-limit registration-vs-runtime-order
+  fragility before touching it, not despite it — so it observes every request end to
+  end, a 429 or a 401 included, which a route-only view would silently miss. Reads
+  `response.status_code` and `request.scope["route"]` (populated by Starlette's router
+  DURING `call_next()`, confirmed still visible after it returns) but touches no header
+  and no body, so it cannot interact with the header-ordering fragility that same
+  comment flags. Exposes request counts by method/path-template/status-class, a 9-bucket
+  latency histogram, per-tenant request counts, webhook queue depth, and DB pool state.
+  `admin`-scoped like every other observability route. The FULL live `test_server.py`
+  suite was re-run clean specifically to confirm this new middleware layer didn't
+  disturb the existing auth/CORS/rate-limit interactions — not assumed safe from reading
+  the code alone.
+- **Per-tenant CAS storage isolation (`AV_CAS_ISOLATION`, default `shared`):** the
+  feature migration `0014`'s primary-key widening was always a schema prerequisite for,
+  shipped as the one complete package the original design review insisted on (shipping
+  physical separation without also fixing every existence-check/Bloom-filter/GC-sweep
+  site together was flagged as a real data-loss bug, not a nitpick). Shared mode
+  (default) is untouched, byte-for-byte: every existence check across `upload_object`/
+  `head_object`/`POST /api/sync/batch-objects`/`build_merkle_tree`/`_object_exists` (and
+  therefore its ~10 RSI-artifact callers: improver versions, change sets, policy packs,
+  canary results, eval suites, plans, lessons, tool manifests, action logs — audited
+  exhaustively via a real grep-and-fix pass, not spot-checked) stays completely
+  unfiltered by tenant, exactly matching the plan's own explicit warning about this
+  class of change. Isolated mode threads `_cas_tenant_id(request)` through all of the
+  above, plus storage (`objects_dir/<tenant_id>/...`, with a legacy-flat-path fallback
+  read so an object uploaded before a deployment/tenant went isolated keeps serving with
+  zero migration step) and the Bloom filter (per-tenant filter names, same fallback
+  logic). GC's mark phase now ALWAYS computes per-tenant alive sets (`alive_by_tenant`)
+  regardless of mode — shared mode's dead-computation uses their union (proven
+  mathematically identical to the old flat computation, since a tenant's own commits
+  only ever reference trees that same tenant fully wrote, per the single-materialization-
+  path invariant); isolated mode's dead-computation uses each row's own tenant's set
+  specifically. These are NOT interchangeable: using the union under isolated mode could
+  delete a row a different tenant still needs; using per-tenant sets under shared mode
+  could delete a row a DIFFERENT tenant references (shared mode's dedup means only the
+  first uploader's row exists at all) — reasoned through explicitly before writing the
+  sweep, not discovered as a bug afterward.
+- **A real structural documentation bug found and fixed while adding this phase's own
+  new contract sections:** a PREVIOUS session's edit to `development/architecture.md`
+  had accidentally inserted new sections in the MIDDLE of the existing Anomaly Alerts
+  Contract, stranding that section's own concluding paragraph after an unrelated later
+  section (Backup & DR). Found by actually re-reading the surrounding text before
+  appending more content, not assumed fine because the diff looked additive.
+- **One real bug this session's live verification caught:** `cmd_admin.py`'s
+  schema-healing step (and its own test's mock) still used `python.av_server.database`
+  — this repo's own test-suite-only import spelling — instead of the installed
+  package's real top-level `av_server.database`, the EXACT mistake v1.3.2's own
+  incident writeup already documented once. Caught by re-verifying the fix rather than
+  assuming last session's note was still being followed; corrected in both places.
+- **One test flake observed and explicitly NOT treated as a real bug, logged rather
+  than silently dismissed:** a fresh two-tenant CAS-isolation test failed once with a
+  HEAD request 404ing immediately after a GET on the identical object succeeded moments
+  earlier, then passed cleanly across 3 separate full re-runs (15 total executions) with
+  zero code changes and did not reproduce in an isolated standalone repro script —
+  consistent with this environment's already-documented Windows/asyncio cross-loop
+  timing flakiness class (Probleme.md), not a logic defect in the new isolation code.
+- **Deferred, stated plainly rather than implied complete:** E2 (SSO), E3 (SCIM), a real
+  Kubernetes HA drill (the Helm chart remains schema-verified only), reference customers,
+  a third-party security audit, and the Obsidian vault regen / full wrap-up sequence.
+
+(No "Essential-Tasks: signed off" line, for the same reason Phase 60's own entry states
+one — the full wrap-up sequence has not run. The owner is rebuilding the Docker image
+and running post-rebuild verification manually for this phase; nothing here is committed
+by the agent.)
+
+## Phase 62 — V1.3.3 "SSO & SCIM": closing the last two enterprise-readiness gaps
+(OIDC + SAML 2.0 login, SCIM 2.0 provisioning) deferred out of Phase 61, plus a real
+architectural fix those two features exposed as a hard blocker
+
+- **OIDC login** (`sso_oidc.py`): authorization-code + PKCE, ID-token validated in full
+  (JWKS signature via `PyJWKClient`, issuer, audience, expiry, nonce-replay) — not a bare
+  decode. Round-trip state is an HMAC-SHA256-signed cookie (`AV_SECRET_KEY`-keyed,
+  10-minute TTL), never server-side session storage. JIT provisioning and IdP-asserted
+  group→role mapping are both per-provider and opt-in (`sso_providers.config`), converging
+  on ONE shared function (`sso_common.py::upsert_user_from_claims`) SAML uses too, so
+  session issuance/JIT/group-sync logic exists once, not once per protocol.
+- **Device-code flow** (`device_flow.py`): `av login` drives this, not a browser
+  redirect — the wrong UX for a terminal. Redis-backed (`av:device:*`), matching this
+  codebase's own existing pattern for short-lived ephemeral state (the Bloom filter,
+  rate-limit counters) rather than a new DB table. Approval is single-use: a successful
+  poll deletes the record immediately, so a session token can never be collected twice
+  even under a client retry after a dropped response.
+- **SAML 2.0** (`sso_saml.py`, `pysaml2` — new optional `[saml]` extra): metadata/ACS/SLS.
+  `parse_authn_request_response` gets signature verification, `NotBefore`/`NotOnOrAfter`
+  conditions, and audience restriction FOR FREE from the library — the entire reason to
+  use a real SAML library instead of hand-rolled XML parsing. `allow_unsolicited=True`
+  supports the common IdP-initiated login case, which means pysaml2 has no InResponseTo
+  to key replay protection off of for that case — added a Redis-backed assertion-ID
+  dedup (atomic `SET NX`) on top, since the library doesn't provide one there.
+- **A real dependency conflict resolved, not worked around:** `authlib`/`pyjwt[crypto]`
+  need `cryptography>=45.0.1`; `pysaml2`'s own dependency `pyOpenSSL 24.2.1` breaks at
+  IMPORT time under that `cryptography` version (`AttributeError: module 'lib' has no
+  attribute 'GEN_EMAIL'`). Fixed by upgrading `pyOpenSSL` to `>=25.0` too (landed at
+  26.4.0) — pip warns `pysaml2 7.5.4 requires pyopenssl<24.3.0`, but a direct import test
+  (`from saml2.client import Saml2Client`) confirms it works correctly at this version in
+  this environment. Verified via the actual import, not assumed from the version numbers.
+- **SCIM 2.0** (`scim.py`, `/scim/v2/*`, RFC 7643/7644): Users/Groups CRUD, `<attr> eq
+  "value"` filtering (`userName`/`externalId`/`emails.value` — what real IdPs actually
+  send), pagination. Deprovisioning (`PATCH {"active": false}`, and a literal `DELETE`)
+  suspends and revokes sessions immediately rather than hard-deleting — matches
+  `server.py::suspend_user`'s own established convention (audit history and
+  commit/run authorship attribution must survive). A repeat `POST` for an existing
+  `userName` returns 409 `uniqueness`, never a silent duplicate — the standard SCIM
+  client behavior on 409 (fall back to GET+PATCH) is what makes an IdP's retried
+  provisioning sync converge on one row rather than accumulating duplicates.
+- **Deliberately does NOT import from `server.py`:** `server.py` imports `scim.py`/
+  `sso_saml.py` at the BOTTOM of its own file (after mounting every other route), so a
+  top-level `from .server import ...` in either of those modules would be a genuine
+  load-time circular import, not merely bad style — confirmed by actually triggering it
+  in a scratch import test before settling on the alternative. Fixed by having each
+  module mirror the handful of primitives it needs (a local `_audit()` matching
+  `server.py`'s own shape exactly, so `tests/test_audit_coverage.py`'s sweep — which
+  looks for the literal `_audit(` substring in a mutating route's own source — covers
+  these modules' routes exactly like every other one, not via a documented exemption)
+  rather than reaching back into `server.py`.
+- **The real, load-bearing architectural fix this phase's own feature work exposed as a
+  hard blocker, not an incidental cleanup:** `identity.py::_permissions_for_subject`
+  never actually expanded a user's effective permissions through group membership —
+  `DBRoleBinding`'s own docstring always promised "unions every binding's role's
+  permissions that apply to the resolved subject", but a group-typed binding only ever
+  applied when the SUBJECT resolving permissions was itself a group, never a real logged-
+  in user. This made SSO's group→role mapping and SCIM's group sync — the entire point of
+  both features from an access-control standpoint — silently inert by construction.
+  Fixed by adding a `subject_type == "user"` branch that additionally resolves through a
+  live `DBGroupMember` subquery, so removing a user from a group revokes that group's
+  role's permissions on the user's very next request, with no separate role-binding
+  cleanup step needed. This was flagged as untested in an earlier compaction of this
+  session's own work — it has now been live-verified (see below), including the
+  revocation-on-removal direction, not just the grant direction.
+- **`login_required` (exit 21) activated, not newly invented:** this code was reserved
+  in the exit-code registry since v1.3.2 specifically with a note that it stays
+  unregistered "until a real caller exists" — `av login`'s device-code timeout is that
+  real caller. Registering it touched all SIX places that must agree (`core.py`,
+  `av_sdk/exceptions.py`, `docs/for-agents.md`, `AGENTS.md`, and two test-side literal
+  registries — `tests/test_contract_matrix.py::EXIT_CODE_REGISTRY` and a new
+  `test_login_required_exits_21[_json]` repro pair in `tests/test_exit_codes.py` — the
+  latter two found only by actually re-running the full anti-drift sweep after adding
+  the code, not by reasoning about the four documented touch points in isolation).
+- **A real bug in `cmd_login.py`'s own first draft, found by writing its own `--output
+  json` exit-code repro test before this ever shipped, not by a user report:** the
+  device-code URL/user-code were printed unconditionally via `click.secho`, which would
+  have broken `test_contract_matrix.py`'s "exactly one clean JSON envelope" contract for
+  every agent-facing `av login --output json` call — human-readable output would have
+  preceded the JSON envelope on stdout. Fixed by gating all such printing behind a
+  JSON-mode check and surfacing the same information inside the envelope's `data`
+  instead (both on success and on the `login_required` failure).
+- **`av init --mode enterprise` now genuinely works**, replacing `StubEnterpriseAuthProvider`
+  (which printed "coming soon" and returned `None`) with a real
+  `DeviceCodeEnterpriseAuthProvider` implementing the SAME `EnterpriseAuthProvider`
+  Protocol — zero call-site changes needed in `cmd_repo.py` (`_reconnect_existing_repo`,
+  `init()`), confirming the seam was designed correctly the first time. Sessions persist
+  to `~/.aether-vault/session.json` — the SAME user-level directory `update_check.py`
+  already established, not a new one invented per the original plan's literal
+  `~/.av/session.json` sketch, since a login session is per-user-per-machine like that
+  existing convention, not per-repo. `resolve_remote()` now prefers a live session's
+  token over `cfg["remote_api_token"]` when the session's own URL matches the repo's
+  configured remote — never sent cross-server.
+- **New CLI**: `av login [--provider] [--url] [--no-browser]`, `av logout`, `av whoami`,
+  `av idp add|list|show|test|remove`, `av scim status`, `av scim token create|revoke`.
+- **New route**: `GET /api/auth/whoami` (no scope required — reports whatever identity,
+  including a genuinely anonymous one, the caller resolved to; what `av whoami`/`av
+  login`'s own post-login confirmation both read from).
+- **No new migration.** Every table SSO/SCIM needs (`sso_providers`, `user_identities`,
+  `groups`, `group_members`, `sessions`) already exists from migration `0011` — verified
+  by actually checking, not assumed from the plan's own original schema sketch.
+- **Live-verified, not merely imported cleanly:** the FULL existing `test_server.py`
+  suite (175 tests) re-run clean with every new module loaded, specifically to confirm
+  none of this session's routes/middleware/identity.py change disturbed anything
+  pre-existing. New coverage: `TestGroupRoleBindingGrantsUserPermission` (the identity.py
+  fix, both grant and revoke-on-removal directions), `TestScim` (discovery, CRUD, 409
+  uniqueness, PATCH/DELETE-suspends, filter, scope enforcement), `TestSsoCrypto`
+  (encrypt/decrypt/mask round trip, refuses-with-no-key, live proof the plaintext secret
+  never lands in the `sso_providers` row), `TestDeviceFlow` (create/approve/poll,
+  single-use collection, unknown-code handling).
+- **One real test-harness bug found and fixed while writing `TestDeviceFlow`, not a bug
+  in `device_flow.py` itself:** calling its async functions from a fresh `asyncio.run()`
+  reused the app's pooled Redis connection (bound to the TestClient's own lifespan event
+  loop) from a DIFFERENT loop — the exact cross-loop failure class this codebase already
+  hit once for asyncpg (`_truncate_all()`'s own documented workaround). Fixed the same
+  way: a brand-new Redis client opened and used entirely inside the test's own loop,
+  monkeypatched in for the duration.
+- **Deferred, stated plainly rather than implied complete:** a Keycloak docker-compose
+  overlay and a live end-to-end OIDC/SAML run against a real external IdP — the protocol
+  code is implemented and tested against this server's own routes, but "works against
+  Keycloak/Okta/Entra" has not itself been verified in this environment. Reference
+  customers, a third-party security audit, and a real Kubernetes HA drill remain
+  deferred from Phase 61 too.
+
+(No "Essential-Tasks: signed off" line — the owner is rebuilding the Docker image and
+running post-rebuild verification manually for this phase, per this session's own
+instruction; nothing here is committed by the agent.)

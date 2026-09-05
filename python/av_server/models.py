@@ -294,6 +294,17 @@ class DBAuditLog(Base):
     # v1.2.2 audit depth: the HTTP outcome of the mutation (201 created, 409 idempotent
     # duplicate, ...) so the trail answers "did it actually land?", not just "was it tried".
     status_code = Column(Integer, nullable=True)
+    # v1.3.3 (migration 0016): hash-chained by `id`'s own natural order -- no `prev_id`
+    # column (unlike policy_packs) since audit rows have no client-chosen ordering to
+    # begin with. Populated by database.py's `_chain_audit_log` before_flush listener,
+    # never by a call site. See audit_chain.py for the exact formula and
+    # migration 0016's own docstring for the concurrency design (a Postgres advisory
+    # transaction lock, not left implicit).
+    chain_hash = Column(String, nullable=False)
+    # Optional ed25519 signature over chain_hash (audit_signing.py) -- NULL unless
+    # AV_AUDIT_SIGNING_KEY_PATH is configured; absence never blocks chain verification,
+    # only signature verification specifically.
+    signature = Column(String, nullable=True)
 
     # v1.2.5 (migration 0004): username/action indexes support the richer audit filters
     # added that same phase. Declared here too (not just in the migration) so this model

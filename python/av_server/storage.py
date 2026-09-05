@@ -16,8 +16,18 @@ class CASStorage:
         self.commits_dir.mkdir(parents=True, exist_ok=True)
         self.refs_dir.mkdir(parents=True, exist_ok=True)
 
-    def _object_path(self, sha256_hash: str) -> Path:
-        return self.objects_dir / sha256_hash[:2] / sha256_hash[2:]
+    def _object_path(self, sha256_hash: str, tenant_id: str | None = None) -> Path:
+        """v1.3.3 (WP-21, AV_CAS_ISOLATION): `tenant_id=None` (every pre-v1.3.3 call
+        site, and every call site under the default `shared` isolation mode) is the
+        EXACT flat layout this method has always used — byte-identical, zero migration
+        needed for existing deployments. A real tenant_id (only ever passed when
+        `AV_CAS_ISOLATION=isolated`) nests the object under its own tenant directory
+        instead, so two tenants' identical bytes are physically stored twice rather than
+        deduplicated across the tenant boundary — see server.py's own module docstring
+        on the storage-efficiency trade-off this switch makes explicit, not silent."""
+        if tenant_id is None:
+            return self.objects_dir / sha256_hash[:2] / sha256_hash[2:]
+        return self.objects_dir / tenant_id / sha256_hash[:2] / sha256_hash[2:]
 
     def _safe_ref_path(self, ref_name: str) -> Path:
         """Resolve a ref name under refs_dir, rejecting any path-traversal escape.
@@ -31,8 +41,9 @@ class CASStorage:
             raise ValueError(f"Ref name escapes refs directory: {ref_name}")
         return p
 
-    async def store_object(self, sha256_hash: str, data_stream: AsyncIterator[bytes]) -> Path:
-        target_path = self._object_path(sha256_hash)
+    async def store_object(self, sha256_hash: str, data_stream: AsyncIterator[bytes],
+                           tenant_id: str | None = None) -> Path:
+        target_path = self._object_path(sha256_hash, tenant_id)
         if target_path.exists():
             return target_path
             
@@ -59,15 +70,24 @@ class CASStorage:
                 temp_path.unlink()
             raise
 
-    def object_exists(self, sha256_hash: str) -> bool:
-        return self._object_path(sha256_hash).exists()
+    def object_exists(self, sha256_hash: str, tenant_id: str | None = None) -> bool:
+        return self.get_object_path(sha256_hash, tenant_id) is not None
 
-    def get_object_path(self, sha256_hash: str) -> Path | None:
-        p = self._object_path(sha256_hash)
-        return p if p.exists() else None
+    def get_object_path(self, sha256_hash: str, tenant_id: str | None = None) -> Path | None:
+        """`tenant_id` given (isolated mode): checks the tenant-scoped path FIRST, then
+        falls back to the flat legacy path — an object stored before a deployment
+        switched to isolated mode (or one shared-mode upload that predates a tenant
+        going isolated) keeps being served with zero migration step and no downtime,
+        exactly as `AV_CAS_ISOLATION`'s own docstring in server.py promises."""
+        if tenant_id is not None:
+            scoped = self._object_path(sha256_hash, tenant_id)
+            if scoped.exists():
+                return scoped
+        flat = self._object_path(sha256_hash, None)
+        return flat if flat.exists() else None
 
-    def get_object_size(self, sha256_hash: str) -> int | None:
-        p = self.get_object_path(sha256_hash)
+    def get_object_size(self, sha256_hash: str, tenant_id: str | None = None) -> int | None:
+        p = self.get_object_path(sha256_hash, tenant_id)
         return p.stat().st_size if p else None
 
     def store_commit(self, commit_hash: str, commit_data: dict) -> None:

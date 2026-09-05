@@ -1271,9 +1271,24 @@ def resolve_remote(repo_root: Path, cfg: dict | None = None) -> tuple[str, str |
     (this module, `cmd_run.py`, `cmd_policy.py`, `cmd_registry.py`, `cmd_env.py`,
     `cmd_audit.py`, `av_sdk/repo.py`, `av_plugins/_shared.py`). No behavior change —
     same default URL, same config keys. Pass an already-loaded `cfg` (several callers
-    need it for other fields too) to skip a redundant `load_config()` read."""
+    need it for other fields too) to skip a redundant `load_config()` read.
+
+    v1.3.3 (WP-14): a live `av login` session (`~/.aether-vault/session.json`) now takes
+    priority over `cfg["remote_api_token"]` — but ONLY when the session was issued for
+    the SAME registry this repo points at. A session from a login against a different
+    server is silently ignored here (never sent cross-server), falling back to whatever
+    this repo's own config already resolves to; a genuinely wrong-server session is
+    exactly the case `av whoami` surfaces so a user notices and re-runs `av login`."""
     cfg = cfg if cfg is not None else load_config(repo_root)
-    return cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token")
+    remote_url = cfg.get("remote_url", "http://localhost:8000")
+
+    from . import session_store
+
+    session = session_store.load_session()
+    if session and session.get("url") == remote_url and session.get("token"):
+        return remote_url, session["token"]
+
+    return remote_url, cfg.get("remote_api_token")
 
 
 def capture_code_pointer(repo_root: Path) -> dict | None:
@@ -1565,12 +1580,15 @@ EXIT_REVIEW_REQUIRED = 19         # improver promotion needs reviewer approval /
 EXIT_SCOPE_DENIED = 20            # token authenticated but lacks the required scope (server 403)
 # v1.3.2 (hard multi-tenancy): mirrors `scope_denied`'s shape exactly — the caller
 # authenticated fine, they just don't own the project_id they targeted
-# (server.py::_enforce_project_tenant's 403, `AV_TENANCY_ENFORCE=1` only). 21
-# (`login_required`) is deliberately NOT registered yet — no command produces it until
-# `av login`/SSO sessions actually exist (a later phase); registering an exit code with
-# no real caller is exactly the "documented but never raised" drift
-# test_contract_matrix.py's registry-parity test exists to catch, so this codebase's own
-# discipline is followed here rather than worked around.
+# (server.py::_enforce_project_tenant's 403, `AV_TENANCY_ENFORCE=1` only).
+# v1.3.3: `login_required` is now real -- `av login`'s device-code flow (cmd_login.py)
+# raises it when the flow times out with no approval, and `resolve_remote()`/whoami-style
+# callers distinguish "never logged in / session expired" from `auth_failed` (12, a
+# REJECTED credential) this way. Registering it here is what activates it in
+# `_EXIT_CODES` below -- it sat reserved-but-unregistered since v1.3.2 specifically
+# until a real caller existed, per this file's own "documented but never raised" drift
+# discipline (test_contract_matrix.py's registry-parity test).
+EXIT_LOGIN_REQUIRED = 21
 EXIT_TENANT_DENIED = 22
 
 _EXIT_CODES = {
@@ -1585,6 +1603,7 @@ _EXIT_CODES = {
     "frozen": EXIT_FROZEN,
     "review_required": EXIT_REVIEW_REQUIRED,
     "scope_denied": EXIT_SCOPE_DENIED,
+    "login_required": EXIT_LOGIN_REQUIRED,
     "tenant_denied": EXIT_TENANT_DENIED,
 }
 

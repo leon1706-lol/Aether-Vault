@@ -696,7 +696,13 @@ av audit list --action-prefix commit.  --cursor <next_cursor>   # (v1.2.5) route
 av audit export --format jsonl --out audit.jsonl   # (v1.2.5) filtered export for compliance (jsonl or csv)
 av audit prune --before-days 90                    # (v1.2.5) admin-only, irreversible; prompts unless --yes
 av audit prune --before-days 90 --dry-run          # (v1.3.0) report what WOULD be deleted, delete nothing, no prompt
+
+av audit verify                                    # (v1.3.3) verify the hash chain is intact; reports the first broken row, if any
+av audit verify --since-id <id>                    # (v1.3.3) only re-verify what's new since a previous check
+av audit verify --export audit.jsonl               # (v1.3.3) verify OFFLINE from a local export — no server trust required for the chain itself
 ```
+
+Every row is hash-chained (`chain_hash`, migration `0016`) so tampering or deleting a row breaks verification from that point forward — see `development/architecture.md`'s Audit Log Hash-Chain Contract. Optional ed25519 signing (`AV_AUDIT_SIGNING_KEY_PATH`, server-side) adds non-repudiation for an export handed to a party with no database access.
 
 #### `av stash`
 
@@ -892,6 +898,30 @@ guard, and Postgres row-level security enforced via a dedicated non-superuser DB
 gated behind `AV_TENANCY_ENFORCE` (server-side env var, off by default) — see
 `development/architecture.md`'s Tenancy Isolation section.
 
+#### `av login` / `av idp` / `av scim` (v1.3.3)
+
+SSO (OIDC + SAML 2.0) and SCIM 2.0 provisioning. An admin registers an IdP once
+(`av idp add`); every user after that authenticates against it directly — no shared
+secret token to distribute.
+
+```bash
+av idp add my-okta --kind oidc --issuer <url> --client-id <id> --client-secret <secret> \
+    --jit --group-role 'Engineering=maintainer'    # register an IdP (admin-scoped)
+av idp list                                        # providers configured for your tenant
+av idp test my-okta                                # confirm the IdP's metadata is reachable
+av login --provider my-okta                        # device-code flow: opens a browser, polls until approved
+av whoami                                          # the identity/tenant/roles your session resolves to
+av logout                                          # clear the local session
+
+av scim status                                     # confirm /scim/v2 is mounted and reachable
+av scim token create okta-connector                # mint the `scim`-scoped Bearer token for your IdP's connector
+```
+
+Sessions persist to `~/.aether-vault/session.json` (user-level, not per-repo) and are
+picked up automatically by every other command via `resolve_remote()` — no separate
+"login mode" flag needed once you've run `av login`. `av init --mode enterprise` drives
+the same device-code flow during repo setup.
+
 #### `av admin backup` (v1.3.2)
 
 Operator-facing disaster recovery — not repo-scoped, run against infrastructure
@@ -951,14 +981,15 @@ For enterprise research teams and institutional algorithmic trading firms:
 
 | Feature | Description |
 |---|---|
-| **Enterprise Login (SSO)** (not yet built) | A stable `EnterpriseAuthProvider` seam exists (`python/av_cli/enterprise.py`); OIDC/SAML against a real IdP has not shipped — the mode is deliberately hidden from interactive `av init` until it does |
-| **SCIM provisioning** (not yet built) | No code yet |
+| **Enterprise Login (SSO)** ✅ shipped (v1.3.3) | OIDC (authorization-code + PKCE, JWKS-verified ID tokens) and SAML 2.0 (via `pysaml2`, an optional extra) — `av login`/`logout`/`whoami`, `av idp add\|list\|show\|test\|remove`. JIT provisioning and IdP-group→role mapping are per-provider and opt-in. `av init --mode enterprise` now genuinely logs in. Verified against this server's own routes; not yet driven end-to-end against a live external IdP (Keycloak/Okta/Entra) in this environment — see `VERSIONING.md`'s v1.3.3 section |
+| **SCIM provisioning** ✅ shipped (v1.3.3) | RFC 7643/7644 under `/scim/v2` — Users/Groups CRUD, filter+pagination, PATCH deprovisioning (`active: false` suspends, never hard-deletes), idempotent-safe create (409 on retry). `av scim status`, `av scim token create\|revoke` mints the dedicated `scim`-scoped credential an IdP connector authenticates with |
 | **Multi-User Collaboration** | The OSS baseline shipped in v1.1.1 (`av clone`/`av pull`/`av merge`, per-project refs). |
 | **RBAC** ✅ shipped (v1.3.2) | DB-backed roles/role-bindings/tokens, remotely administrable — `av role`, `av token`, `av user`, `av tenant`. 6 built-in roles (`owner`/`admin`/`maintainer`/`trainer`/`reviewer`/`reader`); see [CLI Reference](#cli-reference) |
-| **Hard multi-tenancy** ✅ shipped (v1.3.2) | Per-tenant data isolation: an application-level guard plus Postgres row-level security enforced via a dedicated non-superuser DB role, gated behind `AV_TENANCY_ENFORCE` (off by default). Per-tenant *physical* CAS storage separation (vs. today's shared, deduplicated store) is not yet built |
-| **Audit Logging** | Plain, unsigned audit rows today (`audit_log` table, queryable via `av audit`). Cryptographic hash-chaining/signing (matching the pattern `av policy pack` already uses) has not shipped |
+| **Hard multi-tenancy** ✅ shipped (v1.3.2/v1.3.3) | Per-tenant data isolation: an application-level guard plus Postgres row-level security enforced via a dedicated non-superuser DB role (`av_app`, migration `0015`), gated behind `AV_TENANCY_ENFORCE` (off by default). Per-tenant *physical* CAS storage separation now shipped too (`AV_CAS_ISOLATION=isolated`, migration `0014`+v1.3.3 — off by default; the real cost is losing cross-tenant dedup, intra-tenant dedup is unaffected) |
+| **Audit Logging** ✅ shipped (v1.3.3) | Every row is hash-chained (`chain_hash`, migration `0016`) — tampering or deleting a row breaks verification from that point forward. `av audit verify` (± `--export` for genuinely offline/independent verification). Optional ed25519 signing (`AV_AUDIT_SIGNING_KEY_PATH`) adds non-repudiation |
 | **High Availability** ✅ shipped (v1.3.2) | `docker-compose.ha.yml` (nginx LB + N engine replicas + Postgres primary/streaming-replica + Redis primary/replica) and a Helm chart (`deploy/helm/aether-vault/`, schema-verified via `helm template \| kubeconform`, not yet drilled on a real cluster). `scripts/ha_drill.sh` is a real, locally-run drill proving zero failed requests and zero double webhook delivery across a killed replica |
 | **Disaster recovery** ✅ shipped (v1.3.2) | `av admin backup create/verify/restore` (Postgres + CAS objects, hash-verified manifest) — see [`docs/dr.md`](docs/dr.md) for the real destroy-and-restore drill and the measured-RTO/stated-RPO distinction |
+| **Metrics** ✅ shipped (v1.3.3) | `GET /api/metrics` — hand-rolled Prometheus text exposition (request counts/latency histogram, webhook queue depth, DB pool state, per-tenant request counts). Per-process only; see [`docs/slo.md`](docs/slo.md) |
 | **Cloud Connectors** | AWS IAM, GCP Cloud Storage, Azure Blob Storage with automated cold-storage tiering |
 
 ---

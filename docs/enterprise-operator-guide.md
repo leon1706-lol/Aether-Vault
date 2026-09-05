@@ -116,9 +116,104 @@ failed requests / zero double webhook delivery / a globally-enforced rate limit)
 Helm chart (`deploy/helm/aether-vault/`, schema-verified, not yet drilled on a real
 cluster). See `development/architecture.md`'s High Availability Contract.
 
+## 7. Verify the audit trail is intact
+
+```bash
+av audit verify
+```
+
+Every audit row is hash-chained (migration `0016`) — tampering or deleting a row breaks
+verification from that point forward. `av audit verify --export audit.jsonl` (after
+`av audit export --format jsonl --out audit.jsonl`) verifies OFFLINE, with no server
+trust required for the chain computation itself. Optional ed25519 signing
+(`AV_AUDIT_SIGNING_KEY_PATH`, server-side) adds non-repudiation for an export handed to
+a party with no database access — `GET /api/admin/audit/public-key` publishes the key an
+independent verifier checks signatures against.
+
+## 8. Physical per-tenant object storage (optional, real cost)
+
+```text
+AV_CAS_ISOLATION=isolated
+```
+
+Off by default (`shared` — one global content-addressed dedup domain, unchanged from
+every pre-v1.3.3 deployment). Turning it on physically separates every tenant's objects
+on disk and in the Bloom filter — the real, stated cost is losing CROSS-tenant
+deduplication entirely (identical bytes held by two tenants are now stored twice);
+INTRA-tenant dedup, the product's actual headline claim, is completely unaffected either
+way. See `development/architecture.md`'s Per-Tenant CAS Isolation Contract before
+flipping this on a deployment with existing data.
+
+## 9. Metrics
+
+```bash
+curl -H "Authorization: Bearer <admin-token>" http://<registry>:8000/api/metrics
+```
+
+Hand-rolled Prometheus text exposition — request counts/latency histogram, webhook queue
+depth, DB pool state, per-tenant request counts. `admin`-scoped, like every other
+observability route; point a Prometheus scrape config's `bearer_token_file` at an
+admin-scoped `av token create` token. See [`docs/slo.md`](slo.md) for what this does and
+does not yet back (no cross-replica aggregation — each replica is its own scrape target).
+
+## 10. Configure SSO (OIDC or SAML)
+
+```bash
+# OIDC
+av idp add my-okta --kind oidc --issuer https://your-org.okta.com --client-id <client-id> --client-secret <client-secret> --jit --claims-groups groups --group-role 'Engineering=maintainer' --group-role 'Reviewers=reviewer'
+
+# SAML 2.0
+av idp add my-adfs --kind saml --idp-metadata-url https://adfs.your-org.com/federationmetadata/2007-06/federationmetadata.xml --jit
+
+av idp list
+av idp test my-okta      # confirms the IdP's metadata/issuer is reachable (not a full login)
+```
+
+`--jit` (just-in-time provisioning) is opt-in per provider: on means an unknown IdP
+subject is provisioned automatically on first login; off (the default) means only an
+already-linked or pre-provisioned identity can authenticate. `--group-role` maps an
+IdP-asserted group to a role, re-evaluated on every login — a user removed from a group
+upstream loses that role's permissions on their next login, automatically. Client secrets
+are Fernet-encrypted at rest under `AV_SECRET_KEY` — provider creation is refused with a
+clear error if that env var is unset, never stored in plaintext.
+
+Once a provider exists, any user logs in with:
+
+```bash
+av login --provider my-okta   # opens a browser (device-code flow), polls until approved
+av whoami                     # confirm the identity/tenant/roles you're resolved as
+```
+
+`av init --mode enterprise` drives the same flow during repo setup. See
+`AGENTS.md`/`docs/for-agents.md` for the `login_required` (21) exit code this produces
+when the flow times out with no approval.
+
+**Verification note:** SAML/OIDC protocol handling (PKCE, JWKS signature verification,
+SAML assertion signature/conditions via `pysaml2`) is implemented and tested against this
+server's own routes; it has not yet been driven end-to-end against a live external IdP
+(Keycloak/Okta/Entra) in this environment. Treat this as implemented-and-locally-tested,
+not yet field-verified — see `VERSIONING.md`'s v1.3.3 section.
+
+## 11. Provision users via SCIM
+
+```bash
+av scim status                          # confirm /scim/v2 is mounted
+av scim token create okta-connector     # mint the scim-scoped credential
+```
+
+Paste the printed token into your IdP's SCIM connector (base URL:
+`https://<registry>/scim/v2`). From there the IdP owns the provisioning lifecycle — user
+create/update, group membership sync, and deprovisioning (`active: false`, which suspends
+and revokes sessions immediately; it never hard-deletes a row, so audit history and
+authorship attribution survive) all flow through the standard SCIM 2.0 wire protocol
+(RFC 7643/7644). A group synced via SCIM that's also granted a role (`av role grant
+group <group-id> <role-id>`) propagates that role to every member automatically.
+
 ## What's next on the enterprise roadmap
 
-SSO (OIDC + SAML against a real IdP), SCIM 2.0 provisioning, per-tenant physical CAS
-storage isolation (today's dedup is global, `AV_CAS_ISOLATION=shared` the only mode that
-exists), signed/hash-chained audit logs, and an automated security-scanning CI gate are
-tracked in `todo.md` — not represented as shipped here.
+SSO and SCIM are now implemented and locally tested (see sections 10-11 above); the
+remaining gap is genuinely operational, not code: driving the same flows end-to-end
+against a real external IdP (a Keycloak compose overlay, or a live Okta/Entra tenant).
+Reference customers, a third-party security audit, and runtime-verified Kubernetes HA
+(the Helm chart today is `helm template`-verified, not cluster-drilled) round out the
+rest of the roadmap — tracked in `todo.md`, not represented as shipped here.

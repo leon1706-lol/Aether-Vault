@@ -950,7 +950,7 @@ def test_alembic_brings_schema_to_head(db):
             await conn.close()
 
     version, tables = asyncio.run(_probe())
-    assert version == "0015"  # current migration head — bump alongside new revisions
+    assert version == "0016"  # current migration head — bump alongside new revisions
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
@@ -1094,7 +1094,7 @@ def test_legacy_database_is_healed_and_stamped(db):
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "0015"  # stamps to CURRENT head, not a hardcoded rev
+    assert asyncio.run(_version()) == "0016"  # stamps to CURRENT head, not a hardcoded rev
 
 
 def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
@@ -1142,7 +1142,7 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
         command.upgrade(cfg, "head")
 
         version = asyncio.run(_version_after())
-        assert version == "0015"
+        assert version == "0016"
         tables_at_head = asyncio.run(_tables())
         assert {"objects", "trees", "commits", "refs", "runs", "webhooks",
                 "audit_log", "webhook_deliveries", "events",
@@ -1159,6 +1159,7 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
         assert {"policy_outcome", "kind", "improver_id", "integrity_signals",
                 "plan_id", "budget_id", "stop_reason", "lessons_id"} <= _pg_columns("runs")
         assert {"signature", "env_snapshot_id"} <= _pg_columns("commits")
+        assert {"chain_hash", "signature"} <= _pg_columns("audit_log")
     finally:
         # However far the assertions above got, always leave the schema back at head —
         # every OTHER test in this session-scoped file assumes head. A failure partway
@@ -2758,6 +2759,28 @@ def tenancy_enforced():
 
 
 @pytest.fixture
+def cas_isolated(tmp_path, monkeypatch):
+    """v1.3.3 (WP-21): flips AV_CAS_ISOLATION to 'isolated' for one test. Only ONE
+    module-level binding to patch here (`server_module.CAS_ISOLATION`) -- unlike
+    `tenancy_enforced` above, nothing in database.py reads this name, so there's no
+    second copy to keep in sync. Also points AV_DATA_DIR-derived storage at a FRESH
+    tmp_path for this one test, so a prior test's flat-layout objects (which legitimately
+    still exist on disk under `shared` mode, by design) can never accidentally satisfy
+    this test's own isolated-mode assertions via the legacy-fallback read path."""
+    from python.av_server.storage import CASStorage
+
+    original_isolation = server_module.CAS_ISOLATION
+    original_storage = server_module.storage
+    server_module.CAS_ISOLATION = "isolated"
+    server_module.storage = CASStorage(tmp_path)
+    try:
+        yield
+    finally:
+        server_module.CAS_ISOLATION = original_isolation
+        server_module.storage = original_storage
+
+
+@pytest.fixture
 def two_tenants(db):
     """Two real tenants with one admin-scoped DB token each, created via the real HTTP
     surface (not direct DB inserts) -- proves `av tenant create`/`av token create`'s own
@@ -3318,3 +3341,621 @@ class TestAnomalyDetection:
         spikes = [e for e in events if e["payload"]["type"] == "auth_spike"
                  and e["payload"]["identifier"] == "reader"]
         assert not spikes
+
+
+# ---------------------------------------------------------------------------
+# v1.3.3 (WP-21): per-tenant CAS storage isolation, live against real Postgres. The
+# exact scenario WP-21's own design review flagged as a real data-loss risk if shipped
+# half-done: tenant B uploading content identical to tenant A's.
+# ---------------------------------------------------------------------------
+
+class TestPerTenantCAS:
+    def test_identical_content_from_two_tenants_both_succeed_and_stay_independently_readable(
+        self, db, cas_isolated, two_tenants,
+    ):
+        t = two_tenants
+        content = b"identical bytes, two different tenants, isolated mode"
+        h = hashlib.sha256(content).hexdigest()
+
+        first = db.post(f"/api/objects/{h}", content=content, headers=t["headers_a"])
+        assert first.status_code == 201, first.text  # NOT 409 -- this is the bug WP-21 exists to prevent
+
+        second = db.post(f"/api/objects/{h}", content=content, headers=t["headers_b"])
+        assert second.status_code == 201, second.text  # tenant B must ALSO succeed, not see a false 409
+
+        # Both readable independently afterward -- proves each tenant genuinely has its
+        # OWN copy on disk, not one shared file one of them can't actually reach.
+        get_a = db.get(f"/api/objects/{h}", headers=t["headers_a"])
+        assert get_a.status_code == 200 and get_a.content == content
+        get_b = db.get(f"/api/objects/{h}", headers=t["headers_b"])
+        assert get_b.status_code == 200 and get_b.content == content
+
+        head_a = db.head(f"/api/objects/{h}", headers=t["headers_a"])
+        assert head_a.status_code == 200
+
+    def test_a_second_upload_of_the_same_content_by_the_same_tenant_still_409s(
+        self, db, cas_isolated, two_tenants,
+    ):
+        """Isolation must not weaken INTRA-tenant dedup -- the product's actual
+        headline claim -- only remove CROSS-tenant dedup."""
+        t = two_tenants
+        content = b"same tenant, uploaded twice, isolated mode"
+        h = hashlib.sha256(content).hexdigest()
+
+        first = db.post(f"/api/objects/{h}", content=content, headers=t["headers_a"])
+        assert first.status_code == 201, first.text
+        second = db.post(f"/api/objects/{h}", content=content, headers=t["headers_a"])
+        assert second.status_code == 409, second.text
+
+    def test_physically_separate_files_on_disk(self, db, cas_isolated, two_tenants):
+        t = two_tenants
+        content = b"checked directly on disk, isolated mode"
+        h = hashlib.sha256(content).hexdigest()
+        db.post(f"/api/objects/{h}", content=content, headers=t["headers_a"])
+        db.post(f"/api/objects/{h}", content=content, headers=t["headers_b"])
+
+        path_a = server_module.storage.get_object_path(h, t["tenant_a_id"])
+        path_b = server_module.storage.get_object_path(h, t["tenant_b_id"])
+        assert path_a is not None and path_b is not None
+        assert path_a != path_b
+        assert t["tenant_a_id"] in str(path_a)
+        assert t["tenant_b_id"] in str(path_b)
+
+    def test_batch_objects_check_is_tenant_scoped(self, db, cas_isolated, two_tenants):
+        t = two_tenants
+        content = b"batch-checked content, isolated mode"
+        h = hashlib.sha256(content).hexdigest()
+        db.post(f"/api/objects/{h}", content=content, headers=t["headers_a"])
+
+        # Tenant B has never uploaded this content -- isolated mode means B's batch
+        # check must report it MISSING, not "found" via A's row.
+        resp_b = db.post("/api/sync/batch-objects", json=[h], headers=t["headers_b"])
+        assert h in resp_b.json()["missing"]
+        assert h not in resp_b.json()["found"]
+
+        resp_a = db.post("/api/sync/batch-objects", json=[h], headers=t["headers_a"])
+        assert h in resp_a.json()["found"]
+
+    def test_shared_mode_is_completely_unaffected_default_behavior(self, db, two_tenants):
+        """No cas_isolated fixture here -- proves the default (`shared`) mode still
+        behaves exactly like pre-v1.3.3: identical content from a second tenant is a
+        genuine 409, the global dedup guarantee every existing deployment relies on."""
+        t = two_tenants
+        content = b"shared mode, global dedup, two tenants"
+        h = hashlib.sha256(content).hexdigest()
+
+        first = db.post(f"/api/objects/{h}", content=content, headers=t["headers_a"])
+        assert first.status_code == 201, first.text
+        second = db.post(f"/api/objects/{h}", content=content, headers=t["headers_b"])
+        assert second.status_code == 409, second.text
+
+
+# ---------------------------------------------------------------------------
+# v1.3.3 (WP-32): audit-log hash-chaining, live against real Postgres.
+# ---------------------------------------------------------------------------
+
+class TestAuditChain:
+    def test_verify_reports_ok_on_an_untampered_chain(self, db):
+        db.post("/api/webhooks", json={"url": "http://example.invalid/hook", "secret": "s"})
+        resp = db.get("/api/admin/audit/verify")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["checked"] >= 1
+        assert body["signature_checks"]["absent"] >= 1  # no signing key configured in this test env
+
+    def test_verify_detects_a_tampered_row(self, db):
+        create = db.post("/api/webhooks", json={"url": "http://example.invalid/tamper", "secret": "s"})
+        assert create.status_code == 200
+
+        async def _tamper():
+            import asyncpg
+
+            conn = await asyncpg.connect(
+                AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+            )
+            try:
+                row = await conn.fetchrow(
+                    "SELECT id FROM audit_log WHERE action = 'webhook.create' ORDER BY id DESC LIMIT 1"
+                )
+                await conn.execute(
+                    "UPDATE audit_log SET chain_hash = 'deadbeef' WHERE id = $1", row["id"]
+                )
+                return row["id"]
+            finally:
+                await conn.close()
+
+        tampered_id = asyncio.run(_tamper())
+
+        resp = db.get("/api/admin/audit/verify")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is False
+        assert body["broken_at_id"] == tampered_id
+
+    def test_two_audit_rows_in_the_same_flush_chain_against_each_other_not_just_the_db(self, db):
+        """prune_audit_log (DELETE /api/admin/audit) writes its OWN audit row inside the
+        same request as a delete that may itself already be audited elsewhere -- proving
+        the `_chain_seq`-ordered, same-flush chaining path (not just the cross-request
+        path the other tests here exercise) actually produces a verifiable chain."""
+        db.post("/api/webhooks", json={"url": "http://example.invalid/x", "secret": "s"})
+        pruned = db.delete("/api/admin/audit", params={"before_days": 9999})
+        assert pruned.status_code == 200, pruned.text
+
+        resp = db.get("/api/admin/audit/verify")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["ok"] is True
+
+    def test_public_key_404s_when_signing_is_not_configured(self, db):
+        resp = db.get("/api/admin/audit/public-key")
+        assert resp.status_code == 404
+
+    def test_since_id_only_reverifies_the_new_tail(self, db):
+        first = db.get("/api/admin/audit/verify")
+        checkpoint = first.json()["last_id"] or 0
+
+        db.post("/api/webhooks", json={"url": "http://example.invalid/since-id", "secret": "s"})
+
+        resp = db.get("/api/admin/audit/verify", params={"since_id": checkpoint})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["checked"] >= 1
+        assert body["last_id"] > checkpoint
+
+
+class TestAuditSigning:
+    """Same live server, but with AV_AUDIT_SIGNING_KEY_PATH set for the duration of one
+    test — proves the opt-in signing path end to end, not just that it stays off by
+    default (TestAuditChain's public-key 404 test already covers that)."""
+
+    def test_signing_enabled_produces_verifiable_signatures(self, db, tmp_path, monkeypatch):
+        import python.av_server.audit_signing as audit_signing_module
+
+        key_path = tmp_path / "audit-signing.pem"
+        monkeypatch.setenv("AV_AUDIT_SIGNING_KEY_PATH", str(key_path))
+        pytest.importorskip("cryptography")
+        audit_signing_module.ensure_keypair()
+
+        db.post("/api/webhooks", json={"url": "http://example.invalid/signed", "secret": "s"})
+
+        resp = db.get("/api/admin/audit/verify")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["signature_checks"]["verified"] >= 1
+        assert body["signature_checks"]["failed"] == 0
+
+        pub = db.get("/api/admin/audit/public-key")
+        assert pub.status_code == 200
+        assert len(pub.json()["public_key"]) == 64  # 32-byte ed25519 public key, hex-encoded
+
+
+# ---------------------------------------------------------------------------
+# v1.3.3 (WP-35): /api/metrics, live against real Postgres.
+# ---------------------------------------------------------------------------
+
+class TestMetrics:
+    def test_metrics_endpoint_renders_prometheus_text_and_counts_requests(self, db):
+        from python.av_server import metrics as metrics_module
+
+        metrics_module.reset()
+        db.get("/api/health")
+        db.get("/api/health")
+
+        resp = db.get("/api/metrics")
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"].startswith("text/plain")
+        body = resp.text
+        assert "# TYPE av_http_requests_total counter" in body
+        assert 'av_http_requests_total{method="GET",path="/api/health",status_class="2xx"}' in body
+        assert "# TYPE av_http_request_duration_seconds histogram" in body
+        assert "av_http_request_duration_seconds_bucket" in body
+        assert "av_uptime_seconds" in body
+
+    def test_metrics_reports_webhook_queue_depth_and_db_pool(self, db):
+        resp = db.get("/api/metrics")
+        assert resp.status_code == 200, resp.text
+        assert "av_webhook_queue_depth" in resp.text
+        assert "av_db_pool_checked_out" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# v1.3.3 (WP-17 x identity.py fix) — the real architectural gap found and fixed this
+# session: `identity.py::_permissions_for_subject` never expanded through group
+# membership for a `subject_type == "user"` principal, despite `DBRoleBinding`'s own
+# docstring promising exactly that. SSO's group->role mapping and SCIM's group sync both
+# fundamentally depend on this actually working -- this is its first live proof.
+# ---------------------------------------------------------------------------
+
+class TestGroupRoleBindingGrantsUserPermission:
+    def _mint_user_token(self, user_id: str, raw: str) -> None:
+        import asyncpg
+
+        from python.av_server.models import DEFAULT_TENANT_ID
+        import python.av_server.identity as identity_module_direct
+
+        async def _mint():
+            conn = await asyncpg.connect(
+                AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+            )
+            try:
+                await conn.execute(
+                    "INSERT INTO api_tokens (id, tenant_id, user_id, name, token_hash, "
+                    "prefix, created_by, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, now())",
+                    f"tok-{raw}", DEFAULT_TENANT_ID, user_id, f"{raw}-token",
+                    identity_module_direct.hash_token(raw), raw[:8], "test",
+                )
+            finally:
+                await conn.close()
+
+        asyncio.run(_mint())
+        identity_module_direct._principal_cache.clear()
+
+    def test_user_inherits_permission_via_group_role_binding(self, db, scoped_users):
+        """The core proof: carol has NO explicit scopes and NO direct role binding of
+        her own -- her only path to 'review' is through a group SCIM put her in, which
+        was granted the reviewer role. Before this session's fix, this stayed 403
+        forever (group bindings were silently inert for a user subject)."""
+        admin_headers = {"Authorization": "Bearer trainer-token-12345"}
+
+        created = db.post("/api/users", json={"username": "grouped-carol"}, headers=admin_headers)
+        assert created.status_code == 200, created.text
+        user_id = created.json()["id"]
+
+        raw_token = "carol-group-token-xyz789"
+        self._mint_user_token(user_id, raw_token)
+        carol_headers = {"Authorization": f"Bearer {raw_token}"}
+
+        obj_hash = _upload_object(db, b'{"diff":"group-reviewable"}', headers=admin_headers)
+        cs = db.post("/api/change-sets",
+                    json={"id": "cs-group-rb-proof", "project_id": "pgrb", "object_id": obj_hash},
+                    headers=admin_headers)
+        assert cs.status_code == 200, cs.text
+
+        # Before any group membership/binding exists: carol is denied.
+        pre = db.post("/api/reviews",
+                      json={"project_id": "pgrb", "target_type": "change_set",
+                            "target_id": "cs-group-rb-proof", "decision": "approve"},
+                      headers=carol_headers)
+        assert pre.status_code == 403
+
+        # The real production path this fix exists for: a group created via SCIM
+        # (mirroring what an IdP's group sync does) with carol as a member.
+        group_resp = db.post("/scim/v2/Groups",
+                             json={"displayName": "reviewers-team",
+                                   "members": [{"value": user_id}]},
+                             headers=admin_headers)
+        assert group_resp.status_code == 201, group_resp.text
+        group_id = group_resp.json()["id"]
+
+        roles = {r["name"]: r["id"]
+                for r in db.get("/api/roles", headers=admin_headers).json()["roles"]}
+        grant = db.post("/api/role-bindings",
+                        json={"subject_type": "group", "subject_id": group_id,
+                              "role_id": roles["reviewer"]},
+                        headers=admin_headers)
+        assert grant.status_code == 200, grant.text
+
+        import python.av_server.identity as identity_module_direct
+        identity_module_direct._principal_cache.clear()  # the pre-grant 403 above cached "no perms"
+
+        post = db.post("/api/reviews",
+                       json={"project_id": "pgrb", "target_type": "change_set",
+                             "target_id": "cs-group-rb-proof", "decision": "approve"},
+                       headers=carol_headers)
+        assert post.status_code == 200, post.text
+
+        # Still restricted to exactly what 'reviewer' grants -- not a blanket unlock.
+        still_denied = db.post("/api/tokens", json={"name": "x"}, headers=carol_headers)
+        assert still_denied.status_code == 403
+
+    def test_removing_group_membership_revokes_the_inherited_permission(self, db, scoped_users):
+        """The group-expansion subquery reads CURRENT `group_members` rows at request
+        time -- removing carol from the group (via the same SCIM PATCH an IdP's group
+        sync uses) must revoke her `reviewer` permission immediately, with no separate
+        role_bindings change needed."""
+        admin_headers = {"Authorization": "Bearer trainer-token-12345"}
+        import python.av_server.identity as identity_module_direct
+
+        created = db.post("/api/users", json={"username": "grouped-dave"}, headers=admin_headers)
+        user_id = created.json()["id"]
+        raw_token = "dave-group-token-abc456"
+        self._mint_user_token(user_id, raw_token)
+        dave_headers = {"Authorization": f"Bearer {raw_token}"}
+
+        obj_hash = _upload_object(db, b'{"diff":"group-revoke-reviewable"}', headers=admin_headers)
+        db.post("/api/change-sets",
+               json={"id": "cs-group-revoke-proof", "project_id": "pgrbr", "object_id": obj_hash},
+               headers=admin_headers)
+
+        group_resp = db.post("/scim/v2/Groups",
+                             json={"displayName": "reviewers-team-2",
+                                   "members": [{"value": user_id}]},
+                             headers=admin_headers)
+        group_id = group_resp.json()["id"]
+        roles = {r["name"]: r["id"]
+                for r in db.get("/api/roles", headers=admin_headers).json()["roles"]}
+        db.post("/api/role-bindings",
+               json={"subject_type": "group", "subject_id": group_id, "role_id": roles["reviewer"]},
+               headers=admin_headers)
+        identity_module_direct._principal_cache.clear()
+
+        allowed = db.post("/api/reviews",
+                          json={"project_id": "pgrbr", "target_type": "change_set",
+                                "target_id": "cs-group-revoke-proof", "decision": "approve"},
+                          headers=dave_headers)
+        assert allowed.status_code == 200, allowed.text
+
+        # Remove dave from the group via SCIM PATCH (the "remove" op an IdP's own group
+        # sync uses when a user leaves a group upstream).
+        patch = db.patch(f"/scim/v2/Groups/{group_id}",
+                         json={"Operations": [{"op": "remove", "path": "members",
+                                              "value": [{"value": user_id}]}]},
+                         headers=admin_headers)
+        assert patch.status_code == 200, patch.text
+        assert all(m["value"] != user_id for m in patch.json()["members"])
+
+        identity_module_direct._principal_cache.clear()
+        revoked = db.post("/api/reviews",
+                          json={"project_id": "pgrbr", "target_type": "change_set",
+                                "target_id": "cs-group-revoke-proof", "decision": "approve"},
+                          headers=dave_headers)
+        assert revoked.status_code == 403, revoked.text
+
+
+# ---------------------------------------------------------------------------
+# v1.3.3 (WP-17) — SCIM 2.0 (/scim/v2), live against real Postgres.
+# ---------------------------------------------------------------------------
+
+class TestScim:
+    def _admin(self) -> dict:
+        return {"Authorization": "Bearer trainer-token-12345"}
+
+    def test_service_provider_config_and_resource_types(self, db, scoped_users):
+        cfg = db.get("/scim/v2/ServiceProviderConfig", headers=self._admin())
+        assert cfg.status_code == 200
+        assert cfg.json()["patch"]["supported"] is True
+
+        types = db.get("/scim/v2/ResourceTypes", headers=self._admin())
+        assert types.status_code == 200
+        names = {r["id"] for r in types.json()["Resources"]}
+        assert names == {"User", "Group"}
+
+    def test_create_get_list_filter_user(self, db, scoped_users):
+        admin = self._admin()
+        created = db.post("/scim/v2/Users",
+                          json={"userName": "scim.alice", "displayName": "Alice",
+                                "emails": [{"value": "alice@example.com", "primary": True}],
+                                "externalId": "ext-alice-1"},
+                          headers=admin)
+        assert created.status_code == 201, created.text
+        body = created.json()
+        assert body["userName"] == "scim.alice"
+        assert body["active"] is True
+        user_id = body["id"]
+
+        fetched = db.get(f"/scim/v2/Users/{user_id}", headers=admin)
+        assert fetched.status_code == 200
+        assert fetched.json()["emails"][0]["value"] == "alice@example.com"
+
+        listed = db.get("/scim/v2/Users", headers=admin,
+                        params={"filter": 'userName eq "scim.alice"'})
+        assert listed.status_code == 200
+        assert listed.json()["totalResults"] == 1
+        assert listed.json()["Resources"][0]["id"] == user_id
+
+        by_external = db.get("/scim/v2/Users", headers=admin,
+                             params={"filter": 'externalId eq "ext-alice-1"'})
+        assert by_external.json()["totalResults"] == 1
+
+    def test_create_is_not_idempotent_and_reports_409_uniqueness(self, db, scoped_users):
+        """A real IdP retries a provisioning POST -- a 409 (not a silent duplicate, not a
+        silent 200) is what makes that retry safe: the IdP falls back to GET+PATCH."""
+        admin = self._admin()
+        first = db.post("/scim/v2/Users", json={"userName": "scim.bob"}, headers=admin)
+        assert first.status_code == 201
+
+        again = db.post("/scim/v2/Users", json={"userName": "scim.bob"}, headers=admin)
+        assert again.status_code == 409
+        assert again.json()["schemas"] == ["urn:ietf:params:scim:api:messages:2.0:Error"]
+        assert again.json()["scimType"] == "uniqueness"
+
+    def test_patch_active_false_suspends_and_revokes_sessions_not_a_hard_delete(self, db, scoped_users):
+        admin = self._admin()
+        created = db.post("/scim/v2/Users", json={"userName": "scim.carol"}, headers=admin)
+        user_id = created.json()["id"]
+
+        patched = db.patch(f"/scim/v2/Users/{user_id}",
+                           json={"Operations": [{"op": "replace", "path": "active", "value": False}]},
+                           headers=admin)
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["active"] is False
+
+        # Still readable -- not deleted (audit/authorship attribution survives).
+        still_there = db.get(f"/scim/v2/Users/{user_id}", headers=admin)
+        assert still_there.status_code == 200
+        assert still_there.json()["userName"] == "scim.carol"
+
+        reactivated = db.put(f"/scim/v2/Users/{user_id}",
+                             json={"userName": "scim.carol", "active": True}, headers=admin)
+        assert reactivated.status_code == 200
+        assert reactivated.json()["active"] is True
+
+    def test_delete_user_suspends_rather_than_removing_the_row(self, db, scoped_users):
+        admin = self._admin()
+        created = db.post("/scim/v2/Users", json={"userName": "scim.erin"}, headers=admin)
+        user_id = created.json()["id"]
+
+        deleted = db.delete(f"/scim/v2/Users/{user_id}", headers=admin)
+        assert deleted.status_code == 204
+
+        still_there = db.get(f"/scim/v2/Users/{user_id}", headers=admin)
+        assert still_there.status_code == 200
+        assert still_there.json()["active"] is False
+
+    def test_group_create_patch_members_and_delete(self, db, scoped_users):
+        admin = self._admin()
+        u1 = db.post("/scim/v2/Users", json={"userName": "scim.member1"}, headers=admin).json()["id"]
+        u2 = db.post("/scim/v2/Users", json={"userName": "scim.member2"}, headers=admin).json()["id"]
+
+        group = db.post("/scim/v2/Groups",
+                        json={"displayName": "scim-team", "members": [{"value": u1}]},
+                        headers=admin)
+        assert group.status_code == 201, group.text
+        group_id = group.json()["id"]
+        assert {m["value"] for m in group.json()["members"]} == {u1}
+
+        added = db.patch(f"/scim/v2/Groups/{group_id}",
+                         json={"Operations": [{"op": "add", "path": "members",
+                                              "value": [{"value": u2}]}]},
+                         headers=admin)
+        assert added.status_code == 200
+        assert {m["value"] for m in added.json()["members"]} == {u1, u2}
+
+        removed = db.patch(f"/scim/v2/Groups/{group_id}",
+                           json={"Operations": [{"op": "remove", "path": "members",
+                                                "value": [{"value": u1}]}]},
+                           headers=admin)
+        assert removed.status_code == 200
+        assert {m["value"] for m in removed.json()["members"]} == {u2}
+
+        deleted = db.delete(f"/scim/v2/Groups/{group_id}", headers=admin)
+        assert deleted.status_code == 204
+        assert db.get(f"/scim/v2/Groups/{group_id}", headers=admin).status_code == 404
+
+    def test_scim_scope_required_for_reader_only_token(self, db, scoped_users):
+        denied = db.get("/scim/v2/Users", headers={"Authorization": "Bearer reader-token-12345"})
+        # reader-token-12345 carries explicit scopes=["read"], no wildcard and no "scim"
+        # -- this must be denied, not silently treated as SCIM-privileged.
+        assert denied.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# v1.3.3 (WP-10/WP-11) — sso_crypto.py: provider secrets are Fernet-encrypted at rest,
+# never round-tripped back out in plaintext.
+# ---------------------------------------------------------------------------
+
+class TestSsoCrypto:
+    def test_encrypt_decrypt_round_trip_and_masking(self, monkeypatch):
+        monkeypatch.setenv("AV_SECRET_KEY", "test-secret-key-for-sso-crypto")
+        from python.av_server import sso_crypto
+
+        config = {"issuer": "https://idp.example.com", "client_id": "abc",
+                  "client_secret": "super-secret-value"}
+        stored = sso_crypto.encrypt_config(config)
+        assert stored["client_secret"] != "super-secret-value"
+        assert stored["issuer"] == "https://idp.example.com"  # non-secret fields untouched
+
+        restored = sso_crypto.decrypt_config(stored)
+        assert restored["client_secret"] == "super-secret-value"
+
+        masked = sso_crypto.mask_config(stored)
+        assert masked["client_secret"] == "***REDACTED***"
+        assert masked["issuer"] == "https://idp.example.com"
+
+    def test_encrypt_refuses_a_secret_with_no_key_configured(self, monkeypatch):
+        monkeypatch.delenv("AV_SECRET_KEY", raising=False)
+        from python.av_server import sso_crypto
+
+        with pytest.raises(sso_crypto.SecretsUnavailable):
+            sso_crypto.encrypt_config({"client_secret": "x"})
+
+    def test_sso_provider_create_stores_secret_encrypted_not_plaintext(self, db, scoped_users, monkeypatch):
+        monkeypatch.setenv("AV_SECRET_KEY", "test-secret-key-for-sso-crypto")
+        admin = {"Authorization": "Bearer trainer-token-12345"}
+        created = db.post("/api/sso-providers",
+                          json={"kind": "oidc", "name": "test-idp",
+                                "config": {"issuer": "https://idp.example.com",
+                                          "client_id": "abc", "client_secret": "shh"}},
+                          headers=admin)
+        assert created.status_code == 200, created.text
+        provider_id = created.json()["id"]
+
+        shown = db.get(f"/api/sso-providers/{provider_id}", headers=admin)
+        assert shown.json()["config"]["client_secret"] == "***REDACTED***"
+
+        import asyncpg
+
+        async def _raw_config():
+            conn = await asyncpg.connect(
+                AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+            )
+            try:
+                row = await conn.fetchrow("SELECT config FROM sso_providers WHERE id = $1", provider_id)
+                return row["config"]
+            finally:
+                await conn.close()
+
+        raw = asyncio.run(_raw_config())
+        assert "shh" not in raw  # the plaintext secret must never appear in the stored row
+
+
+# ---------------------------------------------------------------------------
+# v1.3.3 (WP-12) — device_flow.py: Redis-backed device-code state for `av login`.
+# ---------------------------------------------------------------------------
+
+class TestDeviceFlow:
+    """device_flow.py's async functions read `redis_cache.py::cache._client` -- the
+    app's own pooled Redis connection, bound to the TestClient's lifespan event loop
+    (started once, session-scoped). Calling them from a fresh `asyncio.run()` here
+    reuses that pooled connection from a DIFFERENT loop and hits exactly the documented
+    cross-loop failure class this codebase already hit once for asyncpg (`_truncate_all`'s
+    own comment) -- confirmed live: the very first draft of this test, calling
+    `device_flow.create()` straight from `asyncio.run()`, failed with
+    `RuntimeError: ... got Future ... attached to a different loop`. The fix mirrors
+    `_truncate_all()`'s own: a brand-new Redis client, opened AND used entirely inside
+    this call's own loop, swapped in for the duration via monkeypatch."""
+
+    def _run_with_isolated_redis_client(self, coro_fn, monkeypatch):
+        from python.av_server import redis_cache as redis_cache_module
+
+        async def _run():
+            import redis.asyncio as redis_asyncio
+
+            isolated_client = redis_asyncio.from_url(
+                redis_cache_module.REDIS_URL, decode_responses=True,
+            )
+            monkeypatch.setattr(redis_cache_module.cache, "_client", isolated_client)
+            try:
+                return await coro_fn()
+            finally:
+                await isolated_client.aclose()
+
+        return asyncio.run(_run())
+
+    def test_create_approve_poll_round_trip_is_single_use(self, db, monkeypatch):
+        from python.av_server import device_flow
+
+        async def _body():
+            created = await device_flow.create("provider-x", ttl_secs=60)
+            assert "-" in created["user_code"]
+
+            pending = await device_flow.lookup_by_user_code(created["user_code"])
+            assert pending["provider_id"] == "provider-x"
+            assert pending["status"] == "pending"
+
+            not_yet = await device_flow.poll(created["device_code"])
+            assert not_yet == ("pending", None)
+
+            approved = await device_flow.approve(created["user_code"], "a-real-session-token")
+            assert approved is True
+
+            polled = await device_flow.poll(created["device_code"])
+            assert polled == ("approved", "a-real-session-token")
+
+            # Single-use: a second poll of the same device_code must not re-deliver the
+            # token (the record is deleted on first successful collection).
+            second_poll = await device_flow.poll(created["device_code"])
+            assert second_poll == ("expired", None)
+
+        self._run_with_isolated_redis_client(_body, monkeypatch)
+
+    def test_poll_unknown_device_code_reports_expired(self, db, monkeypatch):
+        from python.av_server import device_flow
+
+        async def _body():
+            return await device_flow.poll("never-issued-device-code")
+
+        result = self._run_with_isolated_redis_client(_body, monkeypatch)
+        assert result == ("expired", None)

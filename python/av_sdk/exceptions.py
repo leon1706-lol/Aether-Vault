@@ -16,7 +16,8 @@ EXIT_CODES = {
     "frozen": 18,
     "review_required": 19,
     "scope_denied": 20,
-    "tenant_denied": 22,  # 21 (login_required) is deliberately unregistered -- see core.py
+    "login_required": 21,  # v1.3.3: activated once `av login` (a real caller) existed
+    "tenant_denied": 22,
 }
 
 
@@ -90,6 +91,10 @@ class ScopeDeniedError(SDKError):
     code = "scope_denied"
 
 
+class LoginRequiredError(SDKError):
+    code = "login_required"
+
+
 class TenantDeniedError(SDKError):
     code = "tenant_denied"
 
@@ -106,6 +111,7 @@ _CODE_TO_CLASS: dict[str, type[SDKError]] = {
     "frozen": FrozenError,
     "review_required": ReviewRequiredError,
     "scope_denied": ScopeDeniedError,
+    "login_required": LoginRequiredError,
     "tenant_denied": TenantDeniedError,
 }
 

@@ -69,6 +69,17 @@ docker = ["PyYAML>=6.0"]
 # installed package stays dependency-free; CI (this extra) always exercises the strict path.
 dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0", "httpx>=0.24.0", "jsonschema>=4.0", "PyYAML>=6.0"]
 benchmarks = ["dvc>=3.55,<4", "mlflow>=2.16"]
+# v1.3.3: SSO (OIDC) — authlib does the OAuth2/OIDC protocol work (PKCE, JWKS-based ID
+# token verification); pyjwt[crypto] is used directly for the device-code flow's own
+# short-lived tokens (not an OIDC concern, no need to route it through authlib).
+# Optional like every other extra here: an unconfigured server never imports this at
+# all (no sso_providers row of kind="oidc" means the OIDC module is never touched).
+sso = ["authlib>=1.3", "pyjwt[crypto]>=2.8"]
+# v1.3.3: SSO (SAML) — pysaml2 needs the native xmlsec1/libxml2 libraries (installed in
+# the Dockerfile's engine/server targets); kept as its OWN extra, separate from `sso`
+# above, so a pip-only CLI install (no SAML IdP in play) never needs the native
+# dependency at all.
+saml = ["pysaml2>=7.5"]
 
 [project.scripts]
 av = "av_cli.main:run"

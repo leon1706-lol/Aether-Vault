@@ -47,11 +47,16 @@ secret — each teammate revokes/rotates independently and commits attribute to 
 `av user`/`av tenant`), hard multi-tenancy (an application-level guard plus Postgres
 row-level security enforced via a dedicated non-superuser DB role — both gated behind
 `AV_TENANCY_ENFORCE`, off by default), and `av admin backup`/`restore` for disaster
-recovery. **Still not shipped**: SSO (OIDC/SAML), SCIM provisioning, and
-cryptographically signed/hash-chained audit logs — `audit_log` rows are plain, unsigned
-database rows today (unlike `policy_packs`, which already uses the hash-chain pattern a
-future audit-signing feature would reuse). Reports about the shipped defaults are still welcome — reference them so we can
-link.
+recovery. **Shipped as of v1.3.3**: cryptographically hash-chained audit logs
+(`chain_hash` on every row, migration `0016`, `av audit verify` detects tampering from
+the first broken row forward; optional ed25519 signing via `AV_AUDIT_SIGNING_KEY_PATH`
+adds non-repudiation), SSO (OIDC authorization-code+PKCE and SAML 2.0, `av login`/`av
+idp`), and SCIM 2.0 provisioning (`/scim/v2/*`, `av scim`). SSO/SCIM's protocol handling
+is implemented and tested against this server's own routes; it has not yet been driven
+end-to-end against a live external IdP (Keycloak/Okta/Entra) in this environment — see
+`development/threat-model.md`'s T19–T22 for the genuinely new trust boundary an external
+IdP introduces. Reports about the shipped defaults are still welcome — reference them so
+we can link.
 
 **Out of scope:** social engineering, brute-force against deployments you don't own,
 vulnerabilities in Docker/Postgres/Redis themselves (report upstream), and self-hosted
