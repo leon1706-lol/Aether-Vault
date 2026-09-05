@@ -113,13 +113,24 @@ push_object_and_commit() {
   local body="ha-drill-object-$n"
   local hash
   hash="$($PY -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$body")"
-  curl -sf -o /dev/null -X POST "$API/api/objects/$hash" \
-    -H "Content-Type: application/octet-stream" --data-binary "$body" || return 1
+  # v1.3.3.5 fix (found live, right after the hash fix above actually let uploads
+  # succeed): `curl -f`/`--fail` treats ANY response >= 400 as a failure, 409 included --
+  # but 409 ("already exists") is this repo's own documented, CORRECT idempotent outcome
+  # for a CAS re-upload of identical content, exactly like the commit call two lines
+  # below already tolerates. This function's own SECOND (sequential) call site below
+  # deliberately re-pushes the SAME 20 objects the first (concurrent) pass just
+  # uploaded, specifically to prove a retry of already-landed work is harmless -- with
+  # `-f`, that retry pass turned "already landed, harmless" into 20 hard failures on
+  # every single run, every time, unconditionally (not a race, not a flake).
+  local obj_code
+  obj_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/objects/$hash" \
+    -H "Content-Type: application/octet-stream" --data-binary "$body")"
+  [[ "$obj_code" == "201" || "$obj_code" == "409" ]] || { echo "push $n object upload got HTTP $obj_code" >&2; return 1; }
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/commits" \
     -H "Content-Type: application/json" \
     -d "{\"hash\": \"$hash\", \"message\": \"ha-drill-$n\", \"root_tree_hash\": \"$hash\", \"project_id\": \"ha-drill\", \"project_name\": \"ha-drill\"}")"
-  [[ "$code" == "201" || "$code" == "409" ]] || { echo "push $n got HTTP $code" >&2; return 1; }
+  [[ "$code" == "201" || "$code" == "409" ]] || { echo "push $n commit got HTTP $code" >&2; return 1; }
 }
 export -f push_object_and_commit
 export API PY
