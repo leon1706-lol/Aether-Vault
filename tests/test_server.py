@@ -3838,6 +3838,15 @@ class TestScim:
 
 class TestSsoCrypto:
     def test_encrypt_decrypt_round_trip_and_masking(self, monkeypatch):
+        # `cryptography` is the OPTIONAL `[sign]` extra (sso_crypto.py's own docstring:
+        # "reuses the [sign] extra's cryptography dependency"), not a hard dependency of
+        # this package -- a bare `pip install -e .[dev]` (what CI's server-tests/test
+        # jobs actually install) genuinely doesn't have it, matching test_signing.py's
+        # own established `pytest.importorskip("cryptography")` pattern for the exact
+        # same reason. Found live: this test failed in CI, not locally, since local dev
+        # here already has the [sso] extra (which pulls in cryptography transitively)
+        # installed.
+        pytest.importorskip("cryptography")
         monkeypatch.setenv("AV_SECRET_KEY", "test-secret-key-for-sso-crypto")
         from python.av_server import sso_crypto
 
@@ -3862,6 +3871,7 @@ class TestSsoCrypto:
             sso_crypto.encrypt_config({"client_secret": "x"})
 
     def test_sso_provider_create_stores_secret_encrypted_not_plaintext(self, db, scoped_users, monkeypatch):
+        pytest.importorskip("cryptography")  # see the sibling test's comment above
         monkeypatch.setenv("AV_SECRET_KEY", "test-secret-key-for-sso-crypto")
         admin = {"Authorization": "Bearer trainer-token-12345"}
         created = db.post("/api/sso-providers",

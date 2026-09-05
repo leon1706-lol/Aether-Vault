@@ -142,7 +142,12 @@ jobs:
           python-version: "3.10"
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
-        run: pip install -e .[dev]
+        # [sign] (small wheel, same reasoning as e2e-suite's own install line below) so
+        # TestSsoCrypto's real Fernet-encryption path is actually exercised somewhere
+        # against live Postgres+Redis, not skipped everywhere -- tests/test_server.py
+        # itself gracefully importorskip()s the two tests that need it when absent, so
+        # this extra is additive coverage here, not a requirement to keep this job green.
+        run: pip install -e .[dev,sign]
 
       - name: Start aether-vault-server (for the real-wire test)
         env:
@@ -202,7 +207,7 @@ jobs:
           python-version: "3.10"
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
-        run: pip install -e .[dev]
+        run: pip install -e .[dev,sign]
 
       - name: Run av_server tests against live native Postgres + Memurai
         shell: pwsh

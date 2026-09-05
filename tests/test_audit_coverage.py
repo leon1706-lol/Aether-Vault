@@ -54,9 +54,30 @@ def _transitive_source(func, funcs_by_name: dict[str, object], depth: int = 2,
     return source + "\n".join(extra)
 
 
+def _iter_routes_recursive(routes):
+    """Newer FastAPI/Starlette (found live: fastapi 0.141.1 + starlette>=1.6, NOT pinned
+    by this repo's own `fastapi>=0.104.0` floor, so a fresh `pip install` can pick either
+    up at any time) represents a router mounted via `app.include_router(...)` as an
+    opaque, private `_IncludedRouter` wrapper in `app.routes` instead of flattening its
+    routes eagerly — it has no `.path`/`.methods`/`.endpoint` of its own, only an
+    `original_router` (the real `APIRouter` passed to `include_router()`) resolved
+    lazily. `sso_oidc.router`/`sso_saml.router`/`scim.router` (v1.3.3) are the FIRST use
+    of `include_router()` anywhere in this codebase — every other route here is a bare
+    `@app.get/post/...` decorator, which is why this never surfaced before. Matched
+    structurally (`hasattr(route, "original_router")`), not via `isinstance` against the
+    private class name, so this keeps working if that name changes again in a future
+    FastAPI release."""
+    for route in routes:
+        original_router = getattr(route, "original_router", None)
+        if original_router is not None:
+            yield from _iter_routes_recursive(original_router.routes)
+        else:
+            yield route
+
+
 def _mutating_routes():
     seen: set[tuple[str, str]] = set()
-    for route in server_module.app.routes:
+    for route in _iter_routes_recursive(server_module.app.routes):
         methods = getattr(route, "methods", None)
         endpoint = getattr(route, "endpoint", None)
         path = getattr(route, "path", None)

@@ -44,13 +44,23 @@ def test_init_non_interactive_defaults_to_local(tmp_path, monkeypatch):
     assert cfg["login_mode"] == "local"
 
 
-def test_init_enterprise_mode_shows_stub_message(tmp_path, monkeypatch):
+def test_init_enterprise_mode_falls_back_to_local_when_login_does_not_succeed(tmp_path, monkeypatch):
+    """v1.3.3: `StubEnterpriseAuthProvider` (which printed 'coming soon' and always
+    returned None) was replaced with a real `DeviceCodeEnterpriseAuthProvider` that
+    actually attempts an SSO login against `http://localhost:8000` (the default when
+    `--url` isn't given) — this test's own OLD assertion on that literal stub string is
+    obsolete, not the fallback behavior itself, which is genuinely still real and still
+    correct: whatever the real reason a real SSO login didn't complete (registry
+    unreachable, OR reachable but has no SSO provider configured -- deliberately NOT
+    asserted on which one, since a real dev stack can genuinely be up on localhost:8000
+    in this environment, the exact hazard `conftest.py`'s own `unreachable_client`
+    fixture docstring already documents for a different code path), `av init --mode
+    enterprise` must still land safely in local mode, exactly like the stub used to."""
     monkeypatch.chdir(tmp_path)
     result = invoke("init", "--mode", "enterprise", "--no-repl")
     assert result.exit_code == 0, result.output
-    assert "coming soon" in result.output.lower()
     cfg = json.loads((tmp_path / ".av" / "config").read_text())
-    assert cfg["login_mode"] == "local"  # stub falls back to local
+    assert cfg["login_mode"] == "local"  # SSO login not completed -> falls back to local
 
 
 # ---------------------------------------------------------------------------

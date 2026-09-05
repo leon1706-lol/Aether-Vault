@@ -150,8 +150,29 @@ def test_backup_restore_proceeds_on_an_empty_database(tmp_path, monkeypatch):
     _write_fake_backup(tmp_path)
     monkeypatch.setattr(cmd_admin, "_psql_scalar", lambda *a, **kw: "0")
     calls = []
-    monkeypatch.setattr(cmd_admin.subprocess, "run",
-                        lambda cmd, **kw: calls.append(cmd) or type("R", (), {"returncode": 0})())
+    # `cmd_admin.subprocess` IS the real, process-wide `subprocess` module (a bare
+    # `import subprocess`, not a copy) -- this monkeypatch is unavoidably GLOBAL for the
+    # duration of the test, not scoped to cmd_admin's own calls. Found live: `stdout=b""`
+    # matters, not just `returncode` -- `subprocess.check_output()`'s own stdlib
+    # implementation calls `run(..., stdout=PIPE).stdout`, and `platform.win32_ver()`
+    # (transitively imported the FIRST time anything imports far enough into
+    # `sqlalchemy.util.compat`, which happens somewhere in this exact test depending on
+    # what other tests already ran first) uses `subprocess.check_output()` under the
+    # hood on Windows -- a fake result object missing `.stdout` crashes that completely
+    # unrelated stdlib call with `AttributeError: 'R' object has no attribute 'stdout'`
+    # the moment it's the first thing in the whole process to trigger that import path.
+    def _fake_run(cmd, **kw):
+        calls.append(cmd)
+        # Text vs bytes mode must match what a REAL `subprocess.run`/`check_output`
+        # would return for these kwargs -- the unrelated stdlib caller documented above
+        # (`platform.win32_ver()`) calls `check_output(..., text=True)` and then runs a
+        # regex `str` match against the result; a bytes stdout there raises `TypeError:
+        # cannot use a string pattern on a bytes-like object` instead of the original
+        # AttributeError, found live by fixing the first crash and rerunning.
+        text_mode = bool(kw.get("text") or kw.get("universal_newlines") or kw.get("encoding"))
+        return type("R", (), {"returncode": 0, "stdout": "" if text_mode else b""})()
+
+    monkeypatch.setattr(cmd_admin.subprocess, "run", _fake_run)
     monkeypatch.setattr(cmd_admin.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     async def _fake_heal():

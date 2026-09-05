@@ -149,7 +149,16 @@ services:
   redis-replica:
     image: redis/redis-stack-server:latest
     container_name: aether-vault-ha-redis-replica
-    command: ["--replicaof", "redis-primary", "6379"]
+    # NOT a `command:` override -- this image's default CMD is `/entrypoint.sh` itself
+    # (there is no separate ENTRYPOINT keeping it fixed; confirmed via `docker inspect`:
+    # Entrypoint is null, Cmd is ["/entrypoint.sh"]), so a `command:` override replaces
+    # that script entirely rather than passing arguments to it -- Docker then tries to
+    # exec "--replicaof" directly as the container's own binary and fails with
+    # `executable file not found in $PATH`. The script itself appends extra redis-server
+    # flags from the REDIS_ARGS env var at the end of its own invocation, which is the
+    # image's actual supported extension point for this.
+    environment:
+      - REDIS_ARGS=--replicaof redis-primary 6379
     volumes:
       - ha_redis_replica_data:/data
     depends_on:

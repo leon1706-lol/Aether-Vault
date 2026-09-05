@@ -369,7 +369,22 @@ def backup_restore(backup_dir, database_url, data_dir, db_container, engine_cont
         data_path = Path(data_dir)
         data_path.mkdir(parents=True, exist_ok=True)
         with tarfile.open(objects_archive_path, "r:gz") as tf:
-            tf.extractall(data_path, filter="data")
+            # `filter="data"` (PEP 706 — rejects absolute paths/path traversal/device
+            # files during extraction) is unconditionally passed here in every prior
+            # version of this line, which raises `TypeError: extractall() got an
+            # unexpected keyword argument 'filter'` on any Python before the filter
+            # mechanism existed at all (3.10/3.11, this repo's own declared floor and an
+            # actual CI matrix entry — found live, not by reading changelogs: CI's
+            # `test (3.10)` job). `hasattr(tarfile, "data_filter")` (not a hardcoded
+            # version-number check) correctly picks up the early point-release backports
+            # too (3.8.17+/3.9.17+/3.10.12+/3.11.4+ all shipped the filter mechanism as a
+            # security patch before 3.12 made it the norm), so this only silently drops
+            # the hardening on a Python old enough to genuinely lack it, never on a
+            # patched-forward 3.10/3.11.
+            if hasattr(tarfile, "data_filter"):
+                tf.extractall(data_path, filter="data")
+            else:
+                tf.extractall(data_path)
 
     # --- Part 3: bring the schema to THIS build's head (heals a backup taken on an
     # older migration chain — the same adoption path a legacy volume goes through).

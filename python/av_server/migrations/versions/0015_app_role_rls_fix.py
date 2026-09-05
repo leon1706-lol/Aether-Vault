@@ -97,23 +97,83 @@ END
 $$;
 """
 
+# `ALTER DEFAULT PRIVILEGES FOR ROLE <name>` needs the MIGRATING role's own name as an
+# identifier -- originally hardcoded to the literal `av_user` (the role this repo's own
+# `docker-compose.yml` happens to name its Postgres superuser/migrator), which is exactly
+# the same "not a fixed constant this module controls" mistake `_GRANT_CONNECT_SQL`'s own
+# comment already warns against for the database name, just made here for the role name
+# instead. Found live: this repo's own Windows CI runner provisions PostgreSQL fresh via
+# Chocolatey with only a `postgres` superuser and no `av_user` role at all -- migrating
+# there raised `UndefinedObjectError: role "av_user" does not exist`, on every single
+# fixture setup, cascading into 146+ test ERRORs from one bad literal. Fixed the same way
+# `_GRANT_CONNECT_SQL` already fixed the database-name version of this exact mistake:
+# `EXECUTE format(...)` against `CURRENT_USER` (whichever role is ACTUALLY running this
+# migration, on ANY deployment) instead of a hardcoded name. Semantically identical to the
+# original intent either way -- the migrating role is always the one that creates future
+# tables/sequences, so "future objects THE MIGRATOR creates" and "future objects av_user
+# creates" mean the same thing on this repo's own topology, and the dynamic form is also
+# now correct everywhere else.
+_ALTER_DEFAULT_GRANT_TABLES_SQL = f"""
+DO $$
+BEGIN
+  EXECUTE format(
+    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+    'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {APP_ROLE}',
+    CURRENT_USER
+  );
+END
+$$;
+"""
+
+_ALTER_DEFAULT_GRANT_SEQUENCES_SQL = f"""
+DO $$
+BEGIN
+  EXECUTE format(
+    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+    'GRANT USAGE, SELECT ON SEQUENCES TO {APP_ROLE}',
+    CURRENT_USER
+  );
+END
+$$;
+"""
+
+_ALTER_DEFAULT_REVOKE_SEQUENCES_SQL = f"""
+DO $$
+BEGIN
+  EXECUTE format(
+    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+    'REVOKE USAGE, SELECT ON SEQUENCES FROM {APP_ROLE}',
+    CURRENT_USER
+  );
+END
+$$;
+"""
+
+_ALTER_DEFAULT_REVOKE_TABLES_SQL = f"""
+DO $$
+BEGIN
+  EXECUTE format(
+    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+    'REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM {APP_ROLE}',
+    CURRENT_USER
+  );
+END
+$$;
+"""
+
 _GRANT_STATEMENTS = [
     f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}",
     f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {APP_ROLE}",
     f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {APP_ROLE}",
-    # Future tables/sequences: anything av_user (the migrator) creates in a LATER
-    # migration is automatically granted to av_app with no per-migration maintenance.
-    f"ALTER DEFAULT PRIVILEGES FOR ROLE av_user IN SCHEMA public "
-    f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {APP_ROLE}",
-    f"ALTER DEFAULT PRIVILEGES FOR ROLE av_user IN SCHEMA public "
-    f"GRANT USAGE, SELECT ON SEQUENCES TO {APP_ROLE}",
+    # Future tables/sequences: anything the migrating role creates in a LATER migration
+    # is automatically granted to av_app with no per-migration maintenance.
+    _ALTER_DEFAULT_GRANT_TABLES_SQL,
+    _ALTER_DEFAULT_GRANT_SEQUENCES_SQL,
 ]
 
 _REVOKE_STATEMENTS = [
-    f"ALTER DEFAULT PRIVILEGES FOR ROLE av_user IN SCHEMA public "
-    f"REVOKE USAGE, SELECT ON SEQUENCES FROM {APP_ROLE}",
-    f"ALTER DEFAULT PRIVILEGES FOR ROLE av_user IN SCHEMA public "
-    f"REVOKE SELECT, INSERT, UPDATE, DELETE ON TABLES FROM {APP_ROLE}",
+    _ALTER_DEFAULT_REVOKE_SEQUENCES_SQL,
+    _ALTER_DEFAULT_REVOKE_TABLES_SQL,
     f"REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {APP_ROLE}",
     f"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {APP_ROLE}",
     f"REVOKE USAGE ON SCHEMA public FROM {APP_ROLE}",

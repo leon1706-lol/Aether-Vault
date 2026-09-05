@@ -56,6 +56,17 @@ jobs:
           python-version: "3.12"
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
+        # `src/core.cpp` uses C++17 <filesystem> (fs::path/exists/file_size/
+        # last_write_time) -- Apple's libc++ marks every one of those symbols
+        # unavailable before macOS 10.15, but setuptools' default deployment target on
+        # this runner's Python build is 10.14 (baked into the interpreter, not this
+        # repo's own build config -- confirmed via `docker inspect`-style investigation:
+        # no `-mmacosx-version-min`/`MACOSX_DEPLOYMENT_TARGET` is set anywhere in this
+        # repo), so the compile fails with "'path' is unavailable: introduced in macOS
+        # 10.15" before this env var is set. 10.15 is the minimum that actually compiles;
+        # not raised further to stay maximally compatible.
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
         run: pip install -e .[dev]
 
       - name: Cross-OS golden-hash fixtures (env snapshot + CDC chunking)
