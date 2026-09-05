@@ -60,9 +60,15 @@ done
 [[ -n "$PY" ]] || die "no working python/python3 on PATH"
 
 wait_ready() {
+  # v1.3.3.7 fix (found live): no timeout on this curl meant a single request that
+  # connects but never responds (a real hang, not a clean refuse-fast failure -- e.g.
+  # the LB proxying to a container whose IP it has stale-cached) could block this WHOLE
+  # loop indefinitely on ONE of its 60 tries, well past this job's own CI timeout,
+  # rather than cycling through retries and failing cleanly via the `return 1` below.
+  # `--connect-timeout 5 --max-time 10` bounds every single attempt.
   local url="$1" tries=60
   while (( tries-- > 0 )); do
-    if curl -sf -o /dev/null "$url"; then return 0; fi
+    if curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then return 0; fi
     sleep 2
   done
   return 1
@@ -215,17 +221,31 @@ log "phase 4: Redis-backed rate limiter enforces ONE global limit across both re
 # Applied HERE, not from phase 0 — see that section's own comment for why: phases 1-3's
 # legitimate traffic must never share this budget. `docker compose up -d` (no --build,
 # images are already built) detects the changed environment and recreates ONLY the two
-# engine containers with it, leaving the LB/Postgres/Redis containers (and their state —
-# the replication/webhook proof phases 0b/3 already established) completely undisturbed.
+# engine containers with it, leaving Postgres/Redis (and their state — the replication/
+# webhook proof phases 0b/3 already established) completely undisturbed.
 export AV_RATE_LIMIT_DEFAULT="6/minute"
 $COMPOSE up -d
+# v1.3.3.7 fix (found live: the job hung 25+ minutes here and hit CI's own 30-minute
+# job timeout, not a clean FAIL — confirmed via the actual log timestamps, a 25-minute
+# gap with zero script output between "engine-1/2 Recreated" and the timeout kill).
+# `docker compose up -d` RECREATES engine-1/engine-2 (a genuinely new container, not
+# the same one restarted -- unlike phase 2's `docker kill`+`docker start`, which reuses
+# the SAME container and therefore the SAME IP) -- Docker assigns a NEW IP to a
+# recreated container. nginx's `upstream` directive (docker/ha/nginx/nginx.conf)
+# resolves `engine-1`/`engine-2` to an IP ONCE, at its own worker startup, with no
+# dynamic re-resolution configured -- so the `lb` container kept trying the OLD, now
+# nonexistent IPs for the rest of the run, and every request past this point either hung
+# or failed depending on exactly how Docker's bridge network handled the stale address.
+# Restarting `lb` forces nginx to re-resolve both upstream hostnames fresh, immediately
+# after the one operation in this whole drill that actually changes their IPs.
+$COMPOSE restart lb
 log "waiting for both engine replicas to report ready again after the rate-limit env change"
 wait_ready "$API/api/ready" || die "engines never became ready again after applying AV_RATE_LIMIT_DEFAULT"
 
 CODES="$WORK/ratelimit_codes.txt"
 : > "$CODES"
 for i in $(seq 1 20); do
-  curl -s -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
+  curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
 done
 wait
 
