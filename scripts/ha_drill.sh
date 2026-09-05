@@ -102,10 +102,19 @@ log "phase 1: baseline concurrent pushes through the LB (no faults injected)"
 
 push_object_and_commit() {
   local n="$1"
+  # v1.3.3.4 fix (found live): the claimed hash was computed over "ha-drill-$n" while the
+  # actual uploaded body is "ha-drill-object-$n" -- two DIFFERENT strings. Every upload
+  # this function ever made was rejected with a real, correct 400 (server-side hash
+  # verification, threat-model T7's own mitigation working exactly as designed) — this
+  # whole drill has apparently never gotten far enough to actually exercise phase 1
+  # successfully before now (masked first by the redis-replica compose bug, then by the
+  # migration-race bug), so this bug in the drill script itself was never caught either.
+  # The hash must be computed over the EXACT bytes sent as the body.
+  local body="ha-drill-object-$n"
   local hash
-  hash="$($PY -c "import hashlib,sys; print(hashlib.sha256(f'ha-drill-{sys.argv[1]}'.encode()).hexdigest())" "$n")"
+  hash="$($PY -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$body")"
   curl -sf -o /dev/null -X POST "$API/api/objects/$hash" \
-    -H "Content-Type: application/octet-stream" --data-binary "ha-drill-object-$n" || return 1
+    -H "Content-Type: application/octet-stream" --data-binary "$body" || return 1
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/commits" \
     -H "Content-Type: application/json" \
