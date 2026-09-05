@@ -91,14 +91,32 @@ wait_ready() {
   # prevent. `-k 5` (`--kill-after`) closes that gap: 5s after the SIGTERM, if the
   # process is still alive, `timeout` escalates to an unmaskable SIGKILL instead of
   # waiting on it indefinitely.
+  #
+  # v1.3.3.10 (found live): `-k 5` made ZERO observable difference -- the very next CI
+  # run hung in this exact spot for the same ~9.5 minutes with the same total absence of
+  # even ONE progress line, which a genuinely SIGKILL-bounded loop cannot produce (10
+  # iterations at a hard 17s worst case each is ~3 minutes, well inside that window).
+  # Two targeted fixes in a row producing byte-identical symptoms means the curl/timeout
+  # layer was very likely never the actual bottleneck -- so instead of a third guess,
+  # this turns on `set -x` with a per-line UTC timestamp in PS4, scoped tightly to just
+  # this loop, so the NEXT hang's raw trace shows conclusively which exact command bash
+  # is stuck on (inside `timeout`/`curl`, or somewhere entirely different this function
+  # doesn't otherwise print anything for, e.g. the arithmetic or the `if` itself).
   local url="$1" tries=60 start_tries=60
+  local _old_ps4="$PS4"
+  PS4='+ [wait_ready $(date -u +%H:%M:%S)] '
+  set -x
   while (( tries-- > 0 )); do
-    if timeout -k 5 12 curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then return 0; fi
+    if timeout -k 5 12 curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then
+      set +x; PS4="$_old_ps4"
+      return 0
+    fi
     if (( tries % 10 == 0 )); then
       log "  ...still waiting on $url ($((start_tries - tries)) attempts so far)"
     fi
     sleep 2
   done
+  set +x; PS4="$_old_ps4"
   return 1
 }
 
