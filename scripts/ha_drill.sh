@@ -290,10 +290,41 @@ wait_ready "$API/api/ready" || die "engines never became ready again after apply
 
 CODES="$WORK/ratelimit_codes.txt"
 : > "$CODES"
+declare -a _rl_pids=()
 for i in $(seq 1 20); do
   timeout -k 5 12 curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
+  _rl_pids+=("$!")
 done
-wait
+# v1.3.3.11 fix (found live): this exact `timeout -k 5 12 curl ...` guard -- the SAME
+# one that supposedly bounds wait_ready's own call -- hung here just as totally and
+# unkillably in the very next CI run after wait_ready itself hung (v1.3.3.10 traced
+# wait_ready succeeding on its first try; the hang had simply moved to this block). Two
+# independent call sites failing identically means curl/`timeout` itself is very
+# unlikely to be the real problem -- so a blind `wait` (zero visibility, and itself
+# exposed to the same "never returns" class of bug if even one job never exits) is
+# replaced with an explicit, bounded poll: a hard 30s deadline, then `kill -9` issued
+# directly from THIS shell on any PID still alive (bypassing `timeout` entirely, in case
+# `timeout` is somehow the thing not returning) -- and, the actual point of this change,
+# `ps -o stat` printed for that PID first. `stat` code `D` means uninterruptible kernel
+# I/O, immune to every signal including SIGKILL, which no shell-level timeout can ever
+# fix; anything else means a signal really should have reached it and didn't for some
+# other reason.
+_rl_deadline=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < _rl_deadline )); do
+  _rl_alive=0
+  for pid in "${_rl_pids[@]}"; do
+    kill -0 "$pid" 2>/dev/null && _rl_alive=$((_rl_alive + 1))
+  done
+  (( _rl_alive == 0 )) && break
+  sleep 2
+done
+for pid in "${_rl_pids[@]}"; do
+  if kill -0 "$pid" 2>/dev/null; then
+    log "  PID $pid still alive after a 30s deadline -- state: $(ps -o pid,stat,etime,cmd -p "$pid" 2>&1 | tail -1)"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+done
+wait 2>/dev/null || true
 
 OK_COUNT="$(grep -c '^200$' "$CODES" || true)"
 LIMITED_COUNT="$(grep -c '^429$' "$CODES" || true)"
