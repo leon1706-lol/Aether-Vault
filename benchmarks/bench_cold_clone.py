@@ -1,15 +1,10 @@
 """Benchmark #5 — cold clone / first pull time.
 
-`av clone` (added in the v1.1.1 cycle) materializes a fresh working copy of a pushed
-project from the registry: full commit metadata + tip objects, into an empty directory.
-Setup (init/add/commit/push of the fixture) happens untimed; only `av clone` is timed.
-
-Git LFS and DVC get real numbers the same way: push the fixture once to a local bare/dir
-remote (setup, not timed), then time a fresh `git clone` + `git lfs pull` / `git clone` +
-`dvc pull` into an empty directory. MLflow is N/A — it has no project-level clone/pull
-concept (artifacts are fetched per-run via `download_artifacts`, not a wholesale "give me
-this project" verb). av requires a running registry (docker compose stack) — without one
-its column reports "server unreachable", not a fabricated number.
+`av clone` materializes a fresh working copy of a pushed project from the registry into
+an empty directory; setup (init/add/commit/push) happens untimed, only `av clone` is
+timed. Git LFS and DVC get real numbers the same way (push to a local remote untimed,
+then time a fresh clone+pull); MLflow is N/A, having no project-level clone/pull concept.
+av requires a running registry -- without one its column reports "server unreachable".
 """
 
 import os
@@ -48,10 +43,7 @@ def _av_server_reachable() -> bool:
 
 def _bench_av() -> tuple[float | None, str | None]:
     """Pushes the standard CLI fixture to the registry (untimed), then times `av clone`.
-
-    Returns (ms, note). The project name is unique per run so repeated captures on a
-    long-lived dev registry don't collide.
-    """
+    Returns (ms, note); the project name is unique per run to avoid collisions."""
     av_path = shutil.which("av")
     if av_path is None:
         return None, "not installed"

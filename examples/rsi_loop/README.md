@@ -1,10 +1,10 @@
-# RSI reference loop (v1.3.1)
+# RSI reference loop
 
 `agent.py` is a deterministic, scripted reference agent that drives the full RSI
 control-plane loop end to end through `av_sdk.Repo` alone — no LLM key, no hidden state.
-It is the concrete answer to todo.md's item 46 ("close the loop end-to-end, in-repo, with
-a reference agent that actually runs it") and the WP-40 work package: it touches every
-write-capable RSI surface `av_sdk.Repo` exposes (see
+It is the concrete answer to "close the loop end-to-end, in-repo, with a reference agent
+that actually runs it": it touches every write-capable RSI surface `av_sdk.Repo` exposes
+(see
 `development/architecture.md`'s "RSI SDK Surface Contract" section for the full list and
 what's deliberately left off the SDK).
 
@@ -56,5 +56,5 @@ against the live server in `tests/test_review.py` and `tests/test_server.py`.
 `tests/test_rsi_loop.py` calls `run_rsi_loop()` — the same function `__main__` calls
 above — against an in-memory fake registry, proving the narrative's logic (every step
 happens in the right order, every denial is the right one) without any live
-infrastructure. This is the test that actually runs in CI; the live run above is part of
-the project's WP-44 live-verification pass.
+infrastructure. This is the test that actually runs in CI; the live run above is the
+real-infrastructure counterpart.

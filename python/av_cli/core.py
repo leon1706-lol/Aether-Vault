@@ -216,18 +216,11 @@ def save_config(repo_root: Path, config: dict) -> None:
 
 
 class _AuthRetryGroup(click.Group):
-    """`cli`'s class (see `cli = click.group(..., cls=_AuthRetryGroup)` below) — catches
-    AuthenticationError from *any* subcommand in one place, rather than wrapping each of the
-    ~7 commands that talk to the server individually (push, commit, checkout, gc, doctor --fix,
-    stash push/pop). Click's MultiCommand.invoke() lets exceptions raised inside a subcommand's
-    callback propagate up through this call, which is the standard way to add a shared
-    error-handling layer across an entire Click command tree.
-
-    Re-runs the command from scratch after saving a token rather than silently retrying
-    mid-operation — several of the affected commands (push, commit, gc) make multiple
-    sequential server calls, and resuming a partially-completed multi-step operation with a
-    freshly swapped credential is riskier than just asking the user to re-invoke it.
-    """
+    """`cli`'s class — catches AuthenticationError from *any* subcommand in one place
+    rather than wrapping each server-talking command individually. Re-runs the command
+    from scratch after saving a token rather than silently retrying mid-operation, since
+    resuming a partially-completed multi-step operation with a freshly swapped credential
+    is riskier than asking the user to re-invoke it."""
 
     def invoke(self, ctx: click.Context):
         from .client import AuthenticationError
@@ -306,18 +299,10 @@ def env_snapshot_file(repo_root: Path) -> Path:
 
 def canonical_env_bytes(snap: dict) -> bytes:
     """Canonical bytes of an env snapshot: sorted-keys JSON minus volatile fields.
-
-    v1.2.5 (`snapshot_version: 2`): hashes ONLY `snap["env"]` (python, os family, pins,
-    seeds, CUDA TOOLKIT version, critical env vars) — machine-specific `snap["observed"]`
-    context (GPU model, driver version, hostname, conda env, interpreter path) is
-    deliberately excluded, so two genuinely-equivalent environments on different
-    machines/OSes produce the SAME id (see tests/test_env_snapshot.py's golden
-    cross-machine fixtures). `captured_at` was already excluded for the same reason.
-
-    Legacy (no `snapshot_version`, or version 1) snapshots hash exactly as before —
-    minus `captured_at` only — so pre-1.2.5 objects already in a CAS/registry keep
-    resolving to the same id; ids are only comparable WITHIN one snapshot_version.
-    """
+    `snapshot_version: 2` hashes ONLY `snap["env"]` (python, pins, seeds, ...) --
+    machine-specific `snap["observed"]` context is deliberately excluded, so two
+    genuinely-equivalent environments on different machines produce the SAME id. Legacy
+    (no version, or version 1) snapshots hash minus `captured_at` only, for backward compat."""
     if snap.get("snapshot_version") == 2 and isinstance(snap.get("env"), dict):
         canon = {"snapshot_version": 2, "env": snap["env"]}
     else:
@@ -373,33 +358,17 @@ def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) 
 
 
 def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) -> bool:
-    """Upload every tracked file's object/layer shards referenced by a commit tree.
+    """Upload every tracked file's object/layer shards referenced by a commit tree,
+    covering `code` and `artifact` alike (a remote checkout needs code's bytes too).
 
-    Covers every type (`code` and `artifact` alike), not just artifacts — `add()` now writes
-    a CAS object for every tracked file (see its comment), so a remote checkout/clone needs
-    code's bytes uploaded too, or `av checkout` against the remote would restore artifacts but
-    silently leave code files at whatever the puller's working tree already had.
+    MUST run BEFORE push_commit(): the server accepts a commit's tree unconditionally
+    (its object_hash column is deliberately not a real FK), so this function's return
+    value is the ONLY signal that an object genuinely failed to land. Returns True only
+    when every upload succeeded; callers MUST queue rather than call push_commit() on
+    False -- never land commit metadata referencing bytes that were never stored.
 
-    Must run BEFORE push_commit() — but NOT because the server enforces this at the DB
-    level: `DBTree.object_hash` (av_server/models.py) is deliberately NOT a real foreign
-    key (a layer-split/CDC-chunked artifact's whole-file hash never gets its own object
-    row, only its shards do — enforcing the FK there broke every such commit). That means
-    the server accepts a commit's tree unconditionally, even one referencing an object that
-    was never actually stored — so THIS function's own return value is the only signal
-    that an object genuinely failed to land. v1.3.0 (Probleme #126): it used to be silently
-    discarded (`future.result()`'s bool return went nowhere), so a write failure here (a
-    full/unwritable registry disk, mid-upload) let the caller push commit METADATA
-    referencing bytes that were never stored — a "successful" push whose artifact content
-    is unrecoverable. Returns True only when every upload genuinely succeeded (or there
-    was nothing to upload); callers MUST queue rather than call push_commit() on False.
-
-    Uploads are batch-checked then sent in parallel (small thread pool — these are
-    network-bound HTTP calls, not CPU work) rather than one HEAD+POST round trip per
-    object in sequence: a 60-object commit was previously ~120 serial round trips.
-
-    v1.2.2 env snapshot/replay: when `.av/env_snapshot.json` exists it is ALSO uploaded
-    through this exact object flow under its canonical content hash, so `av replay
-    <run|commit>` can fetch the snapshot from any clone of the registry — no side channel.
+    Uploads are batch-checked then sent in parallel (small thread pool). When
+    `.av/env_snapshot.json` exists it is uploaded through this same object flow.
     """
     candidates: dict[str, Path] = {}  # hash -> object file on disk, dedup'd
     for info in tree.values():
@@ -421,10 +390,9 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
         try:
             snap = json.loads(env_file.read_text(encoding="utf-8"))
             sid = env_snapshot_id(snap)
-            # The CAS object must contain EXACTLY the canonical bytes the id hashes —
-            # uploading the pretty-printed .av/env_snapshot.json instead makes the
-            # server reject it (sha256 mismatch → 400) and clones can never replay
-            # (found by the v1.2.2 manual wire pass).
+            # The CAS object must contain EXACTLY the canonical bytes the id hashes --
+            # uploading the pretty-printed .av/env_snapshot.json instead makes the server
+            # reject it (sha256 mismatch -> 400).
             obj_path = repo_root / ".av" / "objects" / sid[:2] / sid[2:]
             if not obj_path.exists():
                 obj_path.parent.mkdir(parents=True, exist_ok=True)
@@ -449,29 +417,18 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
             pool.submit(client.upload_object, path, h, known_missing=True)
             for h, path in missing.items()
         ]
-        # v1.3.0 (Probleme #126): a False return from upload_object() (a clean HTTP
-        # failure — e.g. the server's storage write itself failed) used to be discarded
-        # here entirely, so a caller could never tell "every object genuinely landed"
-        # from "nothing raised". `.result()` for every future first (not a short-
-        # circuiting `all()` over the generator) — an unexpected exception from a LATER
-        # future must still surface, not get silently skipped because an earlier one
-        # already turned out False.
+        # `.result()` for every future first (not a short-circuiting `all()` over the
+        # generator) -- an exception from a LATER future must still surface.
         results = [future.result() for future in futures]
         return all(results)
 
 
 def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
-    """Retry pushing queued commits to the remote server. Returns the entries still pending.
-
-    `client.server_available()` only proves the server process is up — it's exempt from the
-    auth gate (see server.py) specifically so it stays answerable with no credentials, which
-    means it does NOT prove this client's token is valid. A bad/stale token surfaces as
-    AuthenticationError from the calls below, not a False/None return — caught here and
-    treated exactly like "server unreachable" for queueing purposes (queue and retry later,
-    never lose the commit), since from a data-safety standpoint that's exactly what it is.
-    Stops retrying the rest of the queue on the first such failure, since the same bad token
-    would just fail identically for every remaining entry.
-    """
+    """Retry pushing queued commits to the remote server. Returns the entries still
+    pending. `server_available()` only proves the server is up, not that this client's
+    token is valid -- a bad token surfaces as AuthenticationError, caught here and treated
+    like "server unreachable" (queue and retry later), stopping the rest of the queue
+    since the same bad token would fail identically for every remaining entry."""
     pending = load_pending_push(repo_root)
     if not pending or not client.server_available():
         return pending
@@ -486,12 +443,8 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
         with open(commit_path, "r") as f:
             commit_data = json.load(f)
         try:
-            # v1.3.0 (Probleme #126): a False return means an object genuinely failed to
-            # upload again (the server accepts a commit's tree unconditionally — see
-            # upload_commit_objects()'s own docstring — so this return value is the only
-            # signal of that). Skip push_commit() entirely and fall through to
-            # still_pending.append(entry) below, exactly as if push_commit() itself had
-            # failed — never land commit metadata for bytes that still aren't stored.
+            # A False return means an object genuinely failed to upload again -- skip
+            # push_commit() and fall through to still_pending.append(entry) below.
             if upload_commit_objects(repo_root, client, commit_data.get("tree", {})) \
                     and client.push_commit(commit_data):
                 ref_ok = True
@@ -503,11 +456,8 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
                             expected_hash=_parents[0] if _parents else None,
                         )
                     except RefRaceError:
-                        # v1.2.5: lost the compare-and-swap race again — someone else's
-                        # commit is still ahead of this one on the ref. Keep it queued
-                        # (never lose the commit) and keep draining the rest of the
-                        # queue; unlike AuthenticationError this isn't systemic, so it
-                        # shouldn't abort every other entry too.
+                        # Lost the compare-and-swap race again -- keep it queued and keep
+                        # draining the rest, since unlike AuthenticationError this isn't systemic.
                         ref_ok = False
                 if ref_ok:
                     continue
@@ -569,16 +519,10 @@ def materialize_file(
     layers: list | None = None,
     chunks: list | None = None,
 ) -> None:
-    """Writes a tracked path's content to the working tree from the CAS — whole-object,
-    reassembled from safetensors layers (`layers`), or reassembled from CDC chunks
-    (`chunks`, see the .pt/.ckpt dedup), downloading missing pieces from the remote.
-
-    Extracted from `checkout()`'s per-entry restore logic so `av stash pop`/`apply`,
-    clone/pull, and merge can materialize a file the exact same way checkout restores a
-    commit's — reusing this instead of reimplementing it avoids re-introducing the
-    safetensors reconstruction bug this exact code path already had fixed once
-    (development/Probleme.md).
-    """
+    """Writes a tracked path's content to the working tree from the CAS -- whole-object,
+    reassembled from safetensors layers, or reassembled from CDC chunks, downloading
+    missing pieces from the remote. Shared by `checkout`, `av stash pop`/`apply`,
+    clone/pull, and merge, so all of them restore a file identically."""
     layers = layers or []
     chunks = chunks or []
     obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
@@ -698,21 +642,11 @@ def resolve_head_tree(repo_root: Path) -> dict:
     return tree
 
 
-# v1.2.0: generalized dataset chunking - serialization formats that benefit from
-# CDC dedup on re-exports. Per-file override stays with .avattributes.
-#
-# v1.2.5: broadened to every UNCOMPRESSED/block-structured format we could confirm
-# survives content-defined boundaries across a small edit (a byte changed mid-file
-# shifts at most the chunks touching it, not the whole stream) — .bin/.onnx/.model are
-# the same "raw tensor/graph dump" shape as .pt/.ckpt; .arrow/.feather are Arrow's
-# columnar IPC format (fixed-size record batches, block-aligned); .pkl/.pickle are
-# Python's own serialization, uncompressed by default. Deliberately NOT default-chunked:
-# COMPRESSED or otherwise non-block-aligned containers (.parquet often uses per-column
-# compression, .zip/.gz/.tar/.7z always do) — a one-byte logical change there can rewrite
-# the entire compressed stream, so CDC boundaries wouldn't survive an edit and chunking
-# would just add overhead for no dedup benefit. Force-enable chunking for a specific glob
-# regardless of extension (accepting that tradeoff deliberately) via the `chunk`
-# .avattributes flag; `no-chunk` still wins over `chunk` on the same line (safety).
+# Extensions that benefit from CDC dedup: uncompressed/block-structured formats where a
+# small edit only shifts the chunks touching it, not the whole stream. Deliberately NOT
+# default-chunked: compressed containers (.parquet, .zip/.gz/.tar/.7z) can rewrite their
+# whole stream on any logical edit, so CDC boundaries wouldn't survive. Per-file override
+# via the `chunk`/`no-chunk` .avattributes flags (no-chunk always wins).
 CHUNKABLE_EXTS = {
     ".pt", ".pth", ".ckpt", ".npz", ".h5", ".hdf5", ".pb", ".msgpack",
     ".bin", ".onnx", ".model", ".arrow", ".feather", ".pkl", ".pickle",
@@ -728,17 +662,9 @@ def stage_one_file(
     attr_flags: set | None = None,
 ) -> bool:
     """Hashes and stores a single file's current content (LFS threshold check, safetensors
-    layer-split if applicable, CDC chunking for opaque checkpoint formats, pointer creation)
-    and records it in the index. Returns whether anything actually changed (False = already
-    up to date in the index).
-
-    `attr_flags` carries this path's `.avattributes` directives (`no-chunk`,
-    `no-layer-split`) — resolved once per invocation by the caller via attributes.flags_for.
-
-    Extracted from `add()`'s per-file loop body so `av stash push` can get a modified-but-not-
-    yet-staged file's content safely into the CAS before reverting the working copy, using
-    exactly the same logic `add()` already uses — not a reimplementation of it.
-    """
+    layer-split if applicable, CDC chunking, pointer creation) and records it in the
+    index. Returns whether anything actually changed. `attr_flags` carries this path's
+    `.avattributes` directives, resolved once per invocation by the caller."""
     attr_flags = attr_flags or set()
     meta = get_file_meta_safe(str(fpath))
 
@@ -793,10 +719,8 @@ def stage_one_file(
         if not layers:
             suffix = Path(rel_path).suffix.lower()
             core_cdc = _get_aether_core()
-            # v1.2.5: `chunk` in .avattributes force-enables CDC for a glob regardless of
-            # extension (e.g. a .parquet dataset the user has confirmed edits append-only
-            # to); `no-chunk` still wins when both are set on the matching line — safety
-            # over the opt-in, never the reverse.
+            # `chunk` in .avattributes force-enables CDC for a glob regardless of extension;
+            # `no-chunk` still wins when both are set -- safety over the opt-in.
             if (
                 (suffix in CHUNKABLE_EXTS or "chunk" in attr_flags)
                 and "no-chunk" not in attr_flags
@@ -933,16 +857,10 @@ def _finalize_commit(
     outcome_sink=None,
 ) -> str:
     """Everything `av commit` does after its tree snapshot and parents are resolved: hash
-    the payload deterministically over sorted JSON (preserves DAG integrity — two projects
-    can never collide on the same hash even with byte-identical trees/messages/timestamps),
-    persist atomically (commit object before ref move; temp+replace writes so a crash can't
-    leave a half-written commit behind a moved ref), advance the branch ref (or HEAD when
-    detached), clear the staged flags, print the summary, and push to the registry with the
-    standard offline-queue fallbacks.
-
-    Extracted verbatim from commit()'s tail so `av merge` creates its two-parent commits
-    through exactly the same code path instead of duplicating it.
-    """
+    the payload deterministically over sorted JSON, persist atomically (commit object
+    before ref move), advance the branch ref, clear staged flags, and push to the
+    registry with the standard offline-queue fallbacks. Shared by `av merge` so its
+    two-parent commits go through the exact same code path."""
     metrics = metrics or {}
     message = commit_data.get("message", "")
 
@@ -950,11 +868,9 @@ def _finalize_commit(
     commit_hash = hashlib.sha256(commit_str.encode()).hexdigest()
     commit_data["hash"] = commit_hash
 
-    # --- v1.2.2 signed commits: auto-sign when an ed25519 key is configured ---
-    # The signature covers the canonical sorted-keys JSON of the payload INCLUDING the
-    # hash just computed, EXCLUDING the signature itself (see signing.py). Best-effort:
-    # no key configured → unsigned commit (always valid); [sign] extra missing → logged
-    # and skipped. Signing never blocks or fails a commit — tamper evidence, not a gate.
+    # --- Signed commits: auto-sign when an ed25519 key is configured ---
+    # Signature covers the canonical sorted-keys JSON including the hash just computed,
+    # excluding the signature itself. Best-effort: never blocks or fails a commit.
     try:
         from .signing import sign_payload
 
@@ -993,33 +909,23 @@ def _finalize_commit(
             click.secho(f"  Tags: {', '.join(tags)}", fg="cyan")
         if metrics:
             click.secho(f"  Metrics: {metrics}", fg="cyan")
-    # result_sink(result) itself is deferred to just before `return` (below) — v1.2.5 fix:
-    # calling it HERE, before the push-or-queue section runs, froze queued/queued_reason
-    # at their pre-push defaults (False/None) for every machine caller (JSON mode, the
-    # SDK), so `av --output json commit` against an unreachable server always reported
-    # queued:false — the exit-code 13 (unreachable_queued) contract had nothing correct
-    # to key off of. See Probleme.md and tests/test_exit_codes.py.
+    # result_sink(result) itself is deferred to just before `return` (below) -- calling it
+    # here, before push-or-queue runs, would freeze queued/queued_reason at their pre-push
+    # defaults for every machine caller.
 
     # --- Push to remote if available ---
     # Refs are namespaced as "<project_id>/<branch>" on the shared registry so two projects
     # can each have a branch named "main" without overwriting each other's ref.
     remote_ref_name = f"{cfg['project_id']}/{ref_path.name}" if ref_path else None
-    # The parent this commit advances the ref FROM — None for a ref's first-ever commit.
+    # The parent this commit advances the ref FROM -- None for a ref's first-ever commit.
     # Passed as expected_hash below so a losing compare-and-swap race is detectable
-    # instead of silently overwriting a concurrent agent's ref update (v1.2.5).
+    # instead of silently overwriting a concurrent agent's ref update.
     _parents = commit_data.get("parents") or []
     if len(_parents) == 2 and remote_ref_name:
-        # Two-parent MERGE commit. parents[0] ("ours") is only a valid expected_hash if
-        # OUR OWN prior commit on this ref actually landed on the server — normally true
-        # (an ordinary merge of some other branch/commit into a not-diverged ref), so
-        # "ours" stays the default. But if "ours" is still sitting in our OWN pending-push
-        # queue for this exact ref, it lost its own CAS race earlier (exactly the case
-        # `av merge <target>` resolving a genuine divergence reported by `av pull` is
-        # for) — the server's ref is NOT "ours", it's parents[1] ("theirs", the target
-        # being merged in), so use that instead. Otherwise this merge's own ref update
-        # would spuriously race against a server state "ours" never actually reached,
-        # even though the merge is precisely what reconciles that divergence. See
-        # Probleme.md and scripts/e2e_scenario.sh's Phase A.
+        # Two-parent MERGE commit. parents[0] ("ours") is the default expected_hash, but
+        # if it's still sitting in our OWN pending-push queue for this ref, it already
+        # lost its own CAS race -- the server's ref is parents[1] ("theirs") instead, or
+        # this merge's ref update would spuriously race against a state "ours" never reached.
         _still_queued = {
             e.get("commit_hash") for e in load_pending_push(repo_root)
             if e.get("ref_name") == remote_ref_name
@@ -1044,13 +950,8 @@ def _finalize_commit(
             click.secho("  Upload deferred — queued for `av push`", fg="yellow")
     elif client.server_available():
         try:
-            # Objects must reach the server before the commit — NOT because the server
-            # enforces this at the DB level (it deliberately doesn't; see
-            # upload_commit_objects()'s own docstring), but because that function's
-            # return value is the ONLY signal a real object-write failure (a full/
-            # unwritable registry disk, mid-upload) ever produces. Queue exactly like a
-            # failed push_commit() rather than land commit metadata referencing bytes
-            # that were never actually stored (v1.3.0, Probleme #126).
+            # Objects must reach the server before the commit -- upload_commit_objects()'s
+            # return value is the only signal a real object-write failure ever produces.
             if not upload_commit_objects(repo_root, client, tree):
                 queue_pending_push(repo_root, commit_hash, remote_ref_name)
                 _queued("object_upload_failed")
@@ -1067,16 +968,10 @@ def _finalize_commit(
                                                     expected_hash=expected_parent)
                     except RefRaceError as race:
                         # Another agent's commit landed on this ref first. The commit
-                        # itself is already durable (pushed above, content-addressed —
-                        # never lost); only the ref pointer lost the race. Queue it —
-                        # non-negotiable #3 (offline resilience is sacred) applies to lost
-                        # ref races exactly as it does to network failures. `av pull` on
-                        # the next attempt will surface the divergence with run attribution.
+                        # itself is already durable (content-addressed, never lost); only
+                        # the ref pointer lost the race, so queue it like any network
+                        # failure -- `av pull` on the next attempt surfaces the divergence.
                         ref_ok = False
-                        # v1.3.0 (todo.md item 14): the pull-divergence and merge-conflict
-                        # paths already attribute a race to the colliding run IDs and give
-                        # identical remediation in human text and error.data — this is the
-                        # one race path (the actual concurrent-write case) that didn't.
                         winner_run_id = tip_run_id(repo_root, race.current)
                         result["ref_race"] = {
                             "ref": race.ref_name, "current": race.current,
@@ -1085,17 +980,10 @@ def _finalize_commit(
                             "remediation": ["av pull", "av push"],
                         }
                 if ref_ok and len(_parents) == 2 and remote_ref_name:
-                    # v1.2.5: this merge just landed on the ref, directly superseding
-                    # both parents as candidates for THIS ref's tip. A parent still
-                    # sitting in pending_push (e.g. "ours" lost its own earlier ref race
-                    # — see the expected_parent selection above) can never legitimately
-                    # become the ref's value on its own again; its content already lives
-                    # on as an ancestor of the merge that just succeeded. Drop it now,
-                    # rather than have it retry-and-fail forever on every future
-                    # flush_pending_push (its expected_hash can never match again once
-                    # the ref has moved past it) — see Probleme.md and
-                    # scripts/e2e_scenario.sh's Phase B, which caught this via a
-                    # never-draining queue right after Phase A's merge landed.
+                    # This merge just landed on the ref, superseding both parents as
+                    # candidates for the ref's tip. A parent still sitting in pending_push
+                    # can never legitimately become the ref's value again, so drop it now
+                    # rather than have it retry-and-fail forever.
                     still_pending = load_pending_push(repo_root)
                     remaining = [
                         e for e in still_pending
@@ -1247,12 +1135,8 @@ def commit_staged(
 
 
 def parse_metric_args(raw_metrics: tuple) -> dict:
-    """v1.3.1: THE shared `--metric key=value` parser — extracted verbatim from two
-    call sites that had drifted into copies of the same logic (`cmd_history.py`'s
-    `av commit --metric` and `cmd_run.py`'s `av run finish --metric`). Values with a
-    literal `.` parse as float, else int, else fall back to the raw string unchanged;
-    entries without an `=` are silently skipped (matches both callers' prior behavior).
-    """
+    """THE shared `--metric key=value` parser. Values with a literal `.` parse as float,
+    else int, else fall back to the raw string; entries without an `=` are skipped."""
     metrics: dict = {}
     for raw in raw_metrics:
         if "=" in raw:
@@ -1265,20 +1149,10 @@ def parse_metric_args(raw_metrics: tuple) -> dict:
 
 
 def resolve_remote(repo_root: Path, cfg: dict | None = None) -> tuple[str, str | None]:
-    """v1.3.1: THE shared `(remote_url, api_token)` resolution — extracted from the
-    identical `cfg.get("remote_url", "http://localhost:8000")` /
-    `cfg.get("remote_api_token")` idiom that had been copy-pasted at eight call sites
-    (this module, `cmd_run.py`, `cmd_policy.py`, `cmd_registry.py`, `cmd_env.py`,
-    `cmd_audit.py`, `av_sdk/repo.py`, `av_plugins/_shared.py`). No behavior change —
-    same default URL, same config keys. Pass an already-loaded `cfg` (several callers
-    need it for other fields too) to skip a redundant `load_config()` read.
-
-    v1.3.3 (WP-14): a live `av login` session (`~/.aether-vault/session.json`) now takes
-    priority over `cfg["remote_api_token"]` — but ONLY when the session was issued for
-    the SAME registry this repo points at. A session from a login against a different
-    server is silently ignored here (never sent cross-server), falling back to whatever
-    this repo's own config already resolves to; a genuinely wrong-server session is
-    exactly the case `av whoami` surfaces so a user notices and re-runs `av login`."""
+    """THE shared `(remote_url, api_token)` resolution, used across every call site that
+    needs a client. A live `av login` session takes priority over `cfg["remote_api_token"]`
+    but ONLY when issued for the SAME registry this repo points at -- a session from a
+    different server is silently ignored, never sent cross-server."""
     cfg = cfg if cfg is not None else load_config(repo_root)
     remote_url = cfg.get("remote_url", "http://localhost:8000")
 
@@ -1292,12 +1166,9 @@ def resolve_remote(repo_root: Path, cfg: dict | None = None) -> tuple[str, str |
 
 
 def capture_code_pointer(repo_root: Path) -> dict | None:
-    """v1.3.1: THE shared git code-provenance capture for `av run start` — extracted
-    verbatim from `cmd_run.py::start()`'s inline subprocess calls so `av_sdk.Repo.run_start()`
-    can capture the same `{git_remote, git_sha, dirty}` instead of always passing `None`
-    (a documented divergence from the CLI — `av_sdk/repo.py`'s own comment on `run_start()`
-    used to note it explicitly). `None` when this isn't a git checkout, or on any
-    subprocess failure/timeout — code provenance is best-effort, never a hard requirement."""
+    """THE shared git code-provenance capture for `av run start`: {git_remote, git_sha,
+    dirty}, or None when this isn't a git checkout or on any subprocess failure -- code
+    provenance is best-effort, never a hard requirement."""
     import subprocess
 
     try:
@@ -1318,19 +1189,10 @@ def capture_code_pointer(repo_root: Path) -> dict | None:
 
 
 def resolve_run_id(repo_root: Path, explicit: str | None = None) -> str | None:
-    """v1.2.5: THE single run-id precedence rule — explicit argument > AV_RUN_ID env >
-    .av/run.json state — used by every commit path (`av commit`, `av watch`,
-    `commit_scoped_paths`/plugins) so `AV_RUN_ID=<id> <any av command>` behaves
-    identically everywhere, as the docs already advertise ("joins ANY process' commits
-    with zero integration").
-
-    Before this existed, three call sites disagreed: `av commit` checked env before
-    state, `cmd_run.current_run_id()` (used by the plugin/SDK seam) checked state before
-    env, and `av watch` didn't resolve either at all — its auto-commits were silently
-    never filed under the active run regardless of `av run start`/AV_RUN_ID (see
-    Probleme.md). Env wins over state because it's the documented, deliberate
-    per-process override; state is the ambient "someone ran `av run start` in this
-    repo" default.
+    """THE single run-id precedence rule — explicit argument > AV_RUN_ID env >
+    .av/run.json state — used by every commit path so `AV_RUN_ID=<id> <any av command>`
+    behaves identically everywhere. Env wins over state because it's the deliberate
+    per-process override; state is the ambient "someone ran `av run start`" default.
     """
     if explicit:
         return explicit
@@ -1347,14 +1209,9 @@ def resolve_run_id(repo_root: Path, explicit: str | None = None) -> str | None:
 
 
 def tip_run_id(repo_root: Path, commit_hash: str | None) -> str | None:
-    """The run:<id> tag of a (local) commit, or None.
-
-    v1.3.0: moved here from cmd_sync.py's private `_tip_run_id` (still re-exported there
-    for compat) so `_finalize_commit`'s own ref-race path can attribute the collision to
-    a run exactly like `av pull`'s divergence message and `av merge`'s conflict message
-    already do — todo.md item 14 ("every pull/merge/push race path includes run IDs when
-    known") was true for those two but not for this one, the actual concurrent-write case.
-    """
+    """The run:<id> tag of a (local) commit, or None. Lets `_finalize_commit`'s ref-race
+    path attribute a collision to a run, like `av pull`'s divergence message and
+    `av merge`'s conflict message already do."""
     if not commit_hash:
         return None
     from . import sync as _sync
@@ -1375,26 +1232,17 @@ def commit_scoped_paths(
     run_id: str | None = None,
 ) -> str | None:
     """Stages exactly `paths` and commits ONLY them, leaving unrelated staged work alone.
+    THE shared machine-driven-commit seam: framework plugins call this instead of
+    chdir-ing and invoking the CLI. Both this and plain `av commit` funnel into
+    `_finalize_commit`, so there is still exactly one commit writer.
 
-    THE shared machine-driven-commit seam (v1.2.2): framework plugins
-    (`av_plugins._shared.commit_scoped`) call this instead of chdir-ing and invoking
-    the CLI, and agent tooling can too — while plain `av commit` keeps full-snapshot
-    semantics through `commit_staged`. Both funnel into `_finalize_commit`, so there is
-    still exactly one commit writer.
+    Staging runs against the untouched index (so an unchanged re-import stays a no-op),
+    then the index is scoped to exactly what THIS staging touched before committing, and
+    everything else merges back in `finally` with its staged flag untouched. Missing
+    paths are skipped silently (some frameworks announce checkpoints before writing them);
+    directories stage recursively via the same rules `av add .` uses.
 
-    Fixes Probleme.md #38: a naive commit sweeps unrelated staged files under a message
-    they never agreed to. Isolation WITHOUT destroying the change-detection baseline
-    (Probleme.md #71): staging runs against the untouched index so re-importing unchanged
-    content stays a "Nothing to commit" no-op, then the index is scoped to exactly what
-    THIS staging touched (new keys / changed content / staged transitions) before the
-    single-code-path commit, and everything else merges back in `finally` with its staged
-    flag untouched.
-
-    Missing paths are skipped silently (Lightning legitimately announces checkpoints
-    before writing them — Probleme.md #76); directory paths stage recursively via the
-    same iter_working_files rules `av add .` uses (`.avignore` honored).
-
-    Returns the new commit hash, or None when nothing changed (documented no-op).
+    Returns the new commit hash, or None when nothing changed.
     """
     import copy
 
@@ -1411,9 +1259,8 @@ def commit_scoped_paths(
     threshold_bytes = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
     rules = load_attributes(repo_root)
 
-    # v1.2.5: resolve_run_id() is now THE one precedence rule (explicit > env > state),
-    # shared with av commit/av watch — see its docstring for why this used to disagree
-    # across call sites.
+    # resolve_run_id() is THE one precedence rule (explicit > env > state), shared with
+    # av commit/av watch -- see its docstring.
     run_id = resolve_run_id(repo_root, run_id)
 
     try:
@@ -1478,15 +1325,10 @@ def _collect_dirty_paths(repo_root: Path, idx: Index) -> list[str]:
 
 
 def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: Index) -> None:
-    """Makes the index and the working tree match a flat commit tree.
-
-    The one shared restore path behind `checkout`, `av clone`, and `av pull`: replaces
-    idx.entries with the tree's entries (downloading any object the remote has but this
-    machine doesn't), deletes working files the tree no longer contains, then re-stats
-    every entry and clears its staged flag so `av status` reads clean immediately after.
-    Extracted verbatim from checkout's body — behavior-preserving, verified by the existing
-    checkout/stash suites.
-    """
+    """Makes the index and the working tree match a flat commit tree. The one shared
+    restore path behind `checkout`, `av clone`, and `av pull`: replaces idx.entries,
+    deletes working files the tree no longer contains, then re-stats every entry and
+    clears its staged flag so `av status` reads clean immediately after."""
     old_entries = dict(idx.entries)
     idx.entries.clear()
 
@@ -1524,11 +1366,9 @@ def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: I
             if chunks:
                 idx.entries[rel_path]["chunks"] = chunks
 
-            # Restore every tracked file's content from the CAS, not just artifacts — `code`
-            # files are written to .av/objects by `add()` too (see its comment there), so an
-            # older commit's code must be materialized here the same way, or `av checkout`
-            # would silently leave the working tree's code untouched while still claiming
-            # success (development/Probleme.md).
+            # Restore every tracked file's content from the CAS, not just artifacts --
+            # `code` files are written to .av/objects by `add()` too, so an older commit's
+            # code must be materialized here the same way.
             materialize_file(repo_root, client, rel_path, h, layers, chunks)
 
     for rel_path in old_entries:
@@ -1536,9 +1376,7 @@ def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: I
             remove_file_and_pointer(repo_root, rel_path)
 
     # Record the real on-disk size/mtime for every materialized file and clear the staged
-    # flag, so `av status` reports a clean tree right after checkout. Previously entries were
-    # written with mtime_ns=0 (and re-adding into a cleared index marked them staged), which
-    # made every file appear "modified"/"to be committed" immediately after a checkout.
+    # flag, so `av status` reports a clean tree right after checkout.
     for rel_path, entry in idx.entries.items():
         fpath = repo_root / rel_path
         if fpath.exists():
@@ -1567,28 +1405,13 @@ EXIT_UNREACHABLE_QUEUED = 13      # work is SAFE (queued), registry unreachable
 EXIT_CONFLICT = 14                # merge conflicts present, nothing touched
 EXIT_VALIDATION = 15              # bad input values
 EXIT_POLICY_DENIED = 16           # promotion/branch policy rejected the action
-# v1.3.1 (RSI control plane): every reserved code is now real. `av budget consume` exits
-# 17 when any dimension is now exceeded; `av freeze on` blocks `av promote`/`av improver
-# register|propose|apply`/`av policy pack publish` with 18; `av improver promote`'s
-# `require_review` denies with 19 when no approving review is on file for the candidate
-# (distinct from 16 — this is specifically "nobody has signed off yet", not "the metrics/
-# signature don't qualify"); `av freeze on/off` maps the server's 403
-# {"error":"scope_denied"} to 20.
 EXIT_BUDGET_EXHAUSTED = 17        # a budget dimension is now exceeded (the spend still recorded)
 EXIT_FROZEN = 18                  # project is frozen; promotions/self-edits are paused
 EXIT_REVIEW_REQUIRED = 19         # improver promotion needs reviewer approval / has open critiques
 EXIT_SCOPE_DENIED = 20            # token authenticated but lacks the required scope (server 403)
-# v1.3.2 (hard multi-tenancy): mirrors `scope_denied`'s shape exactly — the caller
-# authenticated fine, they just don't own the project_id they targeted
-# (server.py::_enforce_project_tenant's 403, `AV_TENANCY_ENFORCE=1` only).
-# v1.3.3: `login_required` is now real -- `av login`'s device-code flow (cmd_login.py)
-# raises it when the flow times out with no approval, and `resolve_remote()`/whoami-style
-# callers distinguish "never logged in / session expired" from `auth_failed` (12, a
-# REJECTED credential) this way. Registering it here is what activates it in
-# `_EXIT_CODES` below -- it sat reserved-but-unregistered since v1.3.2 specifically
-# until a real caller existed, per this file's own "documented but never raised" drift
-# discipline (test_contract_matrix.py's registry-parity test).
-EXIT_LOGIN_REQUIRED = 21
+# Mirrors scope_denied's shape -- the caller authenticated fine, they just don't own the
+# project_id they targeted (AV_TENANCY_ENFORCE=1 only).
+EXIT_LOGIN_REQUIRED = 21          # av login's device-code flow timed out with no approval
 EXIT_TENANT_DENIED = 22
 
 _EXIT_CODES = {
@@ -1628,14 +1451,9 @@ def output_is_json(ctx) -> bool:
 
 def json_envelope(command: str, data=None, error_code: str | None = None,
                   error_message: str | None = None, error_data: dict | None = None) -> dict:
-    """Builds the one-and-only agent-facing response shape.
-
-    `error_data` (v1.2.5, additive) is an optional dict of machine-readable failure
-    context — conflict file lists, racing run/commit ids, remediation command lines —
-    for the failure modes where a plain message string used to be the only signal
-    (merge conflicts, ref races). Omitted entirely when empty/None so old clients that
-    only look at `error.code`/`error.message` see no shape change.
-    """
+    """Builds the one-and-only agent-facing response shape. `error_data` is an optional
+    dict of machine-readable failure context (conflict file lists, racing run/commit ids,
+    remediation lines), omitted entirely when empty so old clients see no shape change."""
     from . import _version
 
     try:
@@ -1671,14 +1489,9 @@ _CONTRACT_SCHEMA_NAMES = (
 
 
 def load_contract_schema(name: str) -> dict:
-    """Loads and parses one of the published contracts under av_cli/schemas/<name>.schema.json.
-
-    `name` is the file's stem without the `.schema.json` suffix, e.g. "envelope-1.0" or
-    "avh-2.0" — see docs/contracts.md for the full list (`_CONTRACT_SCHEMA_NAMES`).
-    Uses importlib.resources so this works from an installed wheel, not just a checkout —
-    `setup.py`'s package_data ships `av_cli/schemas/*.schema.json` for exactly this reason.
-    Raises FileNotFoundError with the attempted filename on a typo'd/missing name.
-    """
+    """Loads and parses one of the published contracts under av_cli/schemas/<name>.schema.json
+    (see docs/contracts.md for the full list). Uses importlib.resources so this works from
+    an installed wheel, not just a checkout."""
     import importlib.resources as resources
 
     if name not in _CONTRACT_SCHEMA_NAMES:
@@ -1692,25 +1505,13 @@ def load_contract_schema(name: str) -> dict:
 
 def fail(ctx, code: str, message: str, command: str | None = None, data: dict | None = None,
          quiet_text: bool = False):
-    """Uniform failure path: JSON envelope + documented exit code in one raise.
-
-    In text mode the message prints plainly (no traceback); in JSON mode the envelope
-    carries the machine-readable code plus, when given, `error.data` (v1.2.5). Always
-    raises — call sites stop here.
-
-    `quiet_text=True` (v1.2.5) skips the generic "Error: {message}" line in text mode —
-    for call sites that already printed a richer, purpose-formatted explanation (a
-    conflict file list, a divergence's run attribution) and would otherwise duplicate it.
-    JSON mode is unaffected either way; the envelope is the only output there.
-    """
+    """Uniform failure path: JSON envelope + documented exit code in one raise. Always
+    raises -- call sites stop here. `quiet_text=True` skips the generic "Error: {message}"
+    line in text mode, for call sites that already printed a richer explanation."""
     if ctx is None:
-        # v1.2.5 fix: ~40 call sites across the CLI pass ctx=None here (no live context
-        # handy at that point in the call chain) — output_is_json(None) is unconditionally
-        # False, so EVERY one of those silently ignored `--output json` and always printed
-        # plain text instead of an envelope. click.get_current_context(silent=True) finds
-        # the REAL context of whichever command is actually running (always live during a
-        # real invocation), so a bare `fail(None, ...)` now correctly honors JSON mode
-        # instead of requiring every call site to thread ctx through by hand.
+        # Most call sites pass ctx=None (no live context handy at that point in the call
+        # chain). click.get_current_context(silent=True) finds the REAL context of
+        # whichever command is running, so this still correctly honors JSON mode.
         ctx = click.get_current_context(silent=True)
     exit_code = _EXIT_CODES.get(code, EXIT_VALIDATION)
     cmd = command or (ctx.command.name if ctx and getattr(ctx, "command", None) else "av")
@@ -1719,14 +1520,8 @@ def fail(ctx, code: str, message: str, command: str | None = None, data: dict | 
                                              error_data=data)))
     elif not quiet_text:
         click.secho(f"Error: {message}", fg="red", err=True)
-    # Many call sites pass ctx=None (they run outside a click context or before one is
-    # handy). Context.exit on None used to raise AttributeError AFTER the message printed,
-    # so users saw a Python traceback under every clean validation failure (Probleme.md).
-    # v1.2.5: always SystemExit, never ctx.exit() — empirically, Context.exit() raises
-    # click.exceptions.Exit, which CliRunner.invoke(standalone_mode=False) (the pattern
-    # this test suite uses throughout: test_signing.py, test_v122.py, this file's own
-    # tests, ...) silently swallows, leaving result.exit_code at 0 regardless of the
-    # code passed. A bare SystemExit propagates correctly under standalone_mode True
-    # AND False, and in real (non-test) CLI usage — so it's the only mechanism used here
-    # now, resolving ctx (above) purely for output_is_json() detection.
+    # Always SystemExit, never ctx.exit(): Context.exit() raises click.exceptions.Exit,
+    # which CliRunner.invoke(standalone_mode=False) silently swallows, leaving
+    # result.exit_code at 0 regardless of the code passed. A bare SystemExit propagates
+    # correctly either way, so it's the only mechanism used here.
     raise SystemExit(exit_code)

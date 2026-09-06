@@ -1,11 +1,7 @@
-"""av tenant — DB-backed tenant administration (v1.3.2), remote over HTTP.
-
-`create` is a genuinely platform-level bootstrap operation (standing up a fresh
-customer) — deliberately gated behind an operator's own `admin` scope rather than a
-separate platform-superadmin identity tier, which this phase does not build (see
-`server.py`'s tenant-routes section docstring for the full reasoning). There is no
-`list`/`update` here yet: enumerating every tenant on a registry needs that same
-not-yet-built platform-operator concept, so it is left unbuilt rather than faked.
+"""av tenant — DB-backed tenant administration (v1.3.2), remote over HTTP. `create` is
+gated behind an operator's own `admin` scope rather than a separate platform-superadmin
+tier, which this phase does not build. There is no `list`/`update` yet -- that needs the
+same not-yet-built platform-operator concept.
 """
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)

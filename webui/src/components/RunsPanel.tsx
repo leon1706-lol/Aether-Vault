@@ -36,13 +36,10 @@ const STATUS_COLORS: Record<Run["status"], string> = {
   failed: "#fc8181",
 };
 
-// Runs tab (v1.2.0 list; v1.2.2 expandable detail; v1.2.5 dedicated server-backed
-// panel + deep linking): first-class experiment grouping. Clicking a row opens a
-// dedicated detail panel below the table — lineage, linked commits, a metrics history
-// chart, and a SERVER-COMPUTED semantic summary, all from ONE request
-// (GET /api/runs/{id}/summary — replaces the old fetchRun()+N×fetchCommit() fan-out).
-// The selected run id is kept in the URL (?run=<id>) so the panel is shareable/
-// reloadable; the live badge in the header is fed by the event-stream cursor.
+// Runs tab: clicking a row opens a dedicated detail panel — lineage, linked commits, a
+// metrics history chart, and a server-computed semantic summary from one request
+// (GET /api/runs/{id}/summary). The selected run id is kept in the URL (?run=<id>) so
+// the panel is shareable/reloadable.
 export function RunsPanel({
   projectId, initialRunId, runsPollMs = 15_000, eventsPollMs = 10_000, onCompareWeights,
 }: Props) {

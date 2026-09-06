@@ -130,10 +130,8 @@ class FakeRemoteClient(client_module.VaultClient):
         return not self.reject_pushes
 
     def update_ref(self, ref_name: str, commit_hash: str, expected_hash: str | None = None) -> bool:
-        # v1.2.5: mirrors the real server's compare-and-swap semantics (server.py's
-        # update_ref) — expected_hash=None keeps the pre-1.2.5 unconditional-write
-        # behavior every existing test here relies on; when given, a mismatch raises
-        # RefRaceError exactly like the real client does on a live 409.
+        # Mirrors the real server's compare-and-swap semantics: expected_hash=None keeps
+        # unconditional-write behavior; when given, a mismatch raises RefRaceError.
         if self.reject_pushes:
             return False
         if expected_hash is not None and self.recorded_refs.get(ref_name) != expected_hash:
@@ -212,9 +210,8 @@ def fake_registry(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# v1.2.5: a merge resolving a genuine ref-race divergence must actually land its own
-# push, not re-race against a local commit the server never held. Real bug caught live
-# by scripts/e2e_scenario.sh's Phase A (see Probleme.md) — this reproduces it stack-free.
+# A merge resolving a genuine ref-race divergence must actually land its own push, not
+# re-race against a local commit the server never held.
 # ---------------------------------------------------------------------------
 
 def test_merge_push_lands_when_ours_lost_its_own_ref_race(tmp_path, monkeypatch):
@@ -392,13 +389,9 @@ def test_clone_materializes_tip_full_history_and_identity(fake_registry, tmp_pat
     source, pid = fake_registry["source"], fake_registry["pid"]
     monkeypatch.chdir(tmp_path)
 
-    # Explicit target dir, distinct from the "source" fixture repo's own directory name —
-    # omitting it defaults the clone target to Path.cwd()/"source", which collided with
-    # fake_registry["source"] itself (both are tmp_path/"source"). Pre-1.2.5 that silently
-    # hit the "target already exists and is not empty" early-return (exit 0, no real clone
-    # performed) and every assertion below passed trivially by comparing source to itself;
-    # the v1.2.5 exit-code fix (that path now fails loudly, exit 15) surfaced it. Found
-    # during the V1.2.5 conflict-UX work, not a regression from that work itself.
+    # Explicit target dir, distinct from the "source" fixture repo's own directory name --
+    # omitting it defaults the clone target to Path.cwd()/"source", colliding with
+    # fake_registry["source"] itself and silently comparing source to itself.
     result = invoke("clone", "source", "cloned")
     assert result.exit_code == 0, result.output
     cloned = tmp_path / "cloned"

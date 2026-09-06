@@ -1,13 +1,6 @@
-"""Enterprise (cloud) login — real implementation (v1.3.3, WP-14), replacing the
-`StubEnterpriseAuthProvider` that used to print "coming soon" and return `None`.
-
-Drives the same OIDC device-code flow `av login`/`cmd_login.py` uses, and persists to the
-same `~/.aether-vault/session.json` (`session_store.py`) — so a repo initialized with
-`av init --mode enterprise` and a bare `av login` end up in the exact same authenticated
-state, picked up identically by `resolve_remote()`. `main.py`/`cmd_repo.py` only ever call
-`run_enterprise_login_flow()`/the `EnterpriseAuthProvider` Protocol, both unchanged, so
-nothing at either of `cmd_repo.py`'s two call sites (`_reconnect_existing_repo`,
-`init()`) needed to change for this to start working.
+"""Enterprise (cloud) login (v1.3.3). Drives the same OIDC device-code flow `av login`
+uses, and persists to the same `~/.aether-vault/session.json` -- so `av init --mode
+enterprise` and a bare `av login` end up in the exact same authenticated state.
 """
 
 from __future__ import annotations
@@ -44,10 +37,9 @@ def _resolve_url(repo_root: Path | None) -> str:
 
 
 class DeviceCodeEnterpriseAuthProvider:
-    """Drives `/api/auth/device/code` + `/api/auth/device/token` (`sso_oidc.py`) — a
-    browser redirect is the wrong UX here, same reasoning as `cmd_login.py`'s own login
-    command; this class exists so that command AND this Protocol-conforming seam share
-    one real implementation rather than two copies of the same polling loop."""
+    """Drives `/api/auth/device/code` + `/api/auth/device/token` -- shared by `av login`
+    and this Protocol-conforming seam so both use one real implementation, not two
+    copies of the same polling loop."""
 
     def __init__(self, repo_root: Path | None = None, provider_id: str | None = None):
         self._repo_root = repo_root
@@ -153,20 +145,14 @@ class DeviceCodeEnterpriseAuthProvider:
         )
 
     def refresh(self) -> EnterpriseSession | None:
-        # No refresh-token flow exists yet (WP-12's device-code grant issues a plain
-        # session token, not a refresh token) -- an expired session needs a real
-        # `av login` re-run. Returning the still-valid current session unchanged (rather
-        # than raising) keeps every existing caller's "truthy means usable" contract
-        # working for the common case where refresh() is called speculatively on a
-        # session that hasn't actually expired yet.
+        # No refresh-token flow exists yet -- an expired session needs a real `av login`
+        # re-run. Returns the still-valid current session unchanged rather than raising.
         return self.current_session()
 
 
 def run_enterprise_login_flow(repo_root: Path | None = None) -> bool:
-    """Attempt enterprise login. Returns True once a real, usable session exists —
-    either one already on disk (no re-prompt needed, matching
-    `_reconnect_existing_repo`'s "no questions asked" contract for local-mode repos) or
-    a freshly established one."""
+    """Attempt enterprise login. Returns True once a real, usable session exists --
+    either one already on disk (no re-prompt needed) or a freshly established one."""
     provider = DeviceCodeEnterpriseAuthProvider(repo_root=repo_root)
     existing = provider.current_session()
     if existing is not None:

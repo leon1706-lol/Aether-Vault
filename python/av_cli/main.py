@@ -198,12 +198,8 @@ cli.add_command(watch)
 from .cmd_registry import registry, verify as registry_verify  # noqa: E402
 
 cli.add_command(registry)
-# Top-level alias (v1.3.1): docs (`signing.py`, `AGENTS.md`) and `av registry attest`'s
-# own error text have always told users to run `av verify <hash>` — it was never actually
-# registered on the Click tree, only `av registry verify` was. Same object, same name
-# ("verify" — the Click default derived from the function name), so `av verify` and
-# `av registry verify` share one implementation with zero drift risk, mirroring the
-# `replay`/`env replay` alias pattern below.
+# Top-level alias: docs have always told users to run `av verify <hash>`, so this
+# registers the same object under both names -- mirrors the `replay`/`env replay` pattern.
 cli.add_command(registry_verify)
 from .cmd_webhooks import webhooks  # noqa: E402
 
@@ -310,17 +306,10 @@ from .core import (  # noqa: F401,E402
 
 
 def run() -> None:
-    """Console-script entry point (`av = "av_cli.main:run"` in pyproject.toml).
-
-    Wraps `cli()` so the opt-in auto-update check (`av update --enable-auto-update`) runs
-    exactly once per OS process, right as it's about to exit — including after any REPL
-    session `cli()` may have run internally. Can't hook this into `_AuthRetryGroup.invoke()`
-    instead: that fires once per `cli.main()` call, which is once per line typed inside the
-    REPL too, not once per process. `cli()` itself calls `sys.exit(...)` (Click's
-    standalone_mode=True default) — Python still runs `finally` before that exit completes, so
-    the update check reliably gets a turn either way. Any failure in the update check itself is
-    swallowed here so it can never mask the real command's exit code or crash on the way out.
-    """
+    """Console-script entry point. Wraps `cli()` so the opt-in auto-update check runs
+    exactly once per OS process on exit -- including after any REPL session, which calls
+    `cli.main()` once per line typed, not once per process. Any failure in the update
+    check itself is swallowed so it can never mask the real command's exit code."""
     try:
         cli()
     finally:

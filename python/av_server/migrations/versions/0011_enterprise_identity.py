@@ -6,25 +6,17 @@ Revises: 0010
 Create Date: 2026-09-04
 
 Purely additive: eleven NEW tables, no existing table touched (tenant_id lands on
-existing tables in migrations 0012/0013, split out to avoid one long lock across
-add-column + backfill + NOT-NULL + RLS-enable on tables the size `audit_log`/`events`
-can reach in a live deployment).
+existing tables in migrations 0012/0013, split out to avoid one long lock on tables the
+size `audit_log`/`events` can reach in a live deployment).
 
-Seeds a single well-known DEFAULT tenant (`models.py::DEFAULT_TENANT_ID`, the same fixed
-UUID literal migration 0013's RLS policies fall back to) and six built-in roles whose
-`permissions` are expressed in the EXISTING v1.3.1 scope vocabulary
-(`server.py::require_scope()`'s scope strings) — a role binding is a different, DB-backed
-way to arrive at the same `scopes` list `_scopes_for_identity()` already resolves for an
-`.env`-based token, not a parallel permission system. `owner`'s `["*"]` is the exact
-wildcard `_scopes_for_identity()` already returns for the `AV_API_TOKEN` shared secret
-and for any token that declares no explicit scopes — this is what keeps the new RBAC
-surface purely additive: nothing that could already reach a route loses access.
+Seeds a single well-known DEFAULT tenant and six built-in roles whose `permissions` are
+expressed in the existing scope vocabulary -- `owner`'s `["*"]` is the exact wildcard
+`_scopes_for_identity()` already returns for an unscoped token, keeping the new RBAC
+surface purely additive.
 
-`projects` is backfilled from `SELECT DISTINCT project_id, project_name FROM commits` —
-before this migration, "which project_ids exist" was purely virtual (`GET /api/projects`
-was a live `GROUP BY` over `commits`, see server.py::list_projects); this is the first
-migration to make it a real, ownable row. Every backfilled project is owned by the
-default tenant, matching every pre-existing commit's implicit single-tenant world.
+`projects` is backfilled from `SELECT DISTINCT project_id, project_name FROM commits` --
+"which project_ids exist" was previously purely virtual; this makes it a real, ownable
+row, owned by the default tenant.
 """
 from typing import Sequence, Union
 
@@ -213,22 +205,10 @@ def upgrade() -> None:
     ])
 
     # Seeded via a raw parameterized INSERT with an explicit CAST(:permissions AS JSON),
-    # not op.bulk_insert — two failure modes were found and rejected in turn while
-    # writing this migration:
-    #   1. sa.Column("permissions", sa.JSON()) in the bulk_insert helper table: offline
-    #      (--sql) rendering has no literal-value renderer for JSON at all (sa.JSON
-    #      defines none) — fails test_chain_renders_complete_postgres_ddl_offline.
-    #   2. Declaring that helper column sa.String instead fixes offline rendering (an
-    #      untyped SQL string literal implicitly coerces to a JSON column), but then
-    #      breaks ONLINE execution: asyncpg's extended query protocol binds a VARCHAR
-    #      parameter with an explicit type, and Postgres refuses to insert a bound
-    #      VARCHAR into a JSON column with no cast — DatatypeMismatchError, found by
-    #      actually round-tripping this migration live (downgrade + re-upgrade) against
-    #      the real Docker Postgres, not by the offline-only test suite.
-    # An explicit `CAST(:permissions AS JSON)` in raw SQL is the one form that is
-    # correct in BOTH modes: offline literal-binds mode inlines the bound value as a
-    # literal already wrapped in the same CAST; online mode binds it as text and lets
-    # the cast do the conversion server-side either way.
+    # not op.bulk_insert: a JSON-typed helper column has no offline literal renderer, while
+    # a String-typed one breaks ONLINE execution (asyncpg binds a typed VARCHAR that
+    # Postgres refuses to insert into JSON with no cast). The explicit CAST is correct
+    # in both modes.
     import json as _json
 
     conn = op.get_bind()

@@ -1,15 +1,9 @@
 name: Docker Edge Build
 
-# Rolling ":edge" build tracking `master` — for visibility/testing between tagged releases.
-# Never touches `:latest`, which stays exclusively tied to tagged releases (see release.yml).
-# (Was `main` — this repo's default branch has always been `master`, so the trigger never
-# fired; caught in the v1.1.8 doc/config sweep.)
-#
-# v1.2.2 engine consolidation: ONE image (aether-vault-engine) is built and pushed.
-# The historical aether-vault-server/-webui alias tags were removed at v1.3.0 (the
-# earliest-possible MINOR boundary VERSIONING.md named for this) — see
-# docs/migrate-engine-image.md. Already-pulled legacy images still auto-detect their
-# role from DATABASE_URL/NEXT_PUBLIC_API_URL (docker/engine-entrypoint.sh).
+# Rolling ":edge" build tracking `master` — for visibility/testing between tagged
+# releases. Never touches `:latest`, which stays exclusively tied to tagged releases.
+# ONE image (aether-vault-engine) is built and pushed; already-pulled legacy alias
+# images still auto-detect their role from DATABASE_URL/NEXT_PUBLIC_API_URL.
 
 on:
   push:
@@ -25,13 +19,11 @@ on:
       - 'requirements.txt'
       - '.github/workflows/docker-edge.yml'
 
-# v1.3.4 (W1b): deny-all default at the workflow level — the one job below already
-# grants itself exactly contents:read + packages:write, so this only closes the gap for
-# any future job added here without its own explicit block.
+# Deny-all default at the workflow level; the one job below grants itself exactly what it needs.
 permissions: {}
 
-# v1.3.4 (W1b): two master pushes to Dockerfile/docker/webui/python/src in quick
-# succession shouldn't run two overlapping 40-minute triple-image builds.
+# Two master pushes to Dockerfile/docker/webui/python/src in quick succession shouldn't
+# run two overlapping 40-minute triple-image builds.
 concurrency:
   group: docker-edge-${{ github.ref }}
   cancel-in-progress: true
@@ -40,9 +32,7 @@ jobs:
   build-and-push-edge:
     name: Build and push :edge engine image (GHCR)
     runs-on: ubuntu-latest
-    # v1.3.4 (W1f): bumped from 40 -- the engine image is now built twice (once to scan
-    # locally, once to actually push) with no build cache between them yet (Wave 3 adds
-    # cache-from/to). Revisit downward once that caching lands.
+    # The engine image is built twice (once to scan locally, once to actually push).
     timeout-minutes: 55
     permissions:
       contents: read
@@ -52,11 +42,10 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      # v1.3.4 (W3c): every image this job builds gets the SAME real version/revision/
-      # date baked in via the Dockerfile's AV_VERSION/VCS_REF/BUILD_DATE ARGs, instead of
-      # every published image silently reporting "0.0.0.dev0" (Probleme.md #69).
-      # PEP 440's local-version-segment syntax (`+<segment>`) is what makes
-      # "0.0.0.dev0+<sha>" a valid version setuptools-scm/pip will actually accept.
+      # Every image this job builds gets the same real version/revision/date baked in
+      # via the Dockerfile's AV_VERSION/VCS_REF/BUILD_DATE ARGs, instead of silently
+      # reporting "0.0.0.dev0". PEP 440's local-version-segment syntax makes
+      # "0.0.0.dev0+<sha>" a valid version setuptools-scm/pip will accept.
       - name: Compute image metadata
         id: meta
         run: |
@@ -72,14 +61,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # v1.3.4 (todo.md item 3, W1f): the engine image used to build straight to `push:
-      # true` with no scan gate at all -- security.yml's own Trivy job (container-image)
-      # only ever scanned a SEPARATE, throwaway `:security-scan` build, never the actual
-      # image reaching GHCR's `:edge` tag. Build once locally (load: true, no push),
-      # scan it, and only then push the SAME image so a HIGH/CRITICAL finding blocks the
-      # publish, not just a different tag nobody pulls. `cache-from/to: type=gha` (W3b)
-      # means the second (push) build below mostly reuses this one's layers instead of
-      # recompiling from scratch, offsetting the cost of building twice.
+      # Build once locally (load: true, no push), scan it, then push the SAME image so a
+      # HIGH/CRITICAL finding blocks the publish, not just a different tag nobody pulls.
+      # cache-from/to: type=gha lets the second (push) build reuse this one's layers.
       - name: Build engine image (local only, for scanning)
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -119,9 +103,8 @@ jobs:
             BUILD_DATE=${{ steps.meta.outputs.build_date }}
           cache-from: type=gha,scope=edge-engine
           cache-to: type=gha,mode=max,scope=edge-engine
-          # v1.3.4 (todo.md item 4/6, W4f): SBOM + build provenance attached as
-          # in-toto attestations on the published image, verifiable via
-          # `gh attestation verify`/`cosign` (see SECURITY.md).
+          # SBOM + build provenance attached as in-toto attestations, verifiable via
+          # `gh attestation verify`/`cosign`.
           sbom: true
           provenance: mode=max
 
@@ -158,11 +141,9 @@ jobs:
           sbom: true
           provenance: mode=max
 
-  # v1.3.4 (todo.md items 25/26, W5a): "staging" realized as the just-pushed :edge image
-  # smoked immediately after publish — no external host, no new secrets, fully
-  # reproducible. Pulls by DIGEST (not the mutable :edge tag, which could already point
-  # at a LATER push by the time this job starts) so this is provably testing the exact
-  # image build-and-push-edge just built.
+  # "Staging" realized as the just-pushed :edge image smoked immediately after publish.
+  # Pulls by digest (not the mutable :edge tag, which could already point at a later
+  # push) so this provably tests the exact image build-and-push-edge just built.
   staging-smoke:
     name: Staging smoke (:edge, by digest)
     needs: build-and-push-edge

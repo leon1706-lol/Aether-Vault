@@ -1,14 +1,8 @@
 """av branch protect / av promote — promotion guardrails for autonomous loops (v1.2.0).
-
-Policies live in .av/policies.json: {"<branch>": {"metric": str, "op": "<"|"<="|">"|">=",
-"baseline_ref": str, "require_signature": bool}}. `metric"/"op"` and `require_signature`
-(v1.2.5) are independent gates — either or both may be present; a policy with only
-`require_signature` denies an unsigned candidate regardless of metrics. Enforcement is
-CLIENT-SIDE at merge/push-to-protected-branch time (server-side authz is an enterprise-tier
-item); `av promote` evaluates the metric policy by comparing the candidate's latest metrics
-against the baseline ref's tip metrics, and (v1.2.5) the signature policy by verifying the
-candidate's own embedded signature — tamper evidence, not a PKI; this does not bind a key
-to an identity.
+Policies live in .av/policies.json: {"<branch>": {"metric", "op", "baseline_ref",
+"require_signature"}} — `metric`/`op` and `require_signature` are independent gates,
+either or both may be present. Enforcement is CLIENT-SIDE at merge/push-to-protected-
+branch time; signature checking is tamper evidence, not a PKI (no key-to-identity binding).
 """
 
 import contextlib
@@ -38,13 +32,8 @@ def save_policies(repo_root, policies: dict) -> None:
 
 
 def _resolve_ref_ancestor(repo_root, ref_name: str | None) -> str | None:
-    """Resolves REF or REF~N (e.g. `main~1`) to a commit hash.
-
-    `~N` walks N first-parent hops back from REF's tip via `handoff._commit_parent()` —
-    v1.3.1 fix: this previously fell through to "treat the whole string as a commit hash"
-    (always `None` for anything shaped like `main~1`), which is exactly the form the
-    shipped `examples/policies/metric-gate.json` uses, so a fresh policy silently found no
-    baseline the very first time anyone tried the documented example."""
+    """Resolves REF or REF~N (e.g. `main~1`) to a commit hash. `~N` walks N first-parent
+    hops back from REF's tip via `handoff._commit_parent()`."""
     from .handoff import _commit_parent, load_commit, resolve_head
 
     base_name, sep, hops_raw = (ref_name or "").partition("~")
@@ -73,14 +62,9 @@ def _resolve_ref_ancestor(repo_root, ref_name: str | None) -> str | None:
 
 def _latest_metrics_for_ref(repo_root, ref_name: str | None) -> dict | None:
     """Walks from ref tip backwards, returning the first commit with non-empty metrics.
-
-    `ref_name` may be a branch name (refs/heads lookup), `branch~N` ancestry, or a raw
-    commit hash — anything else falls back to HEAD. v1.3.1 fix: walks
-    `handoff._commit_parent()` (tolerates both the local `parents` list shape and the
-    registry's `parent_hash` shape) instead of reading `parent_hash` directly — locally-
-    authored commits only ever have `parents`, so the old walk stopped after one hop for
-    every baseline that was never fetched from the registry (the dual-gate promotion
-    baseline in v1.3.1 depends on this being correct)."""
+    `ref_name` may be a branch name, `branch~N` ancestry, or a raw commit hash. Walks via
+    `handoff._commit_parent()`, which tolerates both the local `parents`-list shape and
+    the registry's `parent_hash` shape."""
     from .handoff import _commit_parent, load_commit
 
     cur = _resolve_ref_ancestor(repo_root, ref_name)
@@ -211,9 +195,8 @@ def policy_remove(branch: str):
 
 
 def candidate_is_signed(repo_root, candidate_ref) -> tuple[bool, str]:
-    """v1.2.5: for `require_signature` policies — verifies the candidate's OWN embedded
-    signature (not a detached one; the candidate must carry it itself to promote/merge).
-    Returns (signed_and_valid, reason) so a denial message can say WHY."""
+    """For `require_signature` policies — verifies the candidate's own embedded signature
+    (not a detached one). Returns (signed_and_valid, reason) so a denial can say why."""
     from .handoff import load_commit
     from .signing import SigningUnavailable, verify_signature
 
@@ -230,10 +213,8 @@ def candidate_is_signed(repo_root, candidate_ref) -> tuple[bool, str]:
 
 
 def _report_policy_outcome(repo_root, decision: str, rule: str | None) -> None:
-    """v1.3.0 (todo.md item 7): best-effort telemetry pointer from the active run to the
-    policy decision that was just made — never raises and never blocks the caller.
-    Silently a no-op with no active run (resolve_run_id() returns None outside `av run`)
-    or no reachable server (offline resilience is sacred; this is reporting, not a gate)."""
+    """Best-effort telemetry pointer from the active run to the policy decision just made
+    — never raises, and a silent no-op with no active run or no reachable server."""
     try:
         from .client import VaultClient
         from .core import resolve_remote
@@ -250,10 +231,8 @@ def _report_policy_outcome(repo_root, decision: str, rule: str | None) -> None:
 def enforce_policy(repo_root, target_branch: str, candidate_metrics: dict | None,
                    baseline_metrics_fn, candidate_ref=None) -> None:
     """Raises PolicyDenied (via fail) when TARGET_BRANCH is protected and policy fails.
-
-    v1.2.5: `candidate_ref` (optional — pass the commit being merged/promoted) enables
-    the `require_signature` policy field. Omitting it preserves exact pre-1.2.5 behavior
-    for policies that don't set it (existing policies never fail a new, unrelated check)."""
+    `candidate_ref` (optional — the commit being merged/promoted) enables the
+    `require_signature` policy field."""
     pol = load_policies(repo_root).get(target_branch)
     if not pol:
         return
@@ -266,8 +245,8 @@ def enforce_policy(repo_root, target_branch: str, candidate_metrics: dict | None
                  f"the candidate is not validly signed ({sig_reason}). "
                  "Sign it (`av registry keygen` then re-commit) or override consciously "
                  "with --force.")
-    # v1.2.5: require_signature is usable standalone — a policy with no "metric" key is a
-    # signature-only gate, not an incomplete metric policy (matches promote()'s handling).
+    # require_signature is usable standalone — a policy with no "metric" key is a
+    # signature-only gate, not an incomplete metric policy.
     if not pol.get("metric"):
         _report_policy_outcome(repo_root, "allow",
                                "require_signature" if pol.get("require_signature") else None)
@@ -305,8 +284,8 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
 
     allowed, reason, deciding_rule = True, "no policy armed", None
     if pol_entry and not force:
-        # v1.2.5: require_signature is checked FIRST — a denial here should say "unsigned",
-        # not a misleading metric-comparison message when the metrics happen to also fail.
+        # require_signature is checked FIRST -- a denial here should say "unsigned", not a
+        # misleading metric-comparison message when the metrics happen to also fail.
         if pol_entry.get("require_signature"):
             signed, sig_reason = candidate_is_signed(repo_root, cand_ref)
             if not signed:
@@ -314,9 +293,8 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
                     f"require_signature is armed and the candidate is not validly signed "
                     f"({sig_reason})"
                 ), "require_signature"
-        # v1.2.5: require_signature is usable standalone — a policy with no "metric" key
-        # is a signature-only gate, not an incomplete metric policy. evaluate() runs only
-        # when a metric IS configured (existing metric-only policies are unaffected).
+        # require_signature is usable standalone -- evaluate() runs only when a metric IS
+        # configured.
         if allowed and pol_entry.get("metric"):
             base_ref = pol_entry.get("baseline_ref")
             baseline = _latest_metrics_for_ref(repo_root, base_ref) if base_ref else None
@@ -330,10 +308,8 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
         deciding_rule = "force"
 
     if dry_run:
-        # v1.2.5's --force already previews a DENY (it stops before landing); this is the
-        # missing half — previewing an ALLOW without landing anything either. Exits 0 for
-        # BOTH decisions (a script branches on data.decision, not the exit code) — dry-run
-        # never fails just because the real promotion would have.
+        # Exits 0 for BOTH decisions (a script branches on data.decision, not the exit
+        # code) -- dry-run never fails just because the real promotion would have.
         decision = "allow" if allowed else "deny"
         if current_output_mode() == "json":
             emit_json(None, "promote", data={"dry_run": True, "decision": decision,
@@ -344,16 +320,13 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
                     + (f" (rule: {deciding_rule})" if deciding_rule else ""), fg=color)
         return
 
-    # v1.3.1: freeze blocks the real landing (never dry-run, which "touches nothing
-    # either way" by contract) — checked AFTER policy evaluation but before anything is
-    # written, and even when --force would otherwise bypass the policy itself: freeze is
-    # a higher-priority safety gate than any single policy override.
+    # Freeze blocks the real landing (never dry-run) even when --force would otherwise
+    # bypass the policy itself -- freeze is a higher-priority safety gate than any policy.
     from .cmd_freeze import freeze_guard
 
     freeze_guard(repo_root)
 
-    # v1.3.0: report the real decision for the active run — dry runs above are deliberately
-    # excluded ("touches nothing either way" is the documented dry-run contract).
+    # Report the real decision for the active run -- dry runs above are excluded.
     if pol_entry:
         _report_policy_outcome(repo_root, "allow" if allowed else "deny", deciding_rule)
 
@@ -363,15 +336,8 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
                                              "forced": bool(force and pol_entry),
                                              "reason": reason, "rule": deciding_rule})
         else:
-            # v1.3.1 fix (Probleme.md): this used to secho unconditionally too — the
-            # SAME leak the comment below already fixed for the landing case, just never
-            # caught here because no existing test parsed a JSON-mode DENY as strict JSON
-            # (test_policy_denied_exits_16 only ever checked exit_code, in text mode).
             click.secho(f"DENIED: {reason}", fg="red", err=True)
         ctx_exit(EXIT_POLICY_DENIED)
-    # v1.3.0 fix (Probleme.md): this used to secho unconditionally, leaking human text
-    # ahead of the JSON envelope emitted below for the landing case — the same bug class
-    # as Probleme #105-107, just never exercised by a full non-dry-run JSON promote before.
     if pol_entry and current_output_mode() != "json":
         click.secho(f"Policy PASS: {reason}", fg="green")
 
@@ -397,16 +363,9 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
         ctx.invoke(merge_cmd, **merge_kwargs)
         return
 
-    # v1.3.0 fix (Probleme.md): merge_cmd emits its OWN top-level JSON envelope in JSON
-    # mode — invoking it here unguarded printed a SECOND JSON object for one `av promote`
-    # call (envelope-1.0 is one object per command; a strict consumer's json.loads() over
-    # the whole invocation's output fails outright, exactly like this fix's own regression
-    # test). Capture merge's output instead of letting it reach real stdout, and fold the
-    # parsed envelope into promote's own single combined envelope. On a merge failure
-    # (conflict, validation, ...) merge has already echoed its OWN failure envelope with
-    # the correct error code into the buffer before raising SystemExit — forward that
-    # captured envelope verbatim as the (single, correct) output and re-raise so the
-    # caller still sees the real exit code.
+    # merge_cmd emits its own top-level JSON envelope -- capture its output instead of
+    # letting it reach real stdout, and fold the parsed envelope into promote's own single
+    # combined one. On a merge failure, forward its captured envelope verbatim and re-raise.
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -427,11 +386,9 @@ def ctx_exit(code):
 
 
 # ---------------------------------------------------------------------------
-# Signed policy packs (v1.3.1, RSI R1: todo.md C.13/I.39) — an append-only, hash-chained
-# publication log for promotion-rule changes. Deliberately separate from `.av/policies.json`
-# (the LOCAL, mutable, currently-armed rules `av policy set/promote` read) — a policy pack
-# is a PUBLISHED SNAPSHOT of some policy state (model gate, improver gate, or both) with a
-# tamper-evident history, the same relationship signed commits have to the working tree.
+# Signed policy packs — an append-only, hash-chained publication log for promotion-rule
+# changes. Separate from `.av/policies.json` (the local, mutable, currently-armed rules);
+# a policy pack is a published snapshot with a tamper-evident history.
 # ---------------------------------------------------------------------------
 
 def _client(repo_root):
@@ -442,11 +399,9 @@ def _client(repo_root):
 
 
 def _pack_require_online(repo_root):
-    """Same reachability contract every other read/write against the registry uses
-    (`cmd_improver.py::_require_online`) — an unguarded `client.session.get/post` raises
-    a raw `requests.exceptions.ConnectionError` on an unreachable server, which crashes
-    with exit 1 and no JSON envelope instead of the documented `unreachable_queued`/13
-    (found via `tests/test_contract_matrix.py`'s anti-leakage sweep on `policy pack log`)."""
+    """Same reachability contract every other read/write against the registry uses --
+    an unguarded `client.session.get/post` would otherwise raise a raw ConnectionError
+    instead of the documented `unreachable_queued`/13."""
     client = _client(repo_root)
     if not client.server_available():
         fail(None, "unreachable_queued",
@@ -588,9 +543,7 @@ def pack_verify(pack_id: str) -> None:
     data = {"id": pack_id, "chain_ok": chain_ok, "signature_ok": sig_ok, "reason": sig_reason}
     if current_output_mode() == "json":
         emit_json(None, "policy pack verify", data=data)
-        # v1.3.1 fix (same class as cmd_canary.py::canary_run): this used to `return`
-        # unconditionally, so a BROKEN chain in JSON mode exited 0 — data said chain_ok:
-        # false but the exit code lied about it.
+        # A broken chain must not exit 0 just because JSON mode already emitted chain_ok: false.
         if not chain_ok:
             ctx_exit(EXIT_VALIDATION)
         return

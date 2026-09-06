@@ -76,9 +76,7 @@ def handoff(ctx: click.Context, update: bool, note: str | None, instructions_fil
         repo_root, update=update, agent_instructions=note_text, diff_weights=diff_weights,
         since=since, with_memory=with_memory,
     )
-    # v1.2.5: guarded so --publish's JSON envelope (below) is the only thing on stdout
-    # in JSON mode — these two lines had no such guard before because this command had
-    # no JSON output path at all until --publish added one.
+    # Guarded so --publish's JSON envelope (below) is the only thing on stdout in JSON mode.
     if current_output_mode() != "json":
         click.secho(f"Handoff snapshot written: {avh_path.relative_to(repo_root)}", fg="green")
         click.secho(f"Markdown log entry: {md_path.relative_to(repo_root)}", fg="cyan")
@@ -92,11 +90,9 @@ def handoff(ctx: click.Context, update: bool, note: str | None, instructions_fil
 
 
 def _publish_avh(repo_root: Path, avh_path: Path) -> None:
-    """v1.2.5: uploads `avh_path` through the NORMAL object flow (same path env
-    snapshots use — POST /api/objects/{hash}, hash re-verified server-side) and links it
-    to the active run via POST /api/runs/{run_id}/avh. Never silent: any failure here is
-    a clear error, not a queued retry — publishing is a deliberate, explicit action with
-    no established offline-retry queue for run-level metadata (unlike commits)."""
+    """Uploads `avh_path` through the normal object flow and links it to the active run.
+    Never silent -- any failure is a clear error, not a queued retry, since publishing has
+    no offline-retry queue (unlike commits)."""
     from .client import VaultClient
     from .core import hash_file_safe, resolve_run_id
 

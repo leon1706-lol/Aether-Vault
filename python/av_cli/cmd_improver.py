@@ -1,21 +1,9 @@
 """av improver — versioned improver artifacts, self-edit proposals, and the improver
-promotion gate (v1.3.1, RSI R1: todo.md A.1-A.5, C.11, C.14).
-
-An "improver version" is the agent's OWN stack — code paths, prompt files, tool schemas,
-and a policy-pack pointer — content-addressed exactly like everything else in this repo
-(`casobj.py`, the same pattern `env_snapshot_id` established). A version's manifest is a
-CAS object; the server keeps a lightweight index row (`improver_versions`) over it for
-lineage (`parent_id` chains, same shape as `runs.parent_run_id`).
-
-Design note: this file DELIBERATELY does NOT touch `.av/policies.json` or any of
-`cmd_policy.py`'s existing load/save/evaluate functions — the improver promotion gate
-lives in its own sibling file, `.av/improver_policy.json`, with the same branch-keyed
-shape. Folding both into one "policy_version: 2" envelope was considered and rejected:
-every existing model-gate reader (`enforce_policy()`, `promote()`, `av policy
-set/list/remove`) does `load_policies(repo_root).get(branch)` directly on the top-level
-dict — changing that shape would be a breaking change to a contract `tests/test_v120.py`
-already pins, for zero functional benefit. Two small files, one per concern, is simpler
-and strictly additive.
+promotion gate (v1.3.1). An "improver version" is the agent's OWN stack (code paths,
+prompt files, tool schemas, policy-pack pointer), content-addressed like everything else
+(`casobj.py`). This file deliberately keeps its own gate file, `.av/improver_policy.json`,
+separate from `cmd_policy.py`'s model-gate `.av/policies.json` — same shape, different
+concern, so neither reader's contract has to change.
 """
 import datetime
 import json
@@ -57,8 +45,7 @@ def _improver_policy_path(repo_root):
 
 def load_improver_policies(repo_root) -> dict:
     """{"<branch>": {"require_canaries": bool, "require_signature": bool}} — the improver-
-    gate sibling of `cmd_policy.py::load_policies()`, same on-disk conventions (atomic
-    write, empty-on-any-error read), deliberately its own file (see module docstring)."""
+    gate sibling of `cmd_policy.py::load_policies()`, same on-disk conventions."""
     path = _improver_policy_path(repo_root)
     if not path.exists():
         return {}
@@ -380,14 +367,9 @@ def improver_review(change_set_id: str, decision: str | None):
 @click.argument("change_set_id")
 def improver_apply(change_set_id: str):
     """Apply an APPROVED change set: mints the next improver version (parented on the
-    change set's improver_id) and marks the change set 'applied'.
-
-    Scope note (v1.3.1 R1): this records the version transition and its audit trail —
-    the mechanical diff execution inside an isolated sandbox is `av sandbox run` (R5,
-    todo.md G.29), which a future improver-registration step can invoke before calling
-    this to make the result official. Applying without executing anything is intentional
-    for a proposal whose change is metadata/config/policy-only.
-    """
+    change set's improver_id) and marks the change set 'applied'. This only records the
+    version transition and its audit trail -- mechanical diff execution is `av sandbox run`,
+    invoked separately before calling this."""
     from .cmd_freeze import freeze_guard
 
     repo_root = ensure_repo()
@@ -611,9 +593,8 @@ def improver_promote(candidate: str | None, into_branch: str, force: bool, dry_r
                                                        "rule": deciding_rule})
         else:
             click.secho(f"DENIED: {reason}", fg="red", err=True)
-        # require_review denies with 19 (review_required) — a distinct signal from every
-        # other denial (16, policy_denied): "nobody has signed off yet" is a different
-        # remediation ("get it reviewed") than "the metrics/signature don't qualify".
+        # require_review denies with 19 (review_required), not 16 (policy_denied) -- a
+        # distinct remediation ("get it reviewed") from a metrics/signature failure.
         raise SystemExit(EXIT_REVIEW_REQUIRED if deciding_rule == "require_review" else EXIT_POLICY_DENIED)
 
     atomic_write_text(_promoted_path(repo_root, into_branch), candidate)

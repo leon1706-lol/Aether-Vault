@@ -13,8 +13,8 @@ against the Kubernetes API schema, for the default values and a representative
 override set (multi-replica + ingress + autoscaling enabled).
 
 **It has NOT been drilled against a real running Kubernetes cluster on this machine.**
-That is a deliberate, stated scope decision for this phase, not an oversight — see
-`todo.md`/the v1.3.2 plan's "What this plan does not deliver" section. The HA claims this
+That is a deliberate, stated scope decision, not an oversight — see `todo.md`'s open
+items. The HA claims this
 project can actually back with a real, live drill are the ones in `docker-compose.ha.yml`
 + `scripts/ha_drill.sh`, which genuinely brings up multiple replicas, kills one mid-load,
 and asserts zero failed requests / zero double webhook delivery / correctly-global rate

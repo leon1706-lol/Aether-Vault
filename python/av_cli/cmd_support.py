@@ -1,11 +1,7 @@
-"""av support-bundle — a redacted diagnostics artifact for a support engineer (v1.3.2,
-WP-34). Repo-scoped like `av doctor` (same `ensure_repo()`/`VaultClient` shape), but
-produces a shareable bundle instead of console output.
-
-**Redaction is the load-bearing part of this file.** Every value under any config key
-whose name looks credential-shaped (token/password/secret/key, case-insensitive) is
-replaced before anything touches disk — `tests/test_support_bundle.py` asserts no known
-token pattern survives into the written bundle.
+"""av support-bundle — a redacted diagnostics artifact for a support engineer (v1.3.2).
+Repo-scoped like `av doctor`, but produces a shareable bundle instead of console output.
+**Redaction is the load-bearing part of this file**: every value under a credential-
+shaped config key is replaced before anything touches disk.
 """
 import datetime
 import json as _json
@@ -80,10 +76,8 @@ def support_bundle(output_dir: str | None) -> None:
     except Exception as exc:
         bundle["ready"] = {"error": str(exc)}
 
-    # Container status/log tails -- best-effort, since a bundle collected against a
-    # non-Docker (managed Postgres, bare uvicorn) deployment legitimately has none of
-    # this. Names match this repo's own docker-compose.yml; a differently-named
-    # deployment simply gets "(unavailable: ...)" for these two fields, not a crash.
+    # Container status/log tails -- best-effort, since a non-Docker deployment
+    # legitimately has none of this.
     bundle["docker_ps"] = _run_best_effort(
         ["docker", "ps", "--filter", "name=aether-vault", "--format",
          "{{.Names}}\t{{.Status}}"])

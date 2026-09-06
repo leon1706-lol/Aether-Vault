@@ -155,14 +155,9 @@ def test_upload_commit_objects_uploads_only_missing_hashes(repo, monkeypatch):
 
 
 def test_upload_commit_objects_returns_false_when_any_upload_fails(repo, monkeypatch):
-    # v1.3.0 (Probleme #126): found live on a real Docker/GHA registry with an unwritable
-    # data dir — the server's storage write failed (a clean 500, upload_object() correctly
-    # returned False for it), but this function's return value was discarded by every
-    # caller, so a commit landed referencing an object that was never actually stored.
-    # DBTree.object_hash is deliberately NOT a real DB foreign key (see its own comment in
-    # av_server/models.py — layer-split artifacts never get a whole-file object row), so
-    # this return value is the ONLY signal a real upload failure ever produces; callers
-    # MUST treat False as a reason to queue instead of pushing the commit.
+    # This return value is the only signal a real upload failure produces (DBTree.object_hash
+    # is deliberately not a real DB foreign key), so callers must treat False as a reason
+    # to queue instead of pushing the commit.
     import python.av_cli.main as main_module
 
     (repo / "c.py").write_text("c = 1")
@@ -189,11 +184,8 @@ def test_upload_commit_objects_returns_false_when_any_upload_fails(repo, monkeyp
 
 
 def test_commit_queues_instead_of_pushing_when_an_object_upload_fails(repo, monkeypatch):
-    # End-to-end version of the unit test above: drives the real `av commit` command and
-    # asserts the commit lands locally but gets QUEUED for retry, never pushed, when an
-    # object upload fails — the exact scenario a real unwritable/full registry disk
-    # produces (development/Probleme.md #126; caught live by scripts/e2e_scenario.sh's
-    # Phase M on a real GHA Linux runner).
+    # End-to-end version of the unit test above: the commit lands locally but gets queued
+    # for retry, never pushed, when an object upload fails.
     from python.av_cli.client import VaultClient
 
     monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
@@ -385,12 +377,9 @@ def test_update_docker_already_up_to_date(repo, monkeypatch):
 # ---------------------------------------------------------------------------
 # av import-lightning / import-transformers / import-mlflow
 #
-# The real av_plugins.lightning/transformers modules raise ImportError at import time when
-# the optional extra isn't installed (not installed in this dev environment), so they can't be
-# imported first and then monkeypatched in the usual way. Instead, inject a fake module
-# directly into sys.modules before invoking the CLI — `from av_plugins.lightning import
-# import_checkpoint` inside the command function then resolves to the fake module without ever
-# executing the real (dependency-requiring) file.
+# The real av_plugins modules raise ImportError at import time when the optional extra
+# isn't installed, so a fake module is injected directly into sys.modules before invoking
+# the CLI instead of importing and monkeypatching the real one.
 # ---------------------------------------------------------------------------
 
 def test_import_lightning_cli_wraps_plugin_function(repo, monkeypatch, tmp_path):

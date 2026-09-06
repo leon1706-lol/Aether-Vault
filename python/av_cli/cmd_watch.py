@@ -1,15 +1,8 @@
-"""av watch — filesystem watcher for continuous training loops (v1.2.0).
-
-Pure-stdlib polling by default (no hard watchdog dependency): scans the repo on an
-interval, stages and commits any file matching --glob that appeared or changed since the
-last scan. Commits run through the SAME single code path (commit command semantics,
-upload deferred) so offline resilience and run-tagging apply unchanged.
-
-v1.3.0: when the optional `watchdog` extra (`pip install aether-vault[watch]`) is
-installed, change DETECTION switches to real filesystem events instead of a full
-os.walk() every tick — the debounce/staging/commit logic below is identical either way,
-this only changes how a tick decides which paths are even worth re-stat'ing. Falls back
-to the original polling behavior automatically when watchdog isn't importable.
+"""av watch — filesystem watcher for continuous training loops (v1.2.0). Pure-stdlib
+polling by default: scans the repo on an interval, stages and commits any file matching
+--glob through the SAME single commit path (upload deferred). With the optional
+`watchdog` extra installed, change DETECTION switches to real filesystem events instead
+of a full os.walk() every tick -- the debounce/commit logic is identical either way.
 """
 
 import fnmatch
@@ -22,12 +15,9 @@ from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 
 def _try_start_watchdog(repo_root, pattern: str):
     """Returns (observer, drain_fn) when the watchdog extra is installed, else None.
-
-    `drain_fn()` returns (and clears) the set of rel_paths that received a real
-    filesystem event since the last call — a superset is fine (a path re-checked that
-    didn't actually change is just a cheap no-op stat), a false negative is not, so
-    `on_any_event` is deliberately unfiltered by event TYPE (create/modify/move/delete
-    all count) and only filtered by the --glob pattern."""
+    `drain_fn()` returns (and clears) the set of rel_paths touched since the last call --
+    a superset is fine (a cheap no-op re-stat), a false negative is not, so events are
+    filtered only by the --glob pattern, never by event type."""
     try:
         from watchdog.events import FileSystemEventHandler
         from watchdog.observers import Observer
@@ -89,11 +79,9 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
 
     repo_root = ensure_repo()
     json_mode = current_output_mode() == "json"
-    # v1.3.0: watch is the one documented streaming exception to "single clean envelope
-    # per invocation" (see docs/contracts.md and the leakage-guard allowlist in
-    # tests/test_contract_matrix.py) — it runs indefinitely and reports as it goes, so JSON
-    # mode emits one newline-delimited envelope PER auto-commit (plus a final summary
-    # envelope on exit) instead of one envelope for the whole command.
+    # watch is the one documented streaming exception to "single clean envelope per
+    # invocation" -- it runs indefinitely, so JSON mode emits one newline-delimited
+    # envelope PER auto-commit plus a final summary envelope on exit.
     watchdog_handle = _try_start_watchdog(repo_root, pattern)
     using_watchdog = watchdog_handle is not None
     if not json_mode:
@@ -110,11 +98,8 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
         while True:
             now = time.monotonic()
             if using_watchdog and not first_tick:
-                # Only re-stat paths a real fs event touched, or that are already mid-
-                # debounce (still need re-checking each tick until they go stable) —
-                # everything else in `seen` carries forward unchanged. A path that
-                # disappeared (deleted/renamed away) drops out of `current` exactly like
-                # a fresh os.walk() would naturally omit it.
+                # Only re-stat paths a real fs event touched, or already mid-debounce --
+                # everything else in `seen` carries forward unchanged.
                 _, drain = watchdog_handle
                 candidates = drain() | set(pending_since)
                 current: dict[str, tuple[int, int]] = dict(seen)
@@ -126,13 +111,9 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
                         continue
                     current[rel] = (st.st_mtime_ns, st.st_size)
             else:
-                # Polling mode every tick, OR the watchdog path's very first tick: a
-                # real fs-event watcher only sees CHANGES from the moment it starts —
-                # it would otherwise never discover files that already existed before
-                # `av watch` was invoked (a real bug this exact comment replaced: the
-                # first version of this code left `current` empty on tick one whenever
-                # nothing had changed yet, so a pre-existing matching file was invisible
-                # forever and --max-commits could never be reached).
+                # Polling mode every tick, OR the watchdog path's very first tick: a real
+                # fs-event watcher only sees CHANGES from the moment it starts, so it would
+                # otherwise never discover files that already existed before `av watch` ran.
                 if using_watchdog:
                     watchdog_handle[1]()  # drain events queued during the scan below
                 current = {}
@@ -182,18 +163,9 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
                     from .core import commit_staged as _commit
                     from .core import resolve_run_id
 
-                    # v1.2.5 fix: av watch never resolved AV_RUN_ID/active-run state at
-                    # all — auto-commits were silently never filed under the active run
-                    # regardless of `av run start`, breaking the documented "AV_RUN_ID
-                    # joins ANY process' commits" contract (Probleme.md). Same precedence
-                    # as every other commit path now (resolve_run_id: env > state).
-                    # v1.3.0 fix: _finalize_commit's own human echoes ("Staged [...]",
-                    # "Upload deferred — queued for `av push`", ...) are gated on
-                    # result_sink is None — cmd_history.py's `commit` command already
-                    # passes a sink in JSON mode for exactly this reason, but this call
-                    # never did, so `av --output json watch` leaked plain text ahead of
-                    # every per-commit envelope below (same regression class as
-                    # Probleme #93, just never exercised for this call site until now).
+                    # Same run-id precedence as every other commit path (resolve_run_id:
+                    # env > state). result_sink suppresses _finalize_commit's own human
+                    # echoes in JSON mode, matching cmd_history.py's `commit` command.
                     sink_data: dict = {}
                     json_sink = (lambda result: sink_data.update(result)) if json_mode else None
                     commit_hash = _commit(repo_root, f"watch: {rel} @ {time.strftime('%H:%M:%S')}",

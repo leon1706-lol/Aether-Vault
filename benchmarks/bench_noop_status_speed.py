@@ -1,13 +1,10 @@
 """Benchmark #4 — no-op `status`/`add` speed at scale.
 
-Stages the fixture once, commits it, then re-runs the staging step again with *nothing*
+Stages the fixture once, commits it, then re-runs the staging step with *nothing*
 changed and times that second, no-op run. Aether's `add()` has an explicit size+mtime
 short-circuit (`compare_meta_safe`, main.py) that skips re-hashing unchanged files
-entirely; this benchmark is what that optimization is actually for.
-
-MLflow has no incremental staging/status concept comparable to add/status (every
-`log_artifact` call is a fresh write, there's no "is this unchanged?" primitive to time) —
-marked N/A rather than approximated.
+entirely; this benchmark is what that optimization is for. MLflow has no incremental
+staging/status concept comparable to add/status, so it's marked N/A.
 """
 
 import shutil

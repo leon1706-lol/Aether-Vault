@@ -23,23 +23,15 @@ EXIT_CODES = {
 
 class SDKError(AetherVaultException):
     """Raised for every SDK failure. `.code` matches docs/for-agents.md's registry.
-
-    Every raise in this package goes through `error_from_code()` below, which returns
-    the matching typed subclass (v1.3.0) — `except SDKError` still catches all of them
-    (nothing about existing code breaks), but callers who want to branch on a specific
-    failure can now do `except NotARepoError` instead of `except SDKError as e: if
-    e.code == "not_a_repo"`. `.exit_code` mirrors the CLI's exit-code registry exactly,
-    so an agent that shells out sometimes and uses the SDK other times sees one number
-    space either way.
-    """
+    Every raise goes through `error_from_code()` below, which returns the matching typed
+    subclass -- `except SDKError` still catches all of them, but callers can also branch
+    on `except NotARepoError`. `.exit_code` mirrors the CLI's exit-code registry exactly."""
 
     code: str = "validation"
 
     def __init__(self, code: str | None = None, message: str = ""):
-        # Backward-compatible: `SDKError("not_a_repo", "...")` (the pre-v1.3.0 call
-        # shape, still used directly in a few call sites and any external code written
-        # against the old signature) keeps working — `code` overrides the subclass's own
-        # class-level default when given explicitly.
+        # Backward-compatible: `SDKError("not_a_repo", "...")` keeps working -- `code`
+        # overrides the subclass's own class-level default when given explicitly.
         resolved_code = code if code is not None else self.code
         super().__init__(f"[{resolved_code}] {message}")
         self.code = resolved_code
@@ -117,8 +109,7 @@ _CODE_TO_CLASS: dict[str, type[SDKError]] = {
 
 
 def error_from_code(code: str, message: str) -> SDKError:
-    """Factory used by every raise site in this package — returns the typed subclass for
-    `code` (falling back to the base SDKError for an unrecognized code, e.g. a future
-    server-side error string this SDK version doesn't know about yet)."""
+    """Factory used by every raise site in this package -- returns the typed subclass for
+    `code`, falling back to the base SDKError for an unrecognized code."""
     cls = _CODE_TO_CLASS.get(code, SDKError)
     return cls(code, message)

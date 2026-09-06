@@ -50,9 +50,7 @@ def _print_synthetic_speed_check() -> None:
 
 def _rewrite_test_count_prose(text: str, total_str: str, file_count: int) -> str:
     """Applied to both README.md and tests/README.md — the same two hand-typed-count
-    shapes ("N-test suite across M files" / "N tests across M files") appear in each,
-    stating the identical underlying fact about the same `tests/` directory, so both get
-    resynced from the one real count rather than tracked as two independent numbers."""
+    shapes appear in each, so both get resynced from the one real count."""
     updated, _n1 = re.subn(
         r"~?[\d,]+-test suite across \d+\+? files",
         f"{total_str}-test suite across {file_count} files",
@@ -67,22 +65,14 @@ def _rewrite_test_count_prose(text: str, total_str: str, file_count: int) -> str
 
 
 def _update_readme_test_badge(passed: int, failed: int) -> None:
-    """Keep every test-count figure in README.md and tests/README.md honest, in one
-    pass: the `tests-N%2FM passing` badge, the `tests/` row in the module table, the
-    Test Suite section's own prose, and tests/README.md's own opening line — all
-    previously separate hand-typed numbers that could (and did — found live: the badge
-    said 492/492 while the real collected count was 1,471 across 63 files, and each
-    prose mention guessed a different approximate number from each other AND from the
-    badge, including tests/README.md's own "~950 tests across 40+ files") silently
-    drift apart the moment the suite grew and nobody happened to re-type every one of
-    them by hand.
-
-    Only called after a full, unfiltered `av test` run (no `-k`) — a scoped subset would
-    overwrite these with a misleadingly small total otherwise.
-    """
+    """Keep every test-count figure in README.md and tests/README.md honest in one pass
+    (badge, module table row, prose mentions) — these were previously separate hand-typed
+    numbers that drifted apart as the suite grew. Only called after a full, unfiltered
+    `av test` run (no `-k`), or a scoped subset would overwrite these with a misleadingly
+    small total."""
     total = passed + failed
     if total == 0:
-        return  # parse failed or nothing collected — leave the numbers alone rather than zero them out
+        return  # parse failed or nothing collected -- leave the numbers alone
     source_root = _root._find_source_root()
     readme_path = source_root / "README.md"
     if not readme_path.is_file():
@@ -101,10 +91,8 @@ def _update_readme_test_badge(passed: int, failed: int) -> None:
 
     updated = badge_pattern.sub(_replace_badge, text, count=1)
 
-    # The file count is real, not parsed from pytest's own summary (which reports test
-    # counts, not file counts) — counted directly off disk, the same set `av test`
-    # itself just ran (only ever meaningful for the full, unscoped run this function is
-    # already gated on above).
+    # File count is counted directly off disk, not parsed from pytest's summary (which
+    # reports test counts, not file counts).
     tests_dir = source_root / "tests"
     file_count = sum(1 for _ in tests_dir.glob("test_*.py")) if tests_dir.is_dir() else 0
     total_str = f"{total:,}"
@@ -125,18 +113,10 @@ def _update_readme_test_badge(passed: int, failed: int) -> None:
 
 
 def _sync_readme_perf_ratio(results: list) -> None:
-    """Keeps README.md's "~Nx slower than Git LFS" mentions (Known Limitations bullet +
-    Benchmark Comparison table row) in sync with the No-Op status/add benchmark's own
-    just-captured numbers — found live: README said "~15x" while the real latest capture
-    in `development/BENCHMARKS.md` (2026-09-03) put it at ~63x, because nothing ever
-    re-derived README's copy of that ratio from a real run; it was hand-typed once and
-    never revisited as the gap widened.
-
-    Only called when `--markdown` was passed (a genuine regeneration, not a scoped
-    `--only` spot-check) and only rewrites anything when the noop benchmark actually ran
-    with a real Git LFS number to compare against — a missing/uninstalled competitor
-    leaves README's existing figure untouched rather than overwriting it with garbage.
-    """
+    """Keeps README.md's "~Nx slower than Git LFS" mentions in sync with the No-Op
+    status/add benchmark's own just-captured numbers, which drifted before since nothing
+    re-derived README's hand-typed ratio from a real run. Only called with `--markdown`,
+    and only rewrites when the noop benchmark actually ran with a real Git LFS number."""
     noop = next((r for r in results if r.name == "noop_status_speed"), None)
     if noop is None or not noop.rows:
         return
@@ -184,8 +164,8 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
         sys.exit(1)
 
     args = [sys.executable, "-m", "pytest", str(tests_dir)]
-    # Force color even though stdout is about to be piped (not a real tty) for output capture
-    # below — otherwise pytest auto-detects the pipe and silently drops all colorization.
+    # Force color even though stdout is piped -- otherwise pytest auto-detects the pipe
+    # and silently drops all colorization.
     args += ["--color=yes"]
     if test_filter:
         args += ["-k", test_filter]
@@ -197,11 +177,9 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
     if not json_mode:
         click.secho("=== Python test suite ===", bold=True, fg="cyan")
         click.secho(f"Running Aether-Vault's test suite (pytest {' '.join(args[3:])})...", fg="cyan")
-    # Stream pytest's output live (line by line, as it would print unbuffered) while also
-    # collecting it, so the final "N passed, M failed" summary can be parsed afterward to keep
-    # README.md's test-count badge honest without a second, redundant pytest run. In JSON mode
-    # nothing streams to stdout (an agent wants one clean envelope, not scrollback mixed with
-    # it) — the full text still ends up in the envelope's data.log for anyone who wants it.
+    # Stream pytest's output live while also collecting it, so the final summary can be
+    # parsed afterward without a second pytest run. JSON mode streams nothing to stdout
+    # (one clean envelope) -- the full text still ends up in data.log.
     process = subprocess.Popen(
         args, cwd=source_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
@@ -242,10 +220,8 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
 
         if not json_mode:
             click.secho("\n=== Web UI test suite (webui/) ===", bold=True, fg="cyan")
-        # shutil.which (not a bare "npm" argv) — on Windows, `npm` resolves to `npm.cmd`, which
-        # subprocess.run(["npm", ...]) frequently fails to locate/execute even when npm is
-        # genuinely installed and on PATH; resolving the full path first (as `which` does, via
-        # PATHEXT) avoids a false "npm not found" on a machine that actually has it.
+        # shutil.which, not a bare "npm" argv -- on Windows, subprocess.run(["npm", ...])
+        # frequently fails to locate npm.cmd even when it's genuinely on PATH.
         npm_path = shutil.which("npm")
         if npm_path is None:
             msg = ("npm not found on PATH — install Node.js to run the webui/ Vitest suite, "
@@ -254,10 +230,8 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
                 fail(None, "validation", msg, command="test")
             click.secho(msg, fg="red")
             sys.exit(1)
-        # capture_output/text only passed when actually True — an always-present kwarg
-        # (even =False) would change subprocess.run's call signature versus plain text
-        # mode's bare call, breaking any caller/test that mocks subprocess.run with a
-        # narrower (args, cwd=None) signature (see tests/test_cli.py's webui tests).
+        # capture_output/text only passed when actually True, so plain text mode's call
+        # signature stays the narrower one tests/test_cli.py's mocks expect.
         extra = {"capture_output": True, "text": True} if json_mode else {}
         webui_result = subprocess.run([npm_path, "test"], cwd=webui_dir, **extra)
         webui_exit = webui_result.returncode

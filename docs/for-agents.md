@@ -56,7 +56,7 @@ whoever (or whatever) picks this up next inherits intent without re-deriving it.
 
 ## Error / exit-code registry
 
-Every failure — CLI exit code, JSON envelope `error.code`, and (v1.3.0+) a matching
+Every failure — CLI exit code, JSON envelope `error.code`, and a matching
 `av_sdk.exceptions` subclass — comes from this one table:
 
 | `error.code` | exit code | SDK exception | Meaning |
@@ -68,12 +68,12 @@ Every failure — CLI exit code, JSON envelope `error.code`, and (v1.3.0+) a mat
 | `merge_conflict` | 14 | `MergeConflictError` | Conflicting changes; `error.data` carries remediation |
 | `validation` | 15 | `ValidationError` | Bad input (unknown ref, malformed flag, policy misconfiguration) |
 | `policy_denied` | 16 | `PolicyDeniedError` | `av promote`/`av merge` blocked by an armed policy |
-| `budget_exhausted` | 17 | `BudgetExhaustedError` | v1.3.1: `av budget consume` reports a dimension now over its limit — the spend is recorded either way, never lost |
-| `frozen` | 18 | `FrozenError` | v1.3.1: project is frozen (`av freeze on`) — `av promote`/`av improver register\|propose\|apply`/`av policy pack publish` are paused |
-| `review_required` | 19 | `ReviewRequiredError` | v1.3.1: `av improver promote`'s `require_review` gate denied — nobody has approved this candidate yet (distinct from `policy_denied`: "get it reviewed" is a different remediation than "the metrics/signature don't qualify") |
-| `scope_denied` | 20 | `ScopeDeniedError` | v1.3.1: token authenticated but lacks the required scope — the server returned 403 (e.g. `av freeze on/off` needs the `admin` scope) |
-| `login_required` | 21 | `LoginRequiredError` | v1.3.3: `av login`'s SSO device-code flow timed out with no approval — distinct from `auth_failed` (12), which is a *rejected* credential, not a missing one |
-| `tenant_denied` | 22 | `TenantDeniedError` | v1.3.2: your credential authenticated fine but doesn't own the target `project_id` — the server returned 403 (`AV_TENANCY_ENFORCE=1` deployments only; enforcement is off by default) |
+| `budget_exhausted` | 17 | `BudgetExhaustedError` | `av budget consume` reports a dimension now over its limit — the spend is recorded either way, never lost |
+| `frozen` | 18 | `FrozenError` | Project is frozen (`av freeze on`) — `av promote`/`av improver register\|propose\|apply`/`av policy pack publish` are paused |
+| `review_required` | 19 | `ReviewRequiredError` | `av improver promote`'s `require_review` gate denied — nobody has approved this candidate yet (distinct from `policy_denied`: "get it reviewed" is a different remediation than "the metrics/signature don't qualify") |
+| `scope_denied` | 20 | `ScopeDeniedError` | Token authenticated but lacks the required scope — the server returned 403 (e.g. `av freeze on/off` needs the `admin` scope) |
+| `login_required` | 21 | `LoginRequiredError` | `av login`'s SSO device-code flow timed out with no approval — distinct from `auth_failed` (12), which is a *rejected* credential, not a missing one |
+| `tenant_denied` | 22 | `TenantDeniedError` | Your credential authenticated fine but doesn't own the target `project_id` — the server returned 403 (`AV_TENANCY_ENFORCE=1` deployments only; enforcement is off by default) |
 | — | 0 | — | Success, **including a queued commit** — see below |
 | — | 2 | — | Click's own usage error (missing/bad CLI argument) — not part of this registry |
 
@@ -111,7 +111,7 @@ av promote --into main             # exit 16 (policy_denied) on DENY
 Three worked `.av/policies.json` shapes (metric gate, signature gate, both combined) live
 in `examples/policies/` — copy one in directly or use it as a reference for `av policy set`.
 
-## RSI control plane (v1.3.1)
+## RSI control plane
 
 Versioning the IMPROVER (the agent's own code/prompts/tools/policy), not just the model
 it produces, is a separate surface — `av_sdk.Repo` gained one method per write-capable

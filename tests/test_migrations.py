@@ -31,28 +31,8 @@ def test_migration_chain_resolves_to_single_head():
     script = ScriptDirectory.from_config(_alembic_config())
     heads = script.get_heads()
     assert heads == ["0016"], f"unexpected heads: {heads}"
-    # walk_revisions() yields every revision reachable from head exactly once —
-    # no dangling down_revisions, no surprise second branch. The chain is strictly
-    # linear: 0002 (runs/events/webhooks/audit) descends from 0001 (baseline),
-    # 0003 (webhook_deliveries/audit outcome/signature) descends from 0002,
-    # 0004 (webhook health tracking/runs.avh_object_id/audit indexes) descends from 0003,
-    # 0005 (runs.policy_outcome) descends from 0004, 0006 (RSI R1: runs.kind/improver_id,
-    # improver_versions, change_sets, policy_packs, canary_results, project_freeze)
-    # descends from 0005, 0007 (RSI R2: runs.integrity_signals, eval_suites,
-    # eval_results, eval_adapters, tasks) descends from 0006, 0008 (RSI R3:
-    # runs.plan_id/budget_id/stop_reason, plans, budgets) descends from 0007, 0009 (RSI
-    # R4: runs.lessons_id, causal_links, strategy_entries, lessons, reviews, critiques,
-    # blackboard_entries) descends from 0008, 0010 (RSI R5: sandbox_jobs, tool_manifests,
-    # action_logs) descends from 0009, 0011 (v1.3.2 enterprise identity: tenants,
-    # projects, users, user_identities, groups, group_members, roles, role_bindings,
-    # api_tokens, sso_providers, sessions) descends from 0010, 0012 (tenant scoping
-    # phase 1: nullable tenant_id + backfill on 28 existing tables) descends from 0011,
-    # 0013 (tenant scoping phase 2: NOT NULL + FK + row-level security on those same 28
-    # tables) descends from 0012, 0014 (per-tenant CAS schema prerequisite: objects/trees
-    # PK widening to include tenant_id) descends from 0013, 0015 (non-superuser av_app
-    # role + grants -- the real fix for the RLS-superuser gap 0013 documented) descends
-    # from 0014, 0016 (v1.3.3: audit_log hash-chaining -- chain_hash/signature columns +
-    # a full historical backfill) descends from 0015.
+    # walk_revisions() yields every revision reachable from head exactly once -- no
+    # dangling down_revisions, no surprise second branch. The chain is strictly linear.
     walked = sorted(rev.revision for rev in script.walk_revisions())
     assert walked == ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008",
                       "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016"]
@@ -61,10 +41,8 @@ def test_migration_chain_resolves_to_single_head():
 def test_env_py_is_valid_python():
     source = (_MIGRATIONS / "env.py").read_text(encoding="utf-8")
     ast.parse(source)  # raises on syntax errors
-    # ast.parse alone accepts constructs that fail at compile stage — notably
-    # 'async with'/'await' inside a plain def ("SyntaxError: 'async with' outside async
-    # function"), which is exactly how env.py once shipped to CI and killed the server
-    # at startup on every fresh database. compile() enforces those semantics here.
+    # ast.parse alone accepts constructs that fail at compile stage, e.g. 'async
+    # with'/'await' inside a plain def -- compile() enforces those semantics too.
     compile(source, str(_MIGRATIONS / "env.py"), "exec")
     # The programmatic-startup contract: env.py must honor an injected connection.
     assert 'attributes.get("connection")' in source
@@ -209,8 +187,8 @@ def test_schema_is_ahead_returns_true_for_an_unknown_future_revision(tmp_path):
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'future.db'}")
     script = ScriptDirectory.from_config(_alembic_config())
     with engine.begin() as conn:
-        # A real, applied alembic_version table row this binary's chain has never heard
-        # of -- exactly the state a rolling upgrade leaves an older replica facing.
+        # A real alembic_version row this binary's chain has never heard of -- the state
+        # a rolling upgrade leaves an older replica facing.
         conn.exec_driver_sql(
             "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL, "
             "PRIMARY KEY (version_num))"
@@ -222,21 +200,16 @@ def test_schema_is_ahead_returns_true_for_an_unknown_future_revision(tmp_path):
 
 
 def test_heal_legacy_indexes_creates_only_whats_missing_on_sqlite(tmp_path):
-    """v1.3.0: the index-shaped sibling of the column-heal test above — an adopted
-    legacy volume's audit_log table (created by an earlier phase, before migration 0004
-    added ix_audit_log_username/ix_audit_log_action) must come out of healing with both
-    indexes, without touching a column-level index (ix_audit_ts) that's unrelated."""
+    """The index-shaped sibling of the column-heal test above — an adopted legacy
+    volume's audit_log table must come out of healing with both missing indexes, without
+    touching an unrelated column-level index (ix_audit_ts)."""
     from python.av_server.models import Base
 
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
     with engine.begin() as conn:
-        # Same shape Base.metadata declares for audit_log, MINUS the two indexes this
-        # heal function is responsible for adding — i.e. exactly what an adopted volume
-        # whose create_all() predates their declaration would look like. Includes
-        # tenant_id (v1.3.2) because in the REAL _ensure_schema_sync() sequence,
-        # _heal_legacy_columns() always runs BEFORE _heal_legacy_indexes() and would
-        # already have added it — this test exercises index-healing in isolation, so it
-        # simulates that precondition directly rather than re-running column-healing too.
+        # Same shape Base.metadata declares for audit_log, minus the two indexes this
+        # heal function adds -- tenant_id included since _heal_legacy_columns always
+        # runs first in the real sequence this isolated test simulates a step of.
         conn.exec_driver_sql(
             "CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts DATETIME NOT NULL,"
             " username VARCHAR, action VARCHAR NOT NULL, project_id VARCHAR,"
@@ -253,10 +226,8 @@ def test_heal_legacy_indexes_creates_only_whats_missing_on_sqlite(tmp_path):
         after = {ix["name"] for ix in sa.inspect(conn).get_indexes("audit_log")}
     engine.dispose()
 
-    # Confirms the fix is genuinely sourced from Base.metadata (the model), not a
-    # hardcoded name list that could itself drift from what DBAuditLog actually declares
-    # — including project_id's own `index=True` column-level index, which this healed
-    # too (not just the two explicit `Index(...)` entries in __table_args__).
+    # Confirms this is genuinely sourced from Base.metadata, not a hardcoded name list
+    # that could drift from what DBAuditLog actually declares.
     declared = {ix.name for ix in Base.metadata.tables["audit_log"].indexes}
     assert {"ix_audit_log_username", "ix_audit_log_action"} <= after
     assert after == declared
@@ -292,13 +263,10 @@ def test_heal_legacy_indexes_ignores_a_genuinely_missing_table(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Stack-free execution proof (v1.1.8): render the full chain to Postgres DDL offline
+# Stack-free execution proof: render the full chain to Postgres DDL offline
 # ---------------------------------------------------------------------------
-# Real-PG execution of the chain debuts on CI's server-tests run — until then nothing has
-# ever executed 0001_baseline's op.* calls against a live database. Alembic's offline
-# ("--sql") mode executes every op for real and renders the dialect DDL instead of hitting
-# a server: any op-level runtime error (bad column type, wrong constraint signature) still
-# raises here, so this catches the whole class without a database.
+# Alembic's offline ("--sql") mode executes every op for real and renders the dialect DDL
+# instead of hitting a server, so any op-level runtime error still raises here.
 
 def test_chain_renders_complete_postgres_ddl_offline():
     import contextlib
@@ -307,15 +275,14 @@ def test_chain_renders_complete_postgres_ddl_offline():
     from alembic import command
 
     cfg = _alembic_config()
-    # A sync postgres URL gives clean Postgres-dialect rendering. Offline mode never opens
-    # a connection, so pointing at localhost is safe; a real dev DATABASE_URL env must not
-    # leak into what gets rendered.
+    # A sync postgres URL gives clean Postgres-dialect rendering; offline mode never
+    # opens a connection, so pointing at localhost is safe.
     cfg.set_main_option("sqlalchemy.url", "postgresql://av_user:av_password@localhost/aether_vault")
     assert cfg.attributes.get("connection") is None  # offline path, not the startup path
 
     buf = io.StringIO()
-    # Both capture mechanisms at once: alembic versions differ in whether they honor
-    # Config.output_buffer or resolve sys.stdout when env.py configures its context.
+    # Both capture mechanisms: alembic versions differ in whether they honor
+    # Config.output_buffer or resolve sys.stdout.
     cfg.output_buffer = buf
     with contextlib.redirect_stdout(buf):
         command.upgrade(cfg, "head", sql=True)

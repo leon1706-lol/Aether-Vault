@@ -8,23 +8,16 @@ import { WeightHeatmap } from "@/components/WeightHeatmap";
 import { LayerDriftChart } from "@/components/LayerDriftChart";
 
 // How many recent commits to eagerly resolve into full trees so the checkpoint list can be
-// built. Previously fetched via fetchCommits() + N parallel GET /api/commits/{hash} requests
-// (one HTTP round trip per candidate checkpoint); now a single GET /api/commits?include_layers
-// request returns all of them with trees already attached (see development/Probleme.md's
-// now-fixed "checkpoint list resolves N commits via N parallel requests" entry, and the new
-// ?include_layers query param on list_commits in server.py). Raised from the old 30 — that cap
-// was specifically there to bound the number of *parallel requests*, which no longer applies
-// now that this is one request; kept at 100 to bound response size/render cost instead.
+// built, via a single GET /api/commits?include_layers request. Kept at 100 to bound
+// response size/render cost.
 const CHECKPOINT_FETCH_LIMIT = 100;
 
 interface Props {
-  // When set, only checkpoints belonging to this project are offered for comparison — keeps
-  // an unrelated project's commits (sharing the same registry) out of the picker. When null,
-  // checkpoints from every project are shown (matches the dashboard's default behavior).
+  // When set, only checkpoints belonging to this project are offered for comparison.
+  // When null, checkpoints from every project are shown.
   projectId?: string | null;
-  // v1.3.0 (todo.md item 25): shareable weight-diff link — read once from
-  // ?tab=weight-diff&a=<hash>&b=<hash>&path=<relPath> by page.tsx and handed down. Applied
-  // once on mount (a manual slot change afterwards is what then drives the URL, not these).
+  // Shareable weight-diff link — read once from ?tab=weight-diff&a=<hash>&b=<hash>&path=<relPath>
+  // by page.tsx and handed down. Applied once on mount.
   initialSlotAHash?: string | null;
   initialSlotBHash?: string | null;
   initialPath?: string | null;
@@ -42,10 +35,9 @@ export function WeightDiffPanel({
   projectId = null, initialSlotAHash = null, initialSlotBHash = null, initialPath = null,
 }: Props) {
   const [fullCommits, setFullCommits] = useState<Map<string, Commit>>(new Map());
-  // v1.3.0: commits resolved by an explicit hash (arbitrary compare / deep link) — kept
-  // separate from the eagerly-fetched "most recent" set above so the periodic refetch on
-  // projectId change can't silently drop a manually-resolved older commit out from under
-  // an active selection.
+  // Commits resolved by an explicit hash (arbitrary compare / deep link) — kept separate
+  // from the eagerly-fetched "most recent" set so a projectId refetch can't drop a
+  // manually-resolved older commit out from under an active selection.
   const [resolvedByHash, setResolvedByHash] = useState<Map<string, Commit>>(new Map());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -127,10 +119,8 @@ export function WeightDiffPanel({
     syncUrl(nextA, nextB, activePath ?? row?.rel_path ?? null);
   }
 
-  // v1.3.0 (todo.md item 25): resolves an arbitrary commit hash — fetching it if it isn't
-  // already known — and fills the given slot with its first model checkpoint (or the
-  // deep-linked `preferredPath`, when that path exists in the resolved tree). Used by both
-  // the "Compare by hash" form (CheckpointPicker) and the initial ?a=&b=&path= deep link.
+  // Resolves an arbitrary commit hash (fetching it if not already known) and fills the
+  // given slot with its first model checkpoint or the deep-linked `preferredPath`.
   async function resolveAndFill(hash: string, slot: "A" | "B", preferredPath?: string | null) {
     const trimmed = hash.trim();
     if (!trimmed) return;
@@ -170,10 +160,9 @@ export function WeightDiffPanel({
     handleSlotChange(slot, { iteration, commitHash: commit.hash, rel_path: relPath, weightHash: entry.hash });
   }
 
-  // v1.3.0: applies the ?a=&b=&path= deep link exactly once, after the initial commit
-  // list load — mirrors RunsPanel's initialRunId effect. Waiting for `loading` to clear
-  // means a/b that ARE among the recently-fetched commits fill in without a network round
-  // trip; either way resolveAndFill() falls back to fetchCommit() for anything older.
+  // Applies the ?a=&b=&path= deep link exactly once, after the initial commit list load.
+  // Waiting for `loading` to clear means recently-fetched commits fill in without a
+  // network round trip; resolveAndFill() falls back to fetchCommit() for anything older.
   useEffect(() => {
     if (deepLinkApplied.current || loading) return;
     if (!initialSlotAHash && !initialSlotBHash) return;

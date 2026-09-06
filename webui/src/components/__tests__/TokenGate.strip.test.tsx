@@ -3,12 +3,9 @@ import { cleanup, render } from "@testing-library/react";
 
 import { TokenGate } from "../TokenGate";
 
-// Regression (webui-e2e token-gate): Next.js patches window.history.replaceState for
-// App Router integration, and a strip issued during render (pre-hydration) can be
-// OVERRIDDEN when hydration completes — restoring "?av_token=" into the address bar.
-// The component must therefore ALSO strip post-mount; this test simulates the override
-// by making the FIRST replaceState call restore the original URL (as Next would) and
-// asserting the URL is still clean after effects run.
+// A strip issued during render (pre-hydration) can be overridden when hydration
+// completes, restoring "?av_token=" into the address bar — the component must also
+// strip post-mount. This simulates that override and asserts the URL is still clean.
 describe("TokenGate av_token stripping", () => {
   const ORIGINAL = "http://localhost:3000/?av_token=owner-browser-secret";
   const CLEAN = "http://localhost:3000/";

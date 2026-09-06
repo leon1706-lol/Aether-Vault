@@ -28,36 +28,21 @@ AV_TEST_DATABASE_URL = os.environ.get(
     "AV_TEST_DATABASE_URL",
     "postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test",
 )
-# v1.3.2 fix (found live this session): the default used to be db 0 -- the SAME logical
-# Redis database `docker-compose.yml`'s own REDIS_URL points the real dev engine at.
-# A local `pytest tests/test_server.py` run with no env override shares its Bloom filter
-# and rate-limit/auth-spike keys with whatever real dev stack happens to be running on
-# this machine -- one contributing factor in this session's second infra incident (see
-# development/CHANGELOG.md Phase 60). Db 1 is still on localhost:6379 (no extra service
-# needed) but is a genuinely separate keyspace from the real stack's db 0.
+# Db 1, not the default db 0 that docker-compose.yml's real dev engine also points at --
+# a local test run with no env override would otherwise share its Bloom filter and
+# rate-limit/auth-spike keys with whatever real dev stack happens to be running.
 AV_TEST_REDIS_URL = os.environ.get("AV_TEST_REDIS_URL", "redis://localhost:6379/1")
 
-# Point the server's own module-level config at the test instance *before* importing it â€”
-# database.py/redis_cache.py read DATABASE_URL/REDIS_URL at import time, and storage.py's
-# CASStorage is constructed at import time too (AV_DATA_DIR). Explicit assignment (not
-# setdefault) so a real dev DATABASE_URL already exported in the shell never leaks in here.
+# Point the server's own module-level config at the test instance *before* importing it:
+# database.py/redis_cache.py/storage.py all read their env vars at import time. Explicit
+# assignment (not setdefault) so a real dev DATABASE_URL already exported never leaks in.
 os.environ["DATABASE_URL"] = AV_TEST_DATABASE_URL
 def _as_app_user_url(db_url: str) -> str:
-    """Rewrites `db_url`'s userinfo to `av_app:av_app_password`, whatever the ORIGINAL
-    username was. Previously a literal `.replace("av_user:av_password", ...)` -- correct
-    on Linux CI/local dev, where `AV_TEST_DATABASE_URL` really does connect as `av_user`
-    (docker-compose's own Postgres service container names it that), but a silent no-op
-    anywhere else: `server-tests-windows` connects as bare `postgres` (Chocolatey's
-    default superuser, no `av_user` role exists there at all), so the literal substring
-    never matched and `AV_TEST_APP_DATABASE_URL` ended up IDENTICAL to the superuser URL
-    -- meaning every "request-serving session routed through av_app" in this whole file
-    was actually still running as a superuser there, silently bypassing RLS entirely.
-    Found live: `TestHardTenancy::test_rls_actually_filters_now_for_the_non_superuser_role`
-    failed on Windows CI the first time it ever actually got to run (a separate, now-fixed
-    bug — the `av_user` role not existing at all — had made every test in this file ERROR
-    before reaching this one, masking this second bug completely until that first one was
-    fixed). `urlsplit`/`urlunsplit` parse the URL properly instead of guessing at its
-    literal text, so this is correct regardless of the base URL's own username."""
+    """Rewrites `db_url`'s userinfo to `av_app:av_app_password`, whatever the original
+    username was. Uses urlsplit/urlunsplit rather than a literal substring replace, since
+    a base URL that doesn't connect as `av_user` (e.g. Windows CI's bare `postgres`
+    superuser) would otherwise silently leave AV_TEST_APP_DATABASE_URL identical to the
+    superuser URL, bypassing RLS entirely in every test that thinks it's using av_app."""
     parts = urlsplit(db_url)
     netloc = f"av_app:av_app_password@{parts.hostname}"
     if parts.port:
@@ -65,15 +50,9 @@ def _as_app_user_url(db_url: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
-# v1.3.2 (migration 0015): route this whole file's request-serving sessions through the
-# non-superuser av_app role too, not just DATABASE_URL/av_user (which migrations and
-# system_session_factory keep using) -- the real fix for the RLS-superuser gap migration
-# 0013 documented only matters if it's actually exercised, and this is the one place
-# every existing route in this file already gets driven end-to-end. Deliberately the
-# SAME Postgres user (av_app) that docker-compose.yml wires the real engine to for
-# AV_APP_DATABASE_URL, just pointed at the test database -- migration 0015 grants it
-# there identically the first time `_apply_schema` runs against `aether_vault_test`.
-# Overridable like the other AV_TEST_* vars above for a differently-shaped test DB.
+# Routes this file's request-serving sessions through the non-superuser av_app role too
+# (not just DATABASE_URL/av_user, which migrations and system_session_factory keep
+# using), so migration 0013's RLS-superuser fix is actually exercised end-to-end here.
 AV_TEST_APP_DATABASE_URL = os.environ.get(
     "AV_TEST_APP_DATABASE_URL",
     _as_app_user_url(AV_TEST_DATABASE_URL),
@@ -81,17 +60,9 @@ AV_TEST_APP_DATABASE_URL = os.environ.get(
 os.environ["AV_APP_DATABASE_URL"] = AV_TEST_APP_DATABASE_URL
 os.environ["REDIS_URL"] = AV_TEST_REDIS_URL
 os.environ["AV_DATA_DIR"] = tempfile.mkdtemp(prefix="av-server-test-")
-# The periodic webhook-retry worker (server.py's _webhook_retry_worker) is created ONCE
-# at app startup with whatever AV_WEBHOOK_RETRY_INTERVAL_SECS is at that moment (the
-# `client` fixture below is session-scoped — one server, one worker task, for the WHOLE
-# file) and never re-reads it afterward. With the real 30s production default, that
-# worker's first tick lands at a fixed wall-clock offset from session start — which
-# collection order and file runtime can walk right into, racing any test that manually
-# drives webhook delivery via its own monkeypatched `requests.post` (a real bug this
-# caught: test_webhook_health_columns_update_on_success_and_failure flaked when new
-# tests earlier in this file shifted its position to land near the 30s mark — see
-# Probleme.md). A huge interval here means the worker's tick never fires during any
-# realistic test session, full stop.
+# The webhook-retry worker is created once at app startup with whatever interval is set
+# then and never re-reads it -- a huge value here means its tick never fires during any
+# realistic test session, so it can't race a test that manually drives delivery itself.
 os.environ["AV_WEBHOOK_RETRY_INTERVAL_SECS"] = "999999"
 
 import python.av_server.server as server_module  # noqa: E402
@@ -119,38 +90,17 @@ def _real_server_reachable() -> bool:
 
 
 async def _truncate_all() -> None:
-    # A raw asyncpg connection, not the SQLAlchemy async engine's pooled connection â€” the pool's
-    # connections are bound to whichever event loop first used them (TestClient's internal
-    # lifespan loop), so reusing the pool from a *separate* asyncio.run() call here raises
-    # "got Future ... attached to a different loop". Opening (and closing) a brand-new
-    # connection scoped entirely to this call's own loop avoids that cross-loop reuse.
+    # A raw asyncpg connection, not the SQLAlchemy async engine's pooled connection --
+    # the pool's connections are bound to whichever event loop first used them, so reusing
+    # it from a separate asyncio.run() call raises "attached to a different loop".
     import asyncpg
     conn = await asyncpg.connect(AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"))
     try:
-        # v1.2.2: include the autonomous-loop + delivery/audit tables — otherwise audit
-        # rows from earlier tests leak into later filters/pagination assertions.
-        #
-        # v1.3.1 WP-44 fix (found live): this list was never extended for ANY of the 20
-        # RSI tables added across migrations 0006-0010 — every test using a hardcoded id
-        # against one of them (e.g. TestImproverVersions::test_create_is_idempotent_by_id
-        # using "imp-1") silently collided with the SAME row a PREVIOUS run of this file
-        # against the same persistent test database had already inserted, turning a
-        # fresh-201-expected assertion into a stale-200-exists one. Invisible in a CI
-        # runner with a brand-new ephemeral service container per run; guaranteed on any
-        # persistent local Postgres re-run — exactly this session's setup, and exactly
-        # why this had never been caught before this cycle's first-ever live pass.
-        # v1.3.2 (migration 0011): eight of the eleven new identity/tenancy tables join
-        # the truncate list (projects, users, user_identities, groups, group_members,
-        # role_bindings, api_tokens, sso_providers, sessions) — the same reasoning as the
-        # WP-44 fix above: a hardcoded-id test against any of them would otherwise
-        # collide with a previous local run's row.
-        #
-        # `tenants` and `roles` are DELIBERATELY excluded — unlike every other table
-        # here, both carry migration-time SEED data (the default tenant, the six
-        # built-in roles) that migration 0011 inserts exactly once, ever, not
-        # per-test-run data. Truncating them would silently delete that seed with
-        # nothing to reinsert it short of a full downgrade+upgrade, breaking every
-        # subsequent test in this file that expects the built-in roles to exist.
+        # Every table a hardcoded-id test could collide with across repeated local runs
+        # against a persistent (not fresh-per-CI-run) test database goes in this list.
+        # `tenants`/`roles` are deliberately excluded: both carry migration-time seed data
+        # (the default tenant, the six built-in roles) inserted exactly once, not
+        # per-test-run data -- truncating them would break every test expecting it to exist.
         await conn.execute(
             "TRUNCATE objects, trees, commits, refs, runs, run_commits, events,"
             " webhooks, webhook_deliveries, audit_log,"
@@ -196,12 +146,9 @@ def client():
 
 
 def _clear_storage_dirs() -> None:
-    # _truncate_all() only clears the DB tables â€” any object a test uploaded via
-    # POST /api/objects/{hash} still has its physical shard file on disk afterward (CASStorage
-    # has no DB-driven TTL of its own). Without also clearing these, later tests in the same
-    # session (e.g. the GC grace-period test) see genuine orphan files left over from earlier
-    # tests and sweep them too, making "exactly N objects deleted" assertions flaky depending on
-    # what ran before. Clear file contents, not the directories themselves.
+    # _truncate_all() only clears the DB tables -- any object a test uploaded still has
+    # its physical shard file on disk afterward, which would make a later "exactly N
+    # objects deleted" GC assertion flaky depending on what ran before.
     for d in (server_module.storage.objects_dir, server_module.storage.commits_dir, server_module.storage.refs_dir):
         for p in d.rglob("*"):
             if p.is_file():
@@ -219,15 +166,10 @@ def db(client):
 
 @pytest.fixture
 def protected_token(db):
-    """Turns on the require_token middleware for the duration of one test ("Protected" mode).
-
-    AV_API_TOKEN is read once at module import (see server.py) â€” empty in this whole test
-    file's process, since nothing sets the env var before `app` is imported above. Reassigning
-    the module attribute directly is the correct way to flip it for a single test: the
-    middleware looks up the bare name `AV_API_TOKEN` in its enclosing module's globals at call
-    time, not at function-definition time, so this is picked up by every request the test
-    issues through `db` and is restored afterward so later tests stay in Anonymous mode.
-    """
+    """Turns on the require_token middleware for one test ("Protected" mode) by reassigning
+    the module attribute directly -- the middleware looks up `AV_API_TOKEN` in its module's
+    globals at call time, so this is picked up by every request through `db` and restored
+    afterward so later tests stay in Anonymous mode."""
     token = "test-secret-token-12345"
     server_module.AV_API_TOKEN = token
     try:
@@ -419,12 +361,8 @@ def test_protected_mode_gates_writes_too_not_just_reads(db, protected_token):
 
 @pytest.fixture
 def auth_users(db):
-    """Turns on per-user tokens ("Protected" mode via AV_AUTH_USERS) for one test.
-
-    Same mechanics as protected_token above: _resolve_identity reads the module global at
-    call time, so reassigning it here is picked up by every request through `db`, and the
-    finally-restore keeps every other test in Anonymous mode.
-    """
+    """Turns on per-user tokens ("Protected" mode via AV_AUTH_USERS) for one test, same
+    mechanics as protected_token above."""
     users = {"alice": "alice-token-12345", "bob": "bob-token-67890"}
     server_module._AUTH_USERS = users
     try:
@@ -623,9 +561,8 @@ def test_update_ref_then_get_ref_roundtrip(db):
 
 
 def test_update_ref_rejects_invalid_name_at_http_layer(db):
-    # %5C = a literal backslash once Starlette decodes the path param; httpx won't "normalize"
-    # an encoded backslash the way it might collapse a literal ../ segment, so this reliably
-    # reaches validate_ref_name() with the backslash intact.
+    # %5C = a literal backslash once Starlette decodes the path param, reaching
+    # validate_ref_name() intact rather than being collapsed the way ../ might be.
     resp = db.put("/api/refs/main%5Csecret", json={"commit_hash": _hex_hash("x")})
     assert resp.status_code == 400
 
@@ -683,11 +620,9 @@ def test_gc_respects_grace_period_then_sweeps_when_aged(db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_cli_commit_pushes_to_a_live_server(tmp_path, monkeypatch):
-    # Checked here (lazily, when this test actually runs) rather than via a `skipif` decorator
-    # (evaluated once at collection time, before any other test has run) â€” a `skipif` condition
-    # check competes with whatever the rest of collection/the test run is doing for CPU/network
-    # scheduling right at that single moment, and a slow tick there reads as "unreachable" even
-    # though the server is fine moments later (observed once in a heavy combined venv+Docker run).
+    # Checked lazily here rather than via a `skipif` decorator (evaluated once at
+    # collection time), since a slow tick there could read as "unreachable" even
+    # though the server is fine moments later.
     if not _real_server_reachable():
         pytest.skip(
             "live aether-vault-engine not reachable on :8000; run "
@@ -716,11 +651,9 @@ def test_cli_commit_pushes_to_a_live_server(tmp_path, monkeypatch):
 
 
 def test_registry_export_restore_round_trip(tmp_path, monkeypatch):
-    """v1.3.0 (todo.md item 18): the one thing this surface never had — a real
-    `av registry export` -> `av registry restore` round trip on a non-trivial fixture
-    (a plain commit, a run-linked commit, and a two-parent merge commit), against the
-    live registry. Also proves --resume actually skips completed work on a second pass.
-    """
+    """A real `av registry export` -> `av registry restore` round trip on a non-trivial
+    fixture (a plain commit, a run-linked commit, a two-parent merge commit), against the
+    live registry. Also proves --resume actually skips completed work on a second pass."""
     if not _real_server_reachable():
         pytest.skip(
             "live aether-vault-engine not reachable on :8000; run "
@@ -756,9 +689,8 @@ def test_registry_export_restore_round_trip(tmp_path, monkeypatch):
     assert r2.exit_code == 0, r2.output
     assert runner.invoke(cli, ["run", "finish"]).exit_code == 0
 
-    # A REAL two-parent merge commit: both sides must diverge on separate files (no
-    # conflict) — main also gets a commit after branching, or `av merge` would just
-    # fast-forward (no merge commit at all, and only 3 unique commits total instead of 5).
+    # A real two-parent merge commit: both sides diverge on separate files (no conflict);
+    # main also gets a commit after branching, or `av merge` would just fast-forward.
     assert runner.invoke(cli, ["branch", "feature"]).exit_code == 0
     assert runner.invoke(cli, ["checkout", "feature"]).exit_code == 0
     (repo / "c.pt").write_bytes(b"weights-c")
@@ -786,11 +718,8 @@ def test_registry_export_restore_round_trip(tmp_path, monkeypatch):
     assert export1.exit_code == 0, export1.output
     export1_data = json_mod.loads(export1.output)["data"]
     assert export1_data["commits"] >= 5  # plain + run-linked + feature + main-work + merge
-    # v1.3.0 (Probleme #119): the whole point of an export is the file content — this is
-    # the assertion whose absence let the object-discovery walk silently find zero hashes
-    # (missing include_layers=true on the commits query) survive three prior fix-and-
-    # verify cycles on this same command undetected. a.pt/b.pt/c.pt/d.pt = 4 distinct
-    # object hashes at minimum (the merge commit reuses its parents' unchanged files).
+    # a.pt/b.pt/c.pt/d.pt = 4 distinct object hashes at minimum (the merge commit reuses
+    # its parents' unchanged files) -- the whole point of an export is the file content.
     assert export1_data["objects_ok"] >= 4, (
         f"expected real file objects to export, got: {export1_data}"
     )
@@ -800,8 +729,8 @@ def test_registry_export_restore_round_trip(tmp_path, monkeypatch):
 
     manifest = json_mod.loads((archive_dir / "manifest.json").read_text())
     assert any(c["hash"] == main_tip for c in manifest["commits"])
-    assert manifest["objects"], "manifest.objects must not be empty — see Probleme #119"
-    assert all(o["ok"] for o in manifest["objects"])  # the always-True bug this fixed
+    assert manifest["objects"], "manifest.objects must not be empty"
+    assert all(o["ok"] for o in manifest["objects"])
 
     # First restore: everything ingests as idempotent duplicates (already on the server).
     restore1 = runner.invoke(cli, ["--output", "json", "registry", "restore", str(archive_dir)])
@@ -862,11 +791,9 @@ def test_single_parent_commit_reports_one_parent(db):
 
 
 def test_live_two_repo_clone_pull_flow(tmp_path, monkeypatch):
-    """The team-collaboration proof, end to end on a real Docker stack:
-
-    repo A init/add/commit/push -> repo B av clone -> B edits/commits/pushes ->
-    A av pull fast-forwards onto B's work. Skips (lazily) when the stack is down.
-    """
+    """The team-collaboration proof, end to end on a real Docker stack: repo A
+    init/add/commit/push -> repo B av clone -> B edits/commits/pushes -> A av pull
+    fast-forwards onto B's work."""
     import httpx
 
     if not _real_server_reachable():
@@ -977,19 +904,17 @@ def test_alembic_brings_schema_to_head(db):
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
-    # v1.2.2 additive surfaces:
     assert {"signature"} <= _pg_columns("commits")
     assert {"status_code"} <= _pg_columns("audit_log")
     assert "webhook_deliveries" in tables
 
 
 def test_migration_0011_seeds_default_tenant_and_builtin_roles(db):
-    """v1.3.2 (WP-1/WP-2): migration 0011's seed data — a default tenant and six
-    built-in roles expressed in the EXISTING require_scope() vocabulary — must be
-    present after any fresh boot, not just conceptually documented. `owner`'s
-    permissions being exactly `["*"]` is the load-bearing assertion: it is the same
-    wildcard `_scopes_for_identity()` already returns for AV_API_TOKEN and for any
-    legacy per-user token with no explicit scopes, which is what keeps this additive —
+    """Migration 0011's seed data — a default tenant and six built-in roles expressed in
+    the existing require_scope() vocabulary — must be present after any fresh boot.
+    `owner`'s permissions being exactly `["*"]` is the load-bearing assertion: it is the
+    same wildcard `_scopes_for_identity()` already returns for a legacy unscoped token,
+    which is what keeps this additive —
     nothing that could already reach a route loses access under the new RBAC surface."""
     import asyncpg
 
@@ -1077,10 +1002,6 @@ def test_legacy_database_is_healed_and_stamped(db):
     and proves startup heals it zero-touch (Phase: DB migrations)."""
     import asyncpg
 
-    # _apply_schema IS the engine-taking entry point (init_db() closes over the module's
-    # own engine); the old `from ...database import init_db_with_engine` here pointed at a
-    # helper that only ever existed in THIS file â€” invisible locally behind the
-    # reachability skip, ImportError on every CI run with a live stack.
     from python.av_server.database import _apply_schema
 
     url_sync = AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
@@ -1098,7 +1019,7 @@ def test_legacy_database_is_healed_and_stamped(db):
     assert "extra_parents" not in _pg_columns("commits")
     assert "chunks" not in _pg_columns("trees")
 
-    # A fresh engine (own event loop) â€” never reuse the TestClient's pooled one across loops.
+    # A fresh engine (own event loop) -- never reuse the TestClient's pooled one across loops.
     from sqlalchemy.ext.asyncio import create_async_engine
 
     legacy_engine = create_async_engine(AV_TEST_DATABASE_URL)
@@ -1121,13 +1042,10 @@ def test_legacy_database_is_healed_and_stamped(db):
 
 
 def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
-    """v1.3.0 (todo.md item 21): every revision's downgrade() had NEVER been executed by
-    anything before this — only rendered offline as SQL text (test_migrations.py) or
-    implied by the upgrade-only live path above. This walks the REAL chain down to base
-    (necessarily dropping every table — that's what "no schema" means, data loss here is
-    by design, not a bug under test) and back up to head against live Postgres, asserting
-    the schema comes back fully functional: right tables, right columns, right indexes,
-    and a brand-new commit pushes/reads back cleanly."""
+    """Walks the real chain down to base (necessarily dropping every table -- that's what
+    "no schema" means, by design) and back up to head against live Postgres, asserting the
+    schema comes back fully functional: right tables/columns/indexes, and a brand-new
+    commit pushes/reads back cleanly."""
     import asyncpg
     from alembic import command
 
@@ -1136,10 +1054,8 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
     url_sync = AV_TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
     cfg = _alembic_config()
-    # A REAL (non-offline) run needs the actual async driver URL this project's env.py
-    # connects with everywhere else — unlike the offline SQL-rendering tests in
-    # test_migrations.py, which only need a dialect name and use the sync/psycopg2-style
-    # URL string purely for cosmetic rendering, never an actual connection.
+    # A real (non-offline) run needs the actual async driver URL, unlike the offline
+    # SQL-rendering tests in test_migrations.py which never make a real connection.
     cfg.set_main_option("sqlalchemy.url", AV_TEST_DATABASE_URL)
 
     try:
@@ -1155,9 +1071,8 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
                 await conn.close()
 
         tables_at_base = asyncio.run(_tables())
-        # alembic_version itself is the only thing alembic ever guarantees survives a
-        # downgrade to base (it's how it knows where it is); every model table this
-        # project owns must be gone.
+        # alembic_version is the only thing alembic guarantees survives a downgrade to
+        # base; every model table this project owns must be gone.
         assert not ({"objects", "trees", "commits", "refs", "runs", "webhooks",
                      "audit_log"} & tables_at_base), \
             f"downgrade to base left tables behind: {tables_at_base}"
@@ -1184,55 +1099,25 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
         assert {"signature", "env_snapshot_id"} <= _pg_columns("commits")
         assert {"chain_hash", "signature"} <= _pg_columns("audit_log")
     finally:
-        # However far the assertions above got, always leave the schema back at head —
-        # every OTHER test in this session-scoped file assumes head. A failure partway
-        # through this test must not corrupt the rest of the suite's fixture state.
+        # Always leave the schema back at head -- every other test in this
+        # session-scoped file assumes head, regardless of how far this one got.
         command.upgrade(cfg, "head")
 
-        # v1.3.2 fix (found live, running the FULL file rather than just this test in
-        # isolation): the drop-and-recreate above gives every table NEW Postgres OIDs.
-        # The existing "one-shot retry" dance below only ever heals the ONE connection
-        # THIS test's own two calls happen to check out (SQLAlchemy's pool is LIFO, so
-        # sequential same-test calls keep reusing that one) -- but by the time this test
-        # runs in a full suite, the pool can already hold SEVERAL distinct idle
-        # connections opened by earlier tests, each still caching prepared-statement
-        # plans against the OLD (now-dropped) OIDs. Any LATER test that happens to draw
-        # one of THOSE out of the pool hits a raw, unretried
-        # `InvalidCachedStatementError` -- confirmed live: a full `pytest
-        # tests/test_server.py` run failed 5 unrelated later tests this way, while this
-        # test in isolation always passed. `engine.dispose(close=False)` DROPS every
-        # currently-pooled connection reference outright (no attempt to close them
-        # over the wrong event loop, which is what previously made a plain `dispose()`
-        # break the TestClient's own anyio portal for the rest of the session, per the
-        # comment below) — every subsequent checkout, in this test and every later one,
-        # opens a genuinely fresh connection instead of possibly drawing a stale one.
-        # Verified live (a standalone repro script) that this does NOT break the portal.
+        # The drop-and-recreate above gives every table new Postgres OIDs; any
+        # connection already pooled from earlier tests still holds prepared-statement
+        # plans against the old OIDs, so the first later query through it would raise
+        # InvalidCachedStatementError. `dispose(close=False)` drops every pooled
+        # connection reference without touching them from the wrong event loop (a plain
+        # `dispose()` broke the TestClient's own anyio portal when tried) -- every
+        # subsequent checkout opens a genuinely fresh connection instead.
         engine.sync_engine.dispose(close=False)
         if app_engine is not engine:
             app_engine.sync_engine.dispose(close=False)
 
-    # A downgrade all the way to `base` necessarily DROPS every table (that's what "no
-    # schema at all" means) — the commit made before the round trip is gone by design,
-    # not a bug. What the round trip actually promises is that the schema comes back
-    # fully FUNCTIONAL: a brand-new commit pushes and reads back cleanly afterward.
-    #
-    # v1.3.1 WP-44 fix (found live): alembic's downgrade-to-base DROPS every table via
-    # its OWN raw connection, entirely bypassing the app's shared SQLAlchemy async engine
-    # pool (used by `db`, the session-scoped TestClient, for the REST of this file). Any
-    # connection already sitting in that pool still holds asyncpg PREPARED STATEMENT
-    # PLANS compiled against the old (now-dropped-and-recreated) table OIDs —
-    # `pool_pre_ping=True` only checks liveness, not statement-cache validity, so the
-    # FIRST query through that pool against an affected table raises
-    # `InvalidCachedStatementError` — SQLAlchemy's own asyncpg dialect catches it and
-    # invalidates that connection's prepared-statement cache IN RESPONSE (see the
-    # exception's own message), so a retried query on the same connection succeeds.
-    # `engine.dispose()` was tried here first and made things categorically worse (broke
-    # the TestClient's own anyio portal for the rest of the session — "This portal is
-    # not running" on every later test, since disposing from a separate `asyncio.run()`
-    # loop tears down state the portal's OWN loop still depends on) — the pool must NOT
-    # be touched from outside the app's own event loop. A one-shot retry is the correct,
-    # narrow fix: absorb the one-time invalidation on a throwaway call, then make the
-    # real, asserted call.
+    # alembic's downgrade-to-base drops every table via its own raw connection, bypassing
+    # the app's shared engine pool -- SQLAlchemy's asyncpg dialect invalidates a stale
+    # connection's cache on the FIRST query against it and raises, so a retried query on
+    # the same connection succeeds. A one-shot retry absorbs that one-time invalidation.
     def _post_absorbing_one_stale_cache_hit(url, **kw):
         # TestClient's default raise_server_exceptions=True means an unhandled exception
         # in the route (exactly what an InvalidCachedStatementError is, here) propagates
@@ -1333,8 +1218,8 @@ def test_events_cursor_orders_and_resumes(db):
 
 
 def test_events_run_id_filter_and_gap_detection(db):
-    # v1.3.0 (todo.md item 9): run_id joins project/kind in one stable query model, and
-    # a stale cursor is reported honestly instead of looking identical to "nothing new".
+    # run_id joins project/kind in one stable query model, and a stale cursor is
+    # reported honestly instead of looking identical to "nothing new".
     import uuid
 
     run_a, run_b = str(uuid.uuid4()), str(uuid.uuid4())
@@ -1399,10 +1284,9 @@ def test_runs_crud_and_commit_linkage_with_lazy_create(db):
 
 
 # ---------------------------------------------------------------------------
-# v1.3.0 contract freeze (todo.md item 27): validates LIVE run/event/webhook-payload
-# bodies against python/av_cli/schemas/*.schema.json — the envelope/semdiff/avh schemas
-# are proven stack-free in tests/test_contracts.py; these three need a live server, so
-# they live here alongside every other reachability-gated assertion in this file.
+# Validates LIVE run/event/webhook-payload bodies against
+# python/av_cli/schemas/*.schema.json (the envelope/semdiff/avh schemas are proven
+# stack-free in tests/test_contracts.py; these three need a live server).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(importlib.util.find_spec("jsonschema") is None,
@@ -1532,8 +1416,7 @@ def test_audit_log_records_mutations(db):
 
 
 def test_audit_prune_dry_run_deletes_nothing(db):
-    # v1.3.0 (todo.md item 16): dry_run=true reports would_delete honestly and leaves
-    # every row untouched.
+    # dry_run=true reports would_delete honestly and leaves every row untouched.
     commit = _make_commit("prune-dry-run")
     db.post("/api/commits", json=commit)
     before = db.get("/api/admin/audit?limit=100").json()["entries"]
@@ -1595,10 +1478,8 @@ def test_ref_update_without_expected_hash_is_unconditional_last_write_wins(db):
 
 
 def test_ref_update_expected_hash_compare_and_swap(db):
-    """v1.2.5: two agents racing the same branch ref. The loser's PUT (stale expected_hash)
-    gets 409 with the ref's real current hash, instead of silently overwriting the winner —
-    this is the server-side half of the WP-7 ref-race fix; core.py's _finalize_commit
-    catches the client-side RefRaceError and queues rather than losing the commit."""
+    """Two agents racing the same branch ref: the loser's PUT (stale expected_hash) gets
+    409 with the ref's real current hash instead of silently overwriting the winner."""
     proj = "proj-ref-race"
     base = _make_commit("ref-race-base", project_id=proj)
     agent_a = _make_commit("ref-race-a", project_id=proj, parents=[base["hash"]])
@@ -1711,17 +1592,14 @@ def test_audit_retention_sweep_runs_during_gc(db, monkeypatch):
     monkeypatch.setattr(server_module, "AUDIT_RETENTION_DAYS", 0)
     gc = db.post("/api/admin/gc")
     assert gc.status_code == 200
-    # v1.2.5: GC's own admin.gc audit row is written AFTER the retention sweep (correctly
-    # — it postdates the cutoff), so comparing raw totals is no longer a reliable signal
-    # (GC always adds at least one new row). Assert the PRE-GC rows specifically are gone.
+    # GC's own admin.gc audit row postdates the sweep, so compare specific ids, not raw totals.
     after_ids = {e["id"] for e in db.get("/api/admin/audit?limit=500").json()["entries"]}
     assert not (before_ids & after_ids), "retention sweep should have removed the pre-GC rows"
 
 
 def test_webhook_delivery_rows_record_outcome_and_dead_letter(db, monkeypatch):
-    """v1.2.2 webhook depth: attempts persist BEFORE the POST; failures retry on the
-    worker interval and dead-letter after AV_WEBHOOK_MAX_ATTEMPTS; observability
-    endpoint exposes the ledger."""
+    """Attempts persist before the POST; failures retry on the worker interval and
+    dead-letter after AV_WEBHOOK_MAX_ATTEMPTS; the observability endpoint exposes the ledger."""
     calls = []
 
     class FakeResp:
@@ -1893,12 +1771,9 @@ def test_webhook_delivery_backoff_grows_exponentially(db, monkeypatch):
             break
         time.sleep(0.05)
     assert rows
-    # v1.2.5: the real background retry worker (started once at test-session lifespan,
-    # on whatever interval it had at THAT time) also races for this row, so the attempt
-    # actually observed here isn't guaranteed to be exactly 1 — checking the FORMULA
-    # against whatever attempt is present is what's actually being tested, not a specific
-    # count. See _webhook_retry_worker: its interval is bound once at task creation, so
-    # this test's monkeypatch of the module global can't (and needn't) control its tick.
+    # The real background retry worker also races for this row, so the observed attempt
+    # isn't guaranteed to be exactly 1 -- checking the formula against whatever attempt
+    # is present is what's actually being tested.
     _assert_formula_holds(rows[0])
 
     async def _force_next_attempt():
@@ -2469,9 +2344,7 @@ def test_push_back_fills_run_env_snapshot_id_once(db):
 
 
 # ---------------------------------------------------------------------------
-# RSI R1 (v1.3.1, migration 0006): improver versions, change sets, policy packs,
-# canary results, project freeze. Live-server tests — Docker-gated like everything else
-# in this file (skips cleanly via the `db` fixture's reachability check).
+# RSI R1: improver versions, change sets, policy packs, canary results, project freeze.
 # ---------------------------------------------------------------------------
 
 def _upload_object(db, content: bytes, headers: dict | None = None) -> str:
@@ -2517,13 +2390,9 @@ class TestImproverVersions:
         assert resp.status_code == 422
 
     def test_create_is_idempotent_by_id(self, db):
-        # v1.3.1 WP-44 fix (found live): this asserted 201 for the create path — but
-        # create_improver_version()'s own docstring says it's "idempotent by
-        # client-generated id, same lazy/ordering-safe contract as POST /api/runs", and
-        # /api/runs's OWN test (test_runs_crud_and_commit_linkage_with_lazy_create)
-        # deliberately asserts 200 for ITS create path too, distinguishing create vs.
-        # exists purely via the response body's "status" field, not the HTTP status —
-        # multi-agent races don't get to pick which one of them "wins" the 201.
+        # Idempotent by client-generated id: create vs. exists is distinguished purely by
+        # the response body's "status" field, not the HTTP status code, since multi-agent
+        # races don't get to pick which one "wins" the 201.
         manifest_hash = _upload_object(db, b'{"kind":"improver_manifest","n":1}')
         body = {"id": "imp-1", "project_id": "p1", "manifest_object_id": manifest_hash}
         first = db.post("/api/improvers", json=body)
@@ -2754,22 +2623,16 @@ class TestProjectFreeze:
 
 
 # ---------------------------------------------------------------------------
-# v1.3.1 RSI R6 (todo.md I.38, WP-36): server-side anomaly detectors -> `kind="anomaly"`
-# events, fanned out through the SAME webhook mechanism every other event kind already
-# uses (no new delivery path — proven by test_webhooks_cli.py/the webhook classes above;
-# these tests only need to prove the DETECTORS fire the event with the right payload).
+# RSI R6: server-side anomaly detectors -> `kind="anomaly"` events, fanned out through
+# the same webhook mechanism every other event kind already uses.
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def tenancy_enforced():
-    """Flips AV_TENANCY_ENFORCE on for one test. Two module-level bindings, not one, are
-    patched -- `python.av_server.database.TENANCY_ENFORCE` (read by `_apply_tenant_guc`/
-    `_apply_bypass_rls`, the RLS GUC listeners) AND `python.av_server.server.TENANCY_ENFORCE`
-    (server.py's OWN name, bound via `from .database import TENANCY_ENFORCE` at import
-    time -- reassigning the database module's attribute does NOT retroactively change
-    server.py's already-bound copy of that name). Same two-module-identity class of bug
-    this codebase has hit before (Probleme.md #132) -- both are patched here so neither
-    half of tenancy enforcement is silently left off."""
+    """Flips AV_TENANCY_ENFORCE on for one test. Patches TWO module-level bindings, not
+    one: `database.TENANCY_ENFORCE` and `server.TENANCY_ENFORCE` (a separate name bound
+    via `from .database import ...` at import time) -- otherwise reassigning only the
+    former leaves server.py's own copy stale."""
     from python.av_server import database as database_module
 
     database_module.TENANCY_ENFORCE = True
@@ -3124,13 +2987,10 @@ class TestTenantsUsersRoles:
         created = db.post("/api/users", json={"username": "bob"}, headers=admin_headers)
         user_id = created.json()["id"]
 
-        # A token explicitly minted FOR this user (user_id set), not a bare service
-        # token. Uses a RAW asyncpg connection (matching _truncate_all()'s own pattern
-        # above), never the app's `async_session_factory()` from inside a fresh
-        # asyncio.run() call here — that pool's connections are bound to the TestClient's
-        # own lifespan event loop, and reusing them from a separate loop hangs rather
-        # than raising cleanly (found live: this exact mistake in an earlier draft of
-        # this test hung for 8+ minutes with near-zero CPU, not a clean traceback).
+        # A token explicitly minted FOR this user (user_id set). Uses a raw asyncpg
+        # connection, never the app's pooled `async_session_factory()` from inside a
+        # fresh asyncio.run() call -- that pool is bound to the TestClient's own
+        # lifespan loop and hangs (not raises) if reused from a separate one.
         import asyncpg
 
         from python.av_server.models import DEFAULT_TENANT_ID
@@ -3247,11 +3107,9 @@ class TestApiTokens:
 
         revoked = db.post(f"/api/tokens/{token_id}/revoke", headers=admin_headers)
         assert revoked.status_code == 200
-        # The TTL cache (identity.py::AUTH_CACHE_TTL_SECS) means a revoke's effect on an
-        # ALREADY-cached resolution is bounded, not immediate -- documented explicitly in
-        # identity.py::invalidate_cached_token's docstring. Clearing it here proves the
-        # revoke itself is real and permanent (the next, uncached resolution correctly
-        # sees it), not that the cache never exists.
+        # The TTL cache means a revoke's effect on an already-cached resolution is
+        # bounded, not immediate; clearing it here proves the revoke itself is real
+        # and permanent, not that the cache never exists.
         identity_module._principal_cache.clear()
         after_revoke = db.get("/api/freeze/tok-revoke-proof-2", headers=raw_headers)
         assert after_revoke.status_code == 401
@@ -3367,9 +3225,8 @@ class TestAnomalyDetection:
 
 
 # ---------------------------------------------------------------------------
-# v1.3.3 (WP-21): per-tenant CAS storage isolation, live against real Postgres. The
-# exact scenario WP-21's own design review flagged as a real data-loss risk if shipped
-# half-done: tenant B uploading content identical to tenant A's.
+# Per-tenant CAS storage isolation, live against real Postgres: tenant B uploading
+# content identical to tenant A's must not corrupt either tenant's copy.
 # ---------------------------------------------------------------------------
 
 class TestPerTenantCAS:
@@ -3584,11 +3441,9 @@ class TestMetrics:
 
 
 # ---------------------------------------------------------------------------
-# v1.3.3 (WP-17 x identity.py fix) — the real architectural gap found and fixed this
-# session: `identity.py::_permissions_for_subject` never expanded through group
-# membership for a `subject_type == "user"` principal, despite `DBRoleBinding`'s own
-# docstring promising exactly that. SSO's group->role mapping and SCIM's group sync both
-# fundamentally depend on this actually working -- this is its first live proof.
+# `identity.py::_permissions_for_subject` must expand through group membership for a
+# `subject_type == "user"` principal -- SSO's group->role mapping and SCIM's group sync
+# both depend on this working.
 # ---------------------------------------------------------------------------
 
 class TestGroupRoleBindingGrantsUserPermission:
@@ -3861,14 +3716,9 @@ class TestScim:
 
 class TestSsoCrypto:
     def test_encrypt_decrypt_round_trip_and_masking(self, monkeypatch):
-        # `cryptography` is the OPTIONAL `[sign]` extra (sso_crypto.py's own docstring:
-        # "reuses the [sign] extra's cryptography dependency"), not a hard dependency of
-        # this package -- a bare `pip install -e .[dev]` (what CI's server-tests/test
-        # jobs actually install) genuinely doesn't have it, matching test_signing.py's
-        # own established `pytest.importorskip("cryptography")` pattern for the exact
-        # same reason. Found live: this test failed in CI, not locally, since local dev
-        # here already has the [sso] extra (which pulls in cryptography transitively)
-        # installed.
+        # `cryptography` is the optional `[sign]` extra, not a hard dependency -- a bare
+        # `pip install -e .[dev]` genuinely doesn't have it, matching test_signing.py's
+        # own `pytest.importorskip("cryptography")` pattern.
         pytest.importorskip("cryptography")
         monkeypatch.setenv("AV_SECRET_KEY", "test-secret-key-for-sso-crypto")
         from python.av_server import sso_crypto

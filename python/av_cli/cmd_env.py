@@ -1,14 +1,7 @@
-"""av env — environment snapshot & replay recipes (v1.2.0; CAS-backed in v1.2.2).
-
-Recipe-exact, not bit-exact: captures the interpreter + curated package pins + seeds
-into .av/env_snapshot.json (embedded into .avh replay), and renders reproduction
-instructions. Full pip freeze via --full for maximal fidelity.
-
-v1.2.2 env snapshot/replay: every snapshot is content-addressed — its canonical
-(sorted-keys, timestamp-stripped) JSON is hashed, and that hash IS the id. The snapshot
-object uploads through the NORMAL object flow at push time (`core.upload_commit_objects`
-picks it up), commits carry `env_snapshot_id`, runs back-fill it server-side on first
-link, and `av replay <run|commit>` loads it from the local CAS or the registry.
+"""av env — environment snapshot & replay recipes (v1.2.0; CAS-backed in v1.2.2). Recipe-
+exact, not bit-exact: captures the interpreter + curated package pins + seeds into
+.av/env_snapshot.json, content-addressed and uploaded through the normal object flow so
+`av replay <run|commit>` can load it from the local CAS or the registry.
 """
 import datetime
 import json
@@ -31,9 +24,8 @@ _CURATED = ["torch", "torchvision", "lightning", "pytorch_lightning", "transform
             "datasets", "numpy", "pandas", "safetensors", "scikit-learn", "mlflow",
             "aether-vault"]
 
-# v1.2.5: env vars captured into the HASHED `env.env_vars` (they change training
-# behavior, so they're part of identity) — overridable via AV_ENV_CAPTURE_VARS
-# (comma-separated) for projects with their own critical vars.
+# Env vars captured into the HASHED `env.env_vars` (they change training behavior, so
+# they're part of identity) — overridable via AV_ENV_CAPTURE_VARS (comma-separated).
 _DEFAULT_CAPTURE_VARS = [
     "CUDA_VISIBLE_DEVICES", "PYTORCH_CUDA_ALLOC_CONF", "OMP_NUM_THREADS",
     "TOKENIZERS_PARALLELISM", "HF_HOME", "TORCH_HOME",
@@ -139,12 +131,9 @@ def _collect(full: bool) -> dict:
     gpu = _gpu_and_cuda_info()
     env_vars = {name: os.environ[name] for name in _capture_var_names() if name in os.environ}
 
-    # snapshot_version 2 (v1.2.5): split into HASHED identity (`env`, reproducibility-
-    # relevant) vs unhashed OBSERVED context (`observed`, machine-specific) — see
-    # core.py::canonical_env_bytes for the rationale. Top-level flat fields (python,
-    # platform, cuda_visible_devices, seeds, pins) are kept for backward compatibility
-    # with every existing reader (render_recipe, .avh replay section, etc.) — `env`/
-    # `observed` exist purely to define what participates in the snapshot's identity.
+    # snapshot_version 2 splits HASHED identity (`env`, reproducibility-relevant) from
+    # unhashed OBSERVED context (`observed`, machine-specific) — see
+    # core.py::canonical_env_bytes. Top-level flat fields stay for backward compatibility.
     snap: dict = {
         "snapshot_version": 2,
         "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -188,12 +177,8 @@ def _collect(full: bool) -> dict:
 
 def _store_snapshot_object(repo_root: Path, snap: dict) -> str:
     """Writes the snapshot into the local CAS under its canonical hash. Returns the id.
-
-    The CAS object holds the CANONICAL bytes (compact, timestamp-stripped) — exactly the
-    bytes the id hashes, so the registry's own sha256 verification accepts the upload and
-    any clone can re-derive the same id from the downloaded object. The human-readable
-    pretty file stays at .av/env_snapshot.json; registry upload happens through the
-    normal push flow (upload_commit_objects), never a side channel."""
+    The CAS object holds the canonical (compact, timestamp-stripped) bytes so any clone
+    can re-derive the same id; the human-readable file stays at .av/env_snapshot.json."""
     sid = env_snapshot_id(snap)
     obj_path = repo_root / ".av" / "objects" / sid[:2] / sid[2:]
     if not obj_path.exists():
@@ -223,10 +208,8 @@ def _link_run_state(repo_root: Path, sid: str) -> bool:
 
 
 def fetch_snapshot_by_id(repo_root: Path, client, sid: str) -> dict | None:
-    """Loads a snapshot object by id — local CAS first, then the registry.
-
-    Downloaded snapshots land in the local CAS like any other object so repeat replays
-    work offline afterward."""
+    """Loads a snapshot object by id — local CAS first, then the registry. Downloaded
+    snapshots land in the local CAS so repeat replays work offline afterward."""
     obj_path = repo_root / ".av" / "objects" / sid[:2] / sid[2:]
     if obj_path.exists():
         try:
@@ -306,23 +289,18 @@ def resolve_replay_target(repo_root: Path, target: str | None):
     return None, None
 
 
-# v1.3.0: the CUDA base tags this project's own CI/Docker images actually build against
-# (see development/infrastructure.md's "CUDA base matrix" section) — --cuda TAG outside
-# this set still generates a Dockerfile (never a hard failure; nvidia/cuda publishes many
-# tags this project simply hasn't validated), just with a warning that combination is
-# unverified.
+# The CUDA base tags this project's CI/Docker images actually build against (see
+# development/infrastructure.md) — --cuda TAG outside this set still generates a
+# Dockerfile, just with an "unverified combination" warning.
 _VALIDATED_CUDA_TAGS = {
     "12.1.0", "12.1.1", "12.4.1", "12.6.2", "12.8.0",
 }
 
 
 def render_recipe(snap: dict, dockerfile: bool, cuda_tag: str | None = None) -> str:
-    """Pure renderer shared by all replay paths (and the golden fixture test).
-
-    v1.2.5: `cuda_tag` switches the Dockerfile base to an nvidia/cuda runtime image
-    (e.g. "12.1.0") instead of plain python:slim, and the Dockerfile itself became
-    multi-stage (builder installs pins into a venv, runtime copies just that venv) with
-    a non-root user — closer to what a real training image looks like."""
+    """Pure renderer shared by all replay paths (and the golden fixture test). `cuda_tag`
+    switches the Dockerfile base to an nvidia/cuda runtime image instead of python:slim,
+    using a multi-stage build with a non-root user."""
     pins = snap.get("freeze") or [f"{k}=={v}" for k, v in (snap.get("pins") or {}).items()]
     py_version = snap.get("python", "3.12")
     if dockerfile:
@@ -401,22 +379,10 @@ def snapshot(full: bool) -> None:
 
 def _resolve_pip_invocation(repo_root: Path, snapshot_id: str | None, target_venv: str | None,
                             conda_env: str | None, into_current: bool):
-    """Where --execute actually installs. Returns (argv_prefix, description).
-
-    v1.3.0: clean-venv is now the DEFAULT happy path — --execute with none of
-    --target-venv/--conda-env/--into-current creates (or reuses)
-    `.av/replay-venv/<snapshot_id>/` instead of installing into the interpreter running
-    `av` itself. Reproducing an experiment's environment into the CURRENT interpreter's
-    site-packages is exactly the kind of silent cross-contamination replay exists to
-    avoid — installing pins from an arbitrary snapshot into your daily-driver Python
-    was surprising, occasionally destructive default behavior. --into-current is the
-    explicit, named opt-out for whoever actually wants that.
-
-    v1.2.5: `sys.executable -m pip` (never a bare `pip`, which can silently resolve to a
-    DIFFERENT interpreter's pip than the one running this command — a real
-    interpreter-mismatch risk on any machine with more than one Python on PATH) is what
-    --into-current now uses.
-    """
+    """Where --execute actually installs. Returns (argv_prefix, description). Clean-venv
+    is the default: creates/reuses `.av/replay-venv/<snapshot_id>/` rather than installing
+    into the interpreter running `av` itself; --into-current is the explicit opt-out.
+    Uses `sys.executable -m pip`, never a bare `pip`, to avoid an interpreter mismatch."""
     import shutil
 
     if conda_env:
@@ -453,9 +419,8 @@ def _resolve_pip_invocation(repo_root: Path, snapshot_id: str | None, target_ven
 
 
 def _validate_pins(pins: list[str]) -> list[dict]:
-    """v1.2.5: resolves each pin via `pip install --dry-run` (real dependency
-    resolution against PyPI, no package actually written to disk) — this is
-    '--validate', the answer to "can this recipe resolve?" without installing anything."""
+    """Resolves each pin via `pip install --dry-run` (real dependency resolution against
+    PyPI, nothing written to disk) — answers "can this recipe resolve?" without installing."""
     import subprocess
 
     results = []
@@ -508,15 +473,9 @@ def replay(target: str | None, dockerfile: bool, cuda_tag: str | None, out_path:
           validate_mode: bool, execute_mode: bool, target_venv: str | None,
           conda_env: str | None, into_current: bool, yes: bool) -> None:
     """Print (or execute) the reproduction recipe for TARGET (a run id, commit hash, or
-    snapshot id) — or the latest local snapshot when omitted.
-
-    Also reachable as the top-level `av replay <target>` alias (v1.2.2). TARGET
-    resolution loads the snapshot from the local CAS or the registry (snapshots ride the
-    normal object flow at push), so any clone can reproduce an experiment's environment
-    without touching the authoring machine. On another machine, resolve by RUN id (runs
-    carry env_snapshot_id server-side) or by the raw snapshot id from `.avh.replay` —
-    commit-payload ids live in local commit files only.
-    """
+    snapshot id) — or the latest local snapshot when omitted. Also reachable as the
+    top-level `av replay <target>` alias; TARGET resolution loads the snapshot from the
+    local CAS or the registry, so any clone can reproduce it without the authoring machine."""
     if cuda_tag and not dockerfile:
         fail(None, "validation", "--cuda only applies together with --dockerfile.")
     if cuda_tag and cuda_tag not in _VALIDATED_CUDA_TAGS and current_output_mode() != "json":

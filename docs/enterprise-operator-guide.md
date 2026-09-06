@@ -1,6 +1,6 @@
-# Enterprise operator guide: identity, tenancy, and DR (v1.3.2, SSO/SCIM added v1.3.3)
+# Enterprise operator guide: identity, tenancy, and DR
 
-A continuous path through the enterprise-readiness surfaces shipped in v1.3.2 — the same
+A continuous path through the enterprise-readiness surfaces — the same
 convention `docs/tutorial.md`/`docs/rsi-operator-guide.md` established, applied to the
 surfaces an operator (not an individual agent/researcher) drives: provisioning tenants
 and users, granting roles, minting remotely-administrable tokens, understanding the
@@ -8,12 +8,10 @@ tenancy boundary, and taking/restoring backups. Every command below is real;
 `tests/test_docs_commands.py` parses every fenced `av ...` line on this page and asserts
 the command and every flag it uses actually exist in the live CLI.
 
-**Read this first — what this pass shipped and what it didn't.** RBAC, hard
+**Read this first — what's implemented and what isn't.** RBAC, hard
 multi-tenancy, and disaster recovery are real, live-verified code (see
 `development/architecture.md`'s Identity & Session / RBAC / Tenancy Isolation / Backup &
-DR contract sections). **v1.3.4 correction:** this paragraph used to say SSO/SCIM were not
-built at all — that stopped being true in v1.3.3 (sections 10-11 below), which this intro
-was never updated to reflect. SSO (OIDC/SAML) and SCIM provisioning ARE implemented and
+DR contract sections). SSO (OIDC/SAML) and SCIM provisioning are implemented and
 locally tested — `av login`/`av idp add`/`av scim token create` exist — with the one
 remaining gap being a live run against a genuinely external IdP (see "What's next on the
 enterprise roadmap" below). Everything below still also works with the OSS `av auth`
@@ -23,7 +21,7 @@ provisions with `av token create`, entirely independent of an identity provider.
 ## 1. Provision a tenant
 
 A tenant is the isolation boundary — every project, user, and token lives under exactly
-one. A fresh registry already has a `default` tenant (every pre-v1.3.2 project lives
+one. A fresh registry already has a `default` tenant (every pre-existing project lives
 there); real multi-tenancy means provisioning more:
 
 ```bash
@@ -31,9 +29,8 @@ av tenant create acme-labs "Acme Labs"
 ```
 
 Requires an `admin`-scoped credential — on an unconfigured (Anonymous) registry, any
-credential qualifies (an unscoped token resolves to `["*"]`, same additive rule
-v1.3.1's own scope rollout used). `av tenant show` reports which tenant your currently
-configured credential resolves to.
+credential qualifies (an unscoped token resolves to `["*"]`). `av tenant show` reports
+which tenant your currently configured credential resolves to.
 
 ## 2. Create users and grant roles
 
@@ -109,8 +106,8 @@ av admin backup restore ./backup-2026-09-05 --database-url $DATABASE_URL --data-
 
 `--force` is required whenever the target database already has tables in it — restore is
 destructive by nature. See [`docs/dr.md`](dr.md) for the full picture, including the real
-destroy-and-restore drill this pass ran (`scripts/e2e_scenario.sh`'s Phase U) and why
-this command never auto-detects "the local docker stack" the way `av auth` does.
+destroy-and-restore drill (`scripts/e2e_scenario.sh`'s Phase U) and why this command
+never auto-detects "the local docker stack" the way `av auth` does.
 
 ## 6. High availability (infrastructure, not CLI)
 
@@ -140,8 +137,7 @@ independent verifier checks signatures against.
 AV_CAS_ISOLATION=isolated
 ```
 
-Off by default (`shared` — one global content-addressed dedup domain, unchanged from
-every pre-v1.3.3 deployment). Turning it on physically separates every tenant's objects
+Off by default (`shared` — one global content-addressed dedup domain). Turning it on physically separates every tenant's objects
 on disk and in the Bloom filter — the real, stated cost is losing CROSS-tenant
 deduplication entirely (identical bytes held by two tenants are now stored twice);
 INTRA-tenant dedup, the product's actual headline claim, is completely unaffected either
@@ -196,7 +192,7 @@ when the flow times out with no approval.
 SAML assertion signature/conditions via `pysaml2`) is implemented and tested against this
 server's own routes; it has not yet been driven end-to-end against a live external IdP
 (Keycloak/Okta/Entra) in this environment. Treat this as implemented-and-locally-tested,
-not yet field-verified — see `VERSIONING.md`'s v1.3.3 section.
+not yet field-verified — see `VERSIONING.md`'s known-limitations note under SSO/SCIM.
 
 ## 11. Provision users via SCIM
 

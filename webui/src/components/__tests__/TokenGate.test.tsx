@@ -5,10 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TokenGate } from "../TokenGate";
 import { getStoredApiToken } from "@/lib/api";
 
-// TokenGate's 401-triggers-the-prompt path is wired through lib/api.ts's real
-// setUnauthorizedHandler (registered by TokenGate itself on mount) — these tests exercise
-// that real path end-to-end by mocking global fetch to return a 401 and calling a real
-// fetchJSON-backed function (fetchHealth), rather than mocking lib/api.ts itself.
+// Exercises the real 401-triggers-the-prompt path end-to-end by mocking global fetch
+// to return a 401 and calling a real fetchJSON-backed function, rather than mocking
+// lib/api.ts itself.
 import * as apiModule from "@/lib/api";
 
 beforeEach(() => {

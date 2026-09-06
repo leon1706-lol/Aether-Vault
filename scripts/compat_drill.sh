@@ -1,36 +1,21 @@
 #!/usr/bin/env bash
 # ============================================================================
-# v1.3.4 (todo.md item 39, W3g): migration compatibility drill — an OLDER server binary
-# vs a database a NEWER binary has already migrated to head. Proves (or disproves)
-# `development/Probleme.md` #136's fix: before that fix, ANY older replica's next
-# restart during a rolling upgrade crashed outright once a newer replica advanced the
-# schema past what the older binary's own alembic script directory recognizes.
+# Migration compatibility drill — an OLDER server binary vs a database a NEWER binary
+# has already migrated to head. Proves an older replica's next restart during a rolling
+# upgrade comes up healthy rather than crash-looping once a newer replica has advanced
+# the schema past what the older binary's alembic script directory recognizes.
 #
-# What this actually does:
-#   1. `git worktree add` a real PREVIOUS release tag (defaults to the most recent one)
-#      into a throwaway directory — the exact old CODE, not a simulation of it.
-#   2. Boots CURRENT code against a fresh Postgres, migrating it all the way to HEAD.
-#   3. Stops it, boots the OLD code's server against that SAME now-fully-migrated
-#      database.
-#   4. Asserts the OLD binary comes up healthy (not a crash-loop) — proving
-#      Probleme.md #136's fix, not just that it LOOKS plausible from reading the code.
+# Steps: checkout a real previous release tag into a worktree, migrate a fresh Postgres
+# to HEAD with current code, then boot the OLD code against that same database and
+# assert it comes up healthy.
 #
 # Usage: DATABASE_URL=postgresql+asyncpg://... [OLD_TAG=v1.2.4] bash scripts/compat_drill.sh
-# Needs a real, disposable Postgres (same contract as scripts/migrations_drill.py) and a
-# git checkout with tag history (`git fetch --tags` / `actions/checkout` with
-# `fetch-depth: 0`).
+# Needs a real, disposable Postgres and a git checkout with tag history.
 #
-# HONEST CURRENT LIMITATION (as of the v1.3.4 CI/CD pass that added this script): the
-# only tag that exists right now, v1.2.4, predates Probleme.md #136's fix entirely --
-# running this drill against it PROVES THE ORIGINAL BUG, not the fix (v1.2.4's own code
-# has no `_schema_is_ahead_of_this_binary` at all, so it crashes exactly as #136
-# describes). That is expected, not a regression in this drill. This script only starts
-# proving the FIX holds once run with `OLD_TAG` set to some FUTURE tag that includes
-# #136's fix, against a database migrated further ahead by an even-newer checkout — which
-# is why this is NOT yet wired into any CI workflow (a gating job that predictably fails
-# today, for a reason unrelated to any regression, trains reviewers to ignore it). Wire it
-# in once the next tag past this fix exists; until then it's available for manual/local
-# use and as the ready mechanism this backlog item asked for.
+# HONEST CURRENT LIMITATION: the only tag that exists right now, v1.2.4, predates the fix
+# this drill proves, so running it against v1.2.4 reproduces the original bug rather than
+# proving the fix -- expected, not a regression. Not yet wired into CI for that reason;
+# wire it in once a tag past the fix exists.
 # ============================================================================
 set -euo pipefail
 
@@ -120,10 +105,8 @@ log "installing $OLD_TAG into a clean venv"
 "$OLD_VENV/bin/pip" install -q "$WORKTREE"[dev] 2>>"$SERVER_LOG" \
   || die "could not install $OLD_TAG into a clean venv -- see $SERVER_LOG"
 
-# Does $OLD_TAG's own checkout actually contain Probleme.md #136's fix? Sets the
-# EXPECTED outcome below honestly instead of treating any boot failure as this drill's
-# own failure — a tag that predates the fix is SUPPOSED to crash here (that's the
-# original bug, reproduced faithfully), not a regression in this script.
+# Does $OLD_TAG actually contain the fix? A tag that predates it is SUPPOSED to crash
+# here (the original bug, reproduced faithfully), not a regression in this script.
 OLD_HAS_FIX=0
 grep -q "_schema_is_ahead_of_this_binary" "$WORKTREE/python/av_server/database.py" 2>/dev/null && OLD_HAS_FIX=1
 log "does $OLD_TAG include Probleme.md #136's fix? $([[ "$OLD_HAS_FIX" == 1 ]] && echo yes || echo no)"
@@ -141,11 +124,11 @@ else
 fi
 
 if [[ "$OLD_HAS_FIX" == 1 ]]; then
-  [[ "$BOOTED" == 1 ]] || die "old code ($OLD_TAG) INCLUDES Probleme.md #136's fix but still failed to boot against a schema newer than it recognizes -- the fix has regressed"
-  pass "old code ($OLD_TAG, includes the fix) booted healthy against a schema migrated past its own head — Probleme.md #136's fix holds"
+  [[ "$BOOTED" == 1 ]] || die "old code ($OLD_TAG) INCLUDES the fix but still failed to boot against a schema newer than it recognizes -- the fix has regressed"
+  pass "old code ($OLD_TAG, includes the fix) booted healthy against a schema migrated past its own head"
 else
-  [[ "$BOOTED" == 0 ]] || die "old code ($OLD_TAG) does NOT include Probleme.md #136's fix but booted anyway -- either the fix isn't needed after all, or this drill's own database-ahead setup is wrong; investigate before trusting this drill's result either way"
-  pass "old code ($OLD_TAG, predates the fix) failed to boot as expected — faithfully reproduces the ORIGINAL bug, not a drill failure. Re-run with OLD_TAG set to a tag that includes the fix to actually prove it holds."
+  [[ "$BOOTED" == 0 ]] || die "old code ($OLD_TAG) does NOT include the fix but booted anyway -- investigate before trusting this drill's result"
+  pass "old code ($OLD_TAG, predates the fix) failed to boot as expected -- faithfully reproduces the original bug, not a drill failure"
 fi
 
 log "ALL COMPAT DRILL CHECKS PASSED ($OLD_TAG vs head $NEW_HEAD)"

@@ -1,13 +1,7 @@
-"""User-level SSO session storage for `av login`/`logout`/`whoami` (v1.3.3, WP-14/WP-15).
-
-Lives at `~/.aether-vault/session.json` — the SAME user-level directory `update_check.py`
-already established (`USER_CONFIG_DIR`, distinct from the per-repo `.av/config`), not the
-plan's originally-sketched `~/.av/session.json`: a login session is per-user-per-machine,
-not per-repo, and this repo already has exactly one established convention for
-"per-user, not per-repo" state — this module follows it rather than adding a second,
-differently-named user config directory for no reason.
-
-Never imported by `server.py`/`av_server` — purely a CLI-side concern.
+"""User-level SSO session storage for `av login`/`logout`/`whoami` (v1.3.3). Lives at
+`~/.aether-vault/session.json` -- the same user-level directory `update_check.py`
+already established (`USER_CONFIG_DIR`), since a login session is per-user-per-machine,
+not per-repo. Never imported by `server.py`/`av_server` -- purely a CLI-side concern.
 """
 from __future__ import annotations
 
@@ -33,10 +27,9 @@ def _secure_permissions(path: Path) -> None:
 
 
 def load_session() -> dict | None:
-    """Returns the stored session dict (`token`, `url`, `username`, `provider_id`,
-    `expires_at`), or None if there is none, it's corrupt, or it's expired. Expiry is
-    checked client-side purely as a courtesy (skip a doomed request) — the server's own
-    `sessions.expires_at`/`revoked_at` checks are the real enforcement."""
+    """Returns the stored session dict, or None if there is none, it's corrupt, or it's
+    expired. Expiry is checked client-side purely as a courtesy -- the server's own
+    checks are the real enforcement."""
     if not SESSION_PATH.exists():
         return None
     try:

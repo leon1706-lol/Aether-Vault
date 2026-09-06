@@ -1,9 +1,6 @@
-# v1.3.4 (todo.md item 2, W1d): SAST for Python + TypeScript, plus the workflow files
-# themselves (the `actions` language — reinforces W1a/W1b's SHA-pinning/least-privilege
-# work by statically checking the SAME workflows for injection-prone patterns). This repo
-# has never run CodeQL before this — `gh api repos/:owner/:repo/code-scanning/analyses`
-# returned "no analysis found" prior to this workflow's first run. Public repo: CodeQL and
-# every runner OS here are free (no GitHub Advanced Security purchase needed).
+# SAST for Python + TypeScript, plus the workflow files themselves (the `actions`
+# language) -- statically checks for injection-prone patterns. Public repo: CodeQL and
+# every runner OS here are free.
 name: CodeQL
 
 on:
@@ -32,9 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `build-mode: none` for all three: python/javascript-typescript are interpreted
-        # (no compilation needed for CodeQL's extraction) and `actions` analyzes YAML
-        # directly — none of these need this repo's C++ extension built first.
+        # build-mode: none for all three -- none of these need the C++ extension built first.
         language: [python, javascript-typescript, actions]
 
     steps:

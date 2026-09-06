@@ -1,8 +1,7 @@
-// lib/runDetail.ts — pure helpers for the Runs panel's expandable detail view (v1.2.2).
+// lib/runDetail.ts — pure helpers for the Runs panel's expandable detail view.
 //
-// Everything here is client-side composition over data the API already returns
-// (GET /api/runs/{id}, GET /api/commits/{hash}) — deliberately NO new server endpoint,
-// mirroring how diffWeights.ts builds the Weight Diff view from already-fetched trees.
+// Client-side composition over data the API already returns, deliberately with no new
+// server endpoint, mirroring how diffWeights.ts builds the Weight Diff view.
 
 import type { Commit, Run } from "@/lib/api";
 

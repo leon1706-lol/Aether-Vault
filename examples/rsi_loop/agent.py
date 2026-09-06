@@ -1,25 +1,16 @@
-"""A deterministic, scripted reference agent driving the full v1.3.1 RSI loop through
-`av_sdk.Repo` alone (todo.md item 46 / plan WP-40) — no LLM key, no network call this
-script doesn't make explicitly, no hidden state beyond what's printed as it runs.
+"""A deterministic, scripted reference agent driving the full RSI loop through
+`av_sdk.Repo` alone — no LLM key, no network call this script doesn't make explicitly.
 
-Narrative (each step is a real call against a real, reachable aether-vault registry —
-this is not a mock): register a baseline improver -> propose a self-edit -> get it
-approved -> apply it in a real sandbox -> run a capability canary against it -> arm the
-improver-promotion gate to require a reviewer's sign-off -> attempt to promote (DENIED:
-review_required) -> get it reviewed by a second identity -> promote again (ALLOWED) ->
-record a lesson from what was learned -> set a tiny compute budget and run it to
-exhaustion (BUDGET_EXHAUSTED). Along the way it also touches the blackboard, causal
-lineage, strategy memory, and cross-run search surfaces, so the script's own log is a
-working tour of every RSI R1-R5 surface `av_sdk.Repo` exposes (see
-`development/architecture.md`'s "RSI SDK Surface Contract" for what's deliberately NOT
-mirrored on the SDK and why).
+Narrative (each step is a real call against a real, reachable registry): register a
+baseline improver -> propose a self-edit -> get it approved -> apply it in a sandbox ->
+run a capability canary -> arm the promotion gate to require review -> attempt to
+promote (denied) -> get it reviewed -> promote again (allowed) -> record a lesson -> set
+a tiny compute budget and run it to exhaustion. Also touches the blackboard, causal
+lineage, strategy memory, and cross-run search surfaces.
 
-Requires a real, reachable aether-vault registry (`av init` already run against it) —
-every RSI surface here is server-authoritative by design (no offline queue for improver
-versions, change sets, canary results, etc. — see each surface's own architecture.md
-section). `tests/test_rsi_loop.py` runs this SAME function stack-free against an
-in-memory fake registry, proving the narrative's logic without Docker; running it here
-for real against a live stack is part of the project's WP-44 live-verification pass.
+Requires a real, reachable aether-vault registry (`av init` already run against it), since
+every RSI surface here is server-authoritative by design. `tests/test_rsi_loop.py` runs
+this same function stack-free against an in-memory fake registry.
 
 Usage (against an already-`av init`-ed repo, pointed at a reachable registry):
     python examples/rsi_loop/agent.py /path/to/repo
@@ -39,17 +30,14 @@ def _log(steps: list[dict], step: str, **detail) -> None:
 
 def run_rsi_loop(repo_path: Path, *, print_fn: Callable[[str], None] | None = None) -> list[dict]:
     """Runs the full narrative against `repo_path` (an already-`av init`-ed repo) and
-    returns the step log `_log()` built along the way — the return value is what
-    `tests/test_rsi_loop.py` asserts against; `print_fn` (default: no printing, so the
-    test run stays quiet) is what the `__main__` block below wires to `print` for a human
-    running this for real."""
+    returns the step log, which `tests/test_rsi_loop.py` asserts against. `print_fn`
+    defaults to no printing so the test run stays quiet."""
     say = print_fn or (lambda _msg: None)
     steps: list[dict] = []
 
     with Repo(repo_path) as repo:
         # 0. A real training checkpoint to give the canary (step 6) and the improver's
-        #    own lineage something concrete to reason about — the RSI surfaces below
-        #    version the IMPROVER, but the improver still exists to produce model runs.
+        #    own lineage something concrete to reason about.
         say("Committing an initial training checkpoint (val_loss=0.5)...")
         (repo_path / "checkpoint.txt").write_text("stub model weights", encoding="utf-8")
         repo.add("checkpoint.txt")
@@ -74,9 +62,8 @@ def run_rsi_loop(repo_path: Path, *, print_fn: Callable[[str], None] | None = No
         _log(steps, "improver_propose", id=change_set["id"])
         say(f"  -> change set {change_set['id']}")
 
-        # 3. A (distinct, in a real deployment) reviewer approves the CHANGE SET itself —
-        #    the prerequisite for applying it; distinct from the reviewer-GATE approval
-        #    step 8 below, which gates PROMOTING the resulting improver version.
+        # 3. A (distinct, in a real deployment) reviewer approves the change set itself,
+        #    the prerequisite for applying it — distinct from step 8's promotion gate.
         say("Approving the change set...")
         repo.improver_review(change_set["id"], "approved")
         _log(steps, "improver_review", decision="approved")
@@ -89,10 +76,8 @@ def run_rsi_loop(repo_path: Path, *, print_fn: Callable[[str], None] | None = No
              previous_improver_id=applied["previous_improver_id"])
         say(f"  -> {candidate} (previous: {applied['previous_improver_id']})")
 
-        # 5. Actually execute the change in an isolated sandbox — the mechanical
-        #    self-edit application, not just the bookkeeping step above. `local` is the
-        #    safety default for a reference script; a real deployment would pass
-        #    `driver="docker"` for genuine process isolation.
+        # 5. Actually execute the change in an isolated sandbox. `local` is the safety
+        #    default here; a real deployment would pass `driver="docker"`.
         say("Executing the change in a local sandbox...")
         job = repo.sandbox_run(["python", "-c", "print('training loop patched and re-run')"],
                                driver="local", improver_id=candidate)
@@ -105,10 +90,9 @@ def run_rsi_loop(repo_path: Path, *, print_fn: Callable[[str], None] | None = No
         _log(steps, "canary_run", passed=canary["passed"])
         say(f"  -> {'PASS' if canary['passed'] else 'FAIL'}")
 
-        # 7. Arm the improver-promotion gate to require a reviewer's sign-off. This is
-        #    local-only config (no network call, no SDK method by design — see
-        #    architecture.md) so it's set directly via the same file cmd_improver.py
-        #    reads, matching what `av improver policy set main --require-review` does.
+        # 7. Arm the improver-promotion gate to require a reviewer's sign-off. Local-only
+        #    config (no SDK method by design), set directly via the same file
+        #    cmd_improver.py reads, matching `av improver policy set main --require-review`.
         from av_cli.cmd_improver import load_improver_policies, save_improver_policies
 
         say("Arming the improver-promotion gate (require_review) for 'main'...")
@@ -127,11 +111,9 @@ def run_rsi_loop(repo_path: Path, *, print_fn: Callable[[str], None] | None = No
             _log(steps, "improver_promote_denied", code=exc.code, exit_code=exc.exit_code)
             say(f"  -> DENIED ({exc.code}, exit {exc.exit_code}) — as expected")
 
-        # 9. Get it reviewed. In a real deployment this call is made by a SECOND
-        #    identity/token (a self-review is rejected server-side, 422) — the reference
-        #    loop runs single-identity for simplicity, so this call demonstrates the
-        #    SUBMISSION shape, not the self-review rejection itself (that's proven
-        #    directly in tests/test_review.py against the live server).
+        # 9. Get it reviewed. A real deployment would use a second identity/token (a
+        #    self-review is rejected server-side); this reference loop runs
+        #    single-identity, demonstrating just the submission shape.
         say("Submitting a reviewer approval for the candidate...")
         review = repo.review_submit(candidate, "approve", target_type="improver")
         _log(steps, "review_submit", decision=review.get("decision", "approve"))
@@ -150,8 +132,8 @@ def run_rsi_loop(repo_path: Path, *, print_fn: Callable[[str], None] | None = No
         )
         _log(steps, "blackboard_post", id=claim["id"])
 
-        # 12. Record the causal claim explicitly (agent-authored, not yet independently
-        #     verified) and add a searchable strategy-memory entry for future lineages.
+        # 12. Record the causal claim (agent-authored, not yet independently verified)
+        #     and add a searchable strategy-memory entry for future lineages.
         say("Recording a causal link and a strategy-memory entry...")
         repo.lineage_link("change_set", change_set["id"], "val_loss", effect_delta=-0.15)
         repo.strategy_add("lower_lr_on_plateau", "worked",
@@ -179,8 +161,7 @@ def run_rsi_loop(repo_path: Path, *, print_fn: Callable[[str], None] | None = No
             _log(steps, "budget_exhausted", code=exc.code, exit_code=exc.exit_code)
             say(f"  -> STOPPED ({exc.code}, exit {exc.exit_code}) — as expected")
 
-        # 15. Confirm the causal graph and strategy memory are queryable across the
-        #     lineage, not just written — the whole point of these surfaces existing.
+        # 15. Confirm the causal graph and strategy memory are queryable, not just written.
         matches = repo.search_runs("val_loss", direction="down")
         _log(steps, "search_runs", match_count=len(matches))
         say(f"Cross-run search found {len(matches)} matching run(s).")

@@ -1,16 +1,8 @@
-"""Server-side ed25519 signing for the audit-log hash chain (v1.3.3, WP-32).
-
-Deliberately SEPARATE from `python/av_cli/signing.py` — that module is repo-scoped
-(keys live under a checkout's `.av/keys/`, one keypair per repo, used to sign COMMITS a
-client controls). Audit-log rows are server-generated and server-wide, not per-repo, so
-this module manages ONE keypair per registry deployment instead, at a path the operator
-controls (`AV_AUDIT_SIGNING_KEY_PATH`, unset by default — chain-hashing alone, this
-module's other half, works with zero signing at all).
-
-Fails soft, not hard: `cryptography` is an optional extra (`[sign]`) elsewhere in this
-codebase, and this module keeps that contract — every function here returns `None`
-(never raises) when the dependency is missing or no key is configured, so a deployment
-that never opts into signing never even imports `cryptography`.
+"""Server-side ed25519 signing for the audit-log hash chain (v1.3.3). Deliberately
+SEPARATE from `python/av_cli/signing.py` (repo-scoped, per-checkout keys for commits) --
+this module manages ONE keypair per registry deployment, at `AV_AUDIT_SIGNING_KEY_PATH`
+(unset by default; chain-hashing works with zero signing). Fails soft: every function
+returns `None`, never raises, when the dependency is missing or no key is configured.
 """
 from __future__ import annotations
 
@@ -38,10 +30,8 @@ def signing_key_path() -> Path | None:
 
 def ensure_keypair() -> tuple[Path, Path] | None:
     """Generates a keypair at `AV_AUDIT_SIGNING_KEY_PATH` (+ `.pub`) if one doesn't
-    already exist there. Returns (private_path, public_path), or None if signing isn't
-    configured/available. Called once at server startup when the env var is set — never
-    silently regenerates over an existing key (that would invalidate every previously
-    issued signature)."""
+    already exist there. Never regenerates over an existing key -- that would invalidate
+    every previously issued signature."""
     crypto = _crypto()
     key_path = signing_key_path()
     if crypto is None or key_path is None:

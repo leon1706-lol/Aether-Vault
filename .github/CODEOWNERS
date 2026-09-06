@@ -1,9 +1,6 @@
-# v1.3.4 (todo.md item 34): CODEOWNERS for the highest-risk paths in this repo — the
-# single commit/restore paths, signing, the container build, deploy manifests, CI itself,
-# and the release-adjacent scripts. Auto-requests review on any PR touching these; does
-# NOT enable "require code owner reviews" in branch protection (that would force every
-# PR through a review gate, which would break this repo's actual direct-to-master flow —
-# a deliberate choice, not an oversight, see development/infrastructure.md).
+# CODEOWNERS for the highest-risk paths in this repo. Auto-requests review on any PR
+# touching these; deliberately does NOT enable "require code owner reviews" in branch
+# protection, which would break this repo's direct-to-master flow.
 
 # Default owner for everything not more specifically matched below.
 *                                       @leon1706-lol

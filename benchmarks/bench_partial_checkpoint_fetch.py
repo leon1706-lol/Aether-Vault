@@ -2,13 +2,9 @@
 
 Pushes a multi-layer checkpoint to a real remote, clears local objects (simulating a fresh
 machine), then times fetching just *one* layer vs the whole checkpoint. None of the three
-competitors have sub-file granularity — pulling always means the whole file — so their
-"single layer" cell is N/A; they only get a real number in the "whole checkpoint" row,
-which av also reports for an honest baseline comparison.
-
-Uses `av_cli.client.VaultClient` directly against a real reachable `av_server` (no mocking)
-— if no server is reachable, av's rows fall back to N/A with a clear note rather than a
-fabricated number, same as every other tool-missing case in this suite.
+competitors have sub-file granularity, so their "single layer" cell is N/A; they only get
+a real number in the "whole checkpoint" row, which av also reports for a baseline
+comparison. Uses `VaultClient` directly against a real reachable `av_server` (no mocking).
 """
 
 import shutil
@@ -74,8 +70,7 @@ def _bench_av() -> dict[str, float | None]:
         client.download_object(layers[0]["hash"], dest)
         layer_ms = (time.perf_counter() - start) * 1000
 
-        # Reset again, then time fetching *every* layer — the whole-checkpoint equivalent
-        # av itself would need if reassembling the file from scratch on a fresh machine.
+        # Reset again, then time fetching every layer -- the whole-checkpoint equivalent.
         shutil.rmtree(root / ".av" / "objects", ignore_errors=True)
         (root / ".av" / "objects").mkdir()
         start = time.perf_counter()

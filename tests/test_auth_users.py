@@ -16,11 +16,8 @@ it debuts on CI exactly like the rest of the live-path suite.
 import os
 import tempfile
 
-# Same import-time env pinning as tests/test_server.py — database.py/redis_cache.py/
-# storage.py read their config at import time. Explicit assignment so a real dev shell's
-# exported DATABASE_URL never leaks in. When the full suite runs, whichever module imports
-# python.av_server.server first fixes these values for the process; this file sorts before
-# tests/test_server.py alphabetically, so its values win — identical defaults, no conflict.
+# Same import-time env pinning as tests/test_server.py: database.py/redis_cache.py/
+# storage.py read their config at import time, so this must be set before import.
 os.environ["DATABASE_URL"] = os.environ.get(
     "AV_TEST_DATABASE_URL",
     "postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test",
@@ -202,10 +199,8 @@ def test_prefix_tokens_do_not_match(auth_state):
 # ---------------------------------------------------------------------------
 # require_token middleware — stack-free via the PRODUCTION middleware on a probe app
 # ---------------------------------------------------------------------------
-# Mounting server_module.require_token (the exact decorated production middleware) onto a
-# tiny DB-free FastAPI app proves BOTH rejection and acceptance without Postgres: a valid
-# token gets 200 from the probe route; an invalid one gets the real 401 shape. No lifespan
-# runs anywhere here, so nothing ever touches the database.
+# Mounts server_module.require_token (the exact decorated production middleware) onto a
+# tiny DB-free FastAPI app to prove both rejection and acceptance without Postgres.
 
 @pytest.fixture(scope="module")
 def probe_client():
@@ -221,10 +216,9 @@ def probe_client():
     def _health_stub():
         return {"status": "ok", "version": "probe"}
 
-    # Same registration ORDER as production (v1.1.12 pipeline: auth added first, CORS
-    # second ⇒ CORS outermost, decorating even auth's 401s) so this fixture reproduces
-    # the real middleware sandwich, preflight and error-visibility behavior included
-    # (Probleme.md #75).
+    # Same registration order as production (auth added first, CORS second ⇒ CORS
+    # outermost, decorating even auth's 401s) so this fixture reproduces the real
+    # middleware sandwich.
     from fastapi.middleware.cors import CORSMiddleware
 
     probe.add_middleware(BaseHTTPMiddleware, dispatch=server_module.require_token)
@@ -306,12 +300,11 @@ def test_combined_mode_accepts_both_credential_shapes(probe_client, auth_state):
 
 
 # ---------------------------------------------------------------------------
-# Browser preflights in Protected mode (Probleme.md #75)
+# Browser preflights in Protected mode
 # ---------------------------------------------------------------------------
 # A Bearer-authenticated fetch is non-simple: the browser sends an OPTIONS preflight
-# FIRST, without any credentials. With auth middleware outside CORS (the production
-# sandwich), that preflight used to be 401'd with no CORS headers and the browser
-# aborted the real request — Protected mode silently broke the entire webui.
+# first, without any credentials. With auth middleware outside CORS, that preflight
+# used to be 401'd with no CORS headers, silently breaking the entire webui.
 
 PREFLIGHT_HEADERS = {
     "Origin": "http://localhost:3000",
@@ -328,10 +321,8 @@ def test_preflight_passes_in_users_only_mode(probe_client, auth_state):
 
 
 def test_unauthorized_response_carries_cors_headers_so_browser_can_read_it(probe_client, auth_state):
-    # The subtle half of #75: with CORS inner to auth, a tokenless browser request's 401
-    # had NO ACAO headers — fetch rejected as a TypeError and the webui showed an empty
-    # dashboard instead of the TokenGate prompt. The 401 must be CORS-decorated so JS
-    # can read res.status and route to onUnauthorized.
+    # A tokenless browser request's 401 must be CORS-decorated, or fetch rejects as a
+    # TypeError and the webui shows an empty dashboard instead of the TokenGate prompt.
     server_module.AV_API_TOKEN = "owner-secret"
     resp = probe_client.get("/api/refs", headers={"Origin": "http://localhost:3000"})
     assert resp.status_code == 401

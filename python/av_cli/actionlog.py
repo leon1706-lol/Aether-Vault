@@ -1,11 +1,6 @@
-"""Append-only agent action log (v1.3.1, RSI R5: todo.md G.31).
-
-`.av/actions.jsonl` records one line per logged decision: `{"ts", "actor", "action",
-"details"}` — the same append-only-JSONL shape `.av/context/memory.jsonl`
-(`cmd_context.py`) already established for agent notes, applied here to DECISIONS instead
-of free-text reasoning. `publish_action_log()` content-addresses the current file (the
-same CAS pattern every other RSI artifact uses) so it can be referenced from a commit or
-a run and later fetched by `av replay-actions` on any clone.
+"""Append-only agent action log (v1.3.1). `.av/actions.jsonl` records one line per logged
+decision, content-addressed via `casobj` so it can be referenced from a commit/run and
+replayed with `av replay-actions`.
 """
 from __future__ import annotations
 
@@ -21,8 +16,7 @@ def _log_path(repo_root: Path) -> Path:
 def log_action(repo_root: Path, action: str, details: dict | None = None,
               actor: str | None = None, command: list[str] | None = None) -> dict:
     """Appends one entry. `command`, when given, is what `av replay-actions --execute`
-    re-runs to check reproducibility — omit it for decisions that aren't a re-runnable
-    command (e.g. "chose hyperparameter X because Y")."""
+    re-runs to check reproducibility."""
     import os
 
     entry = {
@@ -56,9 +50,8 @@ def read_actions(repo_root: Path) -> list[dict]:
 
 
 def publish_action_log(repo_root: Path, client, project_id: str, run_id: str | None = None) -> str | None:
-    """Content-addresses the CURRENT full action log and uploads it. Returns the object
-    id, or None if there's nothing to publish (empty log) — never raises; publishing an
-    action log is a nice-to-have record, not a gate, same as `.avh` publish."""
+    """Content-addresses the current action log and uploads it, returning the object id
+    (or None if the log is empty). Never raises — this is a nice-to-have record, not a gate."""
     from . import casobj
 
     actions = read_actions(repo_root)

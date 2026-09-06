@@ -1,19 +1,12 @@
 # ============================================================================
-# HA topology (v1.3.2, WP-25) -- a SEPARATE compose file from docker-compose.yml, run
-# alongside it with `-f docker-compose.ha.yml` (it reuses docker-compose.yml's build
-# context/image via `extends`-free duplication below, kept intentionally explicit rather
-# than layered with `-f docker-compose.yml -f docker-compose.ha.yml` merge semantics --
-# an HA topology changes so much service-by-service, from host-port mapping to which
-# database each engine talks to, that a partial override file would be harder to read
-# correctly than one self-contained file).
+# HA topology -- a self-contained compose file, deliberately not layered as an override
+# on top of docker-compose.yml since an HA topology changes so much service-by-service
+# (host-port mapping, which database each engine talks to) that a partial override
+# would be harder to read correctly than one self-contained file.
 #
 # Shape: nginx least-conn load balancer in front of 2 stateless engine replicas, a
 # Postgres primary + real streaming-replication standby, and a Redis primary + replica.
-# `scripts/ha_drill.sh` is the actual proof this is more than YAML -- it drives concurrent
-# pushes through the LB, kills one engine replica and one Postgres/Redis node mid-run, and
-# asserts zero failed pushes, zero double webhook deliveries, and globally-correct rate
-# limiting (see WP-24's RedisWindowRateLimiter/AV_RATE_LIMIT_BACKEND, which this topology
-# is the reason to actually turn on).
+# `scripts/ha_drill.sh` is the actual proof this is more than YAML.
 #
 # Run it:
 #   docker compose -f docker-compose.ha.yml up -d --build
@@ -21,10 +14,8 @@
 #   docker compose -f docker-compose.ha.yml down -v
 # ============================================================================
 # Explicit project name -- keeps this topology's network/volumes/container namespace
-# entirely separate from docker-compose.yml's default "aether-vault" project, so both can
-# run side by side on this machine without any name collision (they were colliding on
-# the shared default network before this was added, found via `docker compose -f
-# docker-compose.ha.yml config`).
+# entirely separate from docker-compose.yml's default "aether-vault" project, so both
+# can run side by side without a name collision.
 name: aether-vault-ha
 
 services:
@@ -48,18 +39,10 @@ services:
       context: .
       target: engine
     container_name: aether-vault-ha-engine-1
-    # v1.3.3.6 fix (found live): this file's own header comment claimed
-    # `host.docker.internal` needs no extra config "here" -- true only on Docker Desktop
-    # (Mac/Windows), the environment this compose file was apparently always drilled on
-    # before. `ha_drill.sh`'s phase 3 registers a webhook at
-    # `http://host.docker.internal:$PROBE_PORT/hook` to prove the retry worker actually
-    # delivers -- on a genuinely Linux Docker Engine host (this repo's own CI runner,
-    # ubuntu-latest), that hostname resolves to nothing without this explicit mapping,
-    # so every delivery attempt failed before ever reaching the probe: 0 requests
-    # recorded, not a retry-worker bug. `host-gateway` is Docker's own special value
-    # (Engine 20.10+) for "the host's gateway IP from inside this container", the
-    # standard portable fix -- harmless and already a no-op on Docker Desktop, which
-    # already resolves the name itself.
+    # `host.docker.internal` needs this explicit mapping on a genuinely Linux Docker
+    # Engine host (this repo's own CI runner); without it, ha_drill.sh's phase 3
+    # webhook probe resolves to nothing. `host-gateway` (Engine 20.10+) is a no-op on
+    # Docker Desktop, which already resolves the name itself.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -71,26 +54,20 @@ services:
       - NODE_ENV=production
       - WEBUI_PORT=3000
       - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db-primary:5432/aether_vault
-      # v1.3.2 (migration 0015): request-serving sessions use the non-superuser role in
-      # the HA topology too, same as docker-compose.yml -- see database.py's
-      # APP_DATABASE_URL docstring.
+      # Request-serving sessions use the non-superuser role in the HA topology too,
+      # same as docker-compose.yml -- see database.py's APP_DATABASE_URL docstring.
       - AV_APP_DATABASE_URL=postgresql+asyncpg://av_app:av_app_password@db-primary:5432/aether_vault
       - REDIS_URL=redis://redis-primary:6379/0
       - AV_API_TOKEN=${AV_API_TOKEN:-}
       - AV_AUTH_USERS=${AV_AUTH_USERS:-}
-      # v1.3.2 (WP-24): opt IN to the cross-replica-safe Redis-backed rate limiter and
-      # auth-spike counter -- the whole reason this topology exists is >1 replica, and
-      # the in-process defaults are actively wrong under N replicas (see rate_limit.py's
-      # own module docstring). This is the one place in the repo where turning these on
-      # is the CORRECT default, not merely an option -- a single-instance compose
-      # (docker-compose.yml) rightly leaves them off.
+      # Opts in to the cross-replica-safe Redis-backed rate limiter and auth-spike
+      # counter -- the in-process defaults are actively wrong under N replicas. This is
+      # the one place in the repo where turning these on is the correct default.
       - AV_RATE_LIMIT_BACKEND=redis
       - AV_AUTH_SPIKE_BACKEND=redis
-      # Left unset (today's "unlimited data plane" default, rate_limit.py's own
-      # documented posture) unless the caller opts in -- scripts/ha_drill.sh sets this
-      # for its own run only, to prove the Redis backend enforces ONE global limit
-      # across replicas rather than N independent ones, without baking a restrictive
-      # default into this topology for every other use of it.
+      # Left unset (unlimited data plane) unless the caller opts in -- scripts/ha_drill.sh
+      # sets this for its own run only, to prove the Redis backend enforces one global
+      # limit across replicas rather than N independent ones.
       - AV_RATE_LIMIT_DEFAULT=${AV_RATE_LIMIT_DEFAULT:-}
     depends_on:
       db-primary:
@@ -164,13 +141,9 @@ services:
     image: redis/redis-stack-server:latest
     container_name: aether-vault-ha-redis-replica
     # NOT a `command:` override -- this image's default CMD is `/entrypoint.sh` itself
-    # (there is no separate ENTRYPOINT keeping it fixed; confirmed via `docker inspect`:
-    # Entrypoint is null, Cmd is ["/entrypoint.sh"]), so a `command:` override replaces
-    # that script entirely rather than passing arguments to it -- Docker then tries to
-    # exec "--replicaof" directly as the container's own binary and fails with
-    # `executable file not found in $PATH`. The script itself appends extra redis-server
-    # flags from the REDIS_ARGS env var at the end of its own invocation, which is the
-    # image's actual supported extension point for this.
+    # with no separate ENTRYPOINT, so a `command:` override would replace that script
+    # entirely instead of passing arguments to it. REDIS_ARGS is the image's actual
+    # supported extension point.
     environment:
       - REDIS_ARGS=--replicaof redis-primary 6379
     volumes:

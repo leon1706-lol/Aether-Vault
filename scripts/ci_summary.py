@@ -1,11 +1,7 @@
-"""v1.3.4 (todo.md item 29/31, W5d): CI summary dashboard — job name, conclusion,
-duration, budget, and overrun delta for the current workflow run, rendered as a Markdown
-table for `$GITHUB_STEP_SUMMARY` and (on same-repo PRs) posted as a PR comment. Never
-gating: this only ever reads `GET /repos/{repo}/actions/runs/{run_id}/jobs` and
-`.github/ci-budgets.yml`, and always exits 0 — a slow job gets an `::warning::`
-annotation, not a failed build (see this file's own module docstring on why: the same
-"a hard gate on noise trains reviewers to ignore it" judgment call security.yml's own
-scanners already document for this repo).
+"""CI summary dashboard — job name, conclusion, duration, budget, and overrun delta for
+the current workflow run, rendered as a Markdown table for `$GITHUB_STEP_SUMMARY` and
+(on same-repo PRs) posted as a PR comment. Never gating: always exits 0, a slow job gets
+an `::warning::` annotation instead of a failed build.
 
 Usage: python scripts/ci_summary.py --workflow tests.yml --run-id 12345 [--repo owner/name]
 Prints the Markdown table to stdout; the caller decides where that goes
@@ -19,10 +15,8 @@ from pathlib import Path
 
 
 def load_budgets(repo_root: Path, workflow: str) -> dict[str, int]:
-    """Reads `.github/ci-budgets.yml`'s section for one workflow file. Returns {} (not
-    an error) when the file or that workflow's section is missing — a job with no budget
-    entry just never gets an overrun warning, which `tests/test_ci_map.py` is what
-    actually enforces completeness of this file, not this function."""
+    """Reads `.github/ci-budgets.yml`'s section for one workflow file. Returns {} (not an
+    error) when the file or section is missing -- a job with no entry just never warns."""
     import yaml
 
     path = repo_root / ".github" / "ci-budgets.yml"

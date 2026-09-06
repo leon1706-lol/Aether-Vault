@@ -119,10 +119,8 @@ def test_methods_raise_authentication_error_on_401(monkeypatch, method_name, cal
 
 
 def test_server_available_never_raises_authentication_error_even_on_401(monkeypatch):
-    # /api/health is exempt from auth server-side and should never actually return 401, but
-    # this pins the client's own contract too: server_available() must stay a plain bool probe
-    # (never raise) even if it somehow did, since restart_service's readiness wait depends on
-    # calling this with zero credentials before any token exists.
+    # server_available() must stay a plain bool probe (never raise) even on a 401, since
+    # restart_service's readiness wait calls this with zero credentials before any token exists.
     client = VaultClient()
     monkeypatch.setattr(client.session, "get", lambda *a, **k: _FakeResponse(401))
     assert client.server_available() is False

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# HA drill (v1.3.2, WP-25) — the actual proof docker-compose.ha.yml is more than YAML.
+# HA drill — the actual proof docker-compose.ha.yml is more than YAML.
 #
 # Brings up the real HA topology (nginx LB + 2 engine replicas + Postgres primary/
 # streaming-replica + Redis primary/replica), drives concurrent pushes through the LB,
@@ -13,11 +13,8 @@
 #      2x (what the in-process WindowRateLimiter would silently do under this topology).
 #
 # `host.docker.internal` (phase 3's webhook probe target) is resolvable from every
-# engine container on any Docker Engine (Linux CI runners included, not just Docker
-# Desktop) via `docker-compose.ha.yml`'s own `extra_hosts: host.docker.internal:
-# host-gateway` on the engine service -- v1.3.3.6 fix, found live: this comment used to
-# claim Linux "would need" that mapping without it actually being present, which is
-# exactly why phase 3 silently delivered zero webhooks in CI (ubuntu-latest) every time.
+# engine container via `docker-compose.ha.yml`'s own `extra_hosts:
+# host.docker.internal: host-gateway` on the engine service.
 #
 # Usage: ./scripts/ha_drill.sh            # full drill, tears the stack down after
 #        KEEP_HA_STACK=1 ./scripts/ha_drill.sh   # leaves it up for manual poking
@@ -47,10 +44,6 @@ cleanup() {
   else
     log "KEEP_HA_STACK=1 — leaving the stack up for inspection (docker compose -f docker-compose.ha.yml -p aether-vault-ha down -v to clean up later)"
   fi
-  # v1.3.4 (W0.5): $WORK (the mktemp -d dir holding every phase's error/code logs) was
-  # never removed — every drill run, local or CI, leaked one /tmp/av-ha-drill-XXXXXX
-  # directory forever. Harmless on a CI runner that's destroyed after the job, but a real
-  # leak on a long-lived machine running this locally.
   rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -65,21 +58,11 @@ done
 [[ -n "$PY" ]] || die "no working python/python3 on PATH"
 
 wait_ready() {
-  # v1.3.3.7 fix (found live): no timeout on this curl meant a single request that
-  # connects but never responds (a real hang, not a clean refuse-fast failure -- e.g.
-  # the LB proxying to a container whose IP it has stale-cached) could block this WHOLE
-  # loop indefinitely on ONE of its 60 tries, rather than cycling through retries and
-  # failing cleanly via the `return 1` below. `--connect-timeout 5 --max-time 10` bounds
-  # every single attempt; `timeout -k 5 12` is a second, OS-level backstop outside
-  # curl's own process. Progress is logged every 10 tries (~24s) so a genuine hang here
-  # leaves a visible trail instead of silence.
-  #
-  # v1.3.3.7-3.3.10 investigated a suspected hang in THIS function via `set -x` tracing
-  # (since removed) -- the trace proved wait_ready was never actually the problem; it
-  # always returned within one or two tries. The real bug, found via the SAME kind of
-  # tracing applied further down the script, was an unrelated unscoped `wait` in phase
-  # 4's rate-limit probe block (see v1.3.3.13 there). Left here as a pointer in case this
-  # function is ever blamed again: it wasn't, twice, with hard evidence both times.
+  # No timeout on this curl would let a single hung request (e.g. the LB proxying to a
+  # stale-cached container IP) block the WHOLE loop on one of its 60 tries instead of
+  # cycling to the `return 1` below; `--connect-timeout`/`--max-time` bound each attempt,
+  # `timeout -k` is a second OS-level backstop. (Investigated and cleared of blame twice
+  # for an unrelated hang that was actually phase 4's rate-limit probe block below.)
   local url="$1" tries=60 start_tries=60
   while (( tries-- > 0 )); do
     if timeout -k 5 12 curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then
@@ -97,20 +80,10 @@ wait_ready() {
 log "phase 0: bring up the HA stack (build if needed)"
 touch "$PROBE_LOG"
 
-# v1.3.3.1 fix (found live): AV_RATE_LIMIT_DEFAULT used to be exported HERE, before phase
-# 0 even brings the stack up — meaning it applied to EVERY "default"-bucket route
-# (`bucket_class_for()`, rate_limit.py) for the ENTIRE drill, not just phase 4's own
-# dedicated rate-limit test below. `/api/objects/{hash}` and `/api/commits` (phases 1-3's
-# actual traffic) both fall in the SAME "default" bucket as `/api/refs` (phase 4's probe
-# route) and share the SAME client_key (every request arrives from the LB's own
-# connecting IP, `request.client.host` server-side) — so phase 1 alone (20 concurrent
-# pushes x 2 requests each = 40+ "default"-bucket hits within seconds, all in ONE 60s
-# fixed window) blew straight through a 6/minute cap before phase 4 ever ran, failing
-# EVERY baseline push with no fault injected. The data plane stays genuinely UNLIMITED
-# (this repo's own stated default) through phases 0-3 now; the limit is applied ONLY
-# right before phase 4 below, which is temporally well past 60s from here by the time it
-# runs (phase 3 alone can wait up to ~200s), so phase 4 starts its own fresh window with
-# nothing already counted against it.
+# AV_RATE_LIMIT_DEFAULT must NOT be exported here: phases 1-3's traffic shares the same
+# "default" rate-limit bucket as phase 4's probe route, so applying the limit this early
+# would fail every baseline push before phase 4 ever runs. It's applied only right before
+# phase 4 below, once phases 0-3 are well past their own 60s window.
 $COMPOSE up -d --build
 
 log "waiting for the LB + both engine replicas to report ready"
@@ -130,30 +103,15 @@ log "phase 1: baseline concurrent pushes through the LB (no faults injected)"
 
 push_object_and_commit() {
   local n="$1"
-  # v1.3.3.4 fix (found live): the claimed hash was computed over "ha-drill-$n" while the
-  # actual uploaded body is "ha-drill-object-$n" -- two DIFFERENT strings. Every upload
-  # this function ever made was rejected with a real, correct 400 (server-side hash
-  # verification, threat-model T7's own mitigation working exactly as designed) — this
-  # whole drill has apparently never gotten far enough to actually exercise phase 1
-  # successfully before now (masked first by the redis-replica compose bug, then by the
-  # migration-race bug), so this bug in the drill script itself was never caught either.
-  # The hash must be computed over the EXACT bytes sent as the body.
+  # The hash must be computed over the EXACT bytes sent as the body ("ha-drill-object-$n"),
+  # not the commit message string -- a mismatch here fails every upload with a real,
+  # correct 400 (server-side hash verification working as designed).
   local body="ha-drill-object-$n"
   local hash
   hash="$($PY -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" "$body")"
-  # v1.3.3.5 fix (found live, right after the hash fix above actually let uploads
-  # succeed): `curl -f`/`--fail` treats ANY response >= 400 as a failure, 409 included --
-  # but 409 ("already exists") is this repo's own documented, CORRECT idempotent outcome
-  # for a CAS re-upload of identical content, exactly like the commit call two lines
-  # below already tolerates. This function's own SECOND (sequential) call site below
-  # deliberately re-pushes the SAME 20 objects the first (concurrent) pass just
-  # uploaded, specifically to prove a retry of already-landed work is harmless -- with
-  # `-f`, that retry pass turned "already landed, harmless" into 20 hard failures on
-  # every single run, every time, unconditionally (not a race, not a flake).
-  # v1.3.3.13 (found live, code review): unlike wait_ready and phase 4's rate-limit
-  # probes, these two calls -- by far the most-invoked curl site in the whole drill (70+
-  # calls across phases 1-3) -- had never been given any timeout protection at all.
-  # `--connect-timeout 5 --max-time 10` matches every other curl call site now.
+  # NOT curl -f: 409 ("already exists") is the correct idempotent outcome for a CAS
+  # re-upload of identical content, which this function's sequential re-push call site
+  # deliberately exercises -- -f would turn that harmless retry into a hard failure.
   local obj_code
   obj_code="$(curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' -X POST "$API/api/objects/$hash" \
     -H "Content-Type: application/octet-stream" --data-binary "$body")"
@@ -167,22 +125,9 @@ push_object_and_commit() {
 export -f push_object_and_commit
 export API PY
 
-# v1.3.3.13 (found live, code review): the CONCURRENT pass below is the thing this
-# phase's own name and pass-message actually claim to test -- but its results used to
-# be thrown away entirely (`wait || true` discards every job's exit status), so a real
-# failure in the concurrent run would print to stderr and nothing else: no `FAILS`
-# increment, no `die`, `pass` still fires unconditionally. Only the SECOND, sequential
-# pass below (re-pushing the same 20 objects, expected to get harmless 409s) was ever
-# actually checked -- a materially easier bar to clear than genuine concurrency. Fixed
-# to match phase 2's own already-correct pattern just below: redirect the concurrent
-# batch's output to a log file and check it's empty before declaring success.
-# v1.3.4 (W0.4): this was still a bare, unscoped `wait` — the exact same class of bug
-# root-caused in phase 4 below (v1.3.3.13). It happened to never hang HERE because at
-# this point in the script nothing long-lived has been backgrounded yet (webhook_probe.py
-# only starts in phase 3) -- but that's incidental, not a guarantee, and it discarded
-# every job's own exit status on top (a push killed by a signal rather than printing to
-# stderr would pass silently). Scoped to exactly the PIDs this loop launched, matching
-# phase 4's own fix and phase 2's pattern below.
+# The concurrent pass's own exit status is checked explicitly (not a bare `wait`, which
+# would block on any other long-lived background job and silently discard a signal-killed
+# push): output goes to a log file, checked empty, and each launched PID is waited on by name.
 BASELINE_ERRORS="$WORK/baseline_errors.log"
 : > "$BASELINE_ERRORS"
 declare -a _baseline_pids=()
@@ -219,11 +164,6 @@ sleep 1
 log "docker kill aether-vault-ha-engine-2 (mid-batch)"
 docker kill aether-vault-ha-engine-2 >/dev/null
 
-# v1.3.4 (W0.5): `wait "$PUSH_BATCH_PID" || true` discarded the subshell's own exit
-# status (itself just the LAST job in its internal bare `wait`, not an aggregate anyway)
-# -- the log-emptiness check below was already the real assertion; this just stops
-# silently swallowing a genuine subshell-level failure (e.g. it never reaching its own
-# `wait` at all) on top of it.
 wait "$PUSH_BATCH_PID" || log "push batch subshell exited non-zero (checking its error log next)"
 if [[ -s "$WORK/failover_errors.log" ]]; then
   cat "$WORK/failover_errors.log" >&2
@@ -256,9 +196,8 @@ echo "$HOOK_RESP"
 push_object_and_commit "webhook-trigger" || die "failed to push the webhook-triggering commit"
 
 log "waiting for the initial delivery attempt (fails by design) + up to 2 periodic retries to land"
-# AV_WEBHOOK_RETRY_INTERVAL_SECS is the compose's default (30s) — allow up to 3 ticks'
-# worth of margin for the 2 retries this needs (attempt 1 immediate, attempts 2-3 via the
-# periodic worker) plus its own exponential backoff.
+# AV_WEBHOOK_RETRY_INTERVAL_SECS is the compose's default (30s); allow margin for 2
+# retries plus their own exponential backoff.
 tries=40
 while (( tries-- > 0 )); do
   hits="$(wc -l < "$PROBE_LOG" | tr -d ' ')"
@@ -276,26 +215,12 @@ pass "exactly 3 webhook deliveries across 2 replicas' retry workers — no doubl
 # ---------------------------------------------------------------------------
 log "phase 4: Redis-backed rate limiter enforces ONE global limit across both replicas"
 
-# Applied HERE, not from phase 0 — see that section's own comment for why: phases 1-3's
-# legitimate traffic must never share this budget. `docker compose up -d` (no --build,
-# images are already built) detects the changed environment and recreates ONLY the two
-# engine containers with it, leaving Postgres/Redis (and their state — the replication/
-# webhook proof phases 0b/3 already established) completely undisturbed.
+# Applied here, not from phase 0, since phases 1-3's legitimate traffic must never share
+# this budget. `docker compose up -d` recreates engine-1/engine-2 with new IPs, but
+# nginx's `upstream` directive resolves hostnames once at its own worker startup with no
+# dynamic re-resolution -- restarting `lb` forces it to re-resolve fresh.
 export AV_RATE_LIMIT_DEFAULT="6/minute"
 $COMPOSE up -d
-# v1.3.3.7 fix (found live: the job hung 25+ minutes here and hit CI's own 30-minute
-# job timeout, not a clean FAIL — confirmed via the actual log timestamps, a 25-minute
-# gap with zero script output between "engine-1/2 Recreated" and the timeout kill).
-# `docker compose up -d` RECREATES engine-1/engine-2 (a genuinely new container, not
-# the same one restarted -- unlike phase 2's `docker kill`+`docker start`, which reuses
-# the SAME container and therefore the SAME IP) -- Docker assigns a NEW IP to a
-# recreated container. nginx's `upstream` directive (docker/ha/nginx/nginx.conf)
-# resolves `engine-1`/`engine-2` to an IP ONCE, at its own worker startup, with no
-# dynamic re-resolution configured -- so the `lb` container kept trying the OLD, now
-# nonexistent IPs for the rest of the run, and every request past this point either hung
-# or failed depending on exactly how Docker's bridge network handled the stale address.
-# Restarting `lb` forces nginx to re-resolve both upstream hostnames fresh, immediately
-# after the one operation in this whole drill that actually changes their IPs.
 $COMPOSE restart lb
 log "waiting for both engine replicas to report ready again after the rate-limit env change"
 wait_ready "$API/api/ready" || die "engines never became ready again after applying AV_RATE_LIMIT_DEFAULT"
@@ -307,19 +232,9 @@ for i in $(seq 1 20); do
   timeout -k 5 12 curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
   _rl_pids+=("$!")
 done
-# v1.3.3.13 fix (found live, ROOT CAUSE): every prior fix here (v1.3.3.7-12: curl
-# timeouts, `timeout -k`, `set -x` tracing, a bounded poll with `kill -9`) was chasing
-# an innocent target -- a heartbeat trace finally proved all 20 of these curls exit
-# correctly within 2 SECONDS, every single time. The real bug was a bare `wait` (no
-# arguments) right here, present since before this investigation started: bash's
-# argument-less `wait` blocks for EVERY background job the shell has ever started, not
-# just the ones this block cares about -- and phase 3 started `webhook_probe.py` as a
-# deliberately long-lived listener (`PROBE_PID`), only meant to be killed later in
-# `cleanup()`'s EXIT trap. That job is still running at this point BY DESIGN, so the
-# bare `wait` was blocking on a process that was never supposed to exit yet, for as
-# long as the surrounding job/step timeout allowed. Scoping `wait` to exactly the PIDs
-# this block launched fixes it outright, with no diagnostic machinery needed -- each
-# already has its own `timeout -k 5 12` bound, so this cannot reintroduce the hang.
+# A bare, argument-less `wait` here would block on EVERY background job the shell has
+# ever started, including phase 3's deliberately long-lived webhook_probe.py listener --
+# scoped to exactly the PIDs this block launched instead.
 wait "${_rl_pids[@]}" 2>/dev/null || true
 
 OK_COUNT="$(grep -c '^200$' "$CODES" || true)"
@@ -329,12 +244,9 @@ log "of 20 rapid /api/refs requests through the LB: $OK_COUNT succeeded, $LIMITE
 [[ "$OK_COUNT" -le 6 ]] || die "expected at most 6 successes against a 6/minute GLOBAL limit, got $OK_COUNT — replicas are enforcing independent limits (the exact N-replica bug WP-24 exists to fix), not a shared one"
 pass "rate limit enforced globally across both replicas ($OK_COUNT allowed, capped at the configured 6/minute — not 2x)"
 
-# v1.3.4 (W0.5): phase 4 is the last phase to mutate the stack, and it deliberately
-# applies a restrictive AV_RATE_LIMIT_DEFAULT=6/minute. Under KEEP_HA_STACK=1 (this job's
-# own default) the drill used to just exit here, leaving anyone who then pokes at the kept
-# stack silently rate-limited to 6/minute with no indication why. Recreate the engines one
-# more time with the env var unset so "kept for inspection" means the stack's NORMAL
-# (unlimited-by-default) state, not phase 4's fault-injected one.
+# Phase 4 is the last phase to mutate the stack and deliberately applies a restrictive
+# limit -- reset it so "kept for inspection" (KEEP_HA_STACK=1) means the stack's normal,
+# unlimited-by-default state, not phase 4's fault-injected one.
 unset AV_RATE_LIMIT_DEFAULT
 log "resetting engines to their normal (non-rate-limited) config before finishing"
 $COMPOSE up -d

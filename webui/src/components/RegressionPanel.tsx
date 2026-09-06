@@ -20,10 +20,8 @@ const ANOMALY_LABELS: Record<string, string> = {
   auth_spike: "Auth failure spike",
 };
 
-// v1.3.1 (RSI R6, WP-35/WP-36): continuous regression dashboard — canaries (embeds
-// CanaryPanel), improver churn / failed self-edits (derived from `av change-sets`), and
-// the anomaly event feed (`kind="anomaly"`, see development/architecture.md's "Anomaly
-// Alerts Contract"). One tab, three independent server calls — no new endpoint.
+// Continuous regression dashboard — canaries (embeds CanaryPanel), improver churn /
+// failed self-edits, and the anomaly event feed. One tab, three independent server calls.
 export function RegressionPanel({ projectId }: Props) {
   const [changeSets, setChangeSets] = useState<ChangeSet[]>([]);
   const [anomalies, setAnomalies] = useState<AnomalyEvent[]>([]);

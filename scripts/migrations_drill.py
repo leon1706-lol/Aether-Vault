@@ -1,15 +1,10 @@
-"""v1.3.4 (todo.md item 38): a per-revision upgrade -> downgrade -> re-upgrade drill
-against a real, fresh Postgres — stronger than `tests/test_server.py::
-test_migration_chain_downgrades_and_reupgrades_cleanly`, which only proves ONE full
-head-to-base-and-back round trip works. That's a real gap: a chain of N migrations can
-downgrade-then-reupgrade cleanly as a single round trip while still having an individual
-step in the middle that's broken (e.g. a downgrade that doesn't fully undo its own
-upgrade, invisible unless you actually stop and check state between EVERY step).
+"""A per-revision upgrade -> downgrade -> re-upgrade drill against a real, fresh Postgres
+-- stronger than a single full head-to-base-and-back round trip, since a chain of N
+migrations can pass that while an individual step in the middle is still broken.
 
-Walks: upgrade all the way to head (asserting the DB lands on the SAME head
-`ScriptDirectory` resolves) -> downgrade one revision at a time to base, asserting the
-`alembic_version` table matches the expected revision after every single step -> upgrade
-one revision at a time back to head, asserting the same in reverse.
+Walks: upgrade to head (asserting it matches `ScriptDirectory`'s own head) -> downgrade
+one revision at a time to base, checking `alembic_version` after every step -> upgrade
+one revision at a time back to head, checking the same in reverse.
 
 Usage: DATABASE_URL=postgresql+asyncpg://... python scripts/migrations_drill.py
 Exits 0 if every step lands where expected, 1 with a clear message naming which step and
@@ -42,9 +37,8 @@ async def _current_db_revision(database_url: str) -> str | None:
 
 
 def _ordered_revisions(script) -> list[str]:
-    # Same convention tests/test_migrations.py already establishes for this repo's own
-    # strictly-linear, zero-padded-numeric revision scheme ("0001".."0016", ...): a plain
-    # lexicographic sort of every revision id walked from head IS base-to-head order.
+    # This repo's revision scheme is strictly-linear, zero-padded numeric IDs, so a plain
+    # lexicographic sort IS base-to-head order.
     return sorted(rev.revision for rev in script.walk_revisions())
 
 
@@ -81,9 +75,8 @@ def main() -> int:
 
     print("-- downgrading one revision at a time to base --")
     for rev in reversed(revisions):
-        # down_revision of the CURRENT rev is what we expect to land on after downgrading
-        # past it -- alembic's own `command.downgrade(cfg, "-1")` walks exactly one step
-        # regardless of which revision is current, which is what makes this a genuine
+        # down_revision of the CURRENT rev is what we expect after downgrading past it --
+        # `command.downgrade(cfg, "-1")` walks exactly one step, making this a genuine
         # per-step drill rather than a single jump.
         command.downgrade(cfg, "-1")
         script_rev = script.get_revision(rev)

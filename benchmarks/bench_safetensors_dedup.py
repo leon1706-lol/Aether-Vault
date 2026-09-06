@@ -1,16 +1,13 @@
 """Benchmark #2 — Safetensors layer-dedup storage savings.
 
 Simulates fine-tuning only a model's classifier head across several commits (every other
-layer stays byte-identical — see fixtures.make_finetune_step_safetensors) and measures each
-tool's total on-disk storage after the sequence. None of the three competitors split a
-checkpoint into independently-hashed layers, so they re-store the *entire* file every step;
-Aether's `aether_core.split_and_hash_safetensors` (the same mechanism `av add` already uses)
-only re-stores the one layer that actually changed. This is Aether's strongest, most
-structural differentiator on the whole suite — not a tuning/noise difference like raw speed.
+layer stays byte-identical) and measures each tool's total on-disk storage after the
+sequence. None of the three competitors split a checkpoint into independently-hashed
+layers, so they re-store the entire file every step; Aether's
+`aether_core.split_and_hash_safetensors` only re-stores the layer that actually changed.
 
 Shared with bench_storage_footprint_curve.py: `run_finetune_sequence()` returns the size
-*after each step*, not just the final total, so the curve benchmark can plot it without
-re-implementing the per-tool commit logic.
+after each step, not just the final total.
 """
 
 import shutil
@@ -33,9 +30,8 @@ DEFAULT_STEPS = fixtures.STORAGE_CURVE_COMMIT_COUNT
 
 def _av_sequence(av_path: str, repo: Path, steps: int) -> list[int]:
     subprocess.run([av_path, "init", "--mode", "local", "--yes", "--no-repl"], cwd=repo)
-    # Default LFS threshold is 50MB; the fixture's total file size is well under that, so
-    # without lowering it `av add` would never engage layer-splitting at all and this
-    # benchmark would (silently) show no dedup advantage for any tool.
+    # Default LFS threshold is 50MB, well above the fixture's size, so it must be lowered
+    # or `av add` would never engage layer-splitting at all.
     subprocess.run([av_path, "config", "1"], cwd=repo)
     sizes = []
     for step in range(steps):
@@ -79,9 +75,8 @@ def _dvc_sequence(dvc_path: str, repo: Path, steps: int) -> list[int]:
 def _mlflow_sequence(repo: Path, steps: int) -> list[int]:
     import mlflow
 
-    # MLflow 3.x's filesystem tracking store is maintenance-mode-only (raises unless a
-    # database backend is used) — a local sqlite store is the realistic modern equivalent
-    # of "local tracking," not a workaround.
+    # MLflow 3.x's filesystem tracking store is maintenance-mode-only, so a local sqlite
+    # store is the realistic modern equivalent of "local tracking."
     artifacts_dir = repo / "mlartifacts"
     mlflow.set_tracking_uri(f"sqlite:///{repo / 'mlflow.db'}")
     experiment_id = mlflow.create_experiment("bench-safetensors-dedup", artifact_location=f"file:{artifacts_dir}")
@@ -121,9 +116,8 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
     import tempfile
 
     for tool in ["av", "git-lfs", "dvc", "mlflow"]:
-        # Manual mkdtemp + ignore_errors cleanup, not TemporaryDirectory's context manager:
-        # mlflow's sqlite backend can still hold the DB file open on Windows when the `with`
-        # block exits, turning an otherwise-successful run into a crash during cleanup.
+        # Manual mkdtemp + ignore_errors cleanup: mlflow's sqlite backend can still hold
+        # the DB file open on Windows when a TemporaryDirectory's `with` block exits.
         repo = Path(tempfile.mkdtemp(prefix=f"bench-dedup-{tool}-"))
         handle_status = detect_tools([tool])[tool].status
         try:

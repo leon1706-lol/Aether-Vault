@@ -22,13 +22,10 @@ from .core import (
               help="Registry to clone from (default: $AV_REMOTE_URL, else http://localhost:8000).")
 @click.option("--token", default=None, help="Access token for a Protected registry.")
 def clone(project: str, directory: str | None, remote_url: str | None, token: str | None) -> None:
-    """Clone an existing project from a registry into a new directory.
-
-    Downloads the project's full commit history (metadata — cheap) and materializes the
-    default branch's tip; older versions' large objects lazy-download on first checkout.
-    The cloned repo inherits the source project's identity, so pushes from either copy
-    land in the same project on the shared registry.
-    """
+    """Clone an existing project from a registry into a new directory. Downloads the
+    project's full commit history and materializes the default branch's tip; the cloned
+    repo inherits the source project's identity, so pushes from either copy land in the
+    same project."""
     from .client import VaultClient
     from . import sync
 
@@ -103,8 +100,8 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
     click.echo(detail)
 
 
-# v1.3.0: moved to core.py::tip_run_id() so _finalize_commit's ref-race path can share
-# it too — kept as a thin re-export so nothing here (or any external caller) breaks.
+# Lives in core.py::tip_run_id() so _finalize_commit's ref-race path can share it too;
+# re-exported here so nothing else breaks.
 from .core import tip_run_id as _tip_run_id  # noqa: F401
 
 
@@ -184,9 +181,8 @@ def pull(force: bool) -> None:
                                         local_tip, remote_tip)
     )
     if not ff_allowed:
-        # v1.2.2: surface the runs the two tips belong to, so an agent orchestrating
-        # multiple training efforts can tell WHICH experiments diverged without walking
-        # commits by hand. Best-effort: untagged tips simply contribute no line/field.
+        # Surface the runs the two tips belong to, so an agent orchestrating multiple
+        # training efforts can tell WHICH experiments diverged without walking commits by hand.
         local_run = _tip_run_id(repo_root, local_tip)
         remote_run = _tip_run_id(repo_root, remote_tip)
         remediation = [f"av merge {remote_tip[:7]}"]
@@ -201,11 +197,9 @@ def pull(force: bool) -> None:
                 fmt = lambda rid: f"run:{rid[:8]}…" if rid else "(no run)"
                 click.echo(f"  local  tip [{local_tip[:7]}] belongs to {fmt(local_run)}")
                 click.echo(f"  remote tip [{remote_tip[:7]}] belongs to {fmt(remote_run)}")
-        # v1.2.5: routed through fail() reusing "merge_conflict" (exit 14) — a divergence
-        # is resolved by exactly the same command family as a conflicting merge, and the
-        # exit-code registry is deliberately kept closed rather than growing a new code
-        # per divergence flavor. error.data carries what the text-mode lines above said;
-        # quiet_text=True avoids a redundant generic "Error: ..." line under them.
+        # Reuses "merge_conflict" (exit 14) -- a divergence is resolved by the same
+        # command family as a conflicting merge; the exit-code registry stays closed
+        # rather than growing a new code per divergence flavor.
         fail(ctx, "merge_conflict", f"Local and remote '{branch}' have diverged.",
              data={
                  "reason": "diverged", "branch": branch,
@@ -266,14 +260,10 @@ def pull(force: bool) -> None:
                    "(always written to .av/last_conflict.json regardless of this flag).")
 def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bool,
           no_ff: bool, force: bool, conflict_report_path: str | None) -> None:
-    """Merge another branch or commit into the current branch.
-
-    Tree-level three-way merge against the nearest common ancestor: per file, whichever
-    side changed wins; if BOTH sides changed the same file differently the merge aborts
-    cleanly (nothing touched) and lists the conflicts — resolve with --ours/--theirs.
-    Successful non-fast-forward merges create a two-parent merge commit that syncs to the
-    registry (v1.1.1 servers store both parents).
-    """
+    """Merge another branch or commit into the current branch. Tree-level three-way merge
+    against the nearest common ancestor: per file, whichever side changed wins; if BOTH
+    sides changed the same file differently, the merge aborts cleanly and lists the
+    conflicts for --ours/--theirs to resolve."""
     from .client import VaultClient
     from . import sync
     from .merge import find_merge_base, three_way_tree_merge, tree_is_flat, summarize_changes
@@ -397,10 +387,8 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
 
     merged, conflicts = three_way_tree_merge(base_tree, ours_tree, theirs_tree)
     if conflicts and not (policy_ours or policy_theirs):
-        # v1.2.5: run attribution on the conflict path too, matching pull's divergence
-        # message — reuses _tip_run_id so an agent sees WHICH runs collided, not just
-        # which files. See the "Three real bugs" note in the V1.2.5 plan: this path used
-        # to return None (exit 0) despite EXIT_CONFLICT=14 being documented for it.
+        # Run attribution on the conflict path too, matching pull's divergence message --
+        # reuses _tip_run_id so an agent sees WHICH runs collided, not just which files.
         ours_run = _tip_run_id(repo_root, ours)
         theirs_run = _tip_run_id(repo_root, theirs)
         remediation = [
@@ -427,9 +415,8 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
                 click.echo(f"  ours   [{ours[:7]}] belongs to {fmt(ours_run)}")
                 click.echo(f"  theirs [{theirs[:7]}] belongs to {fmt(theirs_run)}")
 
-        # v1.3.0 (todo.md item 2): structured conflict report, always written locally
-        # (never lost even if this exact stdout is never re-read) plus optionally to a
-        # caller-chosen path — same fields as error.data below, so JSON and file agree.
+        # Structured conflict report, always written locally plus optionally to a
+        # caller-chosen path -- same fields as error.data below, so JSON and file agree.
         import datetime as _dt
 
         report = {

@@ -1,23 +1,12 @@
-"""KubernetesDriver — real `kubectl` isolation, asynchronous (v1.3.1, RSI R5: todo.md G.32).
+"""KubernetesDriver — real `kubectl` isolation, asynchronous (v1.3.1). Same protocol as
+`docker.py`, addressed by Pod name instead of a container name. `submit()` builds a
+minimal Pod manifest and applies it via `kubectl apply -f -` rather than `kubectl run`
+flags, since mounts and resource limits need more structure than the flag form supports.
 
-Same protocol as `docker.py`, addressed by Pod name (`av-sandbox-<job_id>`) instead of a
-container name — a Pod is exactly as persistent a handle as a container, for the same
-reason `base.py`'s module docstring gives for why this driver doesn't need `local`'s
-synchronous workaround. `submit()` builds a minimal Pod manifest (image = first element
-of `spec.command`, matching `docker.py`'s convention) and applies it via
-`kubectl apply -f -` (stdin) rather than `kubectl run` flags, because mounts (`hostPath`
-volumes) and resource requests/limits need more structure than the flag-based form
-supports cleanly.
-
-**Verified by contract tests against fixed `kubectl` output, not a live cluster** — this
-project has no Kubernetes dependency and doesn't add one; anyone WITH a cluster gets a
-working driver, anyone without one gets fully-tested command construction/parsing they
-can trust once they do. `--network none`'s Docker-specific guarantee has no direct
-Kubernetes equivalent via bare `kubectl` (that needs a NetworkPolicy resource, a
-cluster-level concern this driver does not attempt to manage) — `spec.network` is
-recorded on the Pod's labels for audit purposes but is NOT enforced by this driver alone;
-a cluster operator wanting real network isolation must apply a `NetworkPolicy`
-separately. Documented here once, not silently implied otherwise.
+Verified by contract tests against fixed `kubectl` output, not a live cluster.
+`spec.network` is recorded on the Pod's labels for audit purposes but is NOT enforced by
+this driver alone -- a cluster operator wanting real network isolation must apply a
+`NetworkPolicy` separately.
 """
 from __future__ import annotations
 

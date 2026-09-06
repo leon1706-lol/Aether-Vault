@@ -79,14 +79,9 @@ def _context_notes(repo_root: Path) -> list[dict]:
 
 
 def _commit_parent(commit: dict | None) -> str | None:
-    """First parent of a commit dict, tolerating BOTH storage shapes.
-
-    Locally-authored commits store a `parents` LIST (see core._finalize_commit); commits
-    fetched from the registry (sync.normalize_commit_row) carry `parent_hash` instead.
-    handoff used to read ONLY `parent_hash`, so for local commits — i.e. every repo's
-    normal case — the semantic summary compared against an EMPTY baseline and
-    metrics_history_tail stopped after one hop (found by the v1.2.2 flow-through test).
-    """
+    """First parent of a commit dict, tolerating BOTH storage shapes: locally-authored
+    commits store a `parents` LIST, commits fetched from the registry carry `parent_hash`
+    instead."""
     if not commit:
         return None
     direct = commit.get("parent_hash")
@@ -232,11 +227,8 @@ def build_handoff_dict(repo_root: Path, agent_instructions: str | None) -> dict:
             "run_id": run_id,
             "parent_run_ids": run_state.get("parent_run_ids", []),
             "code_pointer": _code_pointer(repo_root),
-            # v1.3.1+, additive: the locally active improver version pointer
-            # (`.av/improver/current`, same file `av improver current` reads) — null
-            # when none is set. `.avh` generation is deliberately local-only/offline, so
-            # this is the improver's LOCAL pointer, not a network fetch of its lineage/
-            # manifest; an agent wanting more calls `av improver show <id>` itself.
+            # The locally active improver version pointer, null when none is set --
+            # `.avh` generation is local-only/offline, so this is never a network fetch.
             "improver_id": _current_improver_id(repo_root),
         },
         "semantic_summary": build_semantic_summary(repo_root, commit_data),
@@ -292,17 +284,10 @@ def _validate_handoff_structural(doc: dict) -> list[str]:
 
 
 def validate_handoff(doc: dict) -> list[str]:
-    """Validates a `.avh` v2 document. Returns a problem list (empty = valid).
-
-    v1.3.0: uses real jsonschema.validate() against the published
-    av_cli/schemas/avh-2.0.schema.json when jsonschema is importable (the `dev` extra —
-    always true in CI since WP-1's contract freeze), falling back to the original
-    hand-rolled structural check when it isn't (the shipped runtime stays
-    dependency-free either way — jsonschema is never a hard requirement to USE av).
-    The structural check also always runs as a second opinion: it catches a couple of
-    shape problems (semantic_summary being neither null nor an object) a schema alone
-    states more permissively than this project actually wants enforced.
-    """
+    """Validates a `.avh` v2 document. Returns a problem list (empty = valid). Uses real
+    jsonschema.validate() when jsonschema is importable, falling back to the hand-rolled
+    structural check when it isn't (jsonschema is never a hard requirement to use av).
+    The structural check also always runs as a second opinion."""
     try:
         import jsonschema
 
@@ -466,10 +451,8 @@ def generate_handoff(
         # Privacy/size trim for agents that only want the state snapshot.
         handoff_data["context_memory"] = {"notes": [], "metrics_history_tail": []}
 
-    # v1.3.0 (todo.md item 8): validate on every write, not just when `av context
-    # validate` is invoked by hand — a schema violation here means build_handoff_dict()
-    # itself produced a malformed document, a real bug worth failing loudly on rather
-    # than silently persisting a broken .avh for the next agent to trip over.
+    # Validate on every write, not just when `av context validate` is invoked by hand --
+    # a violation here means build_handoff_dict() itself produced a malformed document.
     problems = validate_handoff(handoff_data)
     if problems:
         raise ValidationError(

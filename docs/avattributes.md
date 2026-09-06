@@ -67,6 +67,6 @@ scratch/** no-chunk no-layer-split      # last-line-wins: blanket override for a
   `stage_one_file()` — the same staging path `av commit`, `av watch`, and every plugin
   callback ultimately funnel through, so the directives apply uniformly regardless of
   which surface staged the file.
-- `av diff` / `.avh`'s `semantic_summary.chunks` reports realized dedup (count- and, since
-  v1.3.0, byte-weighted) for whatever ended up chunked — see `docs/contracts.md`'s
+- `av diff` / `.avh`'s `semantic_summary.chunks` reports realized dedup (count- and
+  byte-weighted) for whatever ended up chunked — see `docs/contracts.md`'s
   `semdiff-1.0` schema.

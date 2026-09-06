@@ -40,14 +40,14 @@ in logs, config files, or the token handoff flow.
 
 **Hardening status:** CORS is locked to the webui origin by default (`AV_CORS_ORIGINS` to
 widen) and the destructive GC endpoint is rate-limited by default (`AV_RATE_LIMIT_GC`,
-`10/minute`) — both shipped in the v1.1.x hardening cycle. Per-user access tokens
-(`AV_AUTH_USERS` via `av auth add-user`, v1.1.8) now exist alongside the owner's shared
+`10/minute`). Per-user access tokens
+(`AV_AUTH_USERS` via `av auth add-user`) exist alongside the owner's shared
 secret — each teammate revokes/rotates independently and commits attribute to their username.
-**Shipped as of v1.3.2**: DB-backed RBAC (roles/role-bindings, `av role`/`av token`/
+DB-backed RBAC (roles/role-bindings, `av role`/`av token`/
 `av user`/`av tenant`), hard multi-tenancy (an application-level guard plus Postgres
 row-level security enforced via a dedicated non-superuser DB role — both gated behind
 `AV_TENANCY_ENFORCE`, off by default), and `av admin backup`/`restore` for disaster
-recovery. **Shipped as of v1.3.3**: cryptographically hash-chained audit logs
+recovery are also available. Audit logs are cryptographically hash-chained
 (`chain_hash` on every row, migration `0016`, `av audit verify` detects tampering from
 the first broken row forward; optional ed25519 signing via `AV_AUDIT_SIGNING_KEY_PATH`
 adds non-repudiation), SSO (OIDC authorization-code+PKCE and SAML 2.0, `av login`/`av
@@ -71,14 +71,14 @@ omits their port mappings), keep the default CORS lock and GC rate limit in plac
 `AV_CORS_ORIGINS` only for deployments that actually need it), and put TLS termination
 in front of uvicorn for any non-localhost use.
 
-v1.2.0 trust surfaces: the audit trail (audit_log, on by default, disable with
+Trust surfaces: the audit trail (audit_log, on by default, disable with
 AV_AUDIT_LOG=0) records who performed each mutation; webhook signing secrets are stored
 registry-side because deliveries must be signed — treat registry compromise as secret
 compromise for subscribers; commit attestations are HMAC-based integrity-v0 (tamper
 evidence vs. key-holders only). Asymmetric (ed25519) commit signing is a regular,
-free-tier feature since v1.2.2 (`av registry keygen`) — see the next section.
+free-tier feature (`av registry keygen`) — see the next section.
 
-## Signed commits (v1.2.2) - the trust model, stated plainly
+## Signed commits - the trust model, stated plainly
 
 `av registry keygen` generates an ed25519 keypair under `.av/keys/` (private key 0600);
 commits made afterward are signed automatically, and `av verify <hash>` validates the
@@ -102,7 +102,7 @@ DOES NOT mean:
   it like an SSH private key. Registry compromise lets an attacker DELETE signatures but
   not forge new ones without the private key.
 
-## Supply-chain attestations (v1.3.4) — verifying a release, not just trusting it
+## Supply-chain attestations — verifying a release, not just trusting it
 
 Every tagged release publishes an SBOM and a Sigstore-backed build-provenance
 attestation for every artifact — wheels, the sdist, and the `aether-vault-engine` GHCR
@@ -140,7 +140,7 @@ generated). A verification failure means the artifact did NOT come from this rep
 official pipeline — treat it as compromised or mis-sourced, not as a false alarm to
 work around.
 
-### Key management and rotation (v1.2.5)
+### Key management and rotation
 
 `av registry keys list` shows every key this repo knows (active + archived) with its
 fingerprint (`sha256` of the raw public key, first 16 hex chars, `xxxx:xxxx:xxxx:xxxx`) and
@@ -156,7 +156,7 @@ produces a standalone `{hash, algo, public_key, sig, canonical_sha256, exported_
 record; `av verify <hash> --signature FILE` verifies from that file alone, without needing
 local repo config or registry access — useful for a third-party auditor.
 
-### Signature requirement policy (v1.2.5)
+### Signature requirement policy
 
 `av policy set <branch> --require-signature` (optionally combined with a metric gate) denies
 promotion/merge of a candidate with no valid signature embedded in its OWN commit (exit 16,

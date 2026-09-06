@@ -1,9 +1,7 @@
 import { expect, test } from "@playwright/test";
 
-// v1.2.5: Runs tab detail view + deep linking, against the run seeded by
-// webui/e2e/seed_data.py's seed_run() (3 commits with a loss metric, tagged with a
-// distinctive name so this test isn't thrown off by unrelated runs already in the
-// shared dev registry from past manual-testing sessions).
+// Runs tab detail view + deep linking, against the run seeded by seed_data.py's
+// seed_run(), tagged with a distinctive name so unrelated runs don't interfere.
 const RUN_NAME = "e2e-runs-spec-run";
 
 test("Runs: opening a row shows the dedicated detail panel", async ({ page }) => {
@@ -29,9 +27,8 @@ test("Runs: opening a row shows the dedicated detail panel", async ({ page }) =>
 });
 
 test("Runs: a deep-linked URL opens the run detail directly on load", async ({ page, request }) => {
-  // Resolve the seeded run's real (server-generated) id via the API — the deep-link
-  // contract is "reload this exact URL and land on the same run", so this test needs a
-  // real id, not the display name.
+  // Resolve the seeded run's real (server-generated) id via the API, since the deep-link
+  // contract needs the real id, not the display name.
   const runsResp = await request.get("http://localhost:8000/api/runs?limit=200");
   expect(runsResp.ok()).toBeTruthy();
   const { runs } = await runsResp.json();
@@ -44,9 +41,7 @@ test("Runs: a deep-linked URL opens the run detail directly on load", async ({ p
 
   // No click needed — the panel opens straight from the URL on first paint.
   await expect(page.getByText(/Linked commits/)).toBeVisible({ timeout: 15_000 });
-  // The bare id also appears in the runs table row behind the panel (by design — the
-  // list stays visible), so a plain id-substring match is ambiguous (Playwright's
-  // strict mode rejects a locator resolving to >1 element). The "Run detail — " title
-  // is unique to the opened panel, which is what this test is actually confirming.
+  // The bare id also appears in the runs table row behind the panel, so a plain
+  // id-substring match is ambiguous; "Run detail — " is unique to the opened panel.
   await expect(page.getByText(new RegExp(`Run detail.*${seeded!.id.slice(0, 8)}`))).toBeVisible();
 });

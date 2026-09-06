@@ -84,12 +84,12 @@ CI mirrors the runtime split as five jobs in `.github/workflows/tests.yml`: the 
 
 ## Module Map
 
-- `python/av_cli/`: the `av` command surface and every local concern, split (v1.1.1 hardening) so no file is a monolith:
+- `python/av_cli/`: the `av` command surface and every local concern, split so no file is a monolith:
   - `main.py` — thin compat shell: cli group construction + registration order (= `av --help` order), the PEP 562 lazy `VaultClient`, and the two monkeypatch-target owners (`_find_source_root`, `_update_readme_test_badge`) plus re-exports of the historical namespace surface.
   - `core.py` — shared multi-consumer helpers: config/root/logging, staging (`stage_one_file`, avignore), CAS restore machinery (`materialize_file`, `_materialize_tree`, `_collect_dirty_paths`), pending-push trio, `upload_commit_objects`, `_finalize_commit`, meta/hash helpers.
   - command modules — `cmd_repo.py` (init/update), `cmd_staging.py` (config/add/file/unstage/status), `cmd_history.py` (commit/branch/checkout/log/stash/list-meta/push), `cmd_sync.py` (clone/pull/merge), `cmd_auth.py` (Protected-mode tokens + per-user add-user/list-users/remove-user), `cmd_maintenance.py` (doctor/gc), `cmd_devtools.py` (test/benchmark/badge), `cmd_integrations.py` (graph/handoff/webui/plugin imports).
-  - feature modules — `index.py` (`Index`), `merge.py` (pure algorithms), `sync.py` (clone/pull primitives), `history.py` (log walking/rendering), `attributes.py` (`.avattributes` directives), `client.py` (`VaultClient`), `pointer.py`, `fsutil.py`, `handoff.py`, `repl.py`, `docker_runtime.py`, `update_check.py`, `speedcheck.py`, `signing.py` (ed25519 commit signatures, v1.2.2).
-  - agent-facing command groups — `cmd_diff.py`, `cmd_context.py`, `cmd_run.py` (+ SDK), `cmd_env.py` (snapshot/replay incl. top-level `av replay` alias), `cmd_policy.py`, `cmd_watch.py`, `cmd_registry.py` (export/restore/keygen/attest/verify), `cmd_webhooks.py`, `cmd_audit.py` (v1.2.2 audit-trail query).
+  - feature modules — `index.py` (`Index`), `merge.py` (pure algorithms), `sync.py` (clone/pull primitives), `history.py` (log walking/rendering), `attributes.py` (`.avattributes` directives), `client.py` (`VaultClient`), `pointer.py`, `fsutil.py`, `handoff.py`, `repl.py`, `docker_runtime.py`, `update_check.py`, `speedcheck.py`, `signing.py` (ed25519 commit signatures).
+  - agent-facing command groups — `cmd_diff.py`, `cmd_context.py`, `cmd_run.py` (+ SDK), `cmd_env.py` (snapshot/replay incl. top-level `av replay` alias), `cmd_policy.py`, `cmd_watch.py`, `cmd_registry.py` (export/restore/keygen/attest/verify), `cmd_webhooks.py`, `cmd_audit.py` (audit-trail query).
 - `python/av_server/`: the FastAPI CAS registry — `server.py` (routes, GC, auth middleware, CORS, rate limiting), `models.py` (SQLAlchemy schema incl. `extra_parents`/`chunks`), `database.py` (Alembic runner), `migrations/` (versioned schema chain), `rate_limit.py` (fixed-window limiter), `redis_cache.py`, `storage.py` (`CASStorage`).
 - `python/av_plugins/`: optional Lightning/Transformers/MLflow callbacks that drive the CLI in-process via `_shared.py`.
 - `src/`: the C++17 performance core — `core.cpp` (safetensors split + CDC chunker + parallel hashing), `sha256.cpp`, `thread_pool.h`; bound as the `aether_core` pybind11 extension.
@@ -111,10 +111,10 @@ The cheap short-circuit comes before any hashing: when the recorded size and mti
 Artifacts above the LFS threshold — default 50 MB via the `lfs_threshold_mb` config key, changed with `av config <N>` — get structure-aware storage, in priority order:
 
 1. **Layer split** — `.safetensors` files go through `aether_core.split_and_hash_safetensors`, producing one shard per tensor layer plus an `__header__` pseudo-layer holding the header bytes, so unchanged layers dedup across checkpoint epochs and single layers can be fetched alone.
-2. **CDC chunking** — files matching the `CHUNKABLE_EXTS` set go through `aether_core.chunk_and_hash_file`: gear-hash rolling cut points with min 512 KB, avg 2 MB, max 8 MB. The max is a soft cap of `max + min − 1` because a cut is only taken when at least `min_chunk` bytes remain after it — the tail never becomes a sliver. `CHUNKABLE_EXTS` (v1.2.5, broadened from 8 to 15): `.pt .pth .ckpt .npz .h5 .hdf5 .pb .msgpack .bin .onnx .model .arrow .feather .pkl .pickle` — uncompressed/block-structured formats where a local edit only shifts nearby chunks. Compressed/columnar containers (`.parquet`, `.zip`/`.gz`/`.tar`/`.7z`) are deliberately excluded by default — an edit there usually rewrites the whole compressed stream, so CDC boundaries wouldn't survive it — but are reachable per-glob via the `chunk` `.avattributes` flag when a repo owner has verified their export path is safe.
+2. **CDC chunking** — files matching the `CHUNKABLE_EXTS` set go through `aether_core.chunk_and_hash_file`: gear-hash rolling cut points with min 512 KB, avg 2 MB, max 8 MB. The max is a soft cap of `max + min − 1` because a cut is only taken when at least `min_chunk` bytes remain after it — the tail never becomes a sliver. `CHUNKABLE_EXTS`: `.pt .pth .ckpt .npz .h5 .hdf5 .pb .msgpack .bin .onnx .model .arrow .feather .pkl .pickle` — uncompressed/block-structured formats where a local edit only shifts nearby chunks. Compressed/columnar containers (`.parquet`, `.zip`/`.gz`/`.tar`/`.7z`) are deliberately excluded by default — an edit there usually rewrites the whole compressed stream, so CDC boundaries wouldn't survive it — but are reachable per-glob via the `chunk` `.avattributes` flag when a repo owner has verified their export path is safe.
 3. **Whole-file blob** — anything that did not split or chunk stores as one object.
 
-Per-path overrides come from `.avattributes`, parsed by `python/av_cli/attributes.py::flags_for()` with fnmatch globs and last-match-wins semantics: `no-chunk` forces a file down the whole-file path, `chunk` (v1.2.5) force-enables CDC for a glob outside `CHUNKABLE_EXTS` (`no-chunk` wins when both are on the same matching line), `no-layer-split` keeps a safetensors file unsplit. Both splits fall back to whole-file on any exception rather than failing the stage.
+Per-path overrides come from `.avattributes`, parsed by `python/av_cli/attributes.py::flags_for()` with fnmatch globs and last-match-wins semantics: `no-chunk` forces a file down the whole-file path, `chunk` force-enables CDC for a glob outside `CHUNKABLE_EXTS` (`no-chunk` wins when both are on the same matching line), `no-layer-split` keeps a safetensors file unsplit. Both splits fall back to whole-file on any exception rather than failing the stage.
 
 Determinism is a dedup invariant, not a nicety: the gear table in `src/core.cpp` is generated from splitmix64 with a fixed seed, so identical bytes produce identical chunk boundaries — and therefore identical chunk hashes — on every machine and every version. A nondeterministic chunker would silently break cross-version dedup and make pushed histories unreconstructable.
 
@@ -153,7 +153,7 @@ Push ordering is a hard rule enforced inside `_finalize_commit()`: `python/av_cl
 
 Unreachability never loses a commit. When the registry is unreachable, the commit stays local and enters the `.av/pending_push` queue (`python/av_cli/core.py::queue_pending_push()`); `av push` and every subsequent commit retry it via `flush_pending_push()`.
 
-Every ref push carries compare-and-swap (`expected_hash`, the pre-commit tip) — this is unconditional, not opt-in or scoped to "protected" branches: any ref race (two agents' commits landing concurrently) is detected server-side (409) rather than silently overwritten, and a losing race queues via the same `.av/pending_push` path as unreachability (v1.2.5). Since v1.3.0 that race also attributes the winning commit to its run (when known, via `core.py::tip_run_id()`) and carries the same `remediation` (`av pull` then `av push`) in both `error.data.ref_race` and the human-text output — matching what `av pull`'s divergence message and `av merge`'s conflict message already did.
+Every ref push carries compare-and-swap (`expected_hash`, the pre-commit tip) — this is unconditional, not opt-in or scoped to "protected" branches: any ref race (two agents' commits landing concurrently) is detected server-side (409) rather than silently overwritten, and a losing race queues via the same `.av/pending_push` path as unreachability. That race also attributes the winning commit to its run (when known, via `core.py::tip_run_id()`) and carries the same `remediation` (`av pull` then `av push`) in both `error.data.ref_race` and the human-text output — matching what `av pull`'s divergence message and `av merge`'s conflict message already do.
 
 Server-side, `push_commit()` defends itself against hostile or oversized payloads with early request-size guards in `python/av_server/server.py` — caps on tree entries (100,000), metrics (1,000), tags (200), message length (20,000), and tag length (200) — and ref names pass a strict regex (`validate_ref_name()`) because refs become filesystem paths in the storage fallback; traversal attempts like `..` components are rejected at the door.
 
@@ -216,7 +216,7 @@ Tree merging is `three_way_tree_merge()` over the flat trees, per path:
 
 Entries compare by FULL dict equality, so a layer re-split that leaves content identical still reads as unchanged. Absence counts as deletion on that side. Conflicts belong to the caller: `av merge` aborts before touching anything unless `--ours` or `--theirs` resolves it. Content-level line merging is intentionally out of scope — versioned payloads are binary artifacts, and an honest abort beats a corrupt merge.
 
-A conflict attributes both tips to their runs (when known) and always writes a structured report to `.av/last_conflict.json` (`--conflict-report PATH` for an additional copy) — same fields (`conflicts`, `ours`/`theirs`, `*_run_id`, `remediation`) in the file, the human-text output, and `error.data` under `--output json`, so no surface has to re-derive what another already computed (v1.3.0).
+A conflict attributes both tips to their runs (when known) and always writes a structured report to `.av/last_conflict.json` (`--conflict-report PATH` for an additional copy) — same fields (`conflicts`, `ours`/`theirs`, `*_run_id`, `remediation`) in the file, the human-text output, and `error.data` under `--output json`, so no surface has to re-derive what another already computed.
 
 A successful non-fast-forward merge creates a real two-parent commit through the same `_finalize_commit()` path as ordinary commits; `--no-ff` forces that shape even when a fast-forward would do. The wire format is asymmetric by schema evolution, not by design taste: the server stores `parents[0]` in `parent_hash` and the remainder in `extra_parents` as JSON (`python/av_server/models.py::DBCommit.extra_parents`), and read endpoints reconstruct the full parents array via `python/av_server/server.py::_full_parents()` — so clients always see a complete `parents` list.
 
@@ -270,7 +270,7 @@ The single `require_token` middleware resolves Bearer tokens through both source
 | Exempt path | Why it stays open |
 |---|---|
 | `/api/health` | Docker healthchecks and the CLI's reachability probes depend on credential-free checks — gating it would make a freshly-protected server look permanently down to the very code restarting it. Liveness only: DB-free, always green, and (a pre-existing, now-fixed staleness) reports the real installed package version instead of a hardcoded string. |
-| `/api/ready` (v1.2.5) | Readiness, not liveness — checks DB connectivity, Redis, and `AV_DATA_DIR` writability, returning 503 with per-check detail on failure. Same auth-exemption rationale as `/api/health` (compose healthchecks and restart logic must reach it credential-free), but it is allowed to go red when the container is genuinely unusable — that's the whole point of separating it from `/api/health`, which never does. |
+| `/api/ready` | Readiness, not liveness — checks DB connectivity, Redis, and `AV_DATA_DIR` writability, returning 503 with per-check detail on failure. Same auth-exemption rationale as `/api/health` (compose healthchecks and restart logic must reach it credential-free), but it is allowed to go red when the container is genuinely unusable — that's the whole point of separating it from `/api/health`, which never does. |
 | `/docs` | Swagger/ReDoc cannot attach the custom Bearer header; they expose API shape, not data |
 | `/openapi.json` | Same rationale as `/docs` |
 | `/redoc` | Same rationale as `/docs` |
@@ -281,34 +281,31 @@ Everything else — reads included — requires a valid credential once Protecte
 
 Client side: `python/av_cli/client.py::VaultClient` raises `AuthenticationError` on any 401; the CLI catches it centrally (the custom `_AuthRetryGroup`), prompts interactively, saves, and asks for a re-run — or queues the work when it can. Per-user tokens ride the exact same client path (`av auth set-token <personal-token>` in a teammate's repo). The webui wraps everything in `TokenGate`, which accepts a one-time `?av_token=` query parameter appended by `av webui`, saves it to localStorage, and strips it from the URL immediately on mount.
 
-### Token scopes (v1.3.1)
+### Token scopes
 
 An `AV_AUTH_USERS` entry may additionally carry `"scopes": [str, ...]` (`av auth add-user
-NAME TOKEN --scope <s>`, repeatable). Absence — every entry that predates this feature,
-every bare-string entry, and the owner's `AV_API_TOKEN` itself — resolves to the
-unrestricted wildcard `["*"]` (`server.py::_scopes_for_identity`), so this is purely
-additive: no existing deployment loses access to anything it could already reach.
-`require_token` resolves `request.state.scopes` alongside `request.state.username`
-(unconditionally, in the same pass); a route opts into a scope check by adding
-`Depends(require_scope("<scope>"))`.
+NAME TOKEN --scope <s>`, repeatable). Absence — every bare-string entry, and the owner's
+`AV_API_TOKEN` itself — resolves to the unrestricted wildcard `["*"]`
+(`server.py::_scopes_for_identity`), so a deployment with no scopes configured behaves
+exactly as if every entry were unrestricted. `require_token` resolves
+`request.state.scopes` alongside `request.state.username` (unconditionally, in the same
+pass); a route opts into a scope check by adding `Depends(require_scope("<scope>"))`.
 
-This is the one deliberate amendment to this file's historical framing that "enforcement
-is CLIENT-SIDE v1; server-side authz is enterprise-tier" (see the Promotion Policy
-Contract below): that statement remains true for the metric/signature promotion gates
-introduced in v1.2.0/v1.2.5, which stay client-side by design. It is no longer true
-project-wide — the held-out eval vault, improver promotion, and policy-pack publication
-introduced in v1.3.1 are enforced server-side via scopes, because a client-side-only gate
-cannot protect an eval suite from the very agent being scored against it. A `require_scope`
-denial is a `403` with `{"error": "scope_denied", "required_scope": "<scope>"}`, distinct
-from `require_token`'s `401` (the caller authenticated fine; they lack one permission),
-audited as `scope.denied`, and surfaced by the CLI as exit code 20 wherever a call site
-maps it (see docs/for-agents.md's exit-code table).
+Enforcement is client-side for the metric/signature promotion gates (see the Promotion
+Policy Contract below), which stay client-side by design. It is server-side, via scopes,
+for the held-out eval vault, improver promotion, and policy-pack publication — a
+client-side-only gate cannot protect an eval suite from the very agent being scored
+against it. A `require_scope` denial is a `403` with `{"error": "scope_denied",
+"required_scope": "<scope>"}`, distinct from `require_token`'s `401` (the caller
+authenticated fine; they lack one permission), audited as `scope.denied`, and surfaced
+by the CLI as exit code 20 wherever a call site maps it (see docs/for-agents.md's
+exit-code table).
 
 **Verified:** stack-free unit tests (`tests/test_scopes.py`) cover scopes parsing
 (additive, omitted-when-absent), `_scopes_for_identity`'s default-to-wildcard behavior,
 and `require_scope()`'s allow/deny/audit logic against a stub session — no Postgres
-needed. Live end-to-end 403s are proven in `tests/test_server.py` once a real route
-declares a scope requirement (v1.3.1 R1/R2).
+needed. Live end-to-end 403s are proven in `tests/test_server.py` against a real route
+that declares a scope requirement.
 
 ## Transport Hardening Contract
 
@@ -331,7 +328,7 @@ Exemptions mirror auth exactly (health + docs routes). Responses are `429` JSON 
 
 The dashboard is a Next.js App Router application under `webui/src/app`, talking straight to the registry API. The API base URL bakes in at build time via the `NEXT_PUBLIC_API_URL` argument (the compose file passes `http://localhost:8000`), so a registry behind a proxy needs a rebuild, not just a config change. Sidebar tabs: Dashboard, Commits, Branches, Metrics, Storage, Weight Diff, Projects, Runs, Improver, Regression. Project selection persists in localStorage and scopes every panel.
 
-**Improver / Regression tabs (v1.3.1, RSI R6, WP-35/WP-38):** `ImproverPanel` (lineage +
+**Improver / Regression tabs:** `ImproverPanel` (lineage +
 pending self-edits, from `GET /api/improvers`/`GET /api/change-sets`) and
 `RegressionPanel` (improver churn by change-set status, the anomaly event feed via
 `GET /api/events?kinds=anomaly`, and an embedded `CanaryPanel` showing pass/fail trend
@@ -355,7 +352,7 @@ Weight Diff is the distinctive panel: a client-side per-layer heatmap built from
 
 Auth surfaces through `TokenGate` (one-time `?av_token=` handoff, described in Auth Token Contract). Polling cadence defaults to 15 seconds via `webui/src/hooks/useDashboard.ts::useDashboard()` — live enough to feel current during training runs, cheap enough to leave open.
 
-**Note (updated v1.2.2):** the WEBUI commit graph now draws one edge per parent (see the Merge Contract's resolved note). The Runs tab gained an expandable detail view: parent-lineage chain, linked commits with messages and a metrics table, and a semantic summary composed client-side from the last two linked commits' trees (`webui/src/lib/runDetail.ts` — deliberately no new server endpoint). The `av graph` OBSIDIAN export still walks `parent_hash` only, so merge diamonds render linear in generated vaults — tracked limitation, low priority because Obsidian's own graph view is the primary consumption surface there.
+**Note:** the WEBUI commit graph draws one edge per parent (see the Merge Contract's resolved note). The Runs tab has an expandable detail view: parent-lineage chain, linked commits with messages and a metrics table, and a semantic summary composed client-side from the last two linked commits' trees (`webui/src/lib/runDetail.ts` — deliberately no new server endpoint). The `av graph` OBSIDIAN export still walks `parent_hash` only, so merge diamonds render linear in generated vaults — tracked limitation, low priority because Obsidian's own graph view is the primary consumption surface there.
 
 ## Plugin Contract
 
@@ -368,24 +365,16 @@ Optional framework callbacks — Lightning, Transformers, MLflow — auto-stage 
 | `python/av_plugins/mlflow.py` | MLflow | `import_run` backfill (requires the `[mlflow]` extra) |
 | `python/av_plugins/_shared.py` | all | The in-process CLI bridge every plugin routes through |
 
-Plugins drive add/commit through the INTERNAL SEAM since v1.2.2: `_shared.py::commit_scoped()`
+Plugins drive add/commit through an internal seam: `_shared.py::commit_scoped()`
 delegates to `core.commit_scoped_paths()` — the same function agent tooling uses — which
 stages via `stage_one_file` directly (no chdir, no CLI invocation) and funnels into
-`commit_staged` → `_finalize_commit`. Scoped-commit semantics are unchanged: isolation
-without destroying the change-detection baseline (#38/#71), missing-path tolerance (#76),
-AV_RUN_ID flow via `core.resolve_run_id()` (v1.2.5: explicit > `AV_RUN_ID` env >
-`.av/run.json` state — the one precedence rule shared with `av commit`/`av watch`; before
-this, three call sites silently disagreed, and `av watch`'s auto-commits weren't tagged
-under the active run at all). Training-end flush is `_shared.push_pending()` (v1.2.5,
-delegates to `core.flush_pending_push()` directly) — as of v1.2.5 no plugin has any
-remaining chdir or in-process CLI invocation. `run_av()`/`build_metric_args()` were
-deprecated shims kept for external callers through one release's grace window
-(VERSIONING.md); that window closed at v1.3.0 and both are removed from the package
-entirely — `mlflow.py::import_run()`'s `repo_root` argument became required in the same
-release (its `resolve_repo_root(Path.cwd())` fallback was this package's one remaining
-`Path.cwd()` use, and every other plugin entry point already required an explicit root).
+`commit_staged` → `_finalize_commit`. No plugin has any chdir or in-process CLI
+invocation remaining. `AV_RUN_ID` flow goes through `core.resolve_run_id()` (explicit >
+`AV_RUN_ID` env > `.av/run.json` state — the one precedence rule shared with
+`av commit`/`av watch`). Training-end flush is `_shared.push_pending()`, which delegates
+to `core.flush_pending_push()` directly.
 
-**Scoped commits (v1.1.9, seam v1.2.2):** every plugin add+commit pair (callbacks AND import backfills) runs through the scoping seam, which isolates one commit without destroying the change-detection baseline: staging runs against the untouched index, the scope is computed as exactly what that staging touched (new keys, changed content, staged transitions), committed through the real single code path, and everything else merges back with its staged flag untouched — an import or checkpoint commit therefore never sweeps unrelated human-staged files into its tree (Probleme.md #38), and unchanged re-imports stay "Nothing to commit" no-ops (Probleme.md #71). Plain `av commit` keeps full-snapshot semantics; only machine-driven plugin events are scoped.
+**Scoped commits:** every plugin add+commit pair (callbacks AND import backfills) runs through the scoping seam, which isolates one commit without destroying the change-detection baseline: staging runs against the untouched index, the scope is computed as exactly what that staging touched (new keys, changed content, staged transitions), committed through the real single code path, and everything else merges back with its staged flag untouched — an import or checkpoint commit therefore never sweeps unrelated human-staged files into its tree, and unchanged re-imports stay "Nothing to commit" no-ops. Plain `av commit` keeps full-snapshot semantics; only machine-driven plugin events are scoped.
 
 Callbacks commit with the current step or epoch as the message, attach numeric training metrics as first-class metrics, and flush a final `av push` when training ends — so an interrupted run still leaves every intermediate checkpoint committed and queued. `dataset_paths` stages once at training start, tagged `dataset`, because there is no reliable way to auto-detect a dataset's on-disk path from a generic `Dataset`/`DataLoader` object; opt-in beats wrong-guess.
 
@@ -398,19 +387,15 @@ Versions come from setuptools-scm reading git tags — no version string is hand
 1. `cibuildwheel` builds wheels for cp310–cp314 across Windows/Linux/macOS, plus an sdist job.
 2. PyPI publishes via trusted publishing — OIDC, `environment: pypi`, no long-lived token.
 3. A GitHub Release appears with auto-generated notes and every wheel/sdist attached; curated long-form notes link back to [CHANGELOG.md](CHANGELOG.md).
-4. GHCR receives ONE consolidated **engine image** (`ghcr.io/leon1706-lol/aether-vault-engine`) tagged `:latest` + the version tag. Since v1.2.2 the image is multi-stage (py-builder → Node 20 web-builder → runtime with BOTH Python and Node) and runs ALL subservices in ONE container dispatched by `AV_ENGINE_ROLE` (`all` | `server` | `webui`, supervised by `docker/engine-entrypoint.sh`). For one transition cycle the SAME image is also pushed under the historical `aether-vault-server`/`aether-vault-webui` names; the entrypoint auto-detects the legacy per-service role from container env (`DATABASE_URL` set → server-only; `NEXT_PUBLIC_API_URL` without it → webui-only), so pre-1.2.2 pinned compose files keep working unchanged. **The aliases are deprecated now and are removed in the next release** — pinned installs should move to the engine name.
+4. GHCR receives ONE consolidated **engine image** (`ghcr.io/leon1706-lol/aether-vault-engine`) tagged `:latest` + the version tag, plus slim single-role `server`/`webui` targets. The image is multi-stage (py-builder → Node 20 web-builder → runtime with BOTH Python and Node) and runs ALL subservices in ONE container dispatched by `AV_ENGINE_ROLE` (`all` | `server` | `webui`, supervised by `docker/engine-entrypoint.sh`). The historical `aether-vault-server`/`aether-vault-webui` alias tags have been removed; the entrypoint still auto-detects the legacy per-service role from container env (`DATABASE_URL` set → server-only; `NEXT_PUBLIC_API_URL` without it → webui-only) for any already-pulled legacy image.
 
 Installed users pick releases up through `av update`; opted-in silent auto-update re-checks at process exit. `av update --docker` is the separate, opt-in path for the local backend images — restarting a running container is disruptive, so it never rides along with a plain version check; it pulls only the canonical engine image. `docker-edge.yml` pushes `:edge` engine images (+ aliases) on pushes to `master` touching code paths, between tagged releases.
 
 Semver and deprecation policy live in [`../VERSIONING.md`](../VERSIONING.md): MAJOR breaks the CLI, `.av/` format, or API surface; MINOR is additive including new optional response fields; PATCH is safe. Deprecations get at least one full MINOR grace window and never vanish inside a PATCH; database schema changes are owned by Alembic migrations applied automatically at server startup.
 
-**Resolved:** `docker-edge.yml` used to trigger on `main`, but this repo's default branch has always been `master` — so edge images never fired. Reconciled to `[master]` in the v1.1.8 cycle; `:edge` now tracks every code-path push.
+`docker-edge.yml` triggers on `[master]`; `:edge` tracks every code-path push. `cibuildwheel` builds cp310–cp314, matching the supported interpreter range.
 
-**Resolved:** wheels shipped cp310–cp314 since Phase 46 (cibuildwheel matrix), matching the dev environment's Python 3.14.
-
-**Resolved:** the two-image split topology (separate `aether-vault-server` and `aether-vault-webui` containers) was consolidated into the single engine image/container in v1.2.2 — see above for the alias transition contract.
-
-## Runs Contract (v1.2.0)
+## Runs Contract
 
 A Run is the first-class grouping for one training effort. Storage: `runs` +
 `run_commits` (migration `0002`). Creation is idempotent by client-generated UUID;
@@ -420,7 +405,7 @@ on every linked commit. Client surface: `av run start/finish/list/show`, `AV_RUN
 SDK `repo.runs`. Commits auto-tag `run:<id>` (tags remain part of the hashed payload).
 Published schema: `av_cli/schemas/run-1.0.schema.json` — see `docs/contracts.md`.
 
-**Uncapped history (v1.3.0, migration `0005`):** `GET /api/runs/{id}/summary` bounds its
+**Uncapped history (migration `0005`):** `GET /api/runs/{id}/summary` bounds its
 inline `commits`/`lineage` copies (`_RUN_SUMMARY_MAX_COMMITS`/`_MAX_LINEAGE_DEPTH`) —
 bounded response size for the common case, never a silent drop (it reports
 `total_commits` vs. what it actually returned). `GET /api/runs/{id}/metrics` (cursor on
@@ -435,18 +420,18 @@ itself; a reporting failure never blocks the promotion). Surfaced on `_run_to_di
 (so both `GET /api/runs/{id}` and `/summary`'s `run` field carry it) and as a badge in the
 WebUI's run-detail panel.
 
-## Events & Webhooks Contract (v1.2.0, delivery ledger v1.2.2)
+## Events & Webhooks Contract
 
 `events` is append-only; the autoincrement id IS the resumable cursor
 (`GET /api/events?since=<id>&project_id=&kinds=&run_id=&wait=<secs>`, ascending, bounded
-limit). `run_id` (v1.3.0) matches events whose payload carries that run — `commit` and
+limit). `run_id` matches events whose payload carries that run — `commit` and
 `run` kind events today; a kind with no run_id in its payload never matches, same as an
 unknown project/kind narrows to nothing rather than erroring. The response also carries
-`gap`/`oldest_id` (v1.3.0): `gap: true` when `since` predates this project's oldest
+`gap`/`oldest_id`: `gap: true` when `since` predates this project's oldest
 retained event id (swept by `AV_EVENT_RETENTION_DAYS`) — a resuming consumer can tell
 "I fell behind and missed events" apart from "there's simply nothing new yet", which a
-stale cursor used to make silently indistinguishable. Kinds today: commit · ref · run ·
-gc · webhook_test, plus the v1.3.1 RSI additions — improver · change_set · policy ·
+stale cursor would otherwise make silently indistinguishable. Kinds today: commit · ref · run ·
+gc · webhook_test, plus the RSI additions — improver · change_set · policy ·
 canary · freeze · eval · review · blackboard · sandbox · **anomaly** (see this file's
 "Anomaly Alerts Contract" section). Webhooks POST the raw JSON body with
 `X-AV-Event-Id/-Kind/X-AV-Signature: hex(hmac-sha256(secret, body))`; secrets live in the
@@ -457,7 +442,7 @@ plus manual `DELETE /api/events?before_days=N`. Published schemas:
 `av_cli/schemas/webhook-payload-1.0.schema.json` (the signed delivery body) — see
 `docs/contracts.md`.
 
-**Webhook delivery ledger (v1.2.2, migration `0003`):** every fan-out attempt persists a
+**Webhook delivery ledger (migration `0003`):** every fan-out attempt persists a
 `webhook_deliveries` row BEFORE its POST (`pending`) and updates it after
 (`delivered`/`failed`); failed rows carry `next_retry_at` and are re-driven by the server's
 startup+interval retry worker until `AV_WEBHOOK_MAX_ATTEMPTS` (default 5) exhausts into
@@ -466,7 +451,7 @@ byte-identical signed body even after the source event is retention-swept; rows 
 mutation's own transaction so rolled-back mutations leave no phantom records.
 Observability: `GET /api/admin/webhook-deliveries?status&webhook_id&limit&offset`.
 
-**Delivery guarantees (v1.3.0, proven under a real multi-endpoint backlog by
+**Delivery guarantees (proven under a real multi-endpoint backlog by
 `tests/test_server.py::test_webhook_backlog_delivers_all_in_order_without_starving_healthy_hook`):**
 at-least-once per hook — a delivery is `delivered`, retried on schedule, or eventually
 `dead`-lettered, never silently dropped. Delivery order per hook matches event creation
@@ -477,7 +462,7 @@ commits fan out to two hooks), not just a single event. `av webhooks show/delive
 and `POST /api/admin/webhook-deliveries/{id}/replay` reflect the ledger's real state at
 any point during an in-flight backlog, not only once it drains.
 
-## Registry Export/Restore Contract (v1.2.0, resume + real round-trip proof v1.3.0)
+## Registry Export/Restore Contract
 
 `av registry export OUT_DIR [--project]` walks the registry's public API (commits paged,
 refs, runs, then every object hash referenced in any exported tree's files/layers/chunks)
@@ -488,26 +473,24 @@ is safe. Both commands show a progress bar over their item loop (suppressed unde
 `--output json`) and track completed items in `ARCHIVE_DIR/.state.json`, so a killed
 export/restore resumes instead of re-downloading/re-uploading everything (`--resume` is
 the default; `--no-resume` forces a full pass — always safe either way, since every
-write is already idempotent). **v1.3.0 fixes:** a missing `import pathlib` meant every
-real invocation of both commands raised `NameError` immediately — no test had ever driven
-either through the real CLI until `tests/test_server.py::test_registry_export_restore_round_trip`
-(live-registry-gated) closed that gap; both also now call `client.server_available()`
-first instead of letting an unreachable server surface as an unhandled
-`requests.exceptions.ConnectionError` traceback.
+write is already idempotent). Both commands call `client.server_available()` first
+rather than letting an unreachable server surface as an unhandled
+`requests.exceptions.ConnectionError` traceback; the round trip is proven end-to-end by
+`tests/test_server.py::test_registry_export_restore_round_trip` (live-registry-gated).
 
-## Signed Commits Contract (v1.2.2)
+## Signed Commits Contract
 
 Optional per-repo ed25519 signing ("tamper evidence, not a trust network" — see SECURITY.md).
 `av registry keygen` generates `.av/keys/signing.pem` (0600) + `.pub` via the `[sign]`
-extra; when a key exists, `_finalize_commit` auto-signs AFTER hash computation: canonical
+extra; when a key exists, `_finalize_commit` auto-signs after hash computation: canonical
 bytes = sorted-keys JSON of the payload minus `signature`, with the timestamp normalized to
 one UTC rendering (naive/aware/Z spellings of the same instant MUST verify identically —
 the registry echoes naive UTC). The signature blob `{algo, public_key, sig}` rides commits
-verbatim, persists in `commits.signature` (0003), and survives clone/pull so `av verify
+verbatim, persists in `commits.signature` (migration 0003), and survives clone/pull so `av verify
 <hash>` works on any copy: signature-first, legacy HMAC attest-tag fallback, honest UNSIGNED
 verdict (exit 0 — unsigned commits are valid). Signing never blocks or fails a commit.
 
-**Key management (v1.2.5):** `av registry keys list/fingerprint/rotate` — fingerprint is
+**Key management:** `av registry keys list/fingerprint/rotate` — fingerprint is
 `sha256(raw pubkey)[:16 hex]` in `xxxx:xxxx:xxxx:xxxx` form (golden-fixture tested). Rotate
 archives the current keypair under `.av/keys/archive/<fingerprint>/` (never deletes it —
 old commits keep verifying via their embedded public key) and generates a fresh active
@@ -516,9 +499,9 @@ portable signature record (adds `canonical_sha256` + `fingerprint`) for
 `av registry verify <hash> --signature FILE` — detached verification needs only the
 commit content and the record, no local config or registry access.
 
-## Env Snapshot Contract (v1.2.2, `snapshot_version: 2` v1.2.5)
+## Env Snapshot Contract
 
-A snapshot's id IS `sha256(canonical bytes)`. Since v1.2.5 (`snapshot_version: 2`),
+A snapshot's id IS `sha256(canonical bytes)`. For `snapshot_version: 2`,
 canonical bytes = compact sorted-keys JSON of ONLY `{snapshot_version, env}` — `env`
 holds reproducibility-relevant identity (python, os family, curated pins, seeds, CUDA
 *toolkit* version, a configurable critical-env-var set); machine-specific `observed`
@@ -536,14 +519,14 @@ Snapshots upload through the NORMAL object flow at push; commits carry
 linked runs on first link (first-link wins). Readers: `av env replay [target]` /
 top-level `av replay <run-id|commit-hash|snapshot-id>` resolve from local CAS or registry;
 `.avh.replay.snapshot_id` carries the pointer into agent context memory. `av env replay`
-flags (v1.2.5): `--validate` resolves every pin via `pip install --dry-run` without
-installing (exit 15 on any unresolvable pin); `--execute` now always uses
-`sys.executable -m pip` (previously a bare `pip` string, which could silently resolve to
+flags: `--validate` resolves every pin via `pip install --dry-run` without
+installing (exit 15 on any unresolvable pin); `--execute` uses
+`sys.executable -m pip` (never a bare `pip` string, which could resolve to
 the wrong interpreter) and accepts `--target-venv PATH` (create-if-absent) or
 `--conda-env NAME`; `--dockerfile` renders a multi-stage, non-root Dockerfile and accepts
 `--cuda TAG` (nvidia/cuda base) and `--out FILE`.
 
-## Audit Trail Contract (v1.2.2)
+## Audit Trail Contract
 
 Every mutating API call writes `audit_log(username, action, project_id, details,
 status_code)` — the status code captures the HTTP outcome ("did it land?"), not just the
@@ -551,27 +534,26 @@ attempt. Read surface: `GET /api/admin/audit?action&project_id&since&until&limit
 (invalid timestamps → 422), CLI `av audit list`. Retention: `AV_AUDIT_RETENTION_DAYS`
 (default 90) swept during GC plus manual prune endpoint.
 
-## Semantic Diff Contract (v1.2.0, dedup_efficiency v1.2.2, chunks.status v1.2.5, byte-level fields + server parity v1.3.0)
+## Semantic Diff Contract
 
 `python/av_cli/semdiff.py::diff_trees(old_tree, new_tree)` is pure: added/removed/changed,
-per-model layer movement (count/pct/largest movers, plus v1.3.0's `bytes_changed`/
-`bytes_total`/`pct_bytes` — a byte-weighted view that deliberately diverges from the
+per-model layer movement (count/pct/largest movers, plus a byte-weighted
+`bytes_changed`/`bytes_total`/`pct_bytes` view that deliberately diverges from the
 count-based `pct` when layer sizes vary, so "half the layers changed" and "half the
 storage changed" stay answerable independently), chunk reuse ratio across CDC-chunked
 files (+ `chunks.dedup_efficiency` = reused/(reused+new), None when no chunks — flows into
-`.avh.semantic_summary`; `chunks.status` (v1.2.5) is a sibling field ALWAYS present as
+`.avh.semantic_summary`; `chunks.status` is a sibling field ALWAYS present as
 `"measured"`/`"no_chunks"`, so consumers get a stable field to branch on without a
-null-check on the float — `None` stays meaningful as "no signal", not "0%"; v1.3.0 adds
-the byte-weighted siblings `chunks.reused_bytes`/`new_bytes`/`dedup_efficiency_bytes`),
+null-check on the float — `None` stays meaningful as "no signal", not "0%"; the
+byte-weighted siblings are `chunks.reused_bytes`/`new_bytes`/`dedup_efficiency_bytes`),
 dataset classification (extension+name heuristics), byte totals, and a one-sentence human
 summary. Consumers: `av diff`, `.avh.semantic_summary`, WebUI expanded commits and the
-v1.2.2 run-detail panel (client-side re-composition in `webui/src/lib/runDetail.ts`). The
-dict shape is additive-only by policy. Published schema (v1.3.0):
+run-detail panel (client-side re-composition in `webui/src/lib/runDetail.ts`). The
+dict shape is additive-only by policy. Published schema:
 `av_cli/schemas/semdiff-1.0.schema.json` — see `docs/contracts.md`.
 
-**Server-side parity (v1.3.0):** `server.py::_summarize_tree_diff()` independently
-re-implements the FULL schema above (models/chunks/datasets, not just files/totals like
-before) — it deliberately never imports `av_cli` (the server package ships and deploys
+**Server-side parity:** `server.py::_summarize_tree_diff()` independently
+re-implements the full schema above (models/chunks/datasets, not just files/totals) — it deliberately never imports `av_cli` (the server package ships and deploys
 standalone), so the two implementations are proven identical on identical input by a
 shared golden-fixture test
 (`tests/test_server.py::test_server_side_summary_matches_client_side_semdiff_on_the_same_trees`)
@@ -580,7 +562,7 @@ rather than by sharing code. Feeds both `GET /api/runs/{id}/summary`'s
 two-commit compare, not just a run's two most recent linked commits — feeds the WebUI's
 weight-diff arbitrary-hash compare).
 
-## .avh v2 — Agent Context Memory Contract (v1.2.0)
+## `.avh` v2 — Agent Context Memory Contract
 
 `handoff.avh` carries `$schema` + `avh_version:"2.0"`, legacy v1 keys (never removed),
 and: `lineage{run_id,parent_run_ids,code_pointer{git_remote,git_sha,dirty}}`,
@@ -590,29 +572,30 @@ and: `lineage{run_id,parent_run_ids,code_pointer{git_remote,git_sha,dirty}}`,
 Readers must tolerate unknown sections; writers must run `validate_handoff()` in CI paths.
 Published schema: `av_cli/schemas/avh-2.0.schema.json` — see `docs/contracts.md`.
 
-## Promotion Policy Contract (v1.2.0, `require_signature` v1.2.5, `--dry-run` + outcome reporting v1.3.0)
+## Promotion Policy Contract
 
 Policies live in `.av/policies.json`: `{branch: {metric, op∈{<,<=,>,>=},
-baseline_ref|threshold, require_signature}}` — `require_signature` (v1.2.5, additive) is
+baseline_ref|threshold, require_signature}}` — `require_signature` is
 usable standalone (no `metric` required) as a pure signature gate, checked BEFORE any
 metric comparison so a denial reports "unsigned", not a misleading metric mismatch.
 Enforcement points: `av merge` (current branch armed → deny, exit 16, unless --force) and
 `av promote CANDIDATE --into BRANCH` (authoritative eval — merge-side check intentionally
 bypassed there to avoid comparing the baseline against itself). Enforcement is
-CLIENT-SIDE v1; server-side authz is enterprise-tier. Worked examples (metric gate,
-signature gate, combined): `examples/policies/`, loaded by tests so they can't rot.
+client-side; server-side authz (scopes) covers the RSI surfaces instead — see Token
+scopes above. Worked examples (metric gate, signature gate, combined):
+`examples/policies/`, loaded by tests so they can't rot.
 
-`av promote --dry-run` (v1.3.0) evaluates and reports `data.decision`
+`av promote --dry-run` evaluates and reports `data.decision`
 (`allow`/`deny`) plus the deciding rule, touching nothing — exits 0 for BOTH decisions
 (a script branches on `data`, not the exit code). Every REAL (non-dry-run) decision also
 reports to `POST /api/runs/{id}/policy-outcome` for the active run (best-effort,
 never blocks the promotion — see the Runs Contract section above). `promote`'s own JSON
 envelope for a landing (allowed, non-dry-run) promotion is emitted AFTER the merge lands,
 folding in the merge result under `data.merge` — the nested `merge` invocation's own
-stdout is captured, not let through directly, specifically so one `av promote` call never
-prints two top-level JSON objects (Probleme #114/#115).
+stdout is captured, not let through directly, so one `av promote` call never prints two
+top-level JSON objects.
 
-## Improver Artifact Contract (v1.3.1, RSI R1, migration 0006)
+## Improver Artifact Contract (RSI, migration 0006)
 
 An improver version is the agent's OWN stack (code paths, prompt files, tool schemas, a
 policy-pack pointer) — content-addressed exactly like an env snapshot: canonical
@@ -627,7 +610,7 @@ lineage/current/use`; local state is `.av/improver/current` (the active pointer,
 text file — same idiom as `.av/HEAD`) and `.av/improver/last_good` (written by `apply`,
 read by `rollback`).
 
-**Self-edit proposals (`change_sets`, todo.md A.3/A.4):** `av improver propose --diff FILE
+**Self-edit proposals (`change_sets`):** `av improver propose --diff FILE
 --rationale TEXT --risk low|medium|high` is a CAS object (diff + rationale + risk) indexed
 server-side with an explicit state machine — `proposed → approved|rejected`,
 `approved → applied|rejected`, `applied → rolled_back` — enforced by
@@ -638,18 +621,18 @@ can never apply something nobody approved (`av improver review ID --approve|--re
 `improver_id`), marks the change set `applied`, records the previous pointer as
 `.av/improver/last_good`, and advances `.av/improver/current`. Scope note: this records
 the version/lineage transition and its audit trail; executing a diff's content inside an
-isolated sandbox is `av sandbox run` (R5, todo.md G.29) — a future step can run that
-first and then call `apply` to make the result official. `av improver rollback [--to ID]`
+isolated sandbox is `av sandbox run` — a future step can run that first and then call
+`apply` to make the result official. `av improver rollback [--to ID]`
 is the one-command undo: resets `.av/improver/current`, defaulting to `last_good`.
 
-## Dual-Gate Promotion Contract (v1.3.1, RSI R1)
+## Dual-Gate Promotion Contract (RSI)
 
 Aether-Vault now has TWO independent promotion gates, deliberately living in separate
 files rather than one merged envelope:
 
 | Gate | Command | Rule file | Enforcement |
 |---|---|---|---|
-| Model | `av promote` | `.av/policies.json` | Client-side (unchanged since v1.2.0) |
+| Model | `av promote` | `.av/policies.json` | Client-side |
 | Improver | `av improver promote` | `.av/improver_policy.json` | Client-side evaluation + server-side scope on the artifacts it reads |
 
 They were considered as one `policy_version: 2` envelope and rejected: every existing
@@ -668,7 +651,7 @@ improver-side analogue of a model branch ref, though nothing else currently read
 (a future WebUI/CLI surface can). Denial exits 16 (`policy_denied`, shared with the model
 gate — this is the SAME kind of decision, just over a different artifact).
 
-## Signed Policy Pack Contract (v1.3.1, RSI R1: todo.md C.13/I.39)
+## Signed Policy Pack Contract (RSI)
 
 A policy pack is a PUBLISHED SNAPSHOT of some policy state (typically `.av/policies.json`
 and/or `.av/improver_policy.json`, though `av policy pack publish` accepts any JSON
@@ -688,7 +671,7 @@ both the recomputed `chain_hash` and the embedded signature. `POST /api/policy-p
 requires the `policy:write` scope server-side (see Token scopes, above) — this is one of
 the routes the client-side/server-side authz split now genuinely differs on.
 
-## Capability Canary Contract (v1.3.1, RSI R1: todo.md B.9/C.14)
+## Capability Canary Contract (RSI)
 
 A canary suite is a small, fixed set of metric-threshold checks that must not regress —
 `{"checks": [{"name", "metric", "op", "threshold"}, ...]}`, evaluated against the CURRENT
@@ -698,16 +681,16 @@ not reimplemented). `av canary register NAME FILE` content-addresses the suite a
 it locally and, when an improver id is known and the registry is reachable, reports the
 result via `POST /api/canary-results` (`canary_results`: `project_id`, `improver_id`,
 `suite_object_id`, `passed`, `details`, best-effort — a failed report never fails the
-canary run itself, mirroring `_report_policy_outcome`'s telemetry-only contract). This is
-the v1.3.1 scope: a canary that needs to actually EXECUTE arbitrary code (a held-out
-benchmark script, a full eval harness) is `av sandbox run` (R5) reporting through this
-exact same endpoint — the check-evaluation path here and the sandboxed-execution path
-there converge on one result shape.
+canary run itself, mirroring `_report_policy_outcome`'s telemetry-only contract). A
+canary that needs to actually EXECUTE arbitrary code (a held-out benchmark script, a
+full eval harness) is `av sandbox run` reporting through this exact same endpoint — the
+check-evaluation path here and the sandboxed-execution path there converge on one
+result shape.
 
-## Project Freeze Contract (v1.3.1, RSI R1: todo.md C.15/I.40)
+## Project Freeze Contract (RSI)
 
-Global per-project kill-switch, scoped PRECISELY per todo.md C.15 ("no promotes, no
-self-edits, only read + rollback") — not a blanket gate over every CLI invocation.
+Global per-project kill-switch, scoped precisely to "no promotes, no
+self-edits, only read + rollback" — not a blanket gate over every CLI invocation.
 `freeze_guard()` (`cmd_freeze.py`) is called explicitly from exactly the promotion/self-
 edit gate commands: `av promote`, `av improver register/propose/apply`, `av policy pack
 publish`. It is deliberately NOT wired into `_AuthRetryGroup.invoke()` as a hook over
@@ -730,70 +713,70 @@ is a documented, deliberate trade-off, the same kind the model policy gate's own
 `av improver rollback` in one command — freeze first, so nothing new can land while the
 rollback itself is in flight.
 
-## Eval Registry & Integrity Contract (v1.3.1, RSI R2, migration 0007)
+## Eval Registry & Integrity Contract (RSI, migration 0007)
 
 A task/eval suite (`eval_suites`) is content-addressed exactly like an improver version —
 `av eval register NAME FILE [--blind]` writes a CAS object, uploads it, and indexes it
-server-side with `frozen`/`blind` flags. **Eval immutability locks (todo.md B.7):**
+server-side with `frozen`/`blind` flags. **Eval immutability locks:**
 `PUT /api/eval/suites/{id}` (the only route that can change `object_id`/metadata) returns
 `409` unconditionally once `frozen=true` — a training run cannot modify the eval it is
 scored against, enforced server-side, not by convention. `av eval freeze ID` sets that
 flag; there is no unfreeze route (freezing is one-way by design).
 
-**The held-out eval vault (todo.md F.25) is the token-scope mechanism, not a separate
+**The held-out eval vault is the token-scope mechanism, not a separate
 one:** `POST /api/eval/results` requires the `scorer` scope. Operationally this means
 pointing the training agent's token at a project/token pair with no `scorer` scope and a
-scorer's token at one that has it — the SAME `require_scope()` machinery introduced for
+scorer's token at one that has it — the same `require_scope()` machinery introduced for
 freeze/policy-pack routes (see Token scopes, above) is what makes the vault a vault, not a
 new isolation mechanism. `av eval:write` similarly gates suite registration/freezing.
 
-**Blind / delayed scoring (todo.md F.26):** a `blind` suite's results are created with
+**Blind / delayed scoring:** a `blind` suite's results are created with
 `revealed=False`; `GET /api/eval/results` redacts `score`/`details` to `null` (while still
-reporting a result EXISTS) for any reader whose token lacks the `scorer` scope — the
+reporting a result exists) for any reader whose token lacks the `scorer` scope — the
 agent sees its own training metrics live, the held-out score only after
 `av eval reveal RESULT_ID` (also `scorer`-scoped). `_eval_result_to_dict(r, redact=...)` is
 the single function both the redacted and full renderings go through, so there is exactly
 one code path to audit for a leak, not two independently-maintained ones.
 
-**External eval adapters (todo.md F.27):** `av eval adapter add NAME --command "..."`
+**External eval adapters:** `av eval adapter add NAME --command "..."`
 registers a subprocess contract (`eval_adapters.command`, a JSON argv list) so a
 benchmark's pass/fail can't be silently redefined by whatever happens to be checked into
 the training repo at the time — `av eval adapter run NAME [--input FILE]` pipes JSON to
 the adapter's stdin and requires JSON back on stdout with exit 0; a non-zero exit is
 treated as a failed scoring, not swallowed.
 
-**Reproducible scoring runs (todo.md F.28):** `av run start --kind scoring` requires BOTH
+**Reproducible scoring runs:** `av run start --kind scoring` requires both
 an env snapshot (`av env snapshot` first) and a pinned git revision
 (`core.capture_code_pointer()` must find a real `git_sha`) — rejected with `validation`
-(exit 15) up front rather than silently accepted and discovered irreproducible only when
-someone actually needs to re-run the score. `kind ∈ {train, meta, scoring, eval}` rides
+(exit 15) up front rather than discovered irreproducible only when someone needs to
+re-run the score. `kind ∈ {train, meta, scoring, eval}` rides
 `runs.kind` (migration 0006); `scoring`/`eval` are the two kinds this contract cares about.
 
-**Metric-gaming detection signals (todo.md B.10):** `av run integrity-check RUN_ID --suite
+**Metric-gaming detection signals:** `av run integrity-check RUN_ID --suite
 SUITE_ID` compares the run's `metrics_summary` (training-time metrics) against the most
-recent REVEALED eval result for that suite+run, flags any metric whose relative gap
+recent revealed eval result for that suite+run, flags any metric whose relative gap
 exceeds 20%, and reports the comparison via `POST /api/runs/{id}/integrity-signals` —
 best-effort telemetry (`runs.integrity_signals`, migration 0007), never a gate, same
-contract as `policy-outcome`. Two signals this cycle deliberately reports as explicit
+contract as `policy-outcome`. Two signals deliberately report as explicit
 `false`/`null` rather than guessing: `eval_only_improvement` (needs a training-metric time
 series this one-shot comparison doesn't have) and `data_overlap` (needs eval suites to
 declare the dataset object hashes they're built from, which isn't modeled yet) — an honest
 "not yet computed" beats a fabricated zero that would look like a clean bill of health.
 
-**Curriculum tasks (todo.md B.8):** `av task propose/list/accept/reject` — a lightweight
+**Curriculum tasks:** `av task propose/list/accept/reject` — a lightweight
 `proposed → accepted|rejected` record (`tasks`), independent of the eval-suite machinery
-above; a task is a proposal for what to build an eval suite FOR, not a suite itself.
+above; a task is a proposal for what to build an eval suite for, not a suite itself.
 
-## Research Control Contract (v1.3.1, RSI R3, migration 0008)
+## Research Control Contract (RSI, migration 0008)
 
-**Experiment plans (todo.md D.16):** `av plan create/show/attach/validate` — a plan
+**Experiment plans:** `av plan create/show/attach/validate` — a plan
 (hypotheses, ablations, budget, stop rules) is a CAS object, same pattern as an improver
 manifest; `validate` is a pure local structural check (no network) so an agent can sanity
 a plan before ever registering it. `attach` (`POST /api/runs/{id}/plan`) is deliberately
 usable both before AND after `av run start` — real planning happens both ways, and there
 is no reason to force a plan to exist before a run can begin.
 
-**Budget accounts (todo.md D.17):** `budgets` scopes to one run or a whole lineage
+**Budget accounts:** `budgets` scopes to one run or a whole lineage
 (`scope ∈ {"run","lineage"}`, `scope_ref` = a run id either way) with three independent
 dimensions — compute seconds, storage bytes, steps — each an optional limit. `POST
 /api/budgets/{id}/consume` increments usage counters via `SELECT ... FOR UPDATE` (same
@@ -806,10 +789,10 @@ the record must survive even when it turns out to be over the limit) and only th
 `error.code=="budget_exhausted"`, `error.data` carrying the full updated row so a caller
 doesn't need a second round trip to see what was actually spent. This matches every other
 non-zero exit code's `ok:false` contract; `unreachable_queued`'s exit-0-on-success shape
-(queued work is a SAFE, complete outcome) is the one documented exception to it, not a
+(queued work is a safe, complete outcome) is the one documented exception to it, not a
 precedent this code follows.
 
-**Branch exploration policy (todo.md D.18):** `av run branch-policy set/show/check` is
+**Branch exploration policy:** `av run branch-policy set/show/check` is
 advisory-only by design — `.av/branch_policy.json` (`{branch_if, merge_if, abandon_if}`,
 each `{metric, op, threshold}`, reusing `cmd_policy.py`'s own `_OPS` comparison table) is
 evaluated against a run's LIVE `metrics_summary` and returns a recommendation
@@ -819,10 +802,10 @@ branches, merges, or stops anything — those remain separate, deliberate calls
 abandon a promising run on its own would be a worse failure mode than one that sometimes
 has to be told twice.
 
-**Auto-stop conditions (todo.md D.19):** `av run auto-stop-check RUN_ID --metric NAME
+**Auto-stop conditions:** `av run auto-stop-check RUN_ID --metric NAME
 [--stop]` is a one-shot check an external loop re-invokes periodically (`av watch`, a
-scheduler, a cron) — not a daemon of its own. It reuses the EXISTING uncapped per-commit
-metric series (`GET /api/runs/{id}/metrics`, v1.3.0) rather than tracking a second copy of
+scheduler, a cron) — not a daemon of its own. It reuses the existing uncapped per-commit
+metric series (`GET /api/runs/{id}/metrics`) rather than tracking a second copy of
 training history anywhere, and checks three conditions in priority order: `nan` (any
 NaN value ever reported), `divergence` (the latest value is worse than the best-seen value
 by more than `--divergence-factor` × the best value's own scale — scale floors at 1.0 so a
@@ -831,7 +814,7 @@ divergent), `plateau` (no improvement over the best-seen-before-the-tail across 
 `--patience` points). `--stop` (default off — report-only) calls the same
 `POST /api/runs/{id}/stop` the scheduler hooks below use.
 
-**Scheduler hooks (todo.md D.20):** `POST /api/runs/{id}/stop` sets `status="stopped"` —
+**Scheduler hooks:** `POST /api/runs/{id}/stop` sets `status="stopped"` —
 deliberately a THIRD terminal state alongside `"completed"`/`"failed"`, so a lineage query
 can tell "the training genuinely failed" apart from "something outside the run (a
 scheduler, an auto-stop check) decided to end it," with `stop_reason` recording why.
@@ -841,16 +824,16 @@ endpoint models "what's currently in flight." No new event kind: a stop rides th
 existing `run` event kind's `action` field, so anything already polling
 `GET /api/events?kinds=run` sees it for free.
 
-## Multi-Agent & Strategy Memory Contract (v1.3.1, RSI R4, migration 0009)
+## Multi-Agent & Strategy Memory Contract (RSI, migration 0009)
 
-**Causal run graphs (todo.md E.21):** `av lineage link --cause-type change_set|commit
+**Causal run graphs:** `av lineage link --cause-type change_set|commit
 --cause REF --metric NAME [--delta X] [--verified]` records an explicit, agent-authored
 (or independently verified) claim — "this change caused that metric delta" — beyond the
 bare `parent_run_id` pointer lineage already had. `causal_links` is a flat, append-only
-log (`av lineage show [--cause REF]` filters it); nothing currently computes these
-automatically, matching the todo.md wording ("agent-authored + optional verified").
+log (`av lineage show [--cause REF]` filters it); nothing computes these automatically —
+links are agent-authored, with an optional independently-verified flag.
 
-**Strategy memory (todo.md E.22):** `av strategy add TECHNIQUE --outcome
+**Strategy memory:** `av strategy add TECHNIQUE --outcome
 worked|failed|inconclusive [--hyperparameters JSON] [--data-mix JSON] [--run ID]...` is a
 searchable record beyond `.avh`'s per-repo context-memory notes — `av strategy search
 [--technique] [--outcome] [--q SUBSTRING]` queries across the whole project, not just the
@@ -858,24 +841,22 @@ current checkout. `q` does a simple case-insensitive substring match over `techn
 (`ilike`) rather than a full-text engine — the searchable store this item asks for, sized
 for a table an agent skims, not one it fuzzy-searches at scale.
 
-**Distilled lessons (todo.md E.23):** `av lessons update FILE` publishes a new CAS-object
+**Distilled lessons:** `av lessons update FILE` publishes a new CAS-object
 version of the project's "what we believe now" document; `av lessons show` resolves the
 latest by `created_at`, same `/latest` pattern as policy packs (migration 0006) minus the
 hash-chain — lessons revise freely, they are not a tamper-evident policy log. `runs.lessons_id`
 (this run's agent read this version before starting) exists in the schema for a future
-`av run start --require-lessons-read` warn-don't-block check; not yet wired into `av run
-start` itself this cycle — an honest scope note, not a silent gap (the column is real, the
-CLI enforcement is the one todo.md E.23 sub-item this pass left for the wrap-up docs to
-name explicitly rather than build speculatively into an already-large `run start`).
+`av run start --require-lessons-read` warn-don't-block check; the column is real, that CLI
+enforcement is not yet wired into `av run start` itself.
 
-**Cross-run search (todo.md E.24):** `av search runs --metric NAME --direction up|down
+**Cross-run search:** `av search runs --metric NAME --direction up|down
 [--min-delta X]` — e.g. "all runs where eval_acc rose after the change that produced
 them." Deterministic and structured (fixed query parameters, not a free-text/LLM query
 grammar): `GET /api/search/runs` scans one project's runs (bounded at 500, newest-first)
 and compares each to its PARENT run's latest value for the same metric — no external
 index, no vector store, exactly the shape needed at the scale this tool targets.
 
-**Reviewer gate + critiques (todo.md H.34/H.35):** `av review approve|reject TARGET_ID
+**Reviewer gate + critiques:** `av review approve|reject TARGET_ID
 [--target-type change_set|improver]` requires the `review` scope AND rejects a
 self-review (the target's own proposer) with 422 — "another agent (or human) must
 approve" is an enforced server-side fact, not a client-side convention. `reviews` and
@@ -891,15 +872,15 @@ signed off yet" needs a different remediation than "the metrics/signature don't 
 `review` scope only) are deliberately different verbs: waiving means the objection STANDS
 but is overridden, always audited (`critique.waived`), never a silent bypass.
 
-**Shared blackboard (todo.md H.36):** `av blackboard post CLAIM [--evidence type:ref]...`
+**Shared blackboard:** `av blackboard post CLAIM [--evidence type:ref]...`
 / `list [--status]` / `resolve ID` — a durable claim store beyond the ordered event
 stream, for hypotheses that outlive any single event (`evidence` is a flat
 `[{"type","ref"}]` list, not a foreign-keyed join, matching this schema's shallow-write
 convention throughout).
 
-## Sandbox Execution Contract (v1.3.1, RSI R5, migration 0010)
+## Sandbox Execution Contract (RSI, migration 0010)
 
-**Sandbox executor (todo.md G.29):** `python/av_cli/sandbox/` defines one driver
+**Sandbox executor:** `python/av_cli/sandbox/` defines one driver
 protocol (`base.py::SandboxDriver` — `submit`/`status`/`cancel`/`logs`) resolved by name
 via `get_driver(name, repo_root)`. `local` (`drivers/local.py`) is deliberately
 **synchronous** — it runs the real command inside `submit()` via `subprocess.run()` and
@@ -914,7 +895,7 @@ submit-and-wait into one call — see `base.py`'s module docstring for the full 
 `sandbox_jobs` (`POST/GET /api/sandbox/jobs`) after the local operation completes, never
 blocking it — a reporting failure never masks or reverses a real sandbox result.
 
-**Tool permission manifests (todo.md G.30):** a per-improver-version allowlist CAS object
+**Tool permission manifests:** a per-improver-version allowlist CAS object
 (`sandbox/manifest.py`) — `{"writable_paths": [glob,...], "network": "none"|"bridge",
 "network_destinations": [...], "gpu": bool}` — stored locally at
 `.av/tool_manifests/<improver_id>.json` and optionally published to `tool_manifests`
@@ -932,7 +913,7 @@ keep). `av tools manifest show/set/verify` — `verify` is a pure dry-run that t
 nothing, letting an agent check a prospective job against a manifest before ever
 submitting it.
 
-**Deterministic action replay (todo.md G.31):** `.av/actions.jsonl`
+**Deterministic action replay:** `.av/actions.jsonl`
 (`python/av_cli/actionlog.py::log_action()`) is an append-only per-decision log — the same
 shape `.avh`'s `.av/context/memory.jsonl` already established for free-text agent notes,
 applied here to structured `{"ts","actor","action","details","command"}` entries instead.
@@ -945,7 +926,7 @@ default, not configurable per-invocation) comparing exit codes against what was 
 recorded, so replay can prove a training agent's non-training DECISIONS were reproducible,
 not just its training code.
 
-**Resource controller integration (todo.md G.32):** `drivers/kubernetes.py`
+**Resource controller integration:** `drivers/kubernetes.py`
 (`kubectl apply -f -` / `get pod -o jsonpath` / `delete pod --now` / `logs`) and
 `drivers/slurm.py` (`sbatch` a generated batch script / `squeue --name` falling back to
 `sacct --name` for completed jobs / `scancel --name`) implement the identical protocol,
@@ -959,10 +940,9 @@ what's in flight regardless of which backend is running it.
 
 **Migration 0010** adds `sandbox_jobs`, `tool_manifests`, and `action_logs` — no columns on
 any existing table, since a sandbox job, manifest, or action log is always independently
-addressable and never mandatory context for a run the way `runs.plan_id`/`runs.budget_id`
-were in R3.
+addressable and never mandatory context for a run the way `runs.plan_id`/`runs.budget_id` are.
 
-## RSI SDK Surface Contract (v1.3.1, RSI R6, WP-37)
+## RSI SDK Surface Contract
 
 `av_sdk.Repo` gained one method per WRITE operation an autonomous loop actually needs to
 ACT on its own self-improvement cycle: `improver_register/propose/review/apply/rollback/
@@ -980,8 +960,7 @@ module had already factored that logic out of its click function body independen
 this work (`current_improver_id`, `_evaluate_improver_policy`, `project_frozen`,
 `latest_canary_passed`, `_hash_paths`, `_report_job`/`_report_status`, every `casobj.*`
 function) — this is `commit_staged()`'s single-code-path principle applied to the RSI
-surfaces. **Found live while writing this section's own tests**
-(`tests/test_av_sdk_rsi.py`): a handful of those "already-factored-out" helpers
+surfaces. A handful of those "already-factored-out" helpers
 (`_transition`, `_set_freeze`, `freeze_guard`) still call the CLI's `fail()`, which raises
 a bare `SystemExit` — correct for a click command (the whole process is expected to exit
 with that code) but wrong for a library call, which must raise something the caller can
@@ -1003,13 +982,11 @@ one reaches it via `self._client()` directly or the CLI. `av improver policy set
 remove` (local-only config, never a network call) is CLI/SDK-`self._client()`-only for the
 same reason.
 
-**The two pre-existing SDK/CLI divergences this closes:** `run_start()` never captured
-`code_pointer` (fixed earlier in this cycle via `core.capture_code_pointer()`, R1);
-`context_note()` omitted `run_id`, unlike `cmd_context.py::note()` (which has always
-stamped it via `resolve_run_id()`) — fixed here, and `tests/test_av_sdk.py`'s parity test
-(which had pinned the WRONG, incomplete shape) corrected alongside it.
+`run_start()` captures `code_pointer` via `core.capture_code_pointer()`; `context_note()`
+stamps `run_id` via `resolve_run_id()`, matching `cmd_context.py::note()` exactly — the
+SDK and CLI carry identical shapes here, pinned by `tests/test_av_sdk.py`'s parity test.
 
-## Anomaly Alerts Contract (v1.3.1, RSI R6, WP-36, todo.md I.38)
+## Anomaly Alerts Contract (RSI)
 
 Four server-side detectors, each emitting a `kind="anomaly"` event (payload always
 carries a `"type"` discriminator) ALONGSIDE whatever event the mutation already emits —
@@ -1029,11 +1006,11 @@ wraps its own body in a bare `except Exception` (logged, not raised): a detector
 never turn into a failed commit. The auth-spike counter (`_AUTH_FAILURE_WINDOW`) defaults
 to **in-process** — a single-process best-effort "this process just saw a burst" signal,
 not a durable security record (the audit log via `_audit()` already *is* the durable
-per-denial record; this only decides when a BURST of denials is itself worth one
-dedicated event). **v1.3.2 update**: under N replicas the in-process counter is wrong by
+per-denial record; this only decides when a burst of denials is itself worth one
+dedicated event). Under N replicas the in-process counter is wrong by
 construction (each replica sees only its own share of the burst) — `AV_AUTH_SPIKE_BACKEND=redis`
-(default `memory`, byte-identical to this original design) switches to a Redis-backed
-atomic counter for exactly that topology; see the HA Contract below. The window clears
+(default `memory`) switches to a Redis-backed atomic counter for exactly that topology;
+see the HA Contract below. The window clears
 the moment it trips, so one burst raises exactly one anomaly rather than one per
 subsequent failure — a consumer wanting a per-request feed already has the audit log for
 that.
@@ -1045,7 +1022,7 @@ went through a canary at all). No statistical baseline/rolling-average model bac
 either; tightening them from a fixed constant to something adaptive is future work, not
 attempted this cycle.
 
-## Identity & Session Contract (v1.3.2, migration 0011)
+## Identity & Session Contract (migration 0011)
 
 Identity moves from a `.env` JSON blob (`AV_API_TOKEN`/`AV_AUTH_USERS`, still fully
 supported, unchanged) into the database — `tenants`/`users`/`user_identities`/`groups`/
@@ -1059,38 +1036,37 @@ authenticate on a replica that already cached it until that TTL expires (documen
 residual risk, `development/threat-model.md` T17).
 
 **Additive by construction**: an unconfigured deployment (no DB tokens ever minted) is
-byte-identical to pre-v1.3.2 — `.env`-based auth resolves first and is untouched;
-`identity.py` only activates for a bearer value that doesn't match `AV_API_TOKEN`/
-`AV_AUTH_USERS` and DOES hash-match a live `api_tokens`/`sessions` row.
+byte-identical to a `.env`-only setup — `.env`-based auth resolves first and is
+untouched; `identity.py` only activates for a bearer value that doesn't match
+`AV_API_TOKEN`/`AV_AUTH_USERS` and DOES hash-match a live `api_tokens`/`sessions` row.
 
 **Verified:** `tests/test_rbac.py` (all 5 resolution paths, cache TTL/invalidation),
 live 403/revocation proofs in `tests/test_server.py::TestApiTokens`.
 
-## RBAC Contract (v1.3.2)
+## RBAC Contract
 
-`require_scope()` (v1.3.0, unchanged) keeps working exactly as before — every existing
+`require_scope()` keeps working exactly as before — every existing
 call site, every existing token. `identity.Principal.scopes` for a DB-backed token is the
-UNION of the token's own explicit `scopes` and every permission granted by its
+union of the token's own explicit `scopes` and every permission granted by its
 `role_bindings` (tenant-scoped or project-scoped). Remote admin surface: `/api/tenants*`,
 `/api/users*`, `/api/roles*`, `/api/role-bindings*`, `/api/tokens*` (all `admin`-scoped),
 and the CLI groups `av tenant`/`av user`/`av role`/`av token` — the thing that removes
 "you need shell access to the Docker host to add a user," which the OSS `av auth` path
 still requires by design.
 
-Six previously-UNSCOPED admin routes (`POST /api/admin/gc`, `GET`/`DELETE
-/api/admin/audit`, `/api/admin/audit/export`, `/api/admin/webhook-deliveries*`) now
-require `admin` — a real, pre-existing gap closed this pass, additive-safe because a
-token with no explicit `scopes` still resolves to `["*"]` (the same trick v1.3.1's own
-scope rollout used, so no already-working token loses access).
+Six admin routes (`POST /api/admin/gc`, `GET`/`DELETE
+/api/admin/audit`, `/api/admin/audit/export`, `/api/admin/webhook-deliveries*`)
+require `admin` — additive-safe because a
+token with no explicit `scopes` still resolves to `["*"]`, so no already-working token loses access.
 
 **Verified:** `tests/test_server.py::TestTenantsUsersRoles`/`TestApiTokens` (live, real
 Postgres) — role-binding-derived permissions, token-explicit-scope permissions, revoked/
 suspended-user cascades, `test_admin_routes_still_open_for_legacy_tokens`.
 
-## Tenancy Isolation Contract (v1.3.2, migrations 0012–0015)
+## Tenancy Isolation Contract (migrations 0012–0015)
 
 Master switch: `AV_TENANCY_ENFORCE` (server env var, default `0`) — off, every route
-behaves exactly as pre-v1.3.2, no exceptions. Three independent layers when on:
+behaves as if tenancy didn't exist, no exceptions. Three independent layers when on:
 
 1. **Application guard** — `_enforce_project_tenant`, a GLOBAL FastAPI dependency
    (`app = FastAPI(..., dependencies=[Depends(_enforce_project_tenant)])`) rather than a
@@ -1142,10 +1118,10 @@ not fixture shortcuts) plus `tests/test_tenancy_coverage.py` (static: the depend
 genuinely global, takes no eager DB param so `/api/health` stays DB-free, and
 `AV_TENANCY_ENFORCE` defaults off).
 
-## High Availability Contract (v1.3.2)
+## High Availability Contract
 
 Three in-process-state hazards fixed, each opt-in (default `memory`, byte-identical to
-pre-v1.3.2 under N=1 replica):
+a single replica's behavior under N=1):
 
 | Hazard | Fix | Flag |
 |---|---|---|
@@ -1173,15 +1149,15 @@ scope decision, not an oversight — see the chart's own README).
 topology — not simulated) plus `tests/test_rate_limit.py`'s `RedisWindowRateLimiter`
 suite (7 tests against a fake async Redis client).
 
-## Backup & Disaster Recovery Contract (v1.3.2)
+## Backup & Disaster Recovery Contract
 
 `av admin backup create/verify/restore` (`cmd_admin.py`) — `pg_dump -Fc` + a gzip'd CAS
 objects tar + a `backup-manifest-1.0` manifest (sha256/bytes of both parts, alembic head,
 tenant list, approximate row counts via `pg_stat_user_tables.n_live_tup`, never a
 COUNT(*) sweep). Deliberately requires an EXPLICIT `--database-url`/`--db-container` —
 no auto-detection of "the local docker stack" the way `av auth` does, because an
-auto-detecting DESTRUCTIVE command (`restore` can overwrite a real database) is exactly
-the incident class this repo hit once already (see `development/CHANGELOG.md` Phase 60).
+auto-detecting destructive command (`restore` can overwrite a real database) is a real
+incident class (see `development/CHANGELOG.md` Phase 60).
 `restore` refuses a non-empty target without `--force`, then runs the same schema-healing
 path (`init_db()`'s own `_apply_schema`) the server's own boot uses, so a backup taken on
 an older migration chain still lands at the current build's head.
@@ -1194,7 +1170,7 @@ covers argument validation, manifest tamper-detection, and the force-refusal con
 with mocked subprocess calls (no Postgres/Docker needed for that layer). See
 [`docs/dr.md`](../docs/dr.md) for the measured-RTO/stated-RPO distinction.
 
-## Audit Log Hash-Chain Contract (v1.3.3, WP-32, migration 0016)
+## Audit Log Hash-Chain Contract (migration 0016)
 
 Makes `SECURITY.md`'s audit-logging claim true. `audit_log` gains `chain_hash` (NOT
 NULL) and `signature` (nullable). Unlike `policy_packs`' `prev_id`+`chain_hash` (a
@@ -1246,7 +1222,7 @@ Postgres) — an untampered chain verifies ok, a directly-tampered row is caught
 exact broken id, two audit rows written in the SAME flush still chain correctly, and a
 configured signing key produces signatures that verify against the published public key.
 
-## Metrics Contract (v1.3.3, WP-35)
+## Metrics Contract
 
 `GET /api/metrics` — hand-rolled Prometheus text exposition, the same "no new
 dependency" judgment call `rate_limit.py` already made for its own limiter
@@ -1279,7 +1255,7 @@ across replicas. See `docs/slo.md` for what this does and does not yet back.
 Prometheus text, correctly counts a known number of requests by path/status, and reports
 webhook queue depth and DB pool state.
 
-## Per-Tenant CAS Isolation Contract (v1.3.3, WP-21)
+## Per-Tenant CAS Isolation Contract
 
 Completes the schema prerequisite migration `0014` shipped (widening `objects`/`trees`'
 primary keys to include `tenant_id`) with the actual feature: `AV_CAS_ISOLATION`
@@ -1293,8 +1269,8 @@ second tenant's upload); this contract is that complete package.
 **Shared mode (default) is untouched, byte-for-byte.** Every existence check
 (`upload_object`/`head_object`/`POST /api/sync/batch-objects`/`build_merkle_tree`/
 `_object_exists`, the last one shared by ~10 RSI-artifact routes) stays completely
-UNFILTERED by tenant — a global check across every tenant IS what "shared" means, and
-every pre-v1.3.3 deployment already depends on it for cross-tenant dedup. The
+unfiltered by tenant — a global check across every tenant IS what "shared" means, and
+every deployment already depends on it for cross-tenant dedup. The
 `cas_tenant_id` each of these functions now threads through is simply `None` whenever
 `AV_CAS_ISOLATION != "isolated"`, which every storage/cache method treats as "do exactly
 what I always did."
@@ -1316,7 +1292,7 @@ what I always did."
   lessons, tool manifests, action logs).
 - **GC** (`run_garbage_collection`): the mark phase ALWAYS computes per-tenant alive
   sets now (`alive_by_tenant`), regardless of mode — shared mode's dead-computation uses
-  their UNION (mathematically identical to the pre-v1.3.3 flat computation, since a
+  their UNION (mathematically identical to shared mode's own flat computation, since a
   tenant's own commits only ever reference trees that SAME tenant fully wrote, per the
   single-materialization-path invariant); isolated mode's dead-computation uses each
   row's OWN tenant's alive set specifically. Using the union for isolated-mode dead-
@@ -1344,7 +1320,7 @@ reports "missing" for a tenant that never uploaded the content; and — critical
 control test with NO isolation fixture applied proves shared mode's global dedup 409 is
 completely unchanged.
 
-## SSO Contract (v1.3.3, WP-10–WP-16)
+## SSO Contract
 
 OIDC (authorization-code + PKCE) and SAML 2.0, converging on ONE shared provisioning path
 (`sso_common.py::upsert_user_from_claims`/`issue_session`) so JIT provisioning, group→role
@@ -1412,10 +1388,9 @@ the plaintext secret never appears in the `sso_providers` row on disk. `TestDevi
 create/approve/poll round trip and single-use collection. OIDC/SAML protocol handling
 itself (PKCE, JWKS verification, SAML signature/conditions) is implemented and exercised
 against this server's own routes; NOT yet driven end-to-end against a live external IdP
-in this environment — see `VERSIONING.md`'s v1.3.3 section for the honest scope of that
-gap.
+in this environment — see `VERSIONING.md`'s known-limitations note under SSO/SCIM.
 
-## SCIM 2.0 Contract (v1.3.3, WP-17)
+## SCIM 2.0 Contract
 
 `/scim/v2/*` (RFC 7643/7644) — deliberately its own module (`scim.py`), imported at
 module level (no optional dependency; it uses only core, already-required packages)
@@ -1474,36 +1449,36 @@ its bound role's permissions to its members, end to end.
 | Registry primitives | `tests/test_registry.py` | Ref namespacing and project-scoped lookups |
 | Stash / fs utilities / repl / graph / ui | `tests/test_stash.py`, `tests/test_fsutil.py`, `tests/test_repl.py`, `tests/test_graph.py`, `tests/test_ui.py` | Supporting-surface coverage |
 | Runtime plumbing | `tests/test_docker_runtime.py`, `tests/test_update_check.py`, `tests/test_speedcheck.py`, `tests/test_tool_runner.py`, `tests/test_dependency_guards.py` | Container control, update checks, speed budgets, benchmark tool runner, optional-dependency guards |
-| Plugins | `tests/test_plugins.py` | Callback + import paths with framework extras installed; v1.2.2 seam-parity tests (seam vs SDK vs CLI, AV_RUN_ID + metrics flow) |
+| Plugins | `tests/test_plugins.py` | Callback + import paths with framework extras installed; seam-parity tests (seam vs SDK vs CLI, AV_RUN_ID + metrics flow) |
 | Signed commits | `tests/test_signing.py` | Keygen/roundtrip/tamper/unsigned-ok + canonical-bytes golden fixtures + verify CLI; skips without the `[sign]` extra (CI plugin job installs it) |
 | Dataset CDC matrix | `tests/test_dataset_cdc.py` | Boundary stability/determinism across every CHUNKABLE_EXT + `.avattributes` enforcement matrix |
-| V1.2.2 units | `tests/test_v122.py` | dedup_efficiency→.avh flow, avh schema-file validation path, audit-list param contract |
-| Agent surface (v1.2.0) | `tests/test_v120.py`, `tests/test_av_sdk.py`, `tests/test_semdiff.py`, `tests/test_webhooks_cli.py` | Envelope/exit codes, SDK seam, semdiff math, webhooks CLI |
-| RSI R1 — CAS objects | `tests/test_casobj.py` | Canonicalization, id/round-trip, sign/verify, signing.py delegation guard |
-| RSI R1 — improver lifecycle | `tests/test_improver.py` | register/list/show/lineage/current/use, propose→review→apply→rollback, dual-gate promote, in-memory fake registry |
-| RSI R1 — canaries | `tests/test_canary.py` | Check evaluation against HEAD metrics (reuses `cmd_policy._OPS`), offline degrade-gracefully reporting |
-| RSI R1 — freeze | `tests/test_freeze.py` | fail-open when unreachable, gate commands blocked/exempt, `av incident rollback` |
-| RSI R1 — policy packs | `tests/test_policy_pack.py` | Chain-hash computation, publish/show/log/verify, freeze gating |
-| RSI R1 — server routes (live) | `tests/test_server.py::TestImproverVersions/TestChangeSets/TestPolicyPacks/TestCanaryResults/TestProjectFreeze` | Idempotent create, 422s on unresolved object ids, the change-set transition state machine, chain-hash formula, scope 403s (`policy:write`/`admin`) |
-| RSI R1 — scopes | `tests/test_scopes.py` | `_parse_auth_users` scopes parsing (additive), `_scopes_for_identity` defaults, `require_scope()` allow/deny/audit against a stub session |
-| RSI R2 — eval registry | `tests/test_eval.py` | register/list/show/freeze, blind score+reveal, adapter add/list/run (subprocess contract, non-zero exit), scope denials |
-| RSI R2 — curriculum tasks | `tests/test_task.py` | propose/list/accept/reject, status filtering |
-| RSI R2 — run integrity | `tests/test_run_integrity.py` | `--kind scoring`'s env-snapshot+git-sha gate, `integrity-check`'s gap flagging and unrevealed-result exclusion |
-| RSI R2 — server routes (live) | `tests/test_server.py::TestImproverVersions`…(R1 classes, see above) plus eval-suite/-result/-adapter/task route coverage to add alongside R2's live verification pass | Frozen-suite 409, `scorer`/`eval:write` 403s, blind-result redaction, adapter/task CRUD |
-| RSI R3 — plans/budgets | `tests/test_plan_budget.py` | Plan validate/create/show/attach, budget set/show/attach/consume, exit-17 on exhaustion |
-| RSI R3 — branch-policy/auto-stop/scheduler | `tests/test_run_scheduler.py` | Advisory branch-policy recommendation ordering, plateau/divergence/NaN detection (both minimize/maximize directions), scheduler queue listing |
-| RSI R4 — reviewer gate + critiques | `tests/test_review.py` | Approve/reject, scope denial (403->20), self-review rejection, critique add/list/resolve/waive, terminal-state 409 |
-| RSI R4 — lineage/search/strategy/lessons/blackboard | `tests/test_lineage_strategy_lessons_blackboard.py` | Causal link record/list, structured cross-run search, strategy add/search/show, lessons update/show (incl. none-published), blackboard post/list/resolve, malformed-evidence validation |
-| RSI R4 — leaked-output regression guards | `tests/test_exit_codes.py::test_policy_denied_exits_16_json`, `tests/test_canary.py`/`tests/test_policy_pack.py`'s JSON-mode exit assertions | Locks in Probleme #131's fix: no command may leak text after its JSON envelope, or disagree between text/JSON mode on an exit code, on a DENY/FAIL outcome specifically |
-| RSI R5 — sandbox protocol + manifests | `tests/test_sandbox.py` | Manifest load/save/corrupt-fallback, `verify_spec_against_manifest` mount/network/gpu escalation checks, `get_driver` resolution for all four names + unknown-name rejection |
-| RSI R5 — sandbox drivers | `tests/test_sandbox_drivers.py` | `local` via real subprocess (success/failure/timeout/cancel/status-replay); `docker`/`kubernetes`/`slurm` via fake-subprocess contract tests (command construction, status parsing, cancel-only-when-running) — no daemon or cluster required |
-| RSI R5 — CLI + action replay | `tests/test_action_replay.py` | `av sandbox run/status/cancel/logs/queue`, `av tools manifest show/set/verify` (incl. `--publish`), `actionlog.py` round-trip, `av replay-actions` incl. `--execute` |
-| RSI R5 — server routes (live) | `tests/test_server.py` (sandbox-jobs/tool-manifests/action-logs routes) | `improver:write`-scoped mutations, id-lookup 404s |
-| RSI R6 — SDK surface | `tests/test_av_sdk_rsi.py` | Full propose→review→apply→canary→promote(deny)→review→promote(allow)→rollback→lessons loop via `av_sdk.Repo` alone; typed-error assertions for `budget_exhausted`/`review_required`/`unreachable_queued`; critique resolve/waive; freeze status/set |
-| RSI R6 — reference loop | `tests/test_rsi_loop.py` | Runs `examples/rsi_loop/agent.py::run_rsi_loop()` stack-free against an in-memory fake registry — the exact function a live run calls, proving the narrative's ordering and every denial without Docker |
-| RSI R6 — anomaly detection (live) | `tests/test_server.py::TestAnomalyDetection` | metric_jump/mass_rewrite on commit push, policy_change on pack publish, auth_spike on a 403 burst (and confirms below-threshold bursts stay silent) |
-| RSI R6 — WebUI Improver/Regression tabs | `webui/` Vitest: `ImproverPanel.test.tsx`, `CanaryPanel.test.tsx`, `RegressionPanel.test.tsx` | Loading/empty/error states, lineage + pending-self-edit filtering, pass/fail badge math, churn tally by status, anomaly-type labeling |
-| Perf gate | `tests/test_perf_gate.py` | speedcheck synthetic probes, median-of-N (v1.2.5) vs. per-class budgets — CPU 2×, disk 3× (+1.5× more on Windows); fails only when the median AND ≥2/N samples exceed budget; `AV_PERF_BUDGET_MULTIPLIER` escape hatch; incl. semdiff, commit_staged, compute_status, log probes |
+| Semantic-diff/audit units | `tests/test_v122.py` | dedup_efficiency→.avh flow, avh schema-file validation path, audit-list param contract |
+| Agent surface | `tests/test_v120.py`, `tests/test_av_sdk.py`, `tests/test_semdiff.py`, `tests/test_webhooks_cli.py` | Envelope/exit codes, SDK seam, semdiff math, webhooks CLI |
+| RSI — CAS objects | `tests/test_casobj.py` | Canonicalization, id/round-trip, sign/verify, signing.py delegation guard |
+| RSI — improver lifecycle | `tests/test_improver.py` | register/list/show/lineage/current/use, propose→review→apply→rollback, dual-gate promote, in-memory fake registry |
+| RSI — canaries | `tests/test_canary.py` | Check evaluation against HEAD metrics (reuses `cmd_policy._OPS`), offline degrade-gracefully reporting |
+| RSI — freeze | `tests/test_freeze.py` | fail-open when unreachable, gate commands blocked/exempt, `av incident rollback` |
+| RSI — policy packs | `tests/test_policy_pack.py` | Chain-hash computation, publish/show/log/verify, freeze gating |
+| RSI — server routes (live) | `tests/test_server.py::TestImproverVersions/TestChangeSets/TestPolicyPacks/TestCanaryResults/TestProjectFreeze` | Idempotent create, 422s on unresolved object ids, the change-set transition state machine, chain-hash formula, scope 403s (`policy:write`/`admin`) |
+| RSI — scopes | `tests/test_scopes.py` | `_parse_auth_users` scopes parsing (additive), `_scopes_for_identity` defaults, `require_scope()` allow/deny/audit against a stub session |
+| RSI — eval registry | `tests/test_eval.py` | register/list/show/freeze, blind score+reveal, adapter add/list/run (subprocess contract, non-zero exit), scope denials |
+| RSI — curriculum tasks | `tests/test_task.py` | propose/list/accept/reject, status filtering |
+| RSI — run integrity | `tests/test_run_integrity.py` | `--kind scoring`'s env-snapshot+git-sha gate, `integrity-check`'s gap flagging and unrevealed-result exclusion |
+| RSI — eval server routes (live) | `tests/test_server.py::TestImproverVersions` plus eval-suite/-result/-adapter/task route coverage | Frozen-suite 409, `scorer`/`eval:write` 403s, blind-result redaction, adapter/task CRUD |
+| RSI — plans/budgets | `tests/test_plan_budget.py` | Plan validate/create/show/attach, budget set/show/attach/consume, exit-17 on exhaustion |
+| RSI — branch-policy/auto-stop/scheduler | `tests/test_run_scheduler.py` | Advisory branch-policy recommendation ordering, plateau/divergence/NaN detection (both minimize/maximize directions), scheduler queue listing |
+| RSI — reviewer gate + critiques | `tests/test_review.py` | Approve/reject, scope denial (403->20), self-review rejection, critique add/list/resolve/waive, terminal-state 409 |
+| RSI — lineage/search/strategy/lessons/blackboard | `tests/test_lineage_strategy_lessons_blackboard.py` | Causal link record/list, structured cross-run search, strategy add/search/show, lessons update/show (incl. none-published), blackboard post/list/resolve, malformed-evidence validation |
+| RSI — leaked-output regression guards | `tests/test_exit_codes.py::test_policy_denied_exits_16_json`, `tests/test_canary.py`/`tests/test_policy_pack.py`'s JSON-mode exit assertions | No command may leak text after its JSON envelope, or disagree between text/JSON mode on an exit code, on a DENY/FAIL outcome specifically |
+| RSI — sandbox protocol + manifests | `tests/test_sandbox.py` | Manifest load/save/corrupt-fallback, `verify_spec_against_manifest` mount/network/gpu escalation checks, `get_driver` resolution for all four names + unknown-name rejection |
+| RSI — sandbox drivers | `tests/test_sandbox_drivers.py` | `local` via real subprocess (success/failure/timeout/cancel/status-replay); `docker`/`kubernetes`/`slurm` via fake-subprocess contract tests (command construction, status parsing, cancel-only-when-running) — no daemon or cluster required |
+| RSI — CLI + action replay | `tests/test_action_replay.py` | `av sandbox run/status/cancel/logs/queue`, `av tools manifest show/set/verify` (incl. `--publish`), `actionlog.py` round-trip, `av replay-actions` incl. `--execute` |
+| RSI — server routes (live) | `tests/test_server.py` (sandbox-jobs/tool-manifests/action-logs routes) | `improver:write`-scoped mutations, id-lookup 404s |
+| RSI — SDK surface | `tests/test_av_sdk_rsi.py` | Full propose→review→apply→canary→promote(deny)→review→promote(allow)→rollback→lessons loop via `av_sdk.Repo` alone; typed-error assertions for `budget_exhausted`/`review_required`/`unreachable_queued`; critique resolve/waive; freeze status/set |
+| RSI — reference loop | `tests/test_rsi_loop.py` | Runs `examples/rsi_loop/agent.py::run_rsi_loop()` stack-free against an in-memory fake registry — the exact function a live run calls, proving the narrative's ordering and every denial without Docker |
+| RSI — anomaly detection (live) | `tests/test_server.py::TestAnomalyDetection` | metric_jump/mass_rewrite on commit push, policy_change on pack publish, auth_spike on a 403 burst (and confirms below-threshold bursts stay silent) |
+| RSI — WebUI Improver/Regression tabs | `webui/` Vitest: `ImproverPanel.test.tsx`, `CanaryPanel.test.tsx`, `RegressionPanel.test.tsx` | Loading/empty/error states, lineage + pending-self-edit filtering, pass/fail badge math, churn tally by status, anomaly-type labeling |
+| Perf gate | `tests/test_perf_gate.py` | speedcheck synthetic probes, median-of-N vs. per-class budgets — CPU 2×, disk 3× (+1.5× more on Windows); fails only when the median AND ≥2/N samples exceed budget; `AV_PERF_BUDGET_MULTIPLIER` escape hatch; incl. semdiff, commit_staged, compute_status, log probes |
 | Web UI units | `webui/` Vitest suite (`npm test`) | Components plus pure logic incl. `diffWeights` and `runDetail` (lineage chain + client-side tree-diff summary) |
 | Web UI browser E2E | `webui/e2e/*.spec.ts` (Playwright, CI `webui-e2e`) | Seeded live stack: dashboard, weight-diff, and Protected-mode token gate |
 | Product E2E scenarios | `scripts/e2e_scenario.sh` (CI `e2e-suite`) | Real CLI ↔ real server: merge collaboration, offline drain, legacy-volume upgrade, per-user auth attribution/revocation, zero-grace GC, SDK loop, event reactiveness, promotion policy, signed roundtrip (J), audit query (K) |

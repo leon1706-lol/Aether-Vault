@@ -1,21 +1,7 @@
-"""av canary — capability canaries (v1.3.1, RSI R1: todo.md B.9/C.14).
-
-A canary suite is a small, fixed set of metric-threshold checks that must not regress —
-evaluated against the CURRENT HEAD commit's metrics using the exact same comparison
-primitives `cmd_policy.py`'s model-gate policies already use (`_OPS`/`evaluate()`), not a
-reimplementation. This is the v1.3.1 scope: a canary suite that needs to actually EXECUTE
-arbitrary code (a held-out benchmark script, a full eval harness) runs inside `av sandbox
-run` (R5, todo.md G.29) and reports its result via the same `POST /api/canary-results`
-this module posts to — the check-evaluation path here and the sandboxed-execution path
-there converge on one result shape, not two.
-
-Suite definition (JSON, content-addressed like everything else — `casobj.py`):
-    {"kind": "canary_suite", "name": "core-capability",
-     "checks": [{"name": "val_loss_not_worse", "metric": "val_loss", "op": "<=",
-                 "threshold": 0.6}, ...]}
-
-Local registry: `.av/canaries.json` maps a human name -> its suite's CAS object id, so
-`av canary run NAME` doesn't require re-passing the file every time.
+"""av canary — capability canaries (v1.3.1): a small, fixed set of metric-threshold checks
+that must not regress, evaluated against HEAD's metrics using the same comparison
+primitives `cmd_policy.py`'s model-gate policies use. Suites are content-addressed
+(`casobj.py`); `.av/canaries.json` maps a human name to its suite's CAS object id.
 """
 import datetime
 import json
@@ -159,9 +145,8 @@ def canary_run(name: str, improver_id: str | None) -> None:
         emit_json(None, "canary run", data={"name": name, "passed": all_passed,
                                             "checks": results, "reported": reported,
                                             "improver_id": improver_id})
-        # v1.3.1 fix: this used to `return` unconditionally here, so a FAILED canary run
-        # in JSON mode exited 0 — the data said passed:false but the exit code lied about
-        # it. Both output modes now share the same exit-code consequence.
+        # Both output modes share the same exit-code consequence -- a failed canary must
+        # not exit 0 just because JSON mode already emitted passed:false.
         if not all_passed:
             ctx_exit(EXIT_VALIDATION)
         return
@@ -208,9 +193,8 @@ def ctx_exit(code):
 
 
 def latest_canary_passed(repo_root, client, project_id: str, improver_id: str) -> bool:
-    """Used by `av improver promote`'s dual gate (`require_canaries` in
-    `.av/improver_policy.json`) — True only when the MOST RECENT canary result for this
-    improver version exists and passed."""
+    """Used by `av improver promote`'s dual gate -- True only when the most recent canary
+    result for this improver version exists and passed."""
     resp = client.session.get(f"{client.server_url}/api/canary-results",
                               params={"project_id": project_id, "improver_id": improver_id,
                                       "limit": 1})

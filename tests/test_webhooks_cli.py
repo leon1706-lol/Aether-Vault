@@ -22,11 +22,8 @@ class FakeSession:
         self.calls = []
 
     def request(self, method, url, json=None, params=None, timeout=None):
-        # v1.3.0: cmd_webhooks.py now routes EVERY network call (including deliveries()/
-        # show()'s GETs) through the shared _request() helper — session.request(), never
-        # a raw session.get() — so this fake no longer needs a separate get() method; a
-        # future direct session.get() call in cmd_webhooks.py would now hit AttributeError
-        # here instead of silently bypassing the fake's call tracking.
+        # cmd_webhooks.py routes every network call through the shared _request() helper
+        # (session.request(), never a raw session.get()), so this fake needs no get() method.
         self.calls.append((method, url, json, params))
         return self.responses.pop(0)
 

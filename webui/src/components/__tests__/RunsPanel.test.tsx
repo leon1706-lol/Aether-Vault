@@ -92,8 +92,8 @@ describe("RunsPanel", () => {
 });
 
 // ---------------------------------------------------------------------------
-// v1.2.5 run detail: ONE request (GET /api/runs/{id}/summary) instead of the old
-// fetchRun()+N×fetchCommit() fan-out; dedicated panel below the table; deep linking.
+// Run detail: one request (GET /api/runs/{id}/summary); dedicated panel below the
+// table; deep linking.
 // ---------------------------------------------------------------------------
 
 describe("RunsPanel detail", () => {

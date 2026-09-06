@@ -1,23 +1,15 @@
 """av registry — backup/export & restore of a remote registry (v1.2.0 trust surface).
-
-Export walks the registry's public API (commits, refs, runs, objects manifest) into a
-portable archive directory; every object shard is downloaded and its hash RE-VERIFIED
-during download, so an archive is self-validating. Restore re-ingests objects first,
-then commits, then refs/runs (the same ordering the push path guarantees).
-
-Attestation (integrity-v0): HMAC-SHA256 over the canonical commit JSON using a key from
-.av/config (`av registry keygen`). Not asymmetric crypto and not a trust network — it
-detects tampering by anyone without the key, which covers accidental corruption and
-casual tampering. Asymmetric signing is tracked for the enterprise tier.
+Export walks the registry's public API into a portable archive; every object shard is
+downloaded and hash-re-verified, so an archive is self-validating. Attestation
+(integrity-v0) is HMAC-SHA256 over the canonical commit JSON — detects tampering by
+anyone without the key, not asymmetric crypto or a trust network.
 """
 
 import hashlib
 import hmac as hmac_mod
 import json
 import pathlib  # NOT re-exported by `from .core import *` (core.py imports only the
-                # `Path` class, never the module) — every pathlib.Path(...) call below
-                # was a NameError on every real invocation until this import existed;
-                # av registry export/restore had literally never worked (Probleme.md).
+                # `Path` class, never the module) -- needed explicitly for pathlib.Path(...) below.
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from .core import current_output_mode, emit_json, resolve_remote
@@ -44,8 +36,7 @@ class _NullProgressBar:
 
 
 def ctx_exit(code):
-    """Module-local exit helper (restore's failure path used to reference this name
-    without defining it anywhere — a latent NameError on every failed restore)."""
+    """Module-local exit helper."""
     raise SystemExit(code)
 
 
@@ -55,15 +46,9 @@ def registry() -> None:
 
 
 def _state_path(out_path, kind: str) -> "pathlib.Path":
-    # v1.3.0 fix (Probleme.md): export and restore each need their OWN "what's already
-    # done" bookkeeping, even though both operate on the same ARCHIVE_DIR — export's
-    # completed_objects means "already downloaded from the registry into this archive";
-    # restore's means "already uploaded from this archive into the registry". A single
-    # shared file used to let restore's own default --resume=True misread export's
-    # bookkeeping as its own: the FIRST restore of a freshly-exported archive would see
-    # every object already marked "completed" (by export, for a completely different
-    # direction) and skip uploading all of them — silently a no-op restore into an empty
-    # registry, exactly the disaster-recovery scenario this whole feature exists for.
+    # export and restore each need their OWN "what's already done" bookkeeping, even
+    # though both operate on the same ARCHIVE_DIR -- a shared file would let restore's
+    # default --resume=True misread export's bookkeeping as its own.
     return out_path / f".{kind}-state.json"
 
 
@@ -94,9 +79,6 @@ def export(out_dir: str, project_id: str | None, resume: bool) -> None:
     client = _client(repo_root)
     json_mode = current_output_mode() == "json"
 
-    # v1.3.0: was an unhandled requests.exceptions.ConnectionError traceback on every
-    # unreachable-server export — no other command in this codebase lets a raw
-    # connection error escape uncaught.
     if not client.server_available():
         fail(None, "unreachable_queued", f"Registry unreachable at {client.server_url}.",
              command="registry export")
@@ -114,11 +96,8 @@ def export(out_dir: str, project_id: str | None, resume: bool) -> None:
         resp.raise_for_status()
         return resp.json()
 
-    # commits (paged) — v1.3.0 fix (Probleme.md): include_layers=true is REQUIRED here.
-    # Without it, GET /api/commits omits the "tree" key entirely (server.py::list_commits
-    # only attaches it under that flag), so the object-discovery walk below silently found
-    # zero hashes to export on every single real invocation this command has ever had —
-    # a backup archive with commits/refs metadata but NO file content whatsoever.
+    # commits (paged) -- include_layers=true is REQUIRED here, or GET /api/commits omits
+    # the "tree" key entirely and the object-discovery walk below finds zero hashes.
     offset, limit = 0, 200
     while True:
         q = f"/api/commits?limit={limit}&offset={offset}&include_layers=true"
@@ -158,10 +137,8 @@ def export(out_dir: str, project_id: str | None, resume: bool) -> None:
 
     ok = failed = skipped = 0
     sorted_hashes = sorted(hashes)
-    # v1.3.0: a real progress bar over objects — the expensive part of an export.
-    # Suppressed in JSON mode (an agent wants one clean envelope, not a progress bar
-    # mixed into it) — same is_json check every other command in this codebase uses;
-    # --silent has no ctx.obj flag to read here (it only gates logging setup today).
+    # Progress bar over objects (the expensive part of an export), suppressed in JSON
+    # mode -- an agent wants one clean envelope, not a progress bar mixed into it.
     with (click.progressbar(sorted_hashes, label="Downloading objects") if not json_mode
           else _NullProgressBar(sorted_hashes)) as bar:
         for h in bar:
@@ -219,14 +196,10 @@ def export(out_dir: str, project_id: str | None, resume: bool) -> None:
                    "either way since every write here is already idempotent (409/200 on "
                    "duplicate), just not free.")
 def restore(archive_dir: str, resume: bool) -> None:
-    """Re-ingest an `av registry export` archive into the configured registry.
-
-    Ordering mirrors the push path (objects → commits → refs) and every object shard is
-    hash-re-verified BEFORE upload, so a corrupted archive fails loudly instead of
-    poisoning the registry. Duplicate hashes ingest as idempotent 409s — restoring into
-    a partially-populated registry is safe; run `av gc` afterwards to sweep anything
-    orphaned by the export.
-    """
+    """Re-ingest an `av registry export` archive into the configured registry. Ordering
+    mirrors the push path (objects → commits → refs), and every object shard is hash-
+    re-verified BEFORE upload, so a corrupted archive fails loudly instead of poisoning
+    the registry."""
     repo_root = ensure_repo()
     client = _client(repo_root)
     json_mode = current_output_mode() == "json"
@@ -334,13 +307,9 @@ def restore(archive_dir: str, resume: bool) -> None:
 
 @registry.command("keygen")
 def keygen() -> None:
-    """Generate an ed25519 signing keypair under .av/keys/.
-
-    v1.2.2: commits are then AUTO-SIGNED at commit time (signature over the canonical
-    sorted-keys JSON of the payload minus the signature itself) and validated by
-    `av verify <hash>`. Trust model — tamper evidence, not a trust network (SECURITY.md):
-    the embedded public key proves payload integrity, not owner identity. Requires the
-    [sign] extra (`pip install aether-vault[sign]`)."""
+    """Generate an ed25519 signing keypair under .av/keys/. Commits are then auto-signed
+    at commit time and validated by `av verify <hash>` — tamper evidence, not a trust
+    network (SECURITY.md). Requires the [sign] extra."""
     from .signing import SigningUnavailable, generate_keypair
 
     repo_root = ensure_repo()
@@ -366,17 +335,13 @@ def keygen() -> None:
 
 @registry.group("keys")
 def keys_group() -> None:
-    """v1.2.5: signing-key management — list, fingerprint, rotate.
-
-    Tamper evidence, not a PKI: none of these commands bind a key to an identity — they
-    only manage which bytes THIS repo signs with next."""
+    """Signing-key management — list, fingerprint, rotate. Tamper evidence, not a PKI:
+    none of these bind a key to an identity, they only manage what this repo signs with."""
 
 
 @keys_group.command("list")
 def keys_list() -> None:
-    """List every signing key this repo knows about (active + archived from past rotations).
-
-    Tamper evidence, not PKI / identity binding — see `av registry keys --help`."""
+    """List every signing key this repo knows about (active + archived from past rotations)."""
     from .signing import list_keys
 
     repo_root = ensure_repo()
@@ -394,9 +359,7 @@ def keys_list() -> None:
 
 @keys_group.command("fingerprint")
 def keys_fingerprint() -> None:
-    """Print just this repo's active-key fingerprint (scriptable).
-
-    Tamper evidence, not PKI / identity binding — see `av registry keys --help`."""
+    """Print just this repo's active-key fingerprint (scriptable)."""
     from .signing import fingerprint, public_key_path
 
     repo_root = ensure_repo()
@@ -413,11 +376,9 @@ def keys_fingerprint() -> None:
 @keys_group.command("rotate")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip the confirmation prompt.")
 def keys_rotate(yes: bool) -> None:
-    """Archive the current signing key and generate a fresh one.
-
-    Tamper evidence, not PKI / identity binding: old commits keep verifying (their
-    signature carries the OLD public key embedded), new commits sign with the new key.
-    The archived private key is never deleted."""
+    """Archive the current signing key and generate a fresh one. Old commits keep
+    verifying (their signature embeds the old public key); the archived private key is
+    never deleted."""
     from .signing import fingerprint, public_key_path, rotate_keypair
 
     repo_root = ensure_repo()
@@ -451,12 +412,8 @@ def keys_rotate(yes: bool) -> None:
 @click.option("--out", "out_path", default=None, type=click.Path(dir_okay=False),
               help="Write to this file instead of stdout.")
 def export_signature(commit_hash: str, out_path: str | None) -> None:
-    """v1.2.5: export COMMIT_HASH's signature as a standalone record for external audit
-    — verify it elsewhere with `av registry verify <hash> --signature FILE`, without that
-    verifier needing this repo's config or registry access.
-
-    Tamper evidence, not PKI / identity binding: this proves the exported record matches
-    what the signer produced, not who the signer is."""
+    """Export COMMIT_HASH's signature as a standalone record for external audit, verified
+    elsewhere with `av registry verify <hash> --signature FILE` with no repo access needed."""
     from .handoff import load_commit
     from .signing import export_signature_blob
 
@@ -531,19 +488,9 @@ def invoke_mergeless_attest_tag(repo_root, tags):
                    "`av registry export-signature`) instead of the commit's own embedded "
                    "signature — for auditing a commit without this repo's config.")
 def verify(commit_hash: str, signature_file: str | None) -> None:
-    """Verify COMMIT_HASH: an ed25519 commit signature when present, else a legacy
-    HMAC attestation tag.
-
-    Tamper evidence, not PKI / identity binding — this proves the payload wasn't
-    modified after signing, not who the signer is (see SECURITY.md).
-
-    v1.2.2 verification order:
-    1. `signature` blob on the commit → validate the ed25519 signature over the
-       canonical (sorted-keys, signature-stripped) payload. Works on any clone — the
-       signature and public key ride the commit itself (server persists them).
-    2. Legacy `attest:<prefix>` tag → HMAC check against this repo's attest_key.
-    3. Neither → UNSIGNED (exit 0 in text mode; unsigned commits are valid — this is
-       tamper EVIDENCE, not a trust gate)."""
+    """Verify COMMIT_HASH: an ed25519 commit signature when present, else a legacy HMAC
+    attestation tag, else UNSIGNED (exit 0 -- unsigned commits are valid; this is tamper
+    evidence, not a trust gate). See SECURITY.md."""
     from .handoff import load_commit
     from .signing import SigningUnavailable, load_public_key_hex, verify_detached, verify_signature
 

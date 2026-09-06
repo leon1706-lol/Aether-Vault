@@ -1,20 +1,17 @@
 # ============================================================================
-# Dev compose (v1.2.2 engine topology): ONE image, ONE container running ALL
-# subservices — FastAPI registry on :8000 AND the Next.js webui on :3000,
-# supervised by docker/engine-entrypoint.sh inside aether-vault-engine.
+# Dev compose: ONE image, ONE container running ALL subservices — FastAPI registry on
+# :8000 AND the Next.js webui on :3000, supervised by docker/engine-entrypoint.sh.
 #
-# The release twin at python/av_cli/docker/docker-compose.release.yml mirrors
-# this shape but pulls published GHCR images instead of building, and does NOT
-# map 5432/6379 to the host (this dev file does, purely so
-# tests/test_server.py can reach Postgres/Redis directly from localhost).
+# The release twin at python/av_cli/docker/docker-compose.release.yml mirrors this
+# shape but pulls published GHCR images and doesn't map 5432/6379 to the host (this dev
+# file does, so tests/test_server.py can reach Postgres/Redis directly from localhost).
 # ============================================================================
 services:
   aether-vault-engine:
     build:
       context: .
-      # v1.3.0 (Probleme.md): explicit — Dockerfile now has server/webui targets too,
-      # appended after this one, so relying on "the last stage in the file" as the
-      # implicit default is no longer safe.
+      # Explicit — the Dockerfile has server/webui targets appended after this one, so
+      # relying on "the last stage in the file" as the implicit default isn't safe.
       target: engine
     container_name: aether-vault-engine
     ports:
@@ -31,17 +28,11 @@ services:
       - NODE_ENV=production
       - WEBUI_PORT=3000
       - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db:5432/aether_vault
-      # v1.3.2 (migration 0015): closes the RLS-superuser gap migration 0013 documented —
-      # av_user above is a Postgres SUPERUSER (the postgres image grants that to whatever
-      # POSTGRES_USER names) and superusers unconditionally bypass row-level security.
-      # av_app is an ordinary, non-superuser role migration 0015 creates and grants only
-      # SELECT/INSERT/UPDATE/DELETE — request-serving sessions use it (database.py's
-      # app_engine) so RLS (behind AV_TENANCY_ENFORCE=1) is a real backstop in THIS
-      # repo's own default topology, not just in deployments that already happened to
-      # connect as a restricted role. Migrations and the two cross-tenant background
-      # workers keep using DATABASE_URL/av_user above, unchanged — they need DDL rights
-      # and the GUC-based bypass respectively. Unset this var entirely to fall back to
-      # today's exact single-role behavior.
+      # Closes the RLS-superuser gap: av_user is a Postgres superuser (the postgres
+      # image grants that to whatever POSTGRES_USER names) and superusers bypass RLS.
+      # av_app is an ordinary role migration 0015 creates with only
+      # SELECT/INSERT/UPDATE/DELETE; request-serving sessions use it so RLS is a real
+      # backstop here. Unset entirely to fall back to single-role behavior.
       - AV_APP_DATABASE_URL=postgresql+asyncpg://av_app:av_app_password@db:5432/aether_vault
       - REDIS_URL=redis://redis:6379/0
       # Optional shared-secret gate ("Protected" mode) — empty/unset means every route behaves
@@ -57,15 +48,12 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    # v1.2.5: matches AV_ENGINE_STOP_GRACE_SECS' default (engine-entrypoint.sh drains
-    # for up to 25s before SIGKILL) — Docker's own default stop-timeout is 10s, which
-    # would SIGKILL the container before that drain window ever finishes.
+    # Matches AV_ENGINE_STOP_GRACE_SECS' default (drains up to 25s before SIGKILL);
+    # Docker's own default stop-timeout is 10s, which would SIGKILL too early.
     stop_grace_period: 30s
-    # Both runtimes exist in-engine (python + node), so both health legs are checked
-    # without adding any package: python-urllib for :8000, node fetch :3000. The server
-    # leg checks /api/ready (v1.2.5), not /api/health — health is liveness-only (DB-free,
-    # stays green even with an unwritable AV_DATA_DIR); ready also checks DB/Redis/data-dir
-    # writability, which is what "is this container actually usable" should mean here.
+    # Both runtimes exist in-engine, so both health legs are checked without adding any
+    # package. The server leg checks /api/ready, not /api/health -- ready also checks
+    # DB/Redis/data-dir writability, which is what "actually usable" should mean here.
     healthcheck:
       test: ['CMD-SHELL', 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/ready\").read()" && node -e "fetch(\"http://localhost:3000/\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
       interval: 10s

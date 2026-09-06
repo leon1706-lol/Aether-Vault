@@ -1,29 +1,15 @@
-"""v1.3.3.9: closes the one gap `av test`'s own local sync path
-(python/av_cli/cmd_devtools.py::_update_readme_test_badge/_rewrite_test_count_prose)
-can't cover on its own — CI's own `test` job runs bare `pytest tests/`, never `av test`,
-so nothing in a normal CI run ever re-checks README.md's `tests-N%2FM passing` badge,
-its two "N-test suite / N tests across M files" prose mentions, or tests/README.md's
-own opening line against reality. Found live, mid-session: numbers a maintainer had
-JUST hand-verified drifted again within the same working tree the moment one more test
-file landed — a one-time fix isn't a fix, only a snapshot.
-
-Per this project's own no-CI-commits rule (tests/test_ci_policy.py), CI can never
-auto-correct these the way `av test` does locally — so this script is the other half of
-that rule's contract: fail the job loudly the instant they disagree with what the run
-that JUST happened actually produced. No second pytest run: it re-parses the same
-summary line `av test` itself parses, from a log the "Run test suite" CI step already
-captured.
+"""Closes the one gap `av test`'s own local README-sync path can't cover: CI's `test` job
+runs bare `pytest tests/`, never `av test`, so nothing normally re-checks README.md's test
+badge/prose or tests/README.md's opening line against reality. Since CI can never
+auto-correct these (no-CI-commits rule), this script fails the job loudly instead,
+re-parsing the same summary line `av test` parses from the already-captured log.
 
 Usage (wired into .github/workflows/tests.yml's `test` job, one matrix leg only):
     python scripts/check_readme_test_freshness.py PYTEST_OUTPUT_LOG_PATH
 
 The three regexes below are intentionally separate literals from
-python/av_cli/cmd_devtools.py's own copies, not an import of them — mirroring
-tests/test_benchmark_docs_freshness.py's own stated reasoning for the same choice: this
-is a freshness *check*, and re-deriving its ground truth via the exact same code it's
-checking would let a bug in that code hide from the check. They must stay byte-identical
-in shape to cmd_devtools.py's patterns; a change to one belongs with a change to the
-other.
+python/av_cli/cmd_devtools.py's own copies, not an import: re-deriving this check's
+ground truth from the exact code it's checking would let a bug in that code hide from it.
 """
 import re
 import sys
@@ -48,9 +34,8 @@ def _real_file_count() -> int:
 
 def _parse_pytest_summary(log_text: str) -> int | None:
     """Same three-regex approach as cmd_devtools.py's `test_cmd` (passed + failed +
-    error, never counting skipped) — ANSI escapes stripped first for the same reason:
-    `--color=yes`-forced output can otherwise put an escape code between a number and
-    its "passed"/"failed" word."""
+    error, never skipped); ANSI escapes are stripped first since forced color output
+    can put an escape code between a number and its "passed"/"failed" word."""
     cleaned = re.sub(r"\x1b\[[0-9;]*m", "", log_text)
     passed_match = re.search(r"(\d+) passed", cleaned)
     if not passed_match:

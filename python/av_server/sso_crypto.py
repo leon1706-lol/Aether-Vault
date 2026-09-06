@@ -1,14 +1,8 @@
 """Fernet-based encryption at rest for `sso_providers.config`'s client-secret fields
-(v1.3.3, WP-10/WP-16). Reuses the `[sign]` extra's `cryptography` dependency (already
-optional elsewhere in this codebase, e.g. `av_cli/signing.py`) rather than adding a new
-one just for this.
-
-**Secrets rule, enforced here, not just documented:** a provider config containing a
-plaintext secret is refused at creation time with a clear error when `AV_SECRET_KEY`
-isn't set — never silently stored in plaintext. This mirrors `api_tokens.token_hash`/
-`sessions.token_hash`'s own "never the raw value" rule one level up (there it's a hash,
-here it's a reversible encryption because the OIDC/SAML client actually needs the
-plaintext secret back to authenticate with the IdP).
+(v1.3.3). Reuses the `[sign]` extra's `cryptography` dependency rather than adding a new
+one. **Enforced here, not just documented:** a provider config containing a plaintext
+secret is refused at creation time when `AV_SECRET_KEY` isn't set -- never silently
+stored in plaintext.
 """
 from __future__ import annotations
 
@@ -38,10 +32,8 @@ def _fernet():
 
 
 def _derive_key() -> bytes | None:
-    """AV_SECRET_KEY can be any string (an operator-chosen passphrase, not necessarily a
-    raw Fernet key already) — SHA-256 + base64 derives a valid 32-byte Fernet key from
-    it deterministically, the same "derive, don't require a specific format" approach
-    this codebase already takes for other operator-supplied secrets."""
+    """AV_SECRET_KEY can be any string, not necessarily a raw Fernet key already --
+    SHA-256 + base64 derives a valid 32-byte Fernet key from it deterministically."""
     raw = os.environ.get("AV_SECRET_KEY")
     if not raw:
         return None
@@ -77,10 +69,9 @@ def encrypt_config(config: dict) -> dict:
 
 
 def decrypt_config(config: dict) -> dict:
-    """The inverse of encrypt_config — returns a COPY with secret fields decrypted back
-    to plaintext, for the ONE legitimate internal use (actually authenticating with the
-    IdP). Never call this on a response body headed to an HTTP client — use
-    `mask_config` for that."""
+    """The inverse of encrypt_config, for the one legitimate internal use (actually
+    authenticating with the IdP). Never call this on a response body headed to an
+    HTTP client -- use `mask_config` for that."""
     Fernet = _fernet()
     key = _derive_key()
     if Fernet is None or key is None:
@@ -96,9 +87,8 @@ def decrypt_config(config: dict) -> dict:
 
 def mask_config(config: dict) -> dict:
     """What `GET /api/sso-providers*` actually returns — every secret field replaced
-    with a fixed marker, never even a prefix (unlike token masking elsewhere in this
-    codebase, which shows a few characters — a client secret has no safe-to-show
-    prefix convention an IdP guarantees, so this masks it completely)."""
+    with a fixed marker, never even a prefix, since a client secret has no
+    safe-to-show prefix convention an IdP guarantees."""
     out = dict(config)
     for field in SECRET_CONFIG_KEYS:
         if out.get(field):

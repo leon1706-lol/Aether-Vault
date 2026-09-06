@@ -183,18 +183,9 @@ class Repo:
         client = self._client()
         pending = load_pending_push(self.path)
         if not pending:
-            # v1.3.0 fix (parity test caught this): matches cmd_history.py::push()'s own
-            # "nothing pending" branch exactly — reachability is genuinely UNKNOWN here
-            # (never checked, there's nothing to check it for), not False. The previous
-            # version of this method called client.server_available() anyway and reported
-            # its real boolean result, which is both an unnecessary network round trip AND
-            # a payload-shape mismatch (`None` means "not applicable", not "unreachable").
+            # Matches cmd_history.py::push()'s own "nothing pending" branch -- reachability
+            # is genuinely UNKNOWN here (never checked), not False.
             return {"drained": 0, "still_queued": 0, "reachable": None}
-        # v1.3.0 fix (parity test caught this): the previous version skipped this check
-        # and always reported reachable=True whenever pending work existed, even when
-        # flush_pending_push() below re-queued everything because the server genuinely
-        # could not be reached — cmd_history.py::push() checks server_available() FIRST
-        # for exactly this reason.
         if not client.server_available():
             return {"drained": 0, "still_queued": len(pending), "reachable": False}
         still = flush_pending_push(self.path, client)
@@ -221,13 +212,8 @@ class Repo:
             c = load_commit(self.path, cur)
             if not c:
                 break
-            # v1.3.0 fix (full-surface SDK≡CLI parity test caught this): the real local
-            # commit JSON schema stores a single "parents" LIST (core.py's commit_staged,
-            # history.py's walk_history) — there is no "parent_hash"/"extra_parents" key
-            # in it at all (those are av_server's DB *column* names, a different schema).
-            # This method read the wrong keys since it was written, so `parents` was
-            # always [] and the walk stopped after exactly one commit for every repo,
-            # every time — log(limit=30) silently behaved like log(limit=1).
+            # Local commit JSON stores a single "parents" LIST -- "parent_hash"/
+            # "extra_parents" are av_server's DB *column* names, a different schema.
             parents = c.get("parents") or []
             out.append({
                 "hash": cur,
@@ -238,8 +224,7 @@ class Repo:
                 "metrics": c.get("metrics") or {},
                 "parents": parents,
             })
-            # First-parent walk, same rule as history.py::walk_history() — keeps merge
-            # commits linear in this default view instead of duplicating shared ancestors.
+            # First-parent walk, same rule as history.py::walk_history().
             cur = parents[0] if parents else None
         return out
 
@@ -249,11 +234,8 @@ class Repo:
         from av_cli.handoff import _commit_parent, load_commit
         from av_cli.semdiff import diff_trees, human_summary
 
-        # v1.3.1 fix: same bug class as log()'s v1.3.0 fix above — local commit JSON only
-        # ever has a `parents` LIST, never `parent_hash` (that's the registry DB column
-        # name). Reading `parent_hash` directly meant `base` was always None here, so
-        # every diff_semantic() compared against an empty tree instead of the real parent.
-        # `_commit_parent()` tolerates both shapes.
+        # `_commit_parent()` tolerates both storage shapes (local `parents` list vs.
+        # registry `parent_hash`).
         head_hash = self._head()[1]
         head_commit = load_commit(self.path, head_hash) if head_hash else None
         if target:
@@ -285,14 +267,7 @@ class Repo:
         from av_cli.core import capture_code_pointer
 
         run_id = str(uuid.uuid4())
-        # v1.3.1: real git code-provenance capture (was always None here — a documented
-        # divergence from `av run start`, which has always captured it — now shared via
-        # core.capture_code_pointer() instead of reimplemented).
         code_pointer = capture_code_pointer(self.path)
-        # v1.2.5 fix: project_id was missing here (and independently, in the same way, in
-        # cmd_run.py::start() — see Probleme.md) — the server's POST /api/runs requires it
-        # (422 without one), so this always silently failed to register and fell back to
-        # the server's lazy-create-at-push path, which has no way to learn the run's name.
         registered, _resp = _register_remote(
             self.path,
             {"id": run_id, "project_id": self._cfg()["project_id"], "name": name,
@@ -338,12 +313,6 @@ class Repo:
         mem_dir.mkdir(parents=True, exist_ok=True)
         entry = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(),
                  "agent": agent or os.environ.get("AV_AUTHOR", "anonymous"),
-                 # v1.3.1 fix (WP-37, second of the two documented SDK/CLI divergences):
-                 # this omitted run_id since the method was written, so a note taken
-                 # during an active run had no way to be correlated back to it later —
-                 # `av context note` (the CLI equivalent) has never had this gap, since
-                 # it reads AV_RUN_ID at the shell level. The SDK's own active-run pointer
-                 # (`run_start()`/`._run_id()`) was sitting right there unused.
                  "run_id": self._run_id(),
                  "note": note}
         with open(mem_dir / "memory.jsonl", "a", encoding="utf-8") as f:
@@ -354,9 +323,7 @@ class Repo:
         from av_cli.handoff import build_handoff_dict, validate_handoff
 
         doc = build_handoff_dict(self.path, None)
-        # v1.3.0 (todo.md item 8): validate on this read path too — same guarantee as
-        # `av context export`/`av handoff`, so an SDK caller never receives a document
-        # that fails the .avh contract without knowing about it.
+        # Validate on this read path too, same guarantee as `av context export`/`av handoff`.
         problems = validate_handoff(doc)
         if problems:
             self._fail("validation",
@@ -365,13 +332,10 @@ class Repo:
         return doc
 
     def publish_handoff(self) -> dict:
-        """v1.2.5: generates/updates handoff.avh and links it to the active run so the
-        WebUI run-detail view can render context-memory notes — the SDK counterpart to
-        `av handoff --publish`. OPT-IN and explicit only: notes can hold private
-        reasoning, so nothing publishes them without calling this. Requires an active
-        run (run_start() / AV_RUN_ID) and a reachable registry — raises SDKError
-        ("validation") for either failure rather than queuing (no offline-retry queue
-        exists for run-level metadata, unlike commits)."""
+        """Generates/updates handoff.avh and links it to the active run -- the SDK
+        counterpart to `av handoff --publish`. Opt-in and explicit only. Requires an
+        active run and a reachable registry; raises SDKError("validation") for either
+        failure rather than queuing."""
         from av_cli.core import hash_file_safe
         from av_cli.handoff import generate_handoff
 
@@ -396,36 +360,21 @@ class Repo:
                        f"Failed to link the .avh to run {run_id}: HTTP {resp.status_code}")
         return {"run_id": run_id, "avh_object_id": avh_hash, "path": str(avh_path)}
 
-    # -- RSI surfaces (v1.3.1, WP-37) ------------------------------------------
+    # -- RSI surfaces (v1.3.1) ------------------------------------------
     #
-    # Scope note: every WRITE operation an autonomous loop actually needs to ACT on its
-    # own self-improvement cycle is here — propose/apply/rollback/promote, canary run,
-    # review/critique, budget consume, lessons update, sandbox run — each reusing the
-    # SAME plain (non-click), side-effect-free DATA functions the CLI commands themselves
-    # call where those already existed independently of click (`current_improver_id`,
-    # `_evaluate_improver_policy`, `project_frozen`, `latest_canary_passed`,
-    # `_report_job`/`_report_status`, `_hash_paths`, casobj.*) — this is the SAME
-    # single-code-path principle `commit_staged()` established for the substrate, applied
-    # to the RSI surfaces whose command modules already factored their logic out of the
-    # click function bodies.
+    # Scope note: every WRITE operation an autonomous loop needs to act on its own
+    # self-improvement cycle is here, each reusing the same plain (non-click), side-effect-
+    # free DATA functions the CLI commands call -- the same single-code-path principle
+    # `commit_staged()` established for the substrate.
     #
-    # Deliberately NOT reused as-is: any cmd_*.py helper whose OWN error path calls the
-    # CLI's `fail()` (`_transition`, `_set_freeze`, `freeze_guard`, `_parse_mount`, …) —
-    # `fail()` raises a bare `SystemExit`, correct for a click command (the whole process
-    # is expected to exit with that code) but wrong for a library call, which must raise
-    # a catchable `SDKError` instead so a caller can recover rather than have its whole
-    # process killed by an SDK method. Found live while writing this section's own tests
-    # (`tests/test_av_sdk_rsi.py`) — `freeze_set()`/`improver_review()`/the internal
-    # transition inside `improver_apply()` reimplement that one request+typed-error step
-    # inline instead, keeping everything ELSE (the actual decision logic) shared.
+    # Deliberately NOT reused as-is: any cmd_*.py helper whose own error path calls the
+    # CLI's `fail()` -- that raises a bare `SystemExit`, wrong for a library call, which
+    # must raise a catchable `SDKError` instead. `freeze_set()`/`improver_review()`/the
+    # internal transition inside `improver_apply()` reimplement that one step inline.
     #
-    # Pure list/search/show-many endpoints (`av improver list`, `av task list`,
-    # `av strategy search`, `av eval adapter list`, etc.) are deliberately NOT mirrored
-    # here — they're one `GET` each with no decision logic, no more discoverable via the
-    # SDK than `av ... list` itself, and adding thirty near-identical passthrough methods
-    # would bloat this class for negative real value; an agent that needs one can still
-    # reach it via `self._client()` or the CLI. This is a documented scope decision, not
-    # a silent gap.
+    # Pure list/search/show-many endpoints are deliberately NOT mirrored here -- one GET
+    # each with no decision logic, no more discoverable via the SDK than `av ... list`
+    # itself; reach them via `self._client()` or the CLI instead.
 
     def _online_client(self):
         client = self._client()
@@ -768,9 +717,7 @@ class Repo:
                        storage_bytes: int = 0, steps: int = 0) -> dict:
         """Spend is recorded server-side FIRST either way (never lost); raises
         `BudgetExhaustedError` (exit 17) if any dimension is now over its limit, with
-        `.message` naming the exceeded dimensions and the full updated row still
-        returned to the caller via the exception is not needed — see `av budget
-        consume`'s docstring for the same contract on the CLI side."""
+        `.message` naming the exceeded dimensions."""
         client = self._online_client()
         resp = client.session.post(f"{client.server_url}/api/budgets/{budget_id}/consume", json={
             "compute_seconds": compute_seconds, "storage_bytes": storage_bytes, "steps": steps,
@@ -962,9 +909,8 @@ class Repo:
         result = {"job_id": job_id, "driver": driver, "state": status.state,
                  "exit_code": status.exit_code, "message": status.message}
         if status.state == "failed":
-            # Matches `av sandbox run`'s own contract: a failed job is a failure the
-            # caller must handle, not a silent success-shaped dict — same reasoning as
-            # `budget_consume()` raising on exhaustion above.
+            # Matches `av sandbox run`'s contract: a failed job is a failure the caller
+            # must handle, not a silent success-shaped dict.
             self._fail("validation", f"Sandbox job {job_id} failed: {status.message}")
         return result
 

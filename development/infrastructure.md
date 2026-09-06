@@ -2,9 +2,9 @@
 
 How to run Aether-Vault's Docker stack: what runs, how to start it, what to configure, and how to verify each piece. Architecture contracts live in [architecture.md](architecture.md); this file stays operational.
 
-Stack components (v1.2.2 engine topology — ONE image, ONE container for the product):
+Stack components (ONE image, ONE container for the product):
 
-- `aether-vault-engine` — ONE container running ALL subservices: FastAPI CAS registry on :8000 AND the Next.js dashboard on :3000, dispatched/supervised by `docker/engine-entrypoint.sh` (`AV_ENGINE_ROLE=all|server|webui`; default `all`). Image: built from the root Dockerfile (dev compose) or `ghcr.io/leon1706-lol/aether-vault-engine:latest` (release compose). The historical `aether-vault-server`/`-webui` images remain published as ALIASES of this same engine image for one transition cycle (removed next release); legacy per-service containers keep working via entrypoint role auto-detect.
+- `aether-vault-engine` — ONE container running ALL subservices: FastAPI CAS registry on :8000 AND the Next.js dashboard on :3000, dispatched/supervised by `docker/engine-entrypoint.sh` (`AV_ENGINE_ROLE=all|server|webui`; default `all`). Image: built from the root Dockerfile (dev compose) or `ghcr.io/leon1706-lol/aether-vault-engine:latest` (release compose). Legacy per-service containers (pinned to the historical, now-removed `aether-vault-server`/`-webui` alias tags) keep working via entrypoint role auto-detect.
 - `db` — PostgreSQL 15 persistence (image `postgres:15-alpine`, container `aether-vault-db`)
 - `redis` — RedisBloom existence cache (image `redis/redis-stack-server:latest`, container `aether-vault-redis`)
 
@@ -39,7 +39,7 @@ curl -sf http://localhost:3000/ >/dev/null && echo webui-ok   # dashboard leg
 
 End users on Local mode never run any of this by hand — `av init` detects whether the backend is missing, unbuilt, or stopped and starts it automatically.
 
-**Ops measurement task (not a feature):** benchmark #5 (cold clone / first pull) shipped with v1.1.1 but its measured row still reads "capture pending" in the README comparison table — capture it by running `av benchmark --markdown` against this live stack during the next Docker session and pasting the result into [BENCHMARKS.md](BENCHMARKS.md). CI now automates most other formerly-deferred verifications (server-tests/webui-e2e run the live-path suites on every push), so this manual capture is the only remaining one-off.
+**Ops measurement task (not a feature):** if benchmark #5 (cold clone / first pull) ever reads "capture pending" in the README comparison table, capture it by running `av benchmark --markdown` against this live stack and pasting the result into [BENCHMARKS.md](BENCHMARKS.md). CI automates the other live-path verifications (server-tests/webui-e2e run on every push); this manual capture is the one remaining one-off.
 
 ## Starting the Web UI
 
@@ -95,9 +95,9 @@ AV_AUDIT_RETENTION_DAYS  90   (default)
 AV_WEBHOOK_MAX_ATTEMPTS  5   (default)
                 Webhook delivery attempts before a row dead-letters (status='dead').
 AV_WEBHOOK_RETRY_INTERVAL_SECS  30   (default)
-                Worker tick interval AND the base of the v1.2.5 exponential backoff
+                Worker tick interval AND the base of the exponential backoff
                 (next_retry_at = now + this * 2^(attempt-1), capped by the var below —
-                this is no longer a flat retry step, only the base/tick).
+                not a flat retry step, only the base/tick).
 AV_WEBHOOK_RETRY_MAX_SECS  3600   (default)
                 Ceiling on the exponential backoff above — a delivery never waits longer
                 than this between attempts no matter how high the attempt count climbs.
@@ -108,15 +108,15 @@ AV_WEBHOOK_DISABLE_AFTER  0 = off   (default)
 AV_ENGINE_ROLE  all   (container-side default)
                 Engine dispatch: all | server | webui. Legacy alias containers WITHOUT
                 this var auto-detect: DATABASE_URL set → server; NEXT_PUBLIC_API_URL
-                without it → webui (v1.2.5: this path now logs a deprecation warning).
+                without it → webui (this path logs a deprecation warning).
 AV_ENGINE_STOP_GRACE_SECS  25   (default)
                 Seconds engine-entrypoint.sh waits after TERM/INT before SIGKILLing a
                 still-running subservice. Both compose files set stop_grace_period: 30s
                 so Docker's own 10s default doesn't SIGKILL the container first.
 AV_ENGINE_RESTART_SUBSERVICE  1 = on   (default)
                 role=all: a dying subservice restarts just itself instead of tearing the
-                whole engine down. =0 reverts to pre-v1.2.5 behavior (any child dying
-                takes the container down, relying on `restart: unless-stopped`).
+                whole engine down. =0 means any child dying takes the whole container
+                down, relying on `restart: unless-stopped` instead.
 AV_ENGINE_MAX_RESTARTS  5   (default)
                 Sliding-window restart budget (paired with the var below) — exceeding it
                 shuts the engine down loudly instead of crash-looping forever silently.
@@ -146,8 +146,7 @@ AV_ANOMALY_AUTH_SPIKE_THRESHOLD  5   (default)
                counter then resets so one burst raises exactly one event.
 AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS  60   (default)
                Sliding window the threshold above is measured over.
-AV_APP_DATABASE_URL  (empty/unset = request-serving sessions use DATABASE_URL, same as
-               pre-v1.3.2)
+AV_APP_DATABASE_URL  (empty/unset = request-serving sessions use DATABASE_URL)
                Optional second connection string for ORDINARY request-serving sessions
                only — migrations and the two cross-tenant background workers keep using
                DATABASE_URL unconditionally (they need DDL rights / the bypass-RLS GUC).
@@ -156,7 +155,7 @@ AV_APP_DATABASE_URL  (empty/unset = request-serving sessions use DATABASE_URL, s
                Contract. docker-compose.yml sets this by default for its own topology.
 AV_TENANCY_ENFORCE  0 = off   (default)
                1 = the application-level tenant guard + RLS GUC application activate.
-               Off means every route behaves byte-identically to pre-v1.3.2 regardless
+               Off means every route behaves as if tenancy didn't exist, regardless
                of tenant_id columns existing on disk.
 AV_RATE_LIMIT_BACKEND  memory   (default)
                memory = today's in-process WindowRateLimiter (correct at N=1 replica,
@@ -167,8 +166,7 @@ AV_AUTH_SPIKE_BACKEND  memory   (default)
                Same memory/redis choice as AV_RATE_LIMIT_BACKEND, for the auth-spike
                anomaly counter specifically (AV_ANOMALY_AUTH_SPIKE_THRESHOLD above).
 AV_CAS_ISOLATION  shared   (default)
-               shared = one global CAS dedup domain, byte-identical to every pre-v1.3.3
-               deployment. isolated = physically separate objects/trees per tenant on
+               shared = one global CAS dedup domain. isolated = physically separate objects/trees per tenant on
                disk AND in the Bloom filter — real cost: cross-tenant dedup is lost
                entirely (intra-tenant dedup is unaffected). See architecture.md's
                Per-Tenant CAS Isolation Contract before flipping this on a deployment
@@ -193,7 +191,7 @@ av auth clear                # back to Anonymous everywhere
 av auth status               # masked report, never prints the token
 ```
 
-Per-user tokens (v1.1.8) live beside the owner's shared secret as `AV_AUTH_USERS` — a JSON
+Per-user tokens live beside the owner's shared secret as `AV_AUTH_USERS` — a JSON
 map written to the same `.env` by the same plumbing:
 
 ```bash
@@ -256,7 +254,7 @@ E2E_PSQL_URL=postgresql://... bash scripts/e2e_scenario.sh
 
 Phase map: A clone→diverge→conflicting merge→`--theirs`→two-parent push · B offline queue drain across a real restart · C pre-Alembic volume heal + stamp on a real boot · D protected mode with per-user tokens (join/attribution/wrong-token/revocation) · E zero-grace GC sweep · F SDK-driven run/commit lifecycle · G event stream cursor/kind filter · H promotion policy · J signed commits (ed25519 roundtrip, tamper detection, unsigned-ok) · K audit trail filters. Notes for local runs: on Windows use Git Bash (the script converts its temp paths via cygpath), keep psql on PATH, and pass options before the connection URI if calling psql yourself — MSYS-style getopt ignores `-c` after a positional URI.
 
-**Chaos drills (v1.3.0, todo.md item 28), Phases L/M/N:** gated behind `AV_E2E_CHAOS=1`
+**Chaos drills, Phases L/M/N:** gated behind `AV_E2E_CHAOS=1`
 (default off — the phases above run unaffected without it) so they're opt-in for a local
 run and isolated into their own `chaos-drills` CI job rather than folded into `e2e-suite`:
 ```bash
@@ -276,7 +274,7 @@ intact (proving the atomic temp-file+fsync+`os.replace` write pattern under a re
 not just a clean stop — Phase B already covers the clean-stop case) and a later `av push`
 fully drains it.
 
-## Orchestrator readiness & liveness (v1.3.0, todo.md item 19)
+## Orchestrator readiness & liveness
 
 The engine exposes two distinct health routes — conflating them (using one for both
 probes) is the single most common orchestrator misconfiguration for this kind of
@@ -334,7 +332,7 @@ below for the automated proof of this.
 ## CI Job Map
 
 Every job across all 5 workflow files, grouped by which file defines it. `tests/test_ci_map.py`
-(v1.3.4) parses every workflow's real job ids AND this table's "Job(s)" column and fails if
+parses every workflow's real job ids AND this table's "Job(s)" column and fails if
 they ever disagree in either direction — a job added here with no doc row, or a doc row
 naming a job that no longer exists, both fail CI. Keep this table's job-id backticks exact.
 
@@ -343,7 +341,7 @@ naming a job that no longer exists, both fail CI. Keep this table's job-id backt
 | Surface | Job(s) |
 |---|---|
 | Full stack-free suite, py3.10 + 3.14 (Windows build) | `test` matrix |
-| Same, Linux (v1.3.4 OS-parity twin of `test`), + coverage gate + slowest-25 report | `test-linux` matrix |
+| Same, Linux (OS-parity twin of `test`), + coverage gate + slowest-25 report | `test-linux` matrix |
 | Registered-flaky tests only (`tests/FLAKES.md`), non-gating | `flaky-quarantine` |
 | Contract matrix + exit codes + CI policy, as their own named check | `contract-matrix` |
 | Per-revision migration upgrade/downgrade/re-upgrade drill (live Postgres) | `migrations-drill` |
@@ -353,19 +351,19 @@ naming a job that no longer exists, both fail CI. Keep this table's job-id backt
 | Server live stack (Postgres+Redis): TestClient + real-wire | `server-tests` |
 | Same, native Windows services | `server-tests-windows` |
 | Product flows via real CLI: merge collaboration, offline drain, legacy upgrade, per-user auth, GC | `e2e-suite` (`scripts/e2e_scenario.sh`) |
-| Chaos drills: real Redis outage, unwritable storage, genuinely full filesystem (v1.3.4), server killed mid-push | `chaos-drills` (`scripts/e2e_scenario.sh`, `AV_E2E_CHAOS=1`) |
-| Engine image smoke (Phase I): role dispatch + dual healthchecks from ONE container; v1.2.5: `/api/ready` degrading independently of `/api/health`, killing one subservice restarts only it; v1.3.0: a real SIGTERM drain under concurrent load (20 in-flight uploads) all complete cleanly | `e2e-engine-smoke` |
-| Slim `server`/`webui` Dockerfile targets, actually built and booted (v1.3.4) | `slim-image-smoke` |
+| Chaos drills: real Redis outage, unwritable storage, genuinely full filesystem, server killed mid-push | `chaos-drills` (`scripts/e2e_scenario.sh`, `AV_E2E_CHAOS=1`) |
+| Engine image smoke: role dispatch + dual healthchecks from ONE container; `/api/ready` degrading independently of `/api/health`, killing one subservice restarts only it; a real SIGTERM drain under concurrent load (20 in-flight uploads) all complete cleanly | `e2e-engine-smoke` |
+| Slim `server`/`webui` Dockerfile targets, actually built and booted | `slim-image-smoke` |
 | PR preview environment: local image build + `scripts/release_smoke.sh`, results in the run summary | `preview-env` |
 | sdist+wheel build & twine check | `package-build` |
 | Wheel install smoke (Linux venv) | `smoke-wheel-linux` |
 | Sdist compile-install smoke (Windows venv, MSVC path) | `smoke-sdist-windows` |
 | WebUI browser E2E: dashboard, weight-diff, token gate | `webui-e2e` |
-| Helm chart schema verification (v1.3.2): `helm template \| kubeconform -strict` across 4 value permutations — NOT a real cluster deploy | `helm-lint` |
-| HA drill (v1.3.2): real 2-replica compose topology, killed replica mid-load, webhook double-delivery + rate-limit proofs | `ha-drill` (`scripts/ha_drill.sh`) |
-| CI duration/budget dashboard (v1.3.4), `.github/ci-budgets.yml`-driven, posts a PR comment | `ci-summary` |
+| Helm chart schema verification: `helm template \| kubeconform -strict` across 4 value permutations — NOT a real cluster deploy | `helm-lint` |
+| HA drill: real 2-replica compose topology, killed replica mid-load, webhook double-delivery + rate-limit proofs | `ha-drill` (`scripts/ha_drill.sh`) |
+| CI duration/budget dashboard, `.github/ci-budgets.yml`-driven, posts a PR comment | `ci-summary` |
 
-**`security.yml`** — PR + `push: master` + weekly cron (v1.3.4 added the master-push trigger):
+**`security.yml`** — PR + `push: master` + weekly cron:
 
 | Surface | Job(s) |
 |---|---|
@@ -374,9 +372,9 @@ naming a job that no longer exists, both fail CI. Keep this table's job-id backt
 | `semgrep` `p/python` + `p/secrets` (fails on ERROR severity) | `semgrep` |
 | Trivy image scan of the built engine image (fails on HIGH/CRITICAL) | `container-image` |
 | `npm audit --omit=dev` (fails on high) | `webui-deps` |
-| Full-history secret scan, SARIF to the Security tab (v1.3.4) | `gitleaks` |
+| Full-history secret scan, SARIF to the Security tab | `gitleaks` |
 
-**`codeql.yml`** (v1.3.4, new) — push:master + PR + weekly cron:
+**`codeql.yml`** — push:master + PR + weekly cron:
 
 | Surface | Job(s) |
 |---|---|
@@ -390,40 +388,40 @@ from the release gate):
 |---|---|
 | In-between Pythons 3.11–3.13 | `compat` |
 | C++ core builds on macOS (golden-hash cross-OS fixtures) | `golden-fixtures-macos` |
-| macOS wheel install smoke (v1.3.4 — closes the residual noted below) | `macos-install-smoke` |
-| Backup → destroy → restore drill, `av admin backup` (v1.3.4 — Phase U finally wired to CI) | `dr-drill` |
-| Old-binary-vs-new-schema rolling-upgrade drill (v1.3.4, self-calibrating — see `scripts/compat_drill.sh`) | `compat-drill` |
-| Deprecation registry dry-run: prints every entry, what the next MAJOR would remove (v1.3.4) | `deprecation-dry-run` |
+| macOS wheel install smoke | `macos-install-smoke` |
+| Backup → destroy → restore drill, `av admin backup` | `dr-drill` |
+| Old-binary-vs-new-schema rolling-upgrade drill, self-calibrating (see `scripts/compat_drill.sh`) | `compat-drill` |
+| Deprecation registry dry-run: prints every entry, what the next MAJOR would remove | `deprecation-dry-run` |
 
 **`release.yml`** — tag push (`v*.*.*`) + `workflow_dispatch`:
 
 | Surface | Job(s) |
 |---|---|
-| Release gate: stack-free suite, perf-history/BENCHMARKS freshness, CHANGELOG/VERSIONING sync, every required check green (v1.3.4: not just "test" in the name) | `gate` |
-| Wheels, cp310–cp314 × 3 OS via cibuildwheel v4 (v1.3.4 bump — v2.16 predated cp313/314) | `build-wheels` matrix |
+| Release gate: stack-free suite, perf-history/BENCHMARKS freshness, CHANGELOG/VERSIONING sync, every required check green | `gate` |
+| Wheels, cp310–cp314 × 3 OS via cibuildwheel | `build-wheels` matrix |
 | sdist | `build-sdist` |
-| Real install verification of the artifacts about to publish, 3 OS (v1.3.4) | `verify-install` matrix |
+| Real install verification of the artifacts about to publish, 3 OS | `verify-install` matrix |
 | PyPI publish (OIDC trusted publishing) | `publish-pypi` |
-| GitHub Release + release-gate report + SBOM + provenance attestation (v1.3.4) attached | `github-release` |
-| Engine image: scan-before-push gate, multi-arch (linux/amd64+arm64, v1.3.4), SBOM+provenance | `build-and-push-docker` |
-| Rollback drill: previous image ↔ this release, data-survival proof (v1.3.4) | `rollback-drill` |
+| GitHub Release + release-gate report + SBOM + provenance attestation attached | `github-release` |
+| Engine image: scan-before-push gate, multi-arch (linux/amd64+arm64), SBOM+provenance | `build-and-push-docker` |
+| Rollback drill: previous image ↔ this release, data-survival proof | `rollback-drill` |
 
 **`docker-edge.yml`** — push:master, path-filtered:
 
 | Surface | Job(s) |
 |---|---|
-| `:edge`/`:server-edge`/`:webui-edge` images: scan-before-push gate, SBOM+provenance (v1.3.4) | `build-and-push-edge` |
-| Staging smoke: just-pushed `:edge` image, by digest, via `scripts/release_smoke.sh` (v1.3.4) | `staging-smoke` |
+| `:edge`/`:server-edge`/`:webui-edge` images: scan-before-push gate, SBOM+provenance | `build-and-push-edge` |
+| Staging smoke: just-pushed `:edge` image, by digest, via `scripts/release_smoke.sh` | `staging-smoke` |
 
 Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` flow test.
-Dependabot was removed (Phase 55, owner decision — config deleted, all open PRs closed);
-dependency freshness review is manual now.
+Dependabot has been removed (config deleted, all open PRs closed); dependency freshness
+review is manual now.
 
 ## Database Migrations
 
 The schema is owned by Alembic (`python/av_server/migrations/`); `create_all` is gone. Server startup runs the chain programmatically (`python/av_server/database.py::init_db`) — no alembic.ini, no manual step:
 
-1. Fresh database → migrations `0001_baseline` + `0002_runs_events_webhooks_audit` + `0003_webhook_deliveries_audit_signature` create every table exactly as `models.py` defines them (including `commits.extra_parents`, `trees.chunks`, the v1.2.0 runs/events/webhooks/audit tables, and 0003's `webhook_deliveries` + `commits.signature`/`env_snapshot_id` + `audit_log.status_code`), then record the head in `alembic_version`.
+1. Fresh database → the full migration chain (`python/av_server/migrations/versions/`) creates every table exactly as `models.py` defines them, then records the head in `alembic_version`.
 2. Unrecorded schema (a pre-Alembic create_all volume, or any database whose version rows were lost while the tables stayed) → startup creates any MISSING models.py tables, heals known column drift in place (`_LEGACY_COLUMNS`) and stamps the chain applied. Zero-touch; only future revisions ever execute on it. Replaying into existing tables would crash startup with DuplicateTableError — that's what adoption detection exists to prevent (see [Probleme.md](Probleme.md) #70/#73).
 
 Authoring a new migration:
@@ -435,14 +433,13 @@ Authoring a new migration:
 -- 3. restart the server — init_db() upgrades to head on boot
 ```
 
-**Caution:** never edit an already-applied migration in place; append a new revision instead. Volumes that predate the v1.1.x FK removals may still carry `trees_object_hash_fkey`-style constraints — drop those manually once if inserts fail on such a volume (documented per-phase in [CHANGELOG.md](CHANGELOG.md)).
+**Caution:** never edit an already-applied migration in place; append a new revision instead. A very old volume may still carry a `trees_object_hash_fkey`-style constraint predating the current FK-free schema — drop it manually once if inserts fail (documented in [CHANGELOG.md](CHANGELOG.md)).
 
 **Invariant:** `_apply_schema` MUST run the chain inside `engine.begin()` (committing), never `engine.connect()`. Postgres DDL is transactional — a plain connect() rolls the entire freshly-built schema back at context exit while startup logs stay green (Probleme.md #70, four CI cycles undetected). SQLite can't catch regressions here: its driver auto-commits DDL.
 
-**The 5-places checklist (v1.3.4):** every new migration that adds a column to an EXISTING
-table touches five files, not just the migration itself — found the hard way
-(`development/Probleme.md`'s migration-chain incidents) when a subset was missed and only
-surfaced on a legacy-volume-adoption path months later:
+**The 5-places checklist:** every new migration that adds a column to an EXISTING
+table touches five files, not just the migration itself — a subset missed here has
+surfaced on a legacy-volume-adoption path before (see `development/Probleme.md`):
 
 1. `python/av_server/models.py` — the ORM model, the real source of truth.
 2. `python/av_server/database.py::_LEGACY_COLUMNS` — the same column, so a pre-Alembic or
@@ -454,18 +451,15 @@ surfaced on a legacy-volume-adoption path months later:
 5. `tests/test_migrations.py`'s per-revision downgrade-DDL expectations dict (search for
    the previous revision's own entry for the exact shape).
 
-(v1.3.4 also removed a FORMER 6th place — `scripts/e2e_scenario.sh` Phase C's
-legacy-volume-heal assertion used to hardcode the expected post-heal head as a literal
-string, silently going stale every time this checklist's items 3-4 were followed but this
-one wasn't. It now resolves the expected head from `ScriptDirectory` at runtime instead of
-naming a revision id at all — nothing to add here going forward.)
+`scripts/e2e_scenario.sh` Phase C's legacy-volume-heal assertion resolves the expected
+head from `ScriptDirectory` at runtime rather than a hardcoded literal, so it can't go
+stale — nothing to add there for a new migration.
 
 A NEW TABLE (rather than a new column on an existing one) needs none of items 2/5 — a
 legacy volume simply lacks the whole table, which `_create_missing_tables()` already
 handles from `Base.metadata` directly; only items 1/3/4 apply. See also the parallel
-"exit code — six places" checklist in `development/CHANGELOG.md`'s v1.3.3 entry
-(`login_required`/21 activation) for a different but structurally identical class of
-cross-file drift, now also mechanically checked (`tests/test_contract_matrix.py`).
+"exit code — six places" checklist in `docs/for-agents.md` for a structurally identical
+class of cross-file drift, mechanically checked by `tests/test_contract_matrix.py`.
 
 ## Inspecting PostgreSQL
 
@@ -492,7 +486,7 @@ Inside the compose network, services reach each other by service name:
 
 - `db:5432` — Postgres (this exact hostname appears in `DATABASE_URL`)
 - `redis://redis:6379/0` — RedisBloom cache
-- `http://aether-vault-engine:8000` — registry API inside the compose network (v1.2.2; the webui builds against `http://localhost:8000` for browser-side calls instead, and both subservices share the engine container anyway)
+- `http://aether-vault-engine:8000` — registry API inside the compose network (the webui builds against `http://localhost:8000` for browser-side calls instead, and both subservices share the engine container anyway)
 
 From the host machine, everything rides localhost — but two of these exist only because the dev compose maps them:
 
@@ -518,7 +512,7 @@ Mark-and-sweep deletes objects no commit's Merkle tree references, respecting th
 Cutting a release is a tag push; everything else is pipeline:
 
 1. Land work on `master` with green CI — see the CI Job Map above for the current, complete
-   list of required jobs (14 in `tests.yml` alone as of v1.3.4, not five).
+   list of required jobs.
 2. Curate highlights from [CHANGELOG.md](CHANGELOG.md) since the previous tag into release notes.
 3. Tag and push:
 
@@ -531,10 +525,8 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 6. A GitHub Release appears with auto-generated notes and all artifacts attached.
 7. GHCR receives `:latest` + version-tagged **engine images** (`aether-vault-engine`), plus
    slim single-role variants (`:server-*`, `:webui-*`) as TAGS on that same repository — not
-   separate images. (v1.3.4 correction: the legacy `aether-vault-server`/`aether-vault-webui`
-   repository-name ALIASES this used to describe were removed in v1.3.0 — see
-   `VERSIONING.md`'s "Removed in v1.3.0" entry — `release.yml`/`docker-edge.yml` have not
-   published them since.)
+   separate images. The legacy `aether-vault-server`/`aether-vault-webui` repository-name
+   aliases have been removed — see `VERSIONING.md`'s "Removed in v1.3.0" entry.
 
 Users pick releases up themselves:
 

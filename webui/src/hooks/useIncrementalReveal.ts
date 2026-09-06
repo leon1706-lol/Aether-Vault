@@ -3,19 +3,14 @@
 import { useEffect, useState } from "react";
 
 /**
- * v1.3.0 (todo.md item 25): progressively reveals `total` items in batches via
- * requestAnimationFrame, replacing the old hard `MAX_RENDERED_LAYERS` cutoff (see
- * lib/diffWeights.ts) that permanently hid the tail of a checkpoint with more tensors
- * than the cap — every layer now eventually renders, it just fills in over a handful of
- * frames instead of blocking the main thread with one giant synchronous paint (the
- * actual reason the cap existed). `initialBatch` renders immediately with no frame delay
- * so small diffs still look instant; `batchSize` controls the growth step thereafter.
+ * Progressively reveals `total` items in batches via requestAnimationFrame instead of
+ * blocking the main thread with one giant synchronous paint. `initialBatch` renders
+ * immediately so small diffs still look instant; `batchSize` controls the growth step.
  *
- * Deliberately two separate effects rather than one self-rescheduling rAF loop: scheduling
- * the next frame from inside setState's functional updater mixes a side effect into what
- * must stay a pure function, which is unreliable under React's dev-mode double-invocation
- * of updaters. Instead, the reveal effect below re-runs (idiomatically) each time
- * `visibleCount` itself changes, chaining one rAF tick at a time via the dependency array.
+ * Deliberately two separate effects rather than one self-rescheduling rAF loop:
+ * scheduling the next frame from inside setState's functional updater would mix a side
+ * effect into what must stay a pure function. Instead the reveal effect re-runs each
+ * time `visibleCount` itself changes, chaining one rAF tick at a time.
  */
 export function useIncrementalReveal(
   total: number,

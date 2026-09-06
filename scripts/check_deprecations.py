@@ -1,18 +1,12 @@
-"""v1.3.4 (todo.md item 18): reads `development/deprecations.yml` and reports which
-deprecated surfaces are still pending, which are overdue for removal (their own
-`remove_in` version has already been reached), and which are confirmed removed. Read-only
-— never edits the registry or any code; a human decides what to actually remove and
-updates the entry's `status` themselves.
+"""Reads `development/deprecations.yml` and reports which deprecated surfaces are still
+pending, overdue for removal, or confirmed removed. Read-only — a human decides what to
+actually remove.
 
 Usage:
   python scripts/check_deprecations.py --dry-run
-      Prints every entry's status — the nightly `deprecation-dry-run` job's own mode,
-      purely informational, always exits 0 (see this module's own judgment call on why:
-      the same "a hard gate on informational output trains people to ignore it" call
-      security.yml's scanners already document for this repo).
+      Prints every entry's status, always exits 0 (the nightly job's own mode).
   python scripts/check_deprecations.py --current-version 1.4.0
-      Same report, PLUS exits 1 if any "pending" entry's remove_in is <= the given
-      version — i.e. something that was supposed to be gone by now, still isn't.
+      Same report, plus exits 1 if any "pending" entry's remove_in is <= the given version.
 """
 import argparse
 import sys

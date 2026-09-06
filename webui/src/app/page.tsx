@@ -59,12 +59,9 @@ export default function DashboardPage() {
         window.localStorage.removeItem(SELECTED_PROJECT_KEY);
       }
     }
-    // v1.2.5 deep linking: ?tab=<id>&run=<id> in the URL — read once after mount
-    // (not a lazy useState initializer, to avoid an SSR/client hydration mismatch on
-    // this "use client" page) so a shared/reloaded link lands on the right tab/run.
-    // Query params, not real Next.js routes: this stays a single-page tab-state app —
-    // no per-panel mount/state restructuring — see the WebUI Contract in
-    // development/architecture.md for the rationale.
+    // Deep linking: ?tab=<id>&run=<id> in the URL — read once after mount (not a lazy
+    // useState initializer, to avoid an SSR/client hydration mismatch) so a
+    // shared/reloaded link lands on the right tab/run.
     const params = new URLSearchParams(window.location.search);
     const tab = params.get("tab");
     if (tab && tab in TAB_TITLES) setActive(tab);

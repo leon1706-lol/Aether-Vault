@@ -8,27 +8,18 @@ interface Props {
 }
 
 // Gates the whole dashboard behind the shared-secret access token when the server is running
-// in "Protected" mode. Two ways a token reaches this component:
-//
-// 1. Launched via `av webui` while the CLI already has one configured (`.av/config`'s
-//    remote_api_token) — docker_runtime._open_browser() appends it as a one-time `?av_token=`
-//    query param. Saved to localStorage and stripped from the URL immediately on mount, so it
-//    never lingers in browser history longer than necessary and the manual prompt below never
-//    appears in this case.
-// 2. Opened directly (a bookmark, a teammate's own browser that's never seen the token) — any
-//    API call's 401 (see lib/api.ts's fetchJSON) triggers the manual entry prompt via
-//    setUnauthorizedHandler, registered once here on mount.
+// in "Protected" mode. Two ways a token reaches this component: (1) `av webui` appends it as
+// a one-time `?av_token=` query param, saved to localStorage and stripped from the URL on
+// mount; (2) opened directly, any API call's 401 triggers the manual entry prompt via
+// setUnauthorizedHandler.
 export function TokenGate({ children }: Props) {
   const [showPrompt, setShowPrompt] = useState(false);
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  // Consume the one-time handoff token DURING RENDER (guarded to the browser), not in
-  // an effect: child panels mount and fire their first fetches BEFORE this component's
-  // useEffect ever runs (React runs child effects first), so an effect-based consume
-  // raced the very requests it was meant to authenticate — first wave went out
-  // unauthenticated and data only appeared after the next poll interval (Probleme.md
-  // #79). Writing localStorage here is idempotent and happens-before any child fetch.
+  // Consume the one-time handoff token during render (guarded to the browser), not in
+  // an effect: child panels fire their first fetches before this component's useEffect
+  // ever runs, so an effect-based consume would race the very requests it authenticates.
   if (typeof window !== "undefined") {
     const url = new URL(window.location.href);
     const handoffToken = url.searchParams.get("av_token");
@@ -39,12 +30,9 @@ export function TokenGate({ children }: Props) {
     }
   }
 
-  // Strip safety-net AFTER hydration: Next.js patches window.history.replaceState to
-  // integrate with the App Router, and a replaceState issued BEFORE hydration finished
-  // can be overridden when hydration completes — restoring the entry URL with the
-  // ?av_token= param still in the address bar (token itself already persisted, so only
-  // the cosmetic strip was lost; caught by webui-e2e's token-gate spec). Re-running the
-  // strip post-mount is idempotent and costs nothing when the render-phase pass won.
+  // Strip safety-net after hydration: a replaceState issued before hydration finishes
+  // can be overridden when it completes, restoring the ?av_token= param in the address
+  // bar (token itself already persisted). Idempotent and costs nothing when unneeded.
   useEffect(() => {
     const url = new URL(window.location.href);
     if (url.searchParams.has("av_token")) {

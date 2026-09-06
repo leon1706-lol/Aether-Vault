@@ -19,61 +19,42 @@ from typing import Callable
 from .index import Index
 
 Probe = tuple[str, float]  # (label, elapsed_ms)
-# v1.2.5: (label, samples_ms, median_ms, budget_ms, budget_class) — the perf gate's
-# median-of-N view of a probe. budget_class is "cpu" or "disk" (see _BUDGET_CLASS below);
-# the gate (tests/test_perf_gate.py) owns what multiplier each class gets — this module
-# only classifies, it never judges pass/fail.
+# (label, samples_ms, median_ms, budget_ms, budget_class) — the perf gate's median-of-N
+# view of a probe. budget_class is "cpu" or "disk"; this module only classifies, the gate
+# (tests/test_perf_gate.py) owns what multiplier each class gets.
 SampledProbe = tuple[str, list, float, float | None, str]
 
 SYNTHETIC_ENTRY_COUNT = 500
 SYNTHETIC_FILE_COUNT = 2000
 SYNTHETIC_OBJECT_COUNT = 1000
 SYNTHETIC_COMMIT_ENTRY_COUNT = 300
-# 150, not 500 — still 5x `av log`'s default --limit (30), enough depth to catch a real
-# algorithmic regression (e.g. walk_history() turning quadratic), while keeping the
-# probe's absolute cost reasonable: it opens+reads+json.loads() one file per commit
-# sequentially (unlike iter_working_files()/Storage stats(), which only stat/enumerate),
-# so its per-item cost is structurally higher and doesn't need as large an N to be useful.
+# 150, not 500 -- still 5x `av log`'s default --limit, enough depth to catch a real
+# algorithmic regression while keeping the probe's absolute cost reasonable.
 SYNTHETIC_LOG_COMMIT_COUNT = 150
 
-# v1.2.5: how many times the perf gate samples each probe (see run_synthetic_probes_sampled).
-# The first sample is always discarded as a warm-up — first-touch disk cache / OS scheduler
-# noise was the dominant source of the single-shot flakiness that forced the old single
-# global BUDGET_MULTIPLIER up three times (3.0 -> 2.0 -> 2.5, see test_perf_gate.py's
-# docstring) — median-of-N removes that without loosening the real threshold.
+# How many times the perf gate samples each probe. The first sample is always discarded
+# as a warm-up -- first-touch disk cache/OS scheduler noise was the dominant source of
+# single-shot flakiness; median-of-N removes that without loosening the real threshold.
 PROBE_SAMPLES = 5
 
-# Soft advisory budgets in ms, keyed by label prefix — exceeding one only flags a
-# row as SLOW in the printed table, it never fails the command or the test suite.
-# Set generously above typical cold-disk timings (these are filesystem-bound, so vary a
-# lot by machine/antivirus/disk) so a normal run is quiet and only a real regression —
-# e.g. a multiple-times slowdown — trips the flag. Adjust to taste for your own hardware.
+# Soft advisory budgets in ms, keyed by label prefix -- exceeding one only flags a row as
+# SLOW in the printed table, it never fails the command or the test suite. Set generously
+# above typical cold-disk timings so only a real regression trips the flag.
 _BUDGETS_MS = {
     "Index.save()": 150.0,
     "Index.load()": 150.0,
     "load_config()": 50.0,
     "iter_working_files()": 200.0,
     "Storage stats": 1000.0,
-    # v1.2.2: semdiff joined the hot-path family (it runs per handoff/diff and now also
-    # inside the perf gate) — budget sized for the synthetic 500-entry tree below.
     "semdiff.diff_trees()": 100.0,
-    # v1.2.5: per-surface probes the todo asked for — commit/status/log each get their own
-    # budget instead of being implied by Index.save()/iter_working_files(). compute_status()
-    # and log() were both revised upward from their first-cut estimates after a real
-    # measurement run showed the initial guesses (300/150) were too tight even before
-    # applying the disk-class multiplier — see test_perf_gate.py's docstring history for
-    # why "measure, then set the budget" beats guessing here same as it does for the
-    # multiplier itself.
     "commit_staged()": 250.0,
     "compute_status()": 600.0,
     "log()": 300.0,
 }
 
-# v1.2.5: which multiplier family (see test_perf_gate.py) each probe belongs to. CPU probes
-# (pure in-memory work) are far more repeatable across runs/machines than disk probes
-# (filesystem I/O — subject to antivirus scanning, cache state, and Windows' notoriously
-# slow small-file I/O), so they get a tighter multiplier. Unrecognized labels default to
-# "disk" — the more lenient class — rather than silently getting no classification.
+# Which multiplier family (see test_perf_gate.py) each probe belongs to. CPU probes (pure
+# in-memory work) are far more repeatable than disk probes (filesystem I/O), so they get
+# a tighter multiplier. Unrecognized labels default to "disk", the more lenient class.
 _BUDGET_CLASS = {
     "semdiff.diff_trees()": "cpu",
 }
@@ -197,9 +178,8 @@ def run_synthetic_probes(
     label = f"Storage stats ({SYNTHETIC_OBJECT_COUNT} objs)"
     results.append((label, _time_ms(lambda: storage_stats(av_dir)), _budget_for(label)))
 
-    # v1.2.2 probe: semantic-diff cost over a synthetic 500-entry tree pair (a third of
-    # the entries carry chunk manifests, mirroring a checkpoint-heavy repo). Pure CPU —
-    # this is the path `av diff`, .avh generation, and the webui summary all ride.
+    # Semantic-diff cost over a synthetic 500-entry tree pair (a third carry chunk
+    # manifests, mirroring a checkpoint-heavy repo) -- the path `av diff`/.avh ride.
     from .semdiff import diff_trees
 
     def _synth_tree(chunked_every: int) -> dict:
@@ -230,11 +210,8 @@ def run_synthetic_probes(
     results.append((label, _time_ms(lambda: diff_trees(old_tree, new_tree)),
                     _budget_for(label)))
 
-    # v1.2.5 per-surface probe: commit_staged() end-to-end — deterministic hash over sorted
-    # JSON, atomic local persist, ref advance, index clear+resave. Imported lazily (not at
-    # module level) because core.py imports this module (`from . import speedcheck`), so a
-    # top-level `from .core import commit_staged` here would be circular; by the time this
-    # function actually runs, core.py has always finished importing.
+    # commit_staged() end-to-end. Imported lazily, not at module level, because core.py
+    # imports this module, so a top-level import here would be circular.
     from .core import commit_staged
 
     commit_dir = tmp_root / "commit_probe"
@@ -273,11 +250,9 @@ def run_synthetic_probes(
         _budget_for(label),
     ))
 
-    # v1.2.5 per-surface probe: compute_status() — reuses the 2000-file working tree already
-    # built for iter_working_files() above (compute_status() calls iter_working_files()
-    # internally plus a per-file stat/compare, so this measures that combined real cost) with
-    # a fresh Index deliberately mismatched against it: every 4th file untracked (no entry),
-    # the rest split staged/needs-compare, so all four status branches actually execute.
+    # compute_status(), reusing the 2000-file tree above with a fresh Index deliberately
+    # mismatched: every 4th file untracked, the rest split staged/needs-compare, so all
+    # four status branches actually execute.
     from .core import compute_status
 
     status_idx = Index(tmp_root)
@@ -297,9 +272,8 @@ def run_synthetic_probes(
         label, _time_ms(lambda: compute_status(tmp_root, status_idx)), _budget_for(label),
     ))
 
-    # v1.2.5 per-surface probe: log() — walk_history() over a synthetic linear chain, built
-    # by writing commit JSON directly (real commit_staged() calls would be far slower to set
-    # up at this scale and the walk itself, not commit creation, is what this times).
+    # log() -- walk_history() over a synthetic linear chain, built by writing commit JSON
+    # directly (real commit_staged() calls would be far slower to set up at this scale).
     from . import history
 
     log_dir = tmp_root / "log_probe"
@@ -342,24 +316,12 @@ def run_synthetic_probes_sampled(
     tmp_root: Path,
     samples: int | None = None,
 ) -> list[SampledProbe]:
-    """Median-of-N view of run_synthetic_probes(), for the perf gate (test_perf_gate.py).
-
-    Runs the full probe battery `samples` times, each in its own fresh subdirectory (the
-    probes create/mutate files, so a run can't reuse another run's directory), discards the
-    first run as a warm-up (see PROBE_SAMPLES' docstring), and returns the median of the
-    rest alongside the full sample vector and each probe's budget class — the gate applies
-    its own tolerance policy (median-exceeds-budget AND >=2 samples over) on top of this
-    rather than this module baking one policy in, so `av test --speed`'s single-shot
-    printed table (run_synthetic_probes(), unchanged) and the gate's stricter view can
-    each want different things without duplicating the probe bodies themselves.
-
-    `samples` defaults to `PROBE_SAMPLES`, overridable via `AV_PERF_SAMPLES` (env var takes
-    effect only when `samples` isn't passed explicitly — an explicit argument always wins)
-    for a genuinely noisy machine that needs a larger N than the default to get a stable
-    median, without editing source. v1.3.0 also adds an explicit WARM PASS below: a full
-    battery run before any counted sample, discarded entirely (not even the "first sample"
-    slot) — disk-noise immunity on top of the existing discard-first-sample behavior.
-    """
+    """Median-of-N view of run_synthetic_probes(), for the perf gate. Runs the full probe
+    battery `samples` times in fresh subdirectories, then returns the median alongside the
+    full sample vector and each probe's budget class -- the gate applies its own tolerance
+    policy on top rather than this module baking one in. `samples` defaults to
+    `PROBE_SAMPLES`, overridable via `AV_PERF_SAMPLES`. An explicit warm pass runs before
+    any counted sample, discarded entirely, for disk-noise immunity."""
     if samples is None:
         env_override = os.environ.get("AV_PERF_SAMPLES")
         try:

@@ -1,18 +1,10 @@
-# v1.3.4 (todo.md item 20, W4a): fallback list of check-run names `release_gate.py`'s
-# `check_required_checks_green()` requires to be green for a tag, used ONLY when the live
-# GitHub branch-protection API call fails (network hiccup, permissions) — the live
-# `required_status_checks` list on `master` is the primary source of truth and should be
-# kept in sync with this file (`development/infrastructure.md`'s CI Job Map documents the
-# same set; `tests/test_ci_map.py` checks the workflows agree with THAT doc — this file is
-# the release-gate's own copy, checked in so the gate has a real answer even if `gh api`
-# is briefly unreachable).
+# Fallback list of check-run names `release_gate.py` requires to be green for a tag,
+# used only when the live GitHub branch-protection API call fails -- the live
+# `required_status_checks` list on `master` is the primary source of truth.
 #
-# Deliberately EXCLUDES: anything that only runs on a schedule (nightly.yml's jobs,
-# `compat-drill`, `dr-drill`) — those never produce a check-run for a specific commit via
-# an automatic trigger, so requiring them would make every release gate fail forever.
-# Also excludes `flaky-quarantine` (continue-on-error by design) and `docker-edge.yml`'s
-# path-filtered job (may legitimately not have run for a commit that touched none of its
-# paths). One context name per line; blank lines and #-comments ignored.
+# Deliberately excludes anything schedule-only (nightly.yml's jobs), `flaky-quarantine`
+# (continue-on-error by design), and docker-edge.yml's path-filtered job. One context
+# name per line; blank lines and #-comments ignored.
 
 # tests.yml
 test (3.10)

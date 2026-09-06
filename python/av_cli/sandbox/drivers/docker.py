@@ -1,21 +1,13 @@
-"""DockerDriver — real `docker run` isolation, asynchronous (v1.3.1, RSI R5).
+"""DockerDriver — real `docker run` isolation, asynchronous (v1.3.1).
 
 `submit()` launches a DETACHED container named `av-sandbox-<job_id>` and returns
-immediately with state `"running"` — the container itself is the persistent handle
-`status()`/`cancel()`/`logs()` re-attach to in a LATER, separate CLI invocation (this is
-exactly why Docker doesn't need the synchronous workaround `LocalDriver` uses — see
-`base.py`'s module docstring).
+immediately with state `"running"` -- the container is the persistent handle
+`status()`/`cancel()`/`logs()` re-attach to in a later, separate CLI invocation.
 
-**What is actually enforced, stated plainly:** `--network none` (the default; `spec.network
-== "bridge"` switches to the default bridge network) is a REAL, OS-level guarantee —
-Docker's network namespace isolation, not a convention. Mounts are REAL: only the host
-paths in `spec.mounts` are ever visible inside the container, `ro` mounted read-only via
-Docker's own `:ro` flag. `--cpus`/`--memory` are real Docker resource limits (Linux
-cgroups). `--gpus all` is passed only when `spec.gpu` is set (requires the NVIDIA
-container runtime on the host; this driver does not attempt to detect or install it —
-that is a host prerequisite, same as Docker itself). `network_destinations` in a tool
-manifest is NOT enforced per-destination here — see `manifest.py`'s own docstring for why
-that would need an additional sidecar proxy this project doesn't depend on.
+**What is actually enforced:** `--network none`/`bridge` is a real OS-level guarantee
+(Docker's network namespace isolation); mounts, `--cpus`/`--memory`, and `--gpus` are all
+real Docker mechanisms. `network_destinations` in a tool manifest is NOT enforced
+per-destination here -- Docker's own enforcement is binary (none/bridge).
 """
 from __future__ import annotations
 
@@ -52,10 +44,8 @@ class DockerDriver:
             args += ["-e", f"{key}={value}"]
         if spec.cwd:
             args += ["-w", str(spec.cwd)]
-        # A bare image name isn't meaningful here — the caller's command IS the workload,
-        # so the image is always the first element of `command` by convention (same shape
-        # `docker run <image> <cmd...>` always takes); callers build `spec.command` as
-        # `[image, *argv]`.
+        # The image is always the first element of `command` by convention (same shape
+        # `docker run <image> <cmd...>` takes); callers build `spec.command` as [image, *argv].
         args += spec.command
 
         try:

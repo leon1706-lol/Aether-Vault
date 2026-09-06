@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
-# v1.3.4 (todo.md items 16/19/25/26/28, W3a): smokes a REAL published/local engine image
-# against the SAME compose file real `pip install aether-vault` end users get
-# (`python/av_cli/docker/docker-compose.release.yml`) — never exercised by any existing
-# CI job (e2e-engine-smoke builds straight from the Dockerfile; ha-drill uses the
-# separate docker-compose.ha.yml topology). One script, five call sites: docker-edge's
-# staging smoke, a PR preview environment, release.yml's post-push verification, the
-# rollback drill, and local ad-hoc use.
+# Smokes a REAL published/local engine image against the SAME compose file real `pip
+# install aether-vault` end users get -- never exercised by e2e-engine-smoke (builds
+# straight from the Dockerfile) or ha-drill (separate topology). One script, five call
+# sites: docker-edge's staging smoke, a PR preview environment, release.yml's post-push
+# verification, the rollback drill, and local ad-hoc use.
 #
 # Usage: ./scripts/release_smoke.sh <image-ref>
 #   e.g. ./scripts/release_smoke.sh ghcr.io/leon1706-lol/aether-vault-engine:edge
@@ -37,10 +35,8 @@ log()  { printf '\n\033[1;36m[release-smoke]\033[0m %s\n' "$*"; }
 pass() { printf '\033[1;32m[PASS]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# Pins the compose file's own image to whatever ref we're actually smoking, without
-# hand-editing the shipped file. `docker compose -f a -f b` merges b's services over a's
-# by key — only `image:` is overridden here, everything else (env, healthcheck,
-# depends_on) comes from the real file unchanged.
+# Pins the compose file's image to whatever ref we're smoking without hand-editing the
+# shipped file -- `docker compose -f a -f b` merges b's services over a's by key.
 cat > "$OVERRIDE" <<EOF
 services:
   aether-vault-engine:
@@ -65,9 +61,8 @@ done
 [[ -n "$PY" ]] || die "no working python/python3 on PATH"
 
 wait_for() {
-  # Same bounded-retry shape as scripts/ha_drill.sh's own wait_ready() — every attempt is
-  # bounded (curl's own timeouts + an OS-level `timeout` backstop), so a genuine hang here
-  # cancels cleanly instead of burning the whole job/step timeout on one stuck call.
+  # Same bounded-retry shape as ha_drill.sh's wait_ready(): curl timeouts plus an
+  # OS-level `timeout` backstop, so a hang cancels cleanly instead of burning the job.
   local url="$1" tries=60
   while (( tries-- > 0 )); do
     timeout -k 5 12 curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url" && return 0
@@ -96,8 +91,7 @@ pass "image reports a real, non-fallback version"
 # ---------------------------------------------------------------------------
 log "real av push + pull round trip (Anonymous mode)"
 # `av init` has no --remote-url of its own -- a "local"-mode repo pushes to whatever
-# AV_REMOTE_URL resolves to (default http://localhost:8000, which IS $API here; exported
-# explicitly anyway so this never silently depends on that default matching).
+# AV_REMOTE_URL resolves to; exported explicitly so this never silently depends on the default.
 export AV_REMOTE_URL="$API"
 REPO_A="$WORK/repoA"
 REPO_B="$WORK/repoB"

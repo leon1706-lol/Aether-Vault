@@ -24,12 +24,33 @@ shared logic lives in `core.py`, commands live one-feature-per `cmd_*.py`, and
 - agent-facing groups - `cmd_diff.py`, `cmd_context.py`, `cmd_run.py`, `cmd_env.py`
   (snapshot/replay incl. the top-level `av replay` alias), `cmd_policy.py`,
   `cmd_watch.py`, `cmd_registry.py` (export/restore/keygen/attest/verify),
-  `cmd_webhooks.py`, `cmd_audit.py`.
+  `cmd_webhooks.py`, `cmd_audit.py`, `cmd_support.py` (redacted diagnostics bundle).
+- RSI control plane groups - `cmd_improver.py` (versioned improver artifacts, self-edit
+  proposals, the improver promotion gate), `cmd_canary.py` (capability canaries),
+  `cmd_eval.py` (task/eval registry, held-out vault, blind scoring), `cmd_budget.py`
+  (compute/storage/step quotas), `cmd_freeze.py` (global promote/self-edit kill-switch),
+  `cmd_sandbox.py` (sandboxed execution + tool manifests, `cmd_tools.py`),
+  `cmd_blackboard.py` (durable shared claims), `cmd_lineage.py` (causal run graphs +
+  cross-run search, `av search`), `cmd_strategy.py`/`cmd_lessons.py` (what
+  worked/failed, distilled lessons), `cmd_plan.py` (experiment planner objects),
+  `cmd_review.py` (reviewer gate + structured objections, `av critique`),
+  `cmd_task.py` (curriculum task proposals), `cmd_scheduler.py` (external
+  scheduler hooks).
+- Enterprise groups - `cmd_tenant.py`/`cmd_user.py`/`cmd_role.py`/`cmd_token.py`
+  (DB-backed tenant/user/RBAC/token administration), `cmd_login.py` (SSO device-code
+  login, `av login`/`logout`/`whoami`), `cmd_idp.py` (SSO identity provider admin),
+  `cmd_scim.py` (SCIM provisioning-token admin), `cmd_admin.py` (`av admin backup`
+  create/verify/restore).
 - feature modules - `index.py` (`Index`), `merge.py` (pure algorithms), `sync.py`
   (clone/pull primitives), `history.py` (log walking/rendering), `attributes.py`
   (`.avattributes` directives), `client.py` (`VaultClient`), `pointer.py`,
   `fsutil.py`, `handoff.py`, `repl.py`, `docker_runtime.py`, `update_check.py`,
-  `speedcheck.py`, `signing.py` (ed25519 commit signatures).
+  `speedcheck.py`, `signing.py` (ed25519 commit signatures), `casobj.py` (content-
+  addressed CAS objects for non-file RSI artifacts), `actionlog.py` (append-only
+  agent action log), `audit_chain_verify.py` (client-side audit-chain verification),
+  `session_store.py` (SSO session storage), `enterprise.py` (enterprise/cloud login),
+  `graph.py` (the Obsidian vault note generator behind `av graph`), `ui.py` (shared
+  terminal rendering helpers), `exceptions.py` (one typed exception per exit code).
 - `schemas/` - every published JSON Schema contract (`envelope-1.0`, `event-1.0`,
   `run-1.0`, `webhook-payload-1.0`, `semdiff-1.0`, `avh-2.0`), shipped in the wheel via
   `package_data` so an external validator can check against the exact schema this project

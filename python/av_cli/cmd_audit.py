@@ -1,10 +1,6 @@
-"""av audit — read-side CLI for the registry's audit trail (v1.2.2 audit depth).
-
-The trail itself is server-side (DBAuditLog, written on every mutating API call with
-the resolved identity and the HTTP outcome). This command is its human/agent-facing
-query surface: filter by action / project / time window and page through results.
-Read-only — it never mutates anything (pruning lives server-side via
-DELETE /api/admin/audit and the AV_AUDIT_RETENTION_DAYS GC sweep).
+"""av audit — read-side CLI for the registry's audit trail (v1.2.2). The trail itself is
+server-side (DBAuditLog); this is its human/agent-facing query surface for filtering and
+paging results. Read-only — pruning lives server-side.
 """
 
 import datetime
@@ -25,10 +21,8 @@ def audit() -> None:
 
 
 def _common_audit_filters(f):
-    """Shared --action/--project/--since/--until/--username/--status-code/--outcome/
-    --action-prefix option stack for `list` and `export` (v1.2.5 additions past the
-    first four) — kept as one decorator so the two commands can't drift on what they
-    accept."""
+    """Shared filter-option stack for `list` and `export`, kept as one decorator so the
+    two commands can't drift on what they accept."""
     f = click.option("--action", default=None,
                       help="Exact action filter, e.g. commit.push / ref.update / run.create.")(f)
     f = click.option("--action-prefix", default=None,
@@ -220,10 +214,8 @@ def verify_chain(since_id: int, export_path: str | None, public_key_hex: str | N
 
 
 def _verify_export_offline(client, export_path: str, public_key_hex: str | None) -> None:
-    """The genuinely-independent path: recomputes the chain entirely locally from a
-    jsonl export (`av audit export --format jsonl`), never asking the server to grade
-    its own homework. The only server round trip (if any) is fetching the PUBLIC key,
-    which reveals nothing an attacker could use to forge a signature."""
+    """Recomputes the chain entirely locally from a jsonl export, never asking the server
+    to grade its own homework. The only optional server round trip fetches the public key."""
     from .audit_chain_verify import verify_export
 
     if public_key_hex is None:

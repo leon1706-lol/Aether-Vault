@@ -14,12 +14,9 @@ from collections import deque
 
 def find_merge_base(load_commit, ours_hash: str, theirs_hash: str) -> str | None:
     """Nearest common ancestor of two commits, or None when the histories are unrelated.
-
-    Two-phase walk: collect ALL of ours' ancestors into a set (stack DFS), then BFS theirs'
-    ancestors in generation order — the first node that appears in ours' ancestor set is the
-    common ancestor closest to theirs, which is the conventional merge base for this purpose.
-    Merge-aware from day one: every parent edge is followed, not just parents[0].
-    """
+    Two-phase walk: collect ALL of ours' ancestors, then BFS theirs' in generation order
+    -- the first node in ours' ancestor set is the conventional merge base. Every parent
+    edge is followed, not just parents[0]."""
     ours_ancestors: set[str] = set()
     stack = [ours_hash]
     while stack:

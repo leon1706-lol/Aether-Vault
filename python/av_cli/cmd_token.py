@@ -1,15 +1,8 @@
-"""av token — DB-backed, remote-administrable API tokens (v1.3.2).
-
-The remote-administrable alternative to `av auth add-user`: that command (cmd_auth.py)
-requires `docker compose` shell access on the machine running the stack, because it
-writes directly into the compose `.env` file and restarts the container. A token minted
-here works from ANY machine that can reach the registry over HTTP — creation, listing,
-and revocation are all just authenticated API calls (`POST/GET /api/tokens`,
-`POST /api/tokens/{id}/revoke`, `python/av_server/server.py`), gated by the
-`token:write` scope (granted by the built-in `admin` role, migration 0011).
-
-`av auth *` is untouched and stays the documented path for the `.env`-based OSS mode —
-this is the DB-backed enterprise path alongside it, not a replacement.
+"""av token — DB-backed, remote-administrable API tokens (v1.3.2). The remote-
+administrable alternative to `av auth add-user` (which needs shell access to the compose
+`.env` file) — a token minted here works from any machine that can reach the registry
+over HTTP, gated by the `token:write` scope. `av auth *` stays the OSS path alongside it,
+not a replacement.
 """
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)

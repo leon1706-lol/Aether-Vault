@@ -68,15 +68,11 @@ def _compose_env_dict(svc: dict) -> dict:
 
 
 def _doctor_compose_migrate(path_str: str, write: bool) -> None:
-    """v1.3.0 (todo.md item 20): rewrites a pinned legacy two-container compose file
-    (separate aether-vault-server / aether-vault-webui services, the pre-v1.2.2 split
-    topology) into the consolidated one-container AV_ENGINE_ROLE=all form the project has
-    shipped since. Detects the legacy shape narrowly — an image referencing
-    'aether-vault-server'/'aether-vault-webui', or the DATABASE_URL/NEXT_PUBLIC_API_URL
-    env markers engine-entrypoint.sh's own legacy auto-detect already keys off of — rather
-    than attempting a general-purpose compose rewrite; fails cleanly with a clear message
-    when a file doesn't match instead of guessing at an unfamiliar shape. See
-    docs/migrate-engine-image.md."""
+    """Rewrites a pinned legacy two-container compose file (separate aether-vault-server /
+    aether-vault-webui services) into the consolidated one-container AV_ENGINE_ROLE=all
+    form. Detects the legacy shape narrowly (image name or DATABASE_URL/
+    NEXT_PUBLIC_API_URL env markers) and fails cleanly rather than guessing at an
+    unfamiliar shape. See docs/migrate-engine-image.md."""
     try:
         import yaml
     except ImportError:
@@ -121,9 +117,8 @@ def _doctor_compose_migrate(path_str: str, write: bool) -> None:
         "environment": merged_env,
         "restart": server_svc.get("restart") or webui_svc.get("restart") or "unless-stopped",
     }
-    # v1.2.5: the compose files this project ships set a 30s stop_grace_period so
-    # AV_ENGINE_STOP_GRACE_SECS' drain window isn't cut short by Docker's 10s default —
-    # carry that forward (or set it) on the migrated service, not just copy silently past it.
+    # Carry forward (or set) a 30s stop_grace_period so AV_ENGINE_STOP_GRACE_SECS' drain
+    # window isn't cut short by Docker's 10s default.
     engine_service["stop_grace_period"] = (
         server_svc.get("stop_grace_period") or webui_svc.get("stop_grace_period") or "30s"
     )
@@ -176,16 +171,9 @@ def _doctor_compose_migrate(path_str: str, write: bool) -> None:
 @click.option("--write", "write_compose", is_flag=True, default=False,
               help="With --compose, apply the rewrite in place instead of only previewing it.")
 def doctor(fix: bool, dry_run: bool, speed: bool, compose_path: str | None, write_compose: bool) -> None:
-    """Diagnose common repo and environment problems.
-
-    Read-only by default: reports issues (native core availability, server reachability,
-    index/pointer consistency, pending-push queue, leftover temp files) without modifying
-    anything. Pass --fix to repair what's safely recoverable, or --fix --dry-run to preview
-    what --fix would do without changing anything.
-
-    `--compose PATH` is a completely different mode (a compose-file migration tool, not a
-    repo diagnostic) — see that option's help.
-    """
+    """Diagnose common repo and environment problems. Read-only by default; pass --fix to
+    repair what's safely recoverable, or --fix --dry-run to preview. `--compose PATH` is a
+    completely different mode (a compose-file migration tool, not a repo diagnostic)."""
     if compose_path:
         _doctor_compose_migrate(compose_path, write_compose)
         return
@@ -198,10 +186,8 @@ def doctor(fix: bool, dry_run: bool, speed: bool, compose_path: str | None, writ
     av_dir = repo_root / ".av"
 
     json_mode = current_output_mode() == "json"
-    checks: list[dict] = []  # v1.3.0: structured mirror of every ok/warn/fixed call,
-                              # emitted as one envelope in JSON mode instead of each
-                              # check's own click.secho line — see emit_json call at the
-                              # bottom of this command.
+    checks: list[dict] = []  # structured mirror of every ok/warn/fixed call, emitted as
+                              # one envelope in JSON mode instead of per-check click.secho.
 
     if not json_mode:
         click.secho("Aether-Vault Doctor", bold=True)
@@ -253,10 +239,8 @@ def doctor(fix: bool, dry_run: bool, speed: bool, compose_path: str | None, writ
 
     # --- Orphaned pointer entries: index entry has a pointer but its CAS object is missing ---
     # An entry with a pointer but no matching CAS object means `av checkout` would silently
-    # fail to materialize that file's real content. Split artifacts don't store a whole-file
-    # blob at all (see add()'s comment) — for those, "missing content" means a missing
-    # *layer* (safetensors) or *chunk* (.pt/.pth/.ckpt CDC), not the absent-by-design
-    # whole-file object.
+    # fail to materialize that file. Split artifacts (safetensors layers, CDC chunks) check
+    # their parts instead of a whole-file object.
     def _missing_parts(entry: dict, key: str) -> list[dict]:
         return [
             part for part in entry.get(key) or []

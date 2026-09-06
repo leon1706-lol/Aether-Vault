@@ -5,15 +5,9 @@ Revises: 0007
 Create Date: 2026-09-04
 
 Additive: three new nullable columns on `runs` (`plan_id`, `budget_id`, `stop_reason`)
-plus two new tables. No existing row is touched. See
-development/architecture.md's Research Control Contract section.
-
-`plans` indexes a CAS object (hypotheses/ablations/budget/stop-rules), same pattern as
-every other RSI artifact table. `budgets` stores its counters inline (JSON would hide them
-from SQL aggregation, which `av budget show`'s cross-lineage rollup needs).
-
-No foreign keys on `*_id` columns — same shallow/out-of-order-write rationale as every
-prior RSI migration's tables.
+plus two new tables. `plans` indexes a CAS object, same pattern as every other RSI
+artifact table. `budgets` stores its counters inline rather than JSON, since SQL
+aggregation needs them for cross-lineage rollups. No foreign keys on `*_id` columns.
 """
 from typing import Sequence, Union
 

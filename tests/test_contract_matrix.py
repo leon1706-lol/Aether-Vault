@@ -1,13 +1,6 @@
-"""v1.3.0 contract matrix (todo.md item 6): closes the two real gaps `test_exit_codes.py`
-left — a full exit-code registry proof (all seven codes, not one command each) and a
-generic anti-leakage sweep across the ENTIRE CLI, not just the two commands regression
-#93 originally fixed.
-
-Building this sweep is what found (and this cycle then fixed) two previously-uncaught
-leaks: `av --output json add`/`commit` printed "Staged [...]" from stage_one_file()
-unconditionally, and `av --output json watch` printed several _finalize_commit() human
-echoes because it never passed a result_sink (cmd_history.py's `commit` always has). Both
-are fixed at the source (core.py, cmd_watch.py) — see development/Probleme.md.
+"""Contract matrix: a full exit-code registry proof (every documented code, not one
+command each) plus a generic JSON-envelope anti-leakage sweep across the entire CLI,
+rather than just a couple of hand-picked commands.
 """
 import json
 import re
@@ -20,27 +13,13 @@ from python.av_cli.main import cli
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Commands genuinely exempt from "single clean JSON envelope, zero leakage" — each has a
-# specific, documented reason, not a shortcut:
-#   watch      - streams one envelope PER auto-commit by design (NDJSON), not one envelope
-#                for the whole (indefinitely-running) invocation. Covered by its own test
-#                below instead of the generic sweep.
-#   test       - runs the real pytest suite as a subprocess; JSON mode already suppresses
-#                the live stream and emits one final envelope (see cmd_devtools.py), but
-#                actually invoking it here would recursively run the whole suite.
-#   benchmark  - same shape as test (dev-only, subprocess-heavy); exercised manually, not
-#                via CliRunner recursion.
-#   webui      - starts Docker + opens a real browser tab; its status prose runs through
-#                ui.print_step()/rich console across docker_runtime.py, not click.secho —
-#                silencing it fully would mean threading a quiet flag through every step
-#                of that shared, human-interactive module for a command with zero agent
-#                relevance (not in AGENTS.md's v1.2 supported-commands table; a browser
-#                tab is not a thing an agent can consume). Left as a human/ops tool.
-#   import-lightning, import-transformers, import-mlflow
-#              - require the actual ML framework installed (torch/transformers/mlflow) to
-#                do anything meaningful; invoking bare exercises only their own
-#                framework-missing ImportError path, which IS clean JSON-safe but adds
-#                nothing this sweep needs three extra skip-branches for.
+# Commands genuinely exempt from "single clean JSON envelope, zero leakage":
+#   watch      - streams one envelope per auto-commit by design (NDJSON); covered by its
+#                own test below instead.
+#   test, benchmark - subprocess-heavy; invoking them here would recursively run the suite.
+#   webui      - starts Docker + opens a real browser tab; a human/ops tool, not agent-relevant.
+#   import-lightning/transformers/mlflow - need the real ML framework installed to do
+#                anything beyond their own (already clean) ImportError path.
 _LEAKAGE_EXEMPT = {"watch", "test", "benchmark", "webui", "import-lightning",
                     "import-transformers", "import-mlflow"}
 
@@ -67,21 +46,10 @@ ALL_COMMAND_PATHS = list(_iter_command_paths())
 
 
 def _sandbox_compose_dir(repo, monkeypatch):
-    """Prevents commands under `av auth` (set-token/clear/rotate) — swept generically
-    below along with every other zero-required-arg command — from resolving a REAL
+    """Prevents commands under `av auth` (set-token/clear/rotate) from resolving a real
     docker-compose.yml via `_find_source_root()` and writing a real `.env` / restarting
-    the real running engine container as a side effect of running this test file.
-
-    `_find_source_root()` returns this actual checkout's root for an editable install
-    (see main.py's own docstring) — completely independent of the `repo` fixture's
-    tmp_path sandbox that every OTHER command in this sweep already respects via `cwd`.
-    Without this, `pytest tests/test_contract_matrix.py` on any machine with Docker
-    running mutates the real `.env` and restarts the real `aether-vault-engine` container
-    three times per run (set-token, clear, rotate) — the exact same real, dangerous side
-    effect `tests/test_cli.py::_sandbox_compose_dir` already exists to prevent for its own
-    dedicated auth tests; this sweep re-introduced it by not reusing that pattern. See
-    development/Probleme.md.
-    """
+    the real running engine container, since `_find_source_root()` is independent of the
+    `repo` fixture's tmp_path sandbox that every other command in this sweep respects."""
     import python.av_cli.main as main_module
 
     (repo / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
@@ -98,11 +66,8 @@ class TestAntiLeakage:
     def test_command_emits_clean_json_or_usage_error(self, repo, monkeypatch, display_name, args):
         if args[0] in _LEAKAGE_EXEMPT:
             pytest.skip(f"{display_name}: documented exception, see module docstring")
-        # Every command runs from inside the sandboxed repo already (cwd); this additional
-        # sandbox is specifically for the handful (av auth set-token/clear/rotate) that
-        # resolve infrastructure via _find_source_root() instead of cwd — see the helper's
-        # own docstring. Applied unconditionally so a FUTURE command gaining a similar
-        # real-infrastructure touch is safe by default rather than by someone remembering.
+        # Applied unconditionally (not just to the known av auth commands) so a future
+        # command gaining a similar real-infrastructure touch is safe by default.
         _sandbox_compose_dir(repo, monkeypatch)
         result = CliRunner().invoke(cli, ["--output", "json", *args])
         if result.exit_code == 2:
@@ -136,11 +101,8 @@ class TestWatchStreamsNdjson:
 
 
 # ---------------------------------------------------------------------------
-# Full exit-code registry matrix: every documented code, both output modes, driven
-# through a command that actually produces it — test_exit_codes.py already pins one
-# command per code; this file is the (code × mode) truth table read back structurally,
-# so a future command losing its envelope on one specific code/mode combination fails
-# here even if test_exit_codes.py's own one-shot assertion for that code still passes.
+# Full exit-code registry matrix: every documented code, read back structurally against
+# the codebase's own sources of truth, not re-asserted one command at a time.
 # ---------------------------------------------------------------------------
 
 EXIT_CODE_REGISTRY = {
@@ -159,14 +121,9 @@ EXIT_CODE_REGISTRY = {
     "tenant_denied": 22,
 }
 
-# 13 (unreachable_queued) is real in the registry but, by AGENTS.md non-negotiable #3
-# ("offline resilience is sacred"), `commit`/`push` deliberately exit 0 when queued —
-# queued is a SAFE, complete outcome, not a failure. It's reserved for read-path commands
-# where reachability IS the primary outcome (av audit list, av webhooks list) — those
-# don't yet have a dedicated fail(..., "unreachable_queued", ...) repro in
-# test_exit_codes.py (only commit's queued:true data-shape is pinned there), so the
-# per-code repro check below is scoped to the six codes that DO always fail() at that exit
-# status, matching what test_exit_codes.py's own file header documents.
+# 13 (unreachable_queued) is real in the registry but `commit`/`push` deliberately exit 0
+# when queued (a safe, complete outcome, not a failure) -- reserved for read-path commands
+# with no dedicated fail() repro yet, so it's excluded from the per-code check below.
 _HAS_FAIL_PATH_REPRO = {k: v for k, v in EXIT_CODE_REGISTRY.items() if k != "unreachable_queued"}
 
 
@@ -195,12 +152,9 @@ class TestExitCodeRegistryIsSelfConsistent:
         )
 
 
-# v1.3.4 (W6a′): the exit-code "six places" checklist (development/CHANGELOG.md's
-# v1.3.3 entry, `login_required`/21 activation) was only ever mechanically checked for
-# THREE of its six places (core.py's _EXIT_CODES, this file's own EXIT_CODE_REGISTRY, and
-# test_exit_codes.py's naming convention, all three via the tests above). The other
-# three — av_sdk/exceptions.py, docs/for-agents.md, AGENTS.md — could drift silently.
-# These three classes close that gap, one per remaining place.
+# The exit-code "six places" checklist has three places checked above (core.py's
+# _EXIT_CODES, this file's registry, test_exit_codes.py's naming convention); these three
+# classes check the other three: av_sdk/exceptions.py, docs/for-agents.md, AGENTS.md.
 class TestExitCodeRegistryMatchesSdkExceptions:
     def test_sdk_exit_codes_dict_matches_the_registry(self):
         from python.av_sdk.exceptions import EXIT_CODES as sdk_exit_codes
@@ -251,12 +205,9 @@ class TestExitCodeRegistryMatchesAgentsMd:
 
     @pytest.mark.parametrize("code", sorted(EXIT_CODE_REGISTRY))
     def test_every_code_name_is_mentioned(self, code):
-        # AGENTS.md documents this registry as prose, not a table (unlike
-        # docs/for-agents.md) — codes 10-16 are named once as a set with "exit codes
-        # 10-16 respectively" (positional, not individually numbered); codes 17+ are each
-        # individually annotated as `` `code` (NUMBER, ...) `` inline. This only checks
-        # the name is mentioned at all — see the class below for the individually
-        # numbered ones' actual number.
+        # AGENTS.md documents this registry as prose, not a table: codes 10-16 are named
+        # once as a set, codes 17+ are each individually annotated. This only checks the
+        # name is mentioned at all -- see the class below for the numbered ones' actual number.
         assert f"`{code}`" in self._text() or code in self._text(), (
             f"AGENTS.md's exit-code summary no longer mentions {code!r} at all"
         )
@@ -265,9 +216,8 @@ class TestExitCodeRegistryMatchesAgentsMd:
         (c, n) for c, n in EXIT_CODE_REGISTRY.items() if n >= 17
     ))
     def test_individually_numbered_codes_match_their_stated_number(self, code, exit_status):
-        # Codes 17+ are each written as `` `name` (NUMBER, ...) `` inline in AGENTS.md's
-        # own prose — unlike 10-16, which are only ever named as a set against a stated
-        # RANGE ("10-16 respectively"), not individually numbered.
+        # Codes 17+ are each written as `` `name` (NUMBER, ...) `` inline in AGENTS.md,
+        # unlike 10-16 which are only named as a set against a stated range.
         match = re.search(rf"`{re.escape(code)}`\s*\((\d+)", self._text())
         assert match, f"AGENTS.md does not individually number {code!r} as `` `{code}` (N, ...) ``"
         assert int(match.group(1)) == exit_status, (

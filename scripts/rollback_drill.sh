@@ -1,23 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================================
-# v1.3.4 (todo.md item 28, W5c): rollback drill — deploy the PREVIOUS release image,
-# assert healthy → deploy the NEW one (this release), assert healthy → roll BACK to the
-# previous image, assert healthy AND that data written under the new image is still
-# readable. Proves the operational mechanics of a rollback (same compose project, same
-# named volumes, swapping only the image reference) actually work, not just that each
-# image independently boots — `scripts/release_smoke.sh` already proves the latter, and
-# is reused here for the per-step health/push/pull checks; this script's OWN job is
-# keeping the SAME stack (same volumes, never torn down between swaps) across all three
-# deploys, which release_smoke.sh's own `down -v` cleanup deliberately does not allow.
+# Rollback drill — deploy the PREVIOUS release image, assert healthy -> deploy the NEW
+# one, assert healthy -> roll BACK to the previous image, assert healthy AND that data
+# written under the new image is still readable. Proves the operational mechanics of a
+# rollback (same compose project and named volumes, swapping only the image reference)
+# actually work, keeping the same stack across all three deploys rather than tearing it
+# down like release_smoke.sh does.
 #
 # Usage: ./scripts/rollback_drill.sh <new-image-ref> <previous-image-ref>
-#   e.g. ./scripts/rollback_drill.sh \
-#          ghcr.io/leon1706-lol/aether-vault-engine:v1.3.4 \
-#          ghcr.io/leon1706-lol/aether-vault-engine:v1.3.3
 #
-# See docs/runbooks/upgrade-rollback.md for the operator-facing procedure this drill
-# proves (rather than restates in a workflow comment — the workflow this runs from
-# links there in prose, exactly as it must, not as a literal `git push` command).
+# See docs/runbooks/upgrade-rollback.md for the operator-facing procedure this proves.
 # ============================================================================
 set -euo pipefail
 

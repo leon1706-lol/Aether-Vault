@@ -1,23 +1,9 @@
-"""signing.py — ed25519 signed commits (v1.2.2).
-
-Trust model (documented in SECURITY.md): **tamper evidence, not a trust network.**
-A commit signed here proves the payload that reached a reader is byte-identical to
-the one the signing key's owner produced. It does NOT prove who owns the key, and it
-does NOT integrate with any PKI — key distribution is out of scope by design.
-
-Canonical form: sorted-keys JSON of the commit payload minus its `signature` field,
-UTF-8 encoded. The commit hash is computed BEFORE signing, so the signature binds to
-a payload that already includes `hash` — tampering with anything (tree, message,
-metrics, hash itself) breaks verification.
-
-Storage: `.av/keys/signing.pem` (private, 0600 where the OS honors it) and
-`.av/keys/signing.pub` (public). The `[sign]` extra (`cryptography`) is required only
-when actually generating or using keys; every function degrades gracefully so a
-missing extra can never break an ordinary commit.
-
-Signatures ride commits as:
-    {"algo": "ed25519", "public_key": "<hex>", "sig": "<base64>", "signed_at": iso}
-The server persists the blob verbatim (commits.signature) so cloned copies verify too.
+"""signing.py — ed25519 signed commits (v1.2.2). Trust model (SECURITY.md): **tamper
+evidence, not a trust network** -- proves the payload wasn't modified after signing, not
+who owns the key; no PKI integration. Canonical form is sorted-keys JSON of the commit
+payload minus `signature`, computed AFTER the hash so tampering with anything breaks
+verification. Storage: `.av/keys/signing.pem`/`.pub`; the `[sign]` extra is only needed
+to generate or use keys -- every function degrades gracefully without it.
 """
 from __future__ import annotations
 
@@ -122,13 +108,9 @@ def load_public_key_hex(repo_root: Path) -> str | None:
 
 
 def fingerprint(public_key_bytes: bytes) -> str:
-    """v1.2.5: stable, short, human-comparable identifier for a public key.
-
-    sha256(raw 32-byte public key) rendered as the first 16 hex chars in
-    xxxx:xxxx:xxxx:xxxx groups — a golden-fixture-tested contract (tests/test_signing.py),
-    NOT a trust claim: two different keys are (astronomically) unlikely to share a
-    fingerprint, but a matching fingerprint says nothing about who controls the key.
-    """
+    """Stable, short, human-comparable identifier for a public key: sha256 rendered as
+    the first 16 hex chars in xxxx:xxxx:xxxx:xxxx groups. Not a trust claim -- a matching
+    fingerprint says nothing about who controls the key."""
     import hashlib
 
     digest = hashlib.sha256(public_key_bytes).hexdigest()[:16]
@@ -140,9 +122,8 @@ def archived_keys_dir(repo_root: Path) -> Path:
 
 
 def list_keys(repo_root: Path) -> list[dict]:
-    """v1.2.5: every key this repo knows about — the active one (if any) plus every
-    archived one from a previous `rotate`, newest first. Pure filesystem read, no crypto
-    needed (fingerprinting only hashes bytes)."""
+    """Every key this repo knows about -- the active one plus every archived one from a
+    previous `rotate`, newest first."""
     entries: list[dict] = []
     pub_path = public_key_path(repo_root)
     if pub_path.exists():
@@ -171,11 +152,9 @@ def list_keys(repo_root: Path) -> list[dict]:
 
 
 def rotate_keypair(repo_root: Path) -> tuple[Path, Path]:
-    """v1.2.5: archives the current keypair under .av/keys/archive/<fingerprint>/ (if one
-    exists), then generates a fresh one via generate_keypair(). Never deletes a private
-    key — archived keys keep verifying commits signed before the rotation, since the
-    signature blob carries its own public key. Raises FileNotFoundError if there is no
-    current key to rotate (use `av registry keygen` for the first key instead)."""
+    """Archives the current keypair under .av/keys/archive/<fingerprint>/, then generates
+    a fresh one. Never deletes a private key -- archived keys keep verifying commits
+    signed before the rotation."""
     priv_path = private_key_path(repo_root)
     pub_path = public_key_path(repo_root)
     if not priv_path.exists():
@@ -197,13 +176,9 @@ def rotate_keypair(repo_root: Path) -> tuple[Path, Path]:
 
 
 def _canonical_timestamp(value) -> str | None:
-    """Normalizes an ISO timestamp to one canonical UTC rendering.
-
-    The registry persists naive UTC and echoes timestamps WITHOUT the '+00:00' the
-    authoring client wrote — a cloned payload therefore differed from the signed one
-    by that suffix alone and every clone verification failed (found by the manual wire
-    pass, v1.2.2). Parsing both shapes yields the same instant, so the canonical form
-    is computed from the instant, never the spelling."""
+    """Normalizes an ISO timestamp to one canonical UTC rendering -- the registry echoes
+    timestamps without the client's original '+00:00' suffix, so the canonical form is
+    computed from the instant, never the spelling."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -217,13 +192,9 @@ def _canonical_timestamp(value) -> str | None:
 
 def canonical_commit_bytes(commit_data: dict) -> bytes:
     """Sorted-keys JSON of the commit payload minus `signature`, with the timestamp
-    normalized — the exact bytes signed and verified everywhere.
-
-    v1.3.1: delegates the canonicalization itself to `casobj.canonical_bytes()` (the
-    shared core every new CAS object — improver manifests, policy packs, eval suites,
-    etc. — also signs against); this function's only remaining job is the commit-specific
-    timestamp-echo normalization documented above. Byte-identical to the pre-v1.3.1
-    inline `json.dumps(canon, sort_keys=True)` — golden-fixture tests pin this."""
+    normalized -- the exact bytes signed and verified everywhere. Delegates
+    canonicalization to `casobj.canonical_bytes()`, the shared core every CAS object
+    signs against."""
     from .casobj import canonical_bytes as _canonical_bytes
 
     canon = dict(commit_data)
@@ -260,10 +231,8 @@ def sign_payload(commit_data: dict, repo_root: Path) -> dict | None:
 
 
 def export_signature_blob(commit_hash: str, commit_data: dict) -> dict:
-    """v1.2.5: a standalone, portable record of one commit's signature — for handing to
-    an external auditor who has the commit content but not this repo's config/registry
-    access. `canonical_sha256` lets a verifier confirm the commit content matches what
-    was actually signed even before checking the signature itself."""
+    """A standalone, portable record of one commit's signature, for an external auditor
+    who has the commit content but not this repo's config/registry access."""
     import hashlib
 
     sig = commit_data.get("signature")
@@ -282,10 +251,9 @@ def export_signature_blob(commit_hash: str, commit_data: dict) -> dict:
 
 
 def verify_detached(commit_data: dict, detached: dict) -> tuple[bool, str]:
-    """v1.2.5: verifies a commit against a detached signature record from
-    export_signature_blob(), independent of whatever `commit_data["signature"]` (if any)
-    already says — this is the point of "detached": the verifier trusts the external
-    record, not whatever the commit source claims about itself."""
+    """Verifies a commit against a detached signature record from export_signature_blob(),
+    independent of whatever `commit_data["signature"]` already says -- the verifier
+    trusts the external record, not the commit source's own claim."""
     import hashlib
 
     if commit_data.get("hash") != detached.get("hash"):

@@ -20,11 +20,9 @@ interface Props {
   slotA: CheckpointRow | null;
   slotB: CheckpointRow | null;
   onSlotChange: (slot: "A" | "B", row: CheckpointRow | null) => void;
-  // v1.3.0 (todo.md item 25): arbitrary two-commit compare — the list above only ever
-  // shows the most recent CHECKPOINT_FETCH_LIMIT commits (see WeightDiffPanel.tsx); this
-  // lets a caller resolve and select an older commit by hash directly. `onResolveHash`
-  // resolves (fetching if necessary) and fills the given slot; `hashLookupError` surfaces
-  // a failed lookup (unknown hash, or a commit with no model checkpoints) next to the form.
+  // Arbitrary two-commit compare by hash, for a commit older than the eagerly-fetched
+  // list above. `onResolveHash` resolves and fills the given slot; `hashLookupError`
+  // surfaces a failed lookup next to the form.
   onResolveHash?: (hash: string, slot: "A" | "B") => void;
   hashLookupError?: string | null;
 }

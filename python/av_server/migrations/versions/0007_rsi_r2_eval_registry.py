@@ -5,15 +5,10 @@ Revises: 0006
 Create Date: 2026-09-04
 
 Additive: one new nullable column on `runs` (`integrity_signals`) plus four new tables.
-No existing row is touched. See docs/rsi-operator-guide.md and
-development/architecture.md's Eval Registry & Integrity contract section.
-
-Like every other RSI table (migration 0006), `eval_suites`/`eval_adapters` index a CAS
-object for their actual content; `eval_results` stores its score/detail payload inline
-(JSON) since a score is small, per-run, and queried far more often than any manifest.
-
-No foreign keys on `*_id` columns — same shallow/out-of-order-write rationale as
-`commits.parent_hash`/`runs.parent_run_id`/migration 0006's tables.
+`eval_suites`/`eval_adapters` index a CAS object for their content; `eval_results`
+stores its score/detail payload inline (JSON), since a score is small, per-run, and
+queried far more often than any manifest. No foreign keys on `*_id` columns, same
+shallow/out-of-order-write rationale as prior RSI migrations.
 """
 from typing import Sequence, Union
 

@@ -61,8 +61,7 @@ class AetherVaultCallback(Callback):
         if not self.dataset_paths:
             return
         repo_root = resolve_repo_root(Path(self.dataset_paths[0]).parent)
-        # Scoped: a dataset commit must not sweep unrelated staged files into the tree
-        # (Probleme.md #38). Drives the internal seam directly (v1.2.2) — no CLI hop.
+        # Scoped: a dataset commit must not sweep unrelated staged files into the tree.
         commit_scoped(repo_root, list(self.dataset_paths),
                       f"datasets for {self.tag or 'run'}", tags=("dataset",))
 
@@ -87,7 +86,7 @@ class AetherVaultCallback(Callback):
         if not paths:
             return
         repo_root = resolve_repo_root(Path(paths[0]).parent)
-        push_pending(repo_root)  # v1.2.5: no chdir, no CLI hop (run_av() itself removed at v1.3.0)
+        push_pending(repo_root)
 
 
 def import_checkpoint(

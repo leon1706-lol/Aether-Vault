@@ -1,9 +1,7 @@
-# v1.3.2 (WP-31): automated security scanning. Runs on every PR (fast feedback) and
-# weekly on a schedule (catches newly-disclosed CVEs in already-pinned dependencies,
-# which a PR-only trigger would miss indefinitely for a repo with no new PRs). Every job
-# gates on high/critical findings only — see each step's own comment for why: a scanner
-# that fails the build on every low-severity nit trains reviewers to ignore it, which is
-# worse than not running it at all.
+# Automated security scanning. Runs on every PR, weekly on a schedule (catches
+# newly-disclosed CVEs in already-pinned dependencies), and on master push. Every job
+# gates on high/critical findings only — a scanner that fails on every low-severity nit
+# trains reviewers to ignore it.
 name: security
 
 on:
@@ -11,18 +9,15 @@ on:
   schedule:
     - cron: '0 6 * * 1'   # every Monday 06:00 UTC
   workflow_dispatch: {}
-  # v1.3.4 (W1c): security scans used to run on PR + weekly only -- a master push
-  # (the moment code actually lands) went entirely unscanned until the next Monday.
   push:
     branches: [master]
 
-# v1.3.4 (W1b): least-privilege default. `gitleaks`/`codeql-equivalent` SARIF-uploading
-# jobs below grant themselves `security-events: write` individually; every other job
-# here only ever reads the repo, scans, and uploads its own JSON report artifact.
+# Least-privilege default. SARIF-uploading jobs below grant `security-events: write`
+# individually; every other job only reads the repo, scans, and uploads its own report.
 permissions:
   contents: read
 
-# v1.3.4 (W1b): rapid-fire master pushes shouldn't run five overlapping scan sweeps.
+# Rapid-fire master pushes shouldn't run five overlapping scan sweeps.
 concurrency:
   group: security-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -41,8 +36,8 @@ jobs:
           pip install pip-audit
           pip install -e .[dev,sign,watch,docker] >/dev/null
           # --strict would also fail on pip-audit's own inability to find a fix version
-          # for a transitive pin outside our control; -f json + the summary line below is
-          # the actionable signal, not a hard gate on every advisory regardless of reachability.
+          # for a transitive pin outside our control; the summary line below is the
+          # actionable signal instead.
           pip-audit --desc -f json > pip-audit-report.json || true
           python -c "
           import json, sys
@@ -52,12 +47,6 @@ jobs:
           print(f'::notice::pip-audit found {len(vulns)} advisories across {len(deps)} packages')
           for d in deps:
               for v in d.get('vulns', []):
-                  # v1.3.4 fix (Probleme.md, found live -- security.yml had never run
-                  # before this pass, so this was never caught): the outer f-string is
-                  # already single-quoted-delimiter-free (it uses double quotes), so the
-                  # backslash-escaped single quotes below were never needed and are
-                  # invalid inside an f-string expression -- 'SyntaxError: unexpected
-                  # character after line continuation character'.
                   print(f\"  {d['name']}=={d['version']}: {v['id']} - {v.get('description', '')[:120]}\")
           "
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -77,9 +66,8 @@ jobs:
       - name: bandit (Python security linter)
         run: |
           pip install bandit
-          # -ll: only report MEDIUM/HIGH confidence findings at MEDIUM+ severity -- bandit's
-          # LOW/LOW default tier is dominated by noise (subprocess-with-shell-False false
-          # positives, etc.) that would make this gate untrustworthy within a week.
+          # -ll: only MEDIUM/HIGH confidence at MEDIUM+ severity -- bandit's LOW/LOW
+          # default tier is dominated by noise that would make this gate untrustworthy.
           bandit -r python/ -ll -f json -o bandit-report.json || true
           python -c "
           import json
@@ -102,28 +90,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     container:
-      # v1.3.4 (W0.8): was `image: semgrep/semgrep` -- unqualified, so this resolved to
-      # whatever `:latest` happened to be on the day the job ran, an unpinned execution
-      # surface sitting inside the SECURITY workflow itself. Pinned to the digest
-      # `:latest` pointed at on 2026-09-06 (a multi-arch index digest, so both amd64/arm64
-      # runners resolve correctly); bump deliberately, the same policy as every other pin
-      # in this repo (infrastructure.md's "do not downgrade pins" note).
+      # Pinned by digest (not `:latest`) -- a multi-arch index digest, so both
+      # amd64/arm64 runners resolve correctly; bump deliberately.
       image: semgrep/semgrep@sha256:51c9f53a4fce0d55e9abd08d7b96968654248a4b1122e77f20e0a49c0072446c
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: semgrep (Python security + secrets rulesets)
         run: |
-          # v1.3.4 (found live -- this whole workflow had never run before this pass,
-          # Probleme.md #135): `python.sqlalchemy.security.audit.avoid-sqlalchemy-text`
-          # fired 12 times, all inside python/av_server/migrations/versions/ -- Alembic
-          # migrations legitimately use sa.text()/op.execute() for DDL/DML the ORM can't
-          # express (verified each one: hardcoded table/column names from this repo's own
-          # fixed migration-internal lists, values passed as real bind params, never
-          # string-concatenated external input -- the actual injection pattern this rule
-          # exists to catch). Excluded by path, not by rewriting 12 already-applied
-          # migrations (AGENTS.md: never edit an applied migration in place) or silencing
-          # the rule repo-wide (application code's own use of text(), if any is ever
-          # added, should still be caught).
+          # Migrations are excluded by path: Alembic legitimately uses sa.text()/
+          # op.execute() for DDL/DML the ORM can't express, with hardcoded internal
+          # names and real bind params, not string-concatenated external input -- the
+          # actual injection pattern this rule exists to catch.
           semgrep scan --config p/python --config p/secrets \
             --exclude 'python/av_server/migrations/versions/*' \
             --severity ERROR --error --json --output semgrep-report.json python/ || true
@@ -152,11 +129,6 @@ jobs:
       - name: Build the engine image
         run: docker build --target engine -t aether-vault-engine:security-scan .
       - name: Trivy (OS + Python package CVE scan of the built image)
-        # v1.3.4 (W1a / Probleme.md #135): was `@0.28.0` -- that ref does not exist in
-        # aquasecurity/trivy-action (tags are `v`-prefixed; no bare "0.28.0" tag/branch
-        # ever existed). Since this whole workflow had never actually run (see #135:
-        # trigger was PR+weekly-only, and this repo has had zero PRs), this broken
-        # reference was never caught. Pinned to the real, current v0.36.0 by SHA.
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: aether-vault-engine:security-scan
@@ -176,9 +148,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      # v1.3.4 (W0.7): was @v5 -- every other workflow in this repo (and
-      # infrastructure.md's own "do not downgrade pins" note) standardizes on the
-      # Node-24 v6 major.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
@@ -190,12 +159,8 @@ jobs:
           # shipped to a user) are noise for a PRODUCTION-image security gate.
           npm audit --omit=dev --audit-level=high
 
-  # v1.3.4 (W1c, todo.md item 1): secret scanning that actually fails the build. GitHub's
-  # native secret scanning + push protection are already enabled at the repo level (see
-  # infrastructure.md) — this is the complementary layer that scans the FULL git history
-  # on every run (push protection only ever sees NEW pushes going forward) and reports
-  # into the Security tab like the CodeQL workflow below, rather than only a push-time
-  # block.
+  # Secret scanning that actually fails the build. Complements GitHub's native secret
+  # scanning + push protection by scanning the full git history on every run.
   gitleaks:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -216,11 +181,8 @@ jobs:
           rm gitleaks_8.30.1_linux_x64.tar.gz
 
       - name: gitleaks (full history, SARIF output)
-        # `.gitleaks.toml` (repo root) allowlists a handful of known dev-only literals
-        # (local-compose-only DB passwords, scripts/e2e_scenario.sh's Phase D fixture
-        # tokens) — see that file's own comments for exactly which and why. Everything
-        # else is a hard, exit-1 gate; no `|| true` here, unlike the advisory-only scans
-        # above.
+        # `.gitleaks.toml` allowlists a handful of known dev-only literals; everything
+        # else is a hard, exit-1 gate (no `|| true`, unlike the advisory scans above).
         run: gitleaks detect --source . --config .gitleaks.toml --redact --report-format sarif --report-path gitleaks.sarif --exit-code 1
 
       - name: Upload SARIF to the Security tab

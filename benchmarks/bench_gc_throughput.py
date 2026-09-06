@@ -1,14 +1,11 @@
 """Benchmark #9 — garbage collection throughput.
 
-`av gc` is a remote-CAS-server operation (POST /api/admin/gc) with no equivalent primitive
-in Git LFS/DVC/MLflow's storage models — none of the three competitors has a server-side
-garbage-collection concept comparable to Aether's CAS reclaiming dangling objects. Per the
-same reasoning already applied to bench_concurrent_push.py, this is scoped Aether-only; all
-three competitor columns are N/A (see BENCHMARKS.md methodology notes).
+`av gc` is a remote-CAS-server operation with no equivalent in Git LFS/DVC/MLflow's
+storage models, so this is scoped Aether-only (see BENCHMARKS.md methodology); all three
+competitor columns are N/A.
 
-Drives the real `av` CLI as subprocesses (init/add/commit/push), then times `av gc` —
-never the server's internal GC function directly, so this measures the same path a real
-user's `av gc` invocation would take.
+Drives the real `av` CLI as subprocesses, then times `av gc` -- the same path a real
+user's invocation would take, never the server's internal GC function directly.
 """
 
 import os

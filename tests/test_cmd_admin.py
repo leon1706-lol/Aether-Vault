@@ -150,25 +150,12 @@ def test_backup_restore_proceeds_on_an_empty_database(tmp_path, monkeypatch):
     _write_fake_backup(tmp_path)
     monkeypatch.setattr(cmd_admin, "_psql_scalar", lambda *a, **kw: "0")
     calls = []
-    # `cmd_admin.subprocess` IS the real, process-wide `subprocess` module (a bare
-    # `import subprocess`, not a copy) -- this monkeypatch is unavoidably GLOBAL for the
-    # duration of the test, not scoped to cmd_admin's own calls. Found live: `stdout=b""`
-    # matters, not just `returncode` -- `subprocess.check_output()`'s own stdlib
-    # implementation calls `run(..., stdout=PIPE).stdout`, and `platform.win32_ver()`
-    # (transitively imported the FIRST time anything imports far enough into
-    # `sqlalchemy.util.compat`, which happens somewhere in this exact test depending on
-    # what other tests already ran first) uses `subprocess.check_output()` under the
-    # hood on Windows -- a fake result object missing `.stdout` crashes that completely
-    # unrelated stdlib call with `AttributeError: 'R' object has no attribute 'stdout'`
-    # the moment it's the first thing in the whole process to trigger that import path.
+    # `cmd_admin.subprocess` is the real, process-wide `subprocess` module, so this patch
+    # is unavoidably global -- an unrelated stdlib caller (`platform.win32_ver()`, which
+    # some import chain can trigger mid-test) also calls `subprocess.check_output()` on
+    # Windows, so the fake result needs a real `.stdout` in the right text/bytes mode.
     def _fake_run(cmd, **kw):
         calls.append(cmd)
-        # Text vs bytes mode must match what a REAL `subprocess.run`/`check_output`
-        # would return for these kwargs -- the unrelated stdlib caller documented above
-        # (`platform.win32_ver()`) calls `check_output(..., text=True)` and then runs a
-        # regex `str` match against the result; a bytes stdout there raises `TypeError:
-        # cannot use a string pattern on a bytes-like object` instead of the original
-        # AttributeError, found live by fixing the first crash and rerunning.
         text_mode = bool(kw.get("text") or kw.get("universal_newlines") or kw.get("encoding"))
         return type("R", (), {"returncode": 0, "stdout": "" if text_mode else b""})()
 
@@ -179,9 +166,8 @@ def test_backup_restore_proceeds_on_an_empty_database(tmp_path, monkeypatch):
         return None
 
     # _apply_schema is imported inside the function; patch the module it's imported
-    # from -- av_server.database (the bare top-level import cmd_admin.py itself uses,
-    # matching how the INSTALLED package actually resolves it; `python.av_server...`
-    # is a separate sys.modules entry only this repo's own test suite ever uses).
+    # from -- the bare `av_server.database` cmd_admin.py itself uses, not
+    # `python.av_server...` (a separate sys.modules entry only this test suite uses).
     import av_server.database as db_module
     monkeypatch.setattr(db_module, "_apply_schema", lambda engine: _fake_heal())
 

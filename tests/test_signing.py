@@ -565,10 +565,9 @@ def test_require_signature_policy_does_not_affect_policies_without_it(tmp_path, 
 
 
 # ---------------------------------------------------------------------------
-# v1.3.0 (todo.md item 17): "not PKI / not identity binding" must appear on --help for
-# every command under av registry keys / verify / export-signature, not just the parent
-# group — keys list/fingerprint were previously silent about it (only keys' own group
-# docstring said it, and click doesn't roll a group's help into its subcommands' --help).
+# "not PKI / not identity binding" must appear on --help for every command under av
+# registry keys / verify / export-signature, not just the parent group, since click
+# doesn't roll a group's help into its subcommands' --help.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("args", [

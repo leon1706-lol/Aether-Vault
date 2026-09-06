@@ -16,10 +16,8 @@ interface Props {
   layers: LayerDiff[];
 }
 
-// Visualizes *whether* each layer's hash changed across model depth — not a numeric weight
-// delta. Computing an actual tensor-value drift (e.g. L2 norm per layer) would require
-// downloading both full checkpoints into the browser; this chart only uses the per-layer hash
-// equality data the server already exposes (see lib/diffWeights.ts).
+// Visualizes *whether* each layer's hash changed across model depth, not a numeric
+// weight delta — a real drift would require downloading both full checkpoints.
 const STATUS_COLOR: Record<LayerStatus, string> = {
   unchanged: "#68d391",
   changed: "#fc8181",

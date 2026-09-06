@@ -1,15 +1,12 @@
 """Benchmark #8 — concurrent multi-user push throughput.
 
-Per the resolved methodology question (see BENCHMARKS.md): Aether has a real multi-tenant
-FastAPI server (Postgres+Redis-backed) that N clients can push to concurrently against one
-shared endpoint. DVC/Git LFS/MLflow have no equivalent concurrent-server primitive — DVC and
-Git LFS push to a remote with no app-server tier (concurrency is just filesystem/object-store
-writes, not contention on a server process), and MLflow's tracking server maps onto a
-different workflow entirely. Rather than approximate three different non-equivalent setups,
-v1 scopes this to an Aether-only load test; all three competitor columns are N/A.
+Aether has a real multi-tenant FastAPI server that N clients can push to concurrently
+against one shared endpoint; DVC/Git LFS/MLflow have no equivalent concurrent-server
+primitive, so this is scoped Aether-only (see BENCHMARKS.md methodology) with the other
+three columns N/A.
 
-Drives `VaultClient.push_commit()` directly (no subprocess) from a thread pool — N concurrent
-commits against whichever real `av_server` is reachable, never against a fabricated one.
+Drives `VaultClient.push_commit()` directly (no subprocess) from a thread pool against
+whichever real `av_server` is reachable.
 """
 
 import concurrent.futures
@@ -29,8 +26,8 @@ CONCURRENT_PUSHES = 8
 
 
 def _fake_commit() -> dict:
-    # The server validates `hash` as a real-looking 64-char hex sha256 (`^[a-f0-9]{64}$`,
-    # see server.py's push_commit) — uuid4().hex alone is only 32 chars and would 400.
+    # The server validates `hash` as a real-looking 64-char hex sha256 -- uuid4().hex
+    # alone is only 32 chars and would 400.
     fake_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     return {
         "hash": fake_hash,
@@ -67,11 +64,8 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
                 results = list(pool.map(_push_one, range(CONCURRENT_PUSHES)))
             ok = all(results)
         except Exception as exc:
-            # A real capture on a resource-constrained machine hit a raw
-            # ConnectionResetError under 8-way concurrency (see Probleme.md) — that's a
-            # server-was-up-the-whole-time failure, never "not installed". Caught here (not
-            # just a False in `results`) because a reset can raise out of push_commit()
-            # rather than return False.
+            # A reset/failure under concurrency can raise out of push_commit() rather
+            # than return False -- a server-was-up-the-whole-time failure, never "not installed".
             results = []
             ok = False
             notes["av"] = f"server reachable but the operation failed: {exc}"

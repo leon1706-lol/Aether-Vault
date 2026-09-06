@@ -99,11 +99,9 @@ class TestFlakeRegistryConsistency:
 
 
 def test_no_auto_retry_plugin_installed():
-    # v1.3.4: "no silent retry-forever" is a policy decision (todo.md item 12), not just
-    # a convention — pytest-rerunfailures (or a similar auto-retry plugin) would let a
-    # genuinely flaky test pass CI by re-running until it happens to succeed, with none
-    # of this registry's visibility. Checked against the actual extras a real install
-    # would pull in, not just this file's own dependency list.
+    # "No silent retry-forever" is a policy decision, not just a convention --
+    # pytest-rerunfailures would let a genuinely flaky test pass CI with none of this
+    # registry's visibility.
     pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert "rerunfailures" not in pyproject_text.lower(), (
         "pyproject.toml references a rerunfailures-style plugin — this repo's flake "

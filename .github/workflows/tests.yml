@@ -4,10 +4,8 @@ on:
   push:
   pull_request:
 
-# v1.3.4 (W1b): least-privilege default -- every job here only ever reads the repo,
-# builds, and uploads its own artifacts; none pushes anywhere or touches
-# packages/id-token/security-events. Individual jobs are free to grant themselves more
-# if a future one genuinely needs it (none do today).
+# Least-privilege default -- every job here only reads the repo, builds, and uploads
+# its own artifacts.
 permissions:
   contents: read
 
@@ -20,14 +18,14 @@ concurrency:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 25
+    # ~20min typical; 25min left too little margin and got a slow-runner run cancelled
+    # near the finish line (95% done, no hang). 40min gives real headroom.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        # Floor (3.10: eager annotations, oldest supported) + ceiling (3.14: newest stable,
-        # PEP 649 lazy-annotation semantics). The in-between versions add Windows-runner
-        # minutes without covering new failure modes — the static eager-annotation checker
-        # covers ≤3.12 semantics. Wider range runs nightly (see nightly.yml).
+        # Floor (3.10: eager annotations) + ceiling (3.14: PEP 649 lazy-annotation
+        # semantics). Wider range runs nightly (see nightly.yml).
         python-version: ["3.10", "3.14"]
 
     steps:
@@ -38,35 +36,28 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
-        # v1.3.0: [watch] added so tests/test_v120.py's real-watchdog `av watch` test
-        # exercises the actual event-driven path here (not just its polling fallback,
-        # which runs regardless of whether the extra is installed).
+        # [watch] so tests/test_v120.py's real-watchdog `av watch` test exercises the
+        # actual event-driven path, not just its polling fallback.
         run: pip install -e .[dev,watch]
 
       - name: Run test suite
-        # v1.3.3.9: output additionally tee'd to a log file so the freshness check below
-        # can re-parse this SAME run's summary line rather than running pytest a second
-        # time. `exit $LASTEXITCODE` is required, not decorative: once pytest is piped
-        # into Tee-Object it is no longer the last command PowerShell's step wrapper
-        # inspects, so without this line a failing test run would silently report this
-        # step (and the job) as green.
+        # Output tee'd to a log so the freshness check below can re-parse this same
+        # run's summary line. `exit $LASTEXITCODE` is required: once piped through
+        # Tee-Object, pytest is no longer the last command PowerShell's wrapper inspects.
         run: |
           pytest --cov=python --cov-report=term-missing tests/ 2>&1 | Tee-Object -FilePath pytest_output.log
           exit $LASTEXITCODE
 
-      # v1.3.3.9: closes the one gap `av test`'s own local README-sync path can't cover
-      # on its own -- this job runs bare `pytest`, never `av test`, so nothing here ever
-      # re-checked the test-count badge/prose against reality. Runs on one matrix leg
-      # only (like the speedcheck capture below) since both legs collect the same tests.
+      # This job runs bare `pytest`, never `av test`, so nothing else re-checks the
+      # test-count badge/prose against reality. One matrix leg only, since both legs
+      # collect the same tests.
       - name: Check README test-count freshness
         if: matrix.python-version == '3.14'
         run: python scripts/check_readme_test_freshness.py pytest_output.log
 
-      # v1.3.0 (todo.md item 22): captures this run's perf numbers as a workflow artifact —
-      # trends survive artifact expiry via `scripts/append_perf_history.py`'s SEPARATE,
-      # maintainer-run-locally step (never from CI — this project's CI never commits
-      # anything back to the repo, see tests/test_ci_policy.py) that appends a row to the
-      # committed development/perf-history.json from a downloaded copy of this artifact.
+      # Captures this run's perf numbers as a workflow artifact; trends survive artifact
+      # expiry via append_perf_history.py's separate, maintainer-run-locally step
+      # (never from CI, since this project's CI never commits back to the repo).
       - name: Capture speedcheck JSON
         if: matrix.python-version == '3.14'
         run: python scripts/append_perf_history.py --dry-run --save-speedcheck-json speedcheck-${{ matrix.python-version }}.json
@@ -79,12 +70,8 @@ jobs:
           path: speedcheck-${{ matrix.python-version }}.json
           retention-days: 90
 
-  # v1.3.4 (todo.md item 8, W2a): the ONLY other place the full stack-free suite ran was
-  # Windows (`test` above) -- Linux, the platform this project actually deploys/publishes
-  # containers on, had zero coverage of its own test run, only nightly's narrower
-  # in-between-Python `compat` job. This is the real floor+ceiling Linux twin of `test`,
-  # PLUS (todo items 13/14/30, W2b/W2e) the coverage gate and slowest-tests report neither
-  # OS-parity job needs to duplicate.
+  # The floor+ceiling Linux twin of `test` above (the platform this project actually
+  # deploys containers on), plus the coverage gate and slowest-tests report.
   test-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -106,9 +93,8 @@ jobs:
       - name: Run test suite (coverage-gated, slowest 25 reported)
         env:
           AV_DATA_DIR: ${{ runner.temp }}/av-data
-        # `-m "not flaky"` excludes tests/FLAKES.md-registered flakes from this GATING
-        # job (see the separate, non-gating flaky-quarantine job below); `fail_under` is
-        # read automatically from pyproject.toml's [tool.coverage.report].
+        # `-m "not flaky"` excludes tests/FLAKES.md-registered flakes from this gating
+        # job; `fail_under` is read from pyproject.toml's [tool.coverage.report].
         run: |
           pytest -m "not flaky" --cov=python --cov-report=term-missing --cov-report=xml --cov-report=html --durations=25 tests/ -q
 
@@ -131,11 +117,9 @@ jobs:
             htmlcov/
           retention-days: 30
 
-  # v1.3.4 (todo.md item 12, W2d): flake quarantine policy — runs ONLY the registered
-  # flakes (tests/FLAKES.md), non-gating (`continue-on-error`), so a real regression in
-  # one is still visible in the run summary instead of silently retried or ignored
-  # forever. Starts against an EMPTY registry (see FLAKES.md's own header) — this job
-  # collects zero tests today and that is the correct, intended state.
+  # Flake quarantine policy — runs only the registered flakes (tests/FLAKES.md),
+  # non-gating, so a real regression is still visible in the run summary instead of
+  # silently retried or ignored. Starts against an empty registry by design.
   flaky-quarantine:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -151,13 +135,9 @@ jobs:
         run: pip install -e .[dev,watch]
 
       - name: Run only registered-flaky tests (non-gating)
-        # v1.3.4 (found live — this job's own first-ever run): pytest exits 5 ("no tests
-        # collected") whenever the -m filter matches nothing, which is the deliberate,
-        # correct starting state here (tests/FLAKES.md's registry is empty by design —
-        # see that file's own header). `continue-on-error: true` on the job already makes
-        # this non-blocking, but the STEP itself still shows red, which is misleading for
-        # the expected/normal case; exit 5 specifically is treated as success, any OTHER
-        # nonzero exit (a real flaky test genuinely failing) still surfaces as one.
+        # pytest exits 5 ("no tests collected") when the -m filter matches nothing,
+        # the correct starting state while the registry is empty -- treated as success
+        # here so the step itself doesn't show red for the expected/normal case.
         env:
           AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: |
@@ -167,12 +147,8 @@ jobs:
           set -e
           [[ "$code" == 0 || "$code" == 5 ]] || exit "$code"
 
-  # v1.3.4 (todo.md item 11, W2c): promotes the contract matrix from "buried inside the
-  # ~19-minute Windows `test` job" to its own small (~2 min), named, independently
-  # required check. These four files together already assert every CLI command × text/
-  # json output × the full exit-code registry (test_contract_matrix.py) plus the
-  # no-bots/no-push-back policy (test_ci_policy.py) — this job exists so a contract
-  # regression shows up as ITS OWN red check, not buried in a 19-minute job's log tail.
+  # A small, named, independently required check so a contract regression shows up as
+  # its own red check instead of buried in the 19-minute Windows `test` job's log tail.
   contract-matrix:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -192,10 +168,8 @@ jobs:
         run: |
           pytest tests/test_contract_matrix.py tests/test_contracts.py tests/test_exit_codes.py tests/test_ci_policy.py tests/test_helm_chart.py -v
 
-  # v1.3.4 (todo.md item 38, W2f): a real per-revision upgrade/downgrade drill against a
-  # fresh Postgres — stronger than test_server.py's existing single head-to-base-and-back
-  # round trip (test_migration_chain_downgrades_and_reupgrades_cleanly), which only proves
-  # ONE full round trip works, not that every individual step in the chain does.
+  # A real per-revision upgrade/downgrade drill against a fresh Postgres — stronger than
+  # test_server.py's single head-to-base-and-back round trip.
   migrations-drill:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -228,11 +202,8 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_migrations_drill
         run: python scripts/migrations_drill.py
 
-  # v1.3.4 (todo.md item 35, W1e): lints .github/workflows/*.yml and every shell script
-  # this repo ships (scripts/*.sh, docker/**/*.sh) — no services, no build, runs on every
-  # push in well under a minute. Would have caught this same session's own
-  # aquasecurity/trivy-action@0.28.0 broken-ref bug (Probleme.md #135) had it existed
-  # before that fix landed.
+  # Lints .github/workflows/*.yml and every shell script this repo ships -- no
+  # services, no build, runs on every push in well under a minute.
   lint-workflows:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -248,34 +219,20 @@ jobs:
           rm actionlint_1.7.12_linux_amd64.tar.gz
 
       - name: actionlint
-        # v1.3.4 (found live — this job's own first-ever run): actionlint runs shellcheck
-        # over every embedded `run:` block too, at EVERY severity, with no flag to raise
-        # its floor (verified: actionlint's `-ignore` filters by MESSAGE regex, not
-        # severity; the only severity-adjacent flag, `-shellcheck`, only enables/disables
-        # the integration wholesale). It found five real non-error-severity shellcheck
-        # notes across pre-existing `run:` blocks this job had simply never been run
-        # against before: SC2034 (warning — "loop variable unused" on `for i in $(seq 1
-        # N); do ... & done` background-fan-out loops, where `i` is deliberately unused),
-        # SC2015 (info — "A && B || C is not if-then-else" on deliberate best-effort
-        # `cmd && ok || true` idioms), SC2129 (style — "use a {} redirect block"),
-        # SC2012/SC2102 (info — `ls`-over-`find` and a character-class note, neither a
-        # real bug in this controlled CI context). Same error-level-only judgment call as
-        # the standalone shellcheck step below. Named explicitly rather than silencing
-        # shellcheck wholesale (`-shellcheck=`) so a REAL shellcheck error-level finding
-        # in a future `run:` block still fails this job — if a new non-error code shows
-        # up here later, add it the same way, don't reach for the wholesale disable.
+        # actionlint runs shellcheck over every embedded `run:` block at every severity
+        # with no flag to raise the floor, so specific non-error codes (SC2034, SC2015,
+        # SC2129, SC2012, SC2102 -- none a real bug in this controlled CI context) are
+        # named explicitly here rather than silencing shellcheck wholesale, so a real
+        # error-level finding in a future `run:` block still fails this job.
         run: >-
           actionlint -color
           -ignore 'SC2034:' -ignore 'SC2015:' -ignore 'SC2129:'
           -ignore 'SC2012:' -ignore 'SC2102:'
 
       - name: shellcheck (scripts/ + docker/ha/*.sh)
-        # shellcheck ships preinstalled on GitHub-hosted ubuntu-latest runners — no
-        # install step needed. -S error: this repo's scripts lean on bash-specific
-        # constructs (arrays, [[, process substitution) that trip a large number of
-        # shellcheck's stylistic (info/warning-level) defaults on purpose; error-level
-        # only keeps this gate meaningful instead of training reviewers to ignore it
-        # (the same judgment call security.yml's scanners already document).
+        # -S error: this repo's scripts lean on bash-specific constructs that trip a
+        # lot of shellcheck's stylistic defaults on purpose; error-level keeps the gate
+        # meaningful instead of training reviewers to ignore it.
         run: |
           shopt -s globstar
           shellcheck -S error scripts/*.sh docker/ha/*.sh
@@ -292,9 +249,8 @@ jobs:
           python-version: "3.10"
 
       - name: Install Aether-Vault with the Lightning/Transformers/MLflow/sign extras
-        # [sign] added in v1.2.2 so the signed-commit gate (tests/test_signing.py) runs
-        # here rather than skipping everywhere — this is the only job with the
-        # cryptography extra installed by default.
+        # [sign] so the signed-commit gate (tests/test_signing.py) runs here rather than
+        # skipping everywhere -- this is the only job with cryptography installed by default.
         run: pip install -e .[dev,lightning,transformers,mlflow,sign]
 
       - name: Run framework-plugin tests (+ signed-commit gate)
@@ -366,20 +322,16 @@ jobs:
           python-version: "3.10"
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
-        # [sign] (small wheel, same reasoning as e2e-suite's own install line below) so
-        # TestSsoCrypto's real Fernet-encryption path is actually exercised somewhere
-        # against live Postgres+Redis, not skipped everywhere -- tests/test_server.py
-        # itself gracefully importorskip()s the two tests that need it when absent, so
-        # this extra is additive coverage here, not a requirement to keep this job green.
+        # [sign] so TestSsoCrypto's real Fernet-encryption path is exercised somewhere
+        # against live Postgres+Redis -- test_server.py importorskip()s it when absent.
         run: pip install -e .[dev,sign]
 
       - name: Start aether-vault-server (for the real-wire test)
         env:
           DATABASE_URL: ${{ env.AV_TEST_DATABASE_URL }}
           REDIS_URL: ${{ env.AV_TEST_REDIS_URL }}
-          # Bare-metal uvicorn on the runner has no Docker volume mounted at /data — without
-          # a writable CAS dir every object upload fails with PermissionError and the
-          # real-wire commit silently queues offline instead of syncing.
+          # Bare-metal uvicorn on the runner has no Docker volume mounted at /data --
+          # without a writable CAS dir every upload fails and the commit queues offline.
           AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: |
           nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
@@ -387,8 +339,7 @@ jobs:
             curl -sf http://localhost:8000/api/health && break
             sleep 1
           done
-          # Fail THIS step loudly instead of letting every later test ERROR confusingly —
-          # /api/health is auth-exempt and DB-free, so success here means the lifespan ran.
+          # Fail this step loudly instead of letting every later test ERROR confusingly.
           curl -sf http://localhost:8000/api/health > /dev/null || {
             echo "::error::aether-vault-server did not become healthy in 30s"
             exit 1
@@ -494,12 +445,10 @@ jobs:
           path: /tmp/server-e2e.log
           if-no-files-found: ignore
 
-  # v1.3.0 (todo.md item 28): chaos drills — Phases L/M/N in the same
-  # scripts/e2e_scenario.sh (gated behind AV_E2E_CHAOS=1, off by default so this doesn't
-  # change e2e-suite's own behavior above). A separate job, not folded into e2e-suite,
-  # because these phases kill the server process and make its storage briefly unwritable
-  # — deliberately more disruptive than the rest of the suite, worth isolating so a chaos
-  # regression's failure signal doesn't get lost among Phases A-K's unrelated assertions.
+  # Chaos drills — Phases L/M/N in the same e2e_scenario.sh (gated behind AV_E2E_CHAOS=1).
+  # A separate job, not folded into e2e-suite, since these phases kill the server process
+  # and make storage briefly unwritable -- worth isolating so a chaos regression's
+  # failure signal doesn't get lost among Phases A-K's unrelated assertions.
   chaos-drills:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -555,11 +504,9 @@ jobs:
           path: /tmp/server-e2e.log
           if-no-files-found: ignore
 
-  # Phase I of the e2e layer (v1.2.2): the ENGINE IMAGE itself is a product surface now.
-  # Builds the consolidated image and proves all three dispatch modes from it:
-  # role=all (both subservices healthy in ONE container), role=server, role=webui —
-  # including the legacy auto-detect that keeps pre-1.2.2 pinned composes working
-  # against the aliased aether-vault-server/-webui tags.
+  # The engine image itself is a product surface: builds the consolidated image and
+  # proves all three dispatch modes from it -- role=all, role=server, role=webui --
+  # including the legacy auto-detect for pinned pre-1.2.2 composes.
   e2e-engine-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -568,7 +515,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Build the engine image
-        # v1.3.0 (Probleme.md): explicit target — see release.yml's identical comment.
+        # Explicit target — see release.yml's identical comment.
         run: docker build --target engine -t aether-vault-engine:smoke .
 
       - name: Role=all — one container, both subservices healthy
@@ -593,11 +540,9 @@ jobs:
           [[ "$ok" == 1 ]] || { docker logs engine-all >&2 || true; exit 1; }
           echo "::notice::role=all: registry :8000 AND webui :3000 healthy in one container"
 
-      # v1.2.5: /api/health (liveness) and /api/ready (readiness) must actually diverge —
-      # this container's REDIS_URL points at a host that doesn't exist, so /api/ready
-      # SHOULD report the redis check failing while /api/health stays green regardless
-      # (that gap is exactly the "most misleading failure mode" infrastructure.md warns
-      # about, now made visible instead of silent).
+      # /api/health (liveness) and /api/ready (readiness) must actually diverge -- this
+      # container's REDIS_URL points at a nonexistent host, so /api/ready should report
+      # the redis check failing while /api/health stays green regardless.
       - name: Role=all — /api/ready degrades independently of /api/health
         run: |
           curl -sf http://localhost:8000/api/health >/dev/null 2>&1 || {
@@ -610,24 +555,16 @@ jobs:
             echo "::error::/api/ready did not report the redis check as failing"; exit 1; }
           echo "::notice::role=all: /api/health stayed green while /api/ready correctly reported 503"
 
-      # v1.2.5: killing ONE subservice must restart just that subservice, not the whole
+      # Killing ONE subservice must restart just that subservice, not the whole
       # container — RestartCount unchanged proves engine-entrypoint.sh's own restart
       # loop handled it, not Docker's `restart: unless-stopped` policy on the container.
       - name: Role=all — killing one subservice restarts it, not the container
         run: |
           before=$(docker inspect --format '{{.RestartCount}}' engine-all)
-          # v1.2.5.3/.4: a bare `pkill -f ...` under this step's `set -e` aborts the whole
-          # step on ITS OWN non-matching-process exit code (1), before the real
-          # assertions below ever run — and swallowing that blindly with `|| true`
-          # would let the step silently "pass" without having killed anything at all if
-          # the pattern ever stops matching. Find the PID explicitly and kill THAT, so a
-          # genuine match failure fails loudly with a diagnostic instead of either way.
+          # Find the PID explicitly and kill it (rather than a bare `pkill -f`, which
+          # would abort the step on its own non-matching-exit-code under `set -e`).
           # Pattern is "next-server", not "node server.js": Next.js's standalone server
-          # calls process.title = "next-server (vX.Y.Z)" once it starts, which on Linux
-          # overwrites the process's actual argv/proc/<pid>/cmdline — `ps`/`pgrep -f`
-          # both see the renamed title, never the original `node server.js` invocation
-          # engine-entrypoint.sh launched it with (confirmed via this step's own `ps aux`
-          # diagnostic dump in CI — see Probleme.md).
+          # renames its own process title on Linux, so `pgrep -f` never sees the launch invocation.
           webui_pid=$(docker exec engine-all pgrep -f "next-server" | head -1)
           if [[ -z "$webui_pid" ]]; then
             echo "::error::no 'next-server' (webui) process found inside engine-all to kill"
@@ -652,12 +589,9 @@ jobs:
             echo "::error::server leg went down during a webui-only restart"; exit 1; }
           echo "::notice::role=all: killing webui restarted just that subservice (container RestartCount unchanged: $before)"
 
-      # v1.3.0 (todo.md item 19): the only kill test above (subservice restart) kills an
-      # IDLE process — nothing anywhere proved an in-flight request actually survives a
-      # real drain. Fresh container so we can set a short, CI-fast --stop-timeout/grace
-      # pair (AV_ENGINE_STOP_GRACE_SECS=8, docker --stop-timeout 20 comfortably above it —
-      # see infrastructure.md's orchestrator readiness/liveness section for why the two
-      # must stay in that order for a real deployment).
+      # The kill test above kills an idle process -- this proves an in-flight request
+      # actually survives a real drain, on a fresh container with a short,
+      # CI-fast --stop-timeout/grace pair.
       - name: Drain under load — in-flight uploads survive a real SIGTERM
         run: |
           docker run -d --name engine-drain --network avnet -p 8020:8000 \
@@ -722,12 +656,8 @@ jobs:
           done
           [[ "$ok" == 1 ]] || { docker logs engine-srv >&2 || true; exit 1; }
           sleep 8
-          # The webui must NOT be running under either server-role container. Checks for
-          # "next-server" (the running webui's actual, self-renamed process title — see
-          # Probleme.md #103), NOT "node server.js" (the launch invocation, which Next.js
-          # overwrites the instant it finishes booting) — the old pattern silently never
-          # matched even when the webui WAS running, making this assertion a no-op that
-          # always passed regardless of the real answer.
+          # Checks for "next-server" (the webui's self-renamed process title), not
+          # "node server.js" (the launch invocation Next.js overwrites once booted).
           if docker top engine-srv | grep -q "[n]ext-server"; then
             echo "::error::AV_ENGINE_ROLE=server started the webui too"; exit 1; fi
           if docker top engine-legacy | grep -q "[n]ext-server"; then
@@ -757,11 +687,9 @@ jobs:
           docker rm -f engine-all engine-drain engine-srv engine-legacy engine-webui pg >/dev/null 2>&1 || true
           docker network rm avnet >/dev/null 2>&1 || true
 
-  # v1.3.4 (todo.md item 17, W3d): e2e-engine-smoke above proves role dispatch works from
-  # the "all" (engine) target with AV_ENGINE_ROLE overridden -- it never builds or boots
-  # the actual SLIM `server`/`webui` Dockerfile targets released alongside every tag
-  # (release.yml's "Build and push slim server/webui image" steps, published since
-  # v1.3.0). This is the first CI job that ever does.
+  # e2e-engine-smoke above proves role dispatch from the "all" target with
+  # AV_ENGINE_ROLE overridden -- this builds and boots the actual slim
+  # `server`/`webui` Dockerfile targets released alongside every tag.
   slim-image-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -792,9 +720,8 @@ jobs:
             sleep 2
           done
           [[ "$ok" == 1 ]] || { docker logs slim-server >&2 || true; exit 1; }
-          # No Node binary should even EXIST in this image (target: server never installs
-          # it) -- a stronger assertion than "port 3000 doesn't respond", which a slow
-          # boot could produce transiently even if Node WERE present.
+          # No Node binary should exist in this image at all -- stronger than "port 3000
+          # doesn't respond", which a slow boot could produce transiently anyway.
           docker exec slim-server sh -c 'command -v node' && {
             echo "::error::slim server image has a node binary -- target: server should never install Node"; exit 1; } || true
           echo "::notice::role=server (slim image): registry healthy, confirmed no Node runtime present"
@@ -820,11 +747,9 @@ jobs:
           docker rm -f slim-server slim-webui pg-slim >/dev/null 2>&1 || true
           docker network rm avnet-slim >/dev/null 2>&1 || true
 
-  # v1.3.4 (todo.md item 27, W5b): a "preview environment" for a PR — realized the same
-  # way staging is (docker-edge.yml's staging-smoke): boot the real release compose
-  # topology from a LOCALLY built image (never pushed anywhere, works for fork PRs with
-  # zero registry/secrets access) and run the same release smoke checks, with the
-  # results rendered into the PR run's own summary instead of a deployed URL.
+  # A "preview environment" for a PR: boot the real release compose topology from a
+  # locally built image (never pushed, works for fork PRs with no registry access) and
+  # run the same release smoke checks, rendered into the PR run's own summary.
   preview-env:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -844,10 +769,8 @@ jobs:
         run: docker build --target engine -t aether-vault-engine:preview .
 
       - name: Release smoke against the local preview image
-        # Informational, not gating — a preview job's whole point is to show a PR
-        # author what a real deploy would look like; continue-on-error so the summary
-        # below still renders (and still shows) a genuine failure instead of the step
-        # just disappearing behind a red X with no detail.
+        # Informational, not gating -- continue-on-error so the summary below still
+        # renders a genuine failure instead of disappearing behind a red X.
         continue-on-error: true
         run: bash scripts/release_smoke.sh aether-vault-engine:preview 2>&1 | tee preview-smoke.log
 
@@ -919,8 +842,7 @@ jobs:
           cd "$SCRATCH"
           "$AV" --version
           "$PYBIN" -c "import av_cli, av_server"
-          # v1.2.2 packaging gates: the context-diff and registry surfaces must ship in
-          # the wheel (they were both missing-at-runtime classes of bug historically).
+          # Packaging gates: the context-diff and registry surfaces must ship in the wheel.
           "$AV" diff --help > /dev/null
           "$AV" registry --help > /dev/null
           "$AV" init --mode local --yes --no-repl
@@ -928,12 +850,8 @@ jobs:
           "$AV" add f.txt
           "$AV" commit -m "wheel-smoke"
           "$AV" log | grep "wheel-smoke"
-          # v1.3.0 contract freeze (todo.md #27): pyproject.toml's own
-          # [tool.setuptools.package-data] only lists "docker/*.yml" for av_cli — it can
-          # silently shadow setup.py's package_data (which DOES list
-          # "schemas/*.schema.json"). This is the one place that proves the schemas
-          # actually landed in the wheel installed into a clean venv, not just in the
-          # checkout.
+          # Proves the contract schemas actually landed in the wheel installed into a
+          # clean venv, not just in the checkout.
           "$PYBIN" -c "
           import importlib.resources as r
           names = {'envelope-1.0','event-1.0','run-1.0','webhook-payload-1.0','semdiff-1.0','avh-2.0',
@@ -977,7 +895,7 @@ jobs:
           Set-Location $scratch
           & $av --version
           & $py -c "import av_cli, av_server"
-          # v1.2.2 packaging gates: context-diff + registry surfaces present in the sdist.
+          # Packaging gates: context-diff + registry surfaces present in the sdist.
           & $av diff --help *> $null
           & $av registry --help *> $null
           & $av init --mode local --yes --no-repl
@@ -1027,9 +945,8 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault
           REDIS_URL: redis://localhost:6379/0
-          # Bare-metal uvicorn has no Docker volume at /data — without a writable CAS dir
-          # object uploads 500, seed_data's pushes queue offline, and the dashboard renders
-          # empty (Playwright then fails with element-not-found).
+          # Bare-metal uvicorn has no Docker volume at /data — without a writable CAS
+          # dir, object uploads 500 and the dashboard renders empty.
           AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: |
           nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
@@ -1037,14 +954,12 @@ jobs:
             curl -sf http://localhost:8000/api/health && break
             sleep 1
           done
-          # Fail THIS step loudly instead of letting seed/E2E fail with misleading symptoms —
-          # the v1.1.6–v1.1.8 runs showed "Seeded N commits" against a schema-less server.
+          # Fail this step loudly instead of letting seed/E2E fail with misleading symptoms.
           curl -sf http://localhost:8000/api/health > /dev/null || {
             echo "::error::aether-vault-server did not become healthy in 30s"
             exit 1
           }
-          # The health endpoint is DB-free; also assert the SCHEMA actually came up (the
-          # Probleme.md #70 rollback class fails startup cleanly but leaves health green).
+          # The health endpoint is DB-free; also assert the schema actually came up.
           psql "postgresql://av_user:av_password@localhost:5432/aether_vault" \
             -c "SELECT 1 FROM alembic_version" > /dev/null || {
             echo "::error::server up but migration chain did not commit (schema missing)"
@@ -1066,10 +981,8 @@ jobs:
         working-directory: webui
         run: npx playwright install --with-deps chromium
 
-      # Built fresh in this job (not the docker-compose webui image) so the E2E run always
-      # exercises the current checkout's source, not a stale cached Docker layer — that
-      # exact staleness once produced a passing-looking-but-broken local run, see
-      # development/Probleme.md.
+      # Built fresh in this job (not the docker-compose webui image) so the E2E run
+      # always exercises the current checkout's source, not a stale cached Docker layer.
       - name: Build and start the webui
         working-directory: webui
         env:
@@ -1086,10 +999,8 @@ jobs:
         working-directory: webui
         run: npx playwright test dashboard.spec.ts weight-diff.spec.ts runs.spec.ts
 
-      # Browser-level Protected-mode coverage: restart THE SAME server in Protected mode
-      # (same DB/data, so seeded content stays visible), then drive the ?av_token= handoff
-      # — token consumed, URL stripped, localStorage persisted, dashboard renders behind
-      # the gate. Wrong-token must show the entry prompt instead of data.
+      # Browser-level Protected-mode coverage: restart the same server in Protected mode
+      # (same DB/data, seeded content stays visible), then drive the ?av_token= handoff.
       - name: Restart server in Protected mode
         run: |
           pkill -f "uvicorn av_server.server:app" || true
@@ -1126,10 +1037,9 @@ jobs:
           path: webui/playwright-report/
           retention-days: 7
 
-  # v1.3.2 (WP-27): schema-verifies the Helm chart (deploy/helm/aether-vault) on every
-  # PR — NOT a real cluster deployment (that's a deliberate, documented scope decision;
-  # see deploy/helm/aether-vault/README.md's own "Honest verification status" section).
-  # Fast (no Docker build, no services) so it runs on every push, unlike ha-drill below.
+  # Schema-verifies the Helm chart on every PR -- not a real cluster deployment, a
+  # deliberate scope decision (see the chart's own README). Fast, so it runs on every
+  # push, unlike ha-drill below.
   helm-lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1142,10 +1052,8 @@ jobs:
           version: "v3.15.0"
 
       - name: Install kubeconform
-        # v1.3.4 (W0.9): this used to pipe a network download straight into
-        # /usr/local/bin with no integrity check at all -- a compromised release asset or
-        # a MITM'd download would execute unnoticed. Checksum pinned from kubeconform
-        # v0.8.0's own published CHECKSUMS file.
+        # Checksum-verified rather than piping a network download straight into
+        # /usr/local/bin, pinned from kubeconform v0.8.0's own published CHECKSUMS file.
         run: |
           curl -sLO https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
           echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform-linux-amd64.tar.gz" | sha256sum -c -
@@ -1178,12 +1086,10 @@ jobs:
             --set tenancy.enforce=true --set rateLimit.backend=redis --set authSpike.backend=redis \
             | kubeconform -strict -summary
 
-  # v1.3.2 (WP-25/WP-27): the REAL HA proof — brings up docker-compose.ha.yml (nginx LB +
-  # 2 engine replicas + Postgres primary/streaming-replica + Redis primary/replica),
-  # kills one engine replica mid-load, and asserts zero failed pushes, zero double
-  # webhook delivery, and a globally (not per-replica) enforced rate limit. Separate job
-  # from chaos-drills above -- that suite chaos-tests a SINGLE instance; this one is the
-  # only place N-replica correctness is actually exercised end to end.
+  # The real HA proof — brings up docker-compose.ha.yml (nginx LB + 2 engine replicas +
+  # Postgres/Redis primary/replica), kills one engine replica mid-load, and asserts zero
+  # failed pushes, zero double webhook delivery, and a globally enforced rate limit.
+  # Separate from chaos-drills above, which chaos-tests a single instance.
   ha-drill:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1191,29 +1097,19 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Run the HA drill
-        # v1.3.3.1 fix (found live): without KEEP_HA_STACK=1, ha_drill.sh's own `cleanup()`
-        # EXIT trap tears the whole stack down (`down -v`) BEFORE this job ever reaches
-        # the "Dump engine logs on failure" step below -- so on every real failure, that
-        # step ran against containers that no longer existed and silently dumped nothing.
-        # This job's own final "Tear down" step (`if: always()`) is what actually cleans
-        # up now, regardless of KEEP_HA_STACK.
-        # v1.3.3.8: a dedicated STEP timeout, well under the job's own 30 minutes -- a
-        # real, healthy run finishes phases 0-4 in under 10 minutes every time this has
-        # been observed; capping this step at 15 lets a genuine hang cancel (and dump
-        # diagnostics, see below) with time left in the job budget to spare, instead of
-        # silently burning the entire 30-minute job timeout on one stuck step.
+        # KEEP_HA_STACK=1 so this job's own final "Tear down" step (if: always()) does
+        # the cleanup, not ha_drill.sh's own EXIT trap, which would otherwise tear the
+        # stack down before "Dump engine logs on failure" below ever runs.
+        # A dedicated step timeout, well under the job's own 30 minutes, lets a genuine
+        # hang cancel (and dump diagnostics) with budget left, instead of silently
+        # burning the whole job timeout on one stuck step.
         timeout-minutes: 15
         run: KEEP_HA_STACK=1 bash scripts/ha_drill.sh
 
       - name: Dump engine logs on failure
-        # v1.3.3.8 fix (found live): `if: failure()` never fires when the drill hits this
-        # JOB's own 30-minute timeout -- GitHub Actions marks a timeout-killed step
-        # `cancelled`, not `failed`, so this step was silently SKIPPED on every one of
-        # the timeout hangs this whole investigation has been chasing, leaving zero
-        # diagnostics for exactly the failure mode that mattered most. `cancelled()`
-        # covers that case too; `always()` isn't used instead specifically so this stays
-        # silent on a genuine pass, matching every other job's "only dump logs when
-        # something actually needs explaining" convention.
+        # `cancelled()` too: GitHub Actions marks a timeout-killed step `cancelled`, not
+        # `failed`, so `if: failure()` alone would skip this on exactly the timeout case
+        # that matters most. Not `always()`, so this stays silent on a genuine pass.
         if: failure() || cancelled()
         run: |
           docker compose -f docker-compose.ha.yml -p aether-vault-ha logs --tail=500 || true
@@ -1224,11 +1120,9 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.ha.yml -p aether-vault-ha down -v || true
 
-  # v1.3.4 (todo.md item 29/31, W5d): CI observability — a per-job duration/budget table
-  # rendered into this run's own summary (and, on a same-repo PR, posted as a comment)
-  # every time, success or failure. `needs:` every job so this always runs LAST and sees
-  # every result; `if: always()` so a red run still gets a summary (arguably the most
-  # useful time to have one). Never gating — see scripts/ci_summary.py's own docstring.
+  # CI observability — a per-job duration/budget table rendered into this run's own
+  # summary (and, on a same-repo PR, posted as a comment). `needs:` every job so this
+  # always runs last; `if: always()` so a red run still gets a summary. Never gating.
   ci-summary:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1277,10 +1171,8 @@ jobs:
           cat ci-summary.md >> "$GITHUB_STEP_SUMMARY"
 
       # Same-repo PRs only — a fork PR's GITHUB_TOKEN has no write access to the base
-      # repo's PR comments, and this repo permanently bans the OTHER trigger variant
-      # that would grant it (tests/test_ci_policy.py's standing no-elevated-fork-trigger
-      # guard — see that file for exactly which substring, deliberately not spelled out
-      # here so this comment doesn't itself trip the same guard it's describing).
+      # repo's PR comments, and this repo permanently bans the trigger variant that
+      # would grant it (see tests/test_ci_policy.py's standing guard).
       - name: Post/update the summary as a PR comment
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:

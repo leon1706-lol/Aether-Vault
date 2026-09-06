@@ -22,26 +22,26 @@ you run by hand, occasionally, while working on the codebase.
   MINOR-or-above release — genuinely fresh, every required CI check is green, `--report
   PATH` renders a Markdown outcome table). Read-only toward PRs; blocks a publish, never
   merges anything.
-- `release_smoke.sh` (v1.3.4) - boots the REAL release compose file
+- `release_smoke.sh` - boots the REAL release compose file
   (`python/av_cli/docker/docker-compose.release.yml`) against a given image ref and
   asserts health/ready/push-pull/protected-mode. One script, several call sites:
   `docker-edge.yml`'s staging smoke, `tests.yml`'s PR preview environment,
   `release.yml`'s rollback drill, and local ad-hoc use.
-- `migrations_drill.py` (v1.3.4) - per-revision upgrade→downgrade→re-upgrade drill
+- `migrations_drill.py` - per-revision upgrade→downgrade→re-upgrade drill
   against a real Postgres, stronger than the one full-round-trip test in
   `tests/test_server.py`.
-- `compat_drill.sh` (v1.3.4) - old-binary-vs-newer-schema rolling-upgrade drill via a
+- `compat_drill.sh` - old-binary-vs-newer-schema rolling-upgrade drill via a
   `git worktree` at a previous release tag; self-calibrates its expected outcome against
   whether that tag actually contains Probleme.md #136's fix, so it never produces a false
   failure regardless of tag history — see its own header before wiring it into any gate.
-- `rollback_drill.sh` (v1.3.4) - deploys the previous release image → this release →
+- `rollback_drill.sh` - deploys the previous release image → this release →
   back to the previous, asserting no data loss across the round trip. Reuses
   `release_smoke.sh`'s compose-override technique but keeps the SAME stack/volumes
   across all three deploys (release_smoke.sh's own cleanup always tears volumes down).
-- `check_deprecations.py` (v1.3.4) - reads `development/deprecations.yml`, reports every
+- `check_deprecations.py` - reads `development/deprecations.yml`, reports every
   entry's status, and (`--current-version`) flags anything overdue for removal at this
   repo's own MAJOR-only removal policy (VERSIONING.md).
-- `ci_summary.py` (v1.3.4) - renders a per-job duration-vs-`.github/ci-budgets.yml`-
+- `ci_summary.py` - renders a per-job duration-vs-`.github/ci-budgets.yml`-
   budget table for a CI run; `tests.yml`'s `ci-summary` job posts it as a PR comment.
   Never gating — an overrun is a `::warning::` annotation, not a failure.
 

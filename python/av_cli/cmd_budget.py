@@ -98,13 +98,10 @@ def budget_attach(budget_id: str, run_id: str) -> None:
 @click.option("--storage-bytes", type=int, default=0)
 @click.option("--steps", type=int, default=0)
 def budget_consume(budget_id: str, compute_seconds: float, storage_bytes: int, steps: int) -> None:
-    """Record spend against BUDGET_ID. The spend is recorded server-side FIRST either way
-    (never lost); if any dimension is now over its limit, this then exits 17
-    (`budget_exhausted`) via the normal `fail()` path — `ok:false`, `error.code ==
-    "budget_exhausted"`, `error.data` carrying the full updated budget row so a caller
-    doesn't need a second round trip to see what was actually spent. This mirrors every
-    other non-zero exit code's `ok:false` contract; `unreachable_queued`'s exit-0-on-
-    success shape is the one documented exception to it, not the rule."""
+    """Record spend against BUDGET_ID. The spend is recorded server-side first either way
+    (never lost); if now over any limit, this exits 17 (`budget_exhausted`) with the
+    updated budget row in `error.data` so a caller sees what was spent without a second
+    round trip."""
     repo_root = ensure_repo()
     client = _require_online(repo_root)
     resp = client.session.post(f"{client.server_url}/api/budgets/{budget_id}/consume", json={

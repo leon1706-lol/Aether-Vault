@@ -44,10 +44,8 @@ def test_compare_metadata_detects_size_change(tmp_path):
     p.write_bytes(b"data")
     st = os.stat(p)
 
-    # The C++ core's mtime epoch (std::filesystem) is documented (development/Probleme.md) to
-    # differ from Python's os.stat Unix-epoch mtime, so this only asserts the `size` mismatch
-    # case — the CLI itself never compares the two across languages (see compare_meta_safe in
-    # main.py, which uses os.stat exclusively for that reason).
+    # The C++ core's mtime epoch differs from Python's os.stat Unix-epoch mtime, so this
+    # only asserts the `size` mismatch case.
     p.write_bytes(b"data, but longer now")
     assert aether_core.compare_metadata(str(p), st.st_size, st.st_mtime_ns) is False
 
@@ -84,10 +82,8 @@ def test_split_and_hash_safetensors_rejects_oversized_header(tmp_path):
 
 
 def test_chunk_and_hash_file_produces_valid_chunks(tmp_path):
-    # 32 MB: with the default avg-2MB mask the chance of ZERO cut points in random data
-    # is ~e^-15 (vs ~7% at the 6 MB this test used before, which flaked once in CI-style
-    # full runs when a blob happened to produce a single chunk). Deterministic enough to
-    # assert a lower bound of 2 while staying sub-second.
+    # 32 MB: with the default avg-2MB mask, the chance of zero cut points in random data
+    # is ~e^-15 -- reliably asserts a lower bound of 2 cuts while staying sub-second.
     p = tmp_path / "checkpoint.pt"
     data = os.urandom(32 * 1024 * 1024)
     p.write_bytes(data)
@@ -141,19 +137,11 @@ def test_chunk_and_hash_file_rejects_bad_params(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v1.3.0 (todo.md item 1/17): cross-OS golden fixture. Every other CDC test in this
-# suite proves determinism WITHIN one process/machine (same-run reuse, boundary
-# stability under a local edit) — none of them ever pinned an actual expected hash that
-# a genuinely different OS/architecture could be compared against. The gear table is
-# generated from a fixed splitmix64 seed (src/core.cpp) specifically so chunk boundaries
-# (and therefore shard hashes) are architecture-independent — this is the test that
-# actually proves it, by hardcoding the exact expected output and running it on every
-# CI leg: Windows (`test` job), Linux (`nightly`'s `compat` job), and macOS
-# (`nightly`'s dedicated `golden-fixtures-macos` job, -k "golden").
-#
-# Input is `random.Random(42).getrandbits(8)` — CPython's Mersenne Twister stream for a
-# fixed seed is a long-stable, documented property (not OS/architecture-dependent), so
-# this is exactly reproducible input without needing a checked-in binary fixture file.
+# Cross-OS golden fixture: the gear table is generated from a fixed splitmix64 seed so
+# chunk boundaries (and shard hashes) are architecture-independent -- this hardcodes the
+# exact expected output and runs it on every CI leg (Windows/Linux/macOS). Input is
+# `random.Random(42).getrandbits(8)`, a long-stable reproducible stream with no need
+# for a checked-in binary fixture file.
 # ---------------------------------------------------------------------------
 
 def _golden_cdc_input(size_bytes: int) -> bytes:

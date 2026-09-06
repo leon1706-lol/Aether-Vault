@@ -4,17 +4,11 @@ Revision ID: 0010
 Revises: 0009
 Create Date: 2026-09-04
 
-Additive: three new tables, no existing table touched. See
-development/architecture.md's Sandbox Execution Contract section.
-
-These three tables are server-side INDEX/AUDIT records, not the sandbox executor's own
-state — a driver's live job state lives where the driver itself can actually re-query it
-(a container, a Pod, a Slurm job — see `python/av_cli/sandbox/base.py`'s module
-docstring for why). `sandbox_jobs` lets `av sandbox queue` list jobs across drivers/
-machines without each driver needing its own listing capability (Slurm's `squeue`
-already lists that user's jobs, but a `local` job on a laptop has no such listing at
-all); `tool_manifests` and `action_logs` follow the same content-addressed +
-version-history pattern as every other RSI artifact table.
+Additive: three new tables, no existing table touched. These are server-side INDEX/AUDIT
+records, not the sandbox executor's own state -- a driver's live job state lives where
+the driver itself can re-query it (a container, a Pod, a Slurm job). `sandbox_jobs` lets
+`av sandbox queue` list jobs across drivers/machines; `tool_manifests`/`action_logs`
+follow the same content-addressed version-history pattern as other RSI artifact tables.
 """
 from typing import Sequence, Union
 

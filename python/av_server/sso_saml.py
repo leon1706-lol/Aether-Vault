@@ -1,13 +1,8 @@
-"""SAML 2.0 SP (metadata / ACS / SLS) — v1.3.3 (WP-13). Imports `pysaml2` (the `[saml]`
-extra, needs the native `xmlsec1`/`libxml2` libraries — installed in the Dockerfile's
-engine/server targets) at MODULE level deliberately: `server.py` wraps `import
-sso_saml` in a `try/except ImportError` specifically so a deployment without the
-extra installed simply never mounts these routes at all (a 404, not a crash) — see that
-try/except's own comment.
-
-Converges on the SAME `sso_common.py` functions OIDC uses (`upsert_user_from_claims`/
-`issue_session`) so session issuance, JIT provisioning, and group→role mapping exist
-ONCE across both protocols, not once each.
+"""SAML 2.0 SP (metadata / ACS / SLS) — v1.3.3. Imports `pysaml2` (the `[saml]` extra) at
+MODULE level deliberately: `server.py` wraps `import sso_saml` in a `try/except
+ImportError` so a deployment without the extra never mounts these routes at all (a 404,
+not a crash). Converges on the SAME `sso_common.py` functions OIDC uses, so session
+issuance, JIT provisioning, and group→role mapping exist ONCE across both protocols.
 """
 from __future__ import annotations
 
@@ -34,12 +29,8 @@ router = APIRouter()
 _REPLAY_KEY_PREFIX = "av:saml:assertion:"
 _REPLAY_TTL_SECS = 24 * 3600  # comfortably longer than any real assertion's validity window
 
-# Same shape as server.py's own `AUDIT_ENABLED`/`_audit()` (and scim.py's copy) --
-# duplicated, not imported, to avoid a load-time circular import (server.py imports THIS
-# module at the bottom of its own file). A real login/logout is exactly the kind of
-# event `tests/test_audit_coverage.py`'s sweep exists to guarantee never goes silently
-# untracked -- this local helper is what makes `POST .../acs` and `POST .../sls` show up
-# in that sweep as genuinely audited, not merely exempted.
+# Same shape as server.py's own `AUDIT_ENABLED`/`_audit()` -- duplicated, not imported,
+# to avoid a load-time circular import (server.py imports THIS module).
 AUDIT_ENABLED = os.environ.get("AV_AUDIT_LOG", "1") not in ("", "0", "false")
 _audit_seq_counter = itertools.count()
 
@@ -82,13 +73,10 @@ def _sp_config(provider_id: str, config: dict, base_url: str) -> SPConfig:
                         (sls_url, BINDING_HTTP_REDIRECT), (sls_url, BINDING_HTTP_POST),
                     ],
                 },
-                # IdP-initiated login is the common enterprise case (a user clicks a
-                # tile in Okta/Entra's own dashboard, with no preceding SP AuthnRequest
-                # for pysaml2 to correlate a response against) -- allow_unsolicited is
-                # what makes that not fail signature/InResponseTo checks. Replay
-                # protection for THIS case is handled explicitly below (Redis-backed
-                # assertion-ID dedup), since pysaml2 has no InResponseTo to key off of
-                # here either.
+                # IdP-initiated login (a user clicks a tile in Okta/Entra, no preceding
+                # SP AuthnRequest to correlate against) -- allow_unsolicited avoids
+                # failing signature/InResponseTo checks. Replay protection for this case
+                # is handled explicitly below (Redis-backed assertion-ID dedup).
                 "allow_unsolicited": True,
                 "authn_requests_signed": False,
                 "want_assertions_signed": True,
@@ -101,8 +89,7 @@ def _sp_config(provider_id: str, config: dict, base_url: str) -> SPConfig:
     elif config.get("idp_metadata_xml"):
         import tempfile
 
-        # pysaml2's metadata loader takes a file path, not an inline string -- a
-        # short-lived temp file is the simplest bridge; deleted immediately after load.
+        # pysaml2's metadata loader takes a file path, not an inline string.
         with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
             f.write(config["idp_metadata_xml"])
             temp_path = f.name
@@ -133,10 +120,9 @@ async def saml_metadata(provider_id: str, request: Request):
 @router.post("/api/auth/saml/{provider_id}/acs")
 async def saml_acs(provider_id: str, request: Request):
     """Assertion Consumer Service — where the IdP POSTs the SAML response after the
-    user authenticates. pysaml2's `parse_authn_request_response` does the heavy
-    lifting a hand-rolled XML parser never should: signature verification,
-    `NotBefore`/`NotOnOrAfter` conditions, and audience restriction. Replay protection
-    (a stored assertion-ID set) is this module's own addition on top."""
+    user authenticates. pysaml2's `parse_authn_request_response` handles signature
+    verification, conditions, and audience restriction; replay protection (a stored
+    assertion-ID set) is this module's own addition on top."""
     from .database import async_session_factory
 
     form = await request.form()
@@ -162,10 +148,8 @@ async def saml_acs(provider_id: str, request: Request):
         assertion_id = authn_response.assertion.id if authn_response.assertion else authn_response.in_response_to
         if assertion_id:
             replay_key = f"{_REPLAY_KEY_PREFIX}{assertion_id}"
-            # NX: only succeeds if this key does NOT already exist -- the atomic
-            # test-and-set that makes this a real replay guard, not a check-then-set
-            # race. A second POST of the identical assertion (a captured/replayed
-            # response) is rejected outright, not silently re-processed.
+            # NX: only succeeds if this key does NOT already exist -- an atomic
+            # test-and-set, not a check-then-set race.
             first_use = await cache._client.set(replay_key, "1", nx=True, ex=_REPLAY_TTL_SECS)
             if not first_use:
                 raise HTTPException(status_code=400, detail="SAML assertion already used (replay rejected)")
@@ -211,11 +195,9 @@ async def saml_acs(provider_id: str, request: Request):
 @router.get("/api/auth/saml/{provider_id}/sls")
 @router.post("/api/auth/saml/{provider_id}/sls")
 async def saml_sls(provider_id: str, request: Request):
-    """Single Logout — best-effort: revokes THIS server's own session (via the
-    LogoutRequest's NameID, matched against `sessions`/`user_identities`) and
-    acknowledges the IdP's request. Does not attempt to propagate logout to OTHER
-    service providers the same IdP session may be federated with (SAML's IdP-driven
-    multi-SP logout fan-out) — a real, stated scope limit, not silently unhandled."""
+    """Single Logout — best-effort: revokes THIS server's own session and acknowledges
+    the IdP's request. Does not propagate logout to OTHER service providers the same IdP
+    session may be federated with -- a stated scope limit, not silently unhandled."""
     from .database import async_session_factory
     from .models import DBSession, DBUserIdentity, utcnow_naive
 

@@ -1,21 +1,12 @@
-"""LocalDriver — real subprocess isolation, synchronous (v1.3.1, RSI R5).
+"""LocalDriver — real subprocess isolation, synchronous (v1.3.1). Runs `spec.command` as
+a real subprocess scoped to `spec.cwd`/`spec.env`. `submit()` BLOCKS until the process
+exits or `spec.timeout_secs` elapses, then persists the terminal result.
 
-Runs `spec.command` as a real subprocess, scoped to `spec.cwd` and `spec.env` (merged
-over, not replacing, the current process's environment — matches every other subprocess
-call site in this codebase, e.g. `cmd_eval.py::adapter_run`). `submit()` BLOCKS until the
-process exits or `spec.timeout_secs` elapses, then persists the terminal result to
-`.av/sandbox/jobs/<job_id>.json` (state + exit code + combined stdout/stderr) — see
-`base.py`'s module docstring for why this driver is synchronous while the others aren't.
-
-**Enforcement limits, stated plainly:** this driver enforces `writable_paths` at the
-MOUNT level (a `Mount` outside the manifest's globs is validated away by
-`manifest.verify_spec_against_manifest()` before `submit()` is ever called — see
-`cmd_sandbox.py`), but it CANNOT stop the launched process from writing anywhere else the
-OS user account can reach, and it CANNOT enforce `network: "none"` at all — a local
-subprocess shares this machine's real network stack. Use the `docker` driver when network
-isolation actually matters; `local` is for trusted, low-risk jobs (a lint check, a unit
-test run) where the isolation that matters is "not polluting the working tree with an
-unreviewed change," not "cannot reach the network."
+**Enforcement limits:** enforces `writable_paths` only at the mount-declaration level
+(checked before `submit()` runs) -- it CANNOT stop the process from writing elsewhere the
+OS user can reach, and CANNOT enforce `network: "none"` at all, since a local subprocess
+shares this machine's real network stack. Use `docker` when network isolation matters;
+`local` is for trusted, low-risk jobs only.
 """
 from __future__ import annotations
 
@@ -80,8 +71,8 @@ class LocalDriver:
         return JobStatus(job_id=job_id, state=record["state"], exit_code=record.get("exit_code"))
 
     def cancel(self, job_id: str) -> bool:
-        # submit() already ran to completion by the time any cancel() could be called —
-        # there is nothing in-flight to stop. Honest False, not an error (see base.py).
+        # submit() already ran to completion by the time cancel() could be called --
+        # nothing in-flight to stop.
         return False
 
     def logs(self, job_id: str) -> str:

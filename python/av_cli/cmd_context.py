@@ -31,10 +31,8 @@ def note(note: str, agent: str | None) -> None:
     repo_root = ensure_repo()
     path = _memory_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # v1.3.0 (todo.md item 8): stamp the active run (if any) at write time — additive
-    # field, so `av context search --run ID` can scope notes to the run they were
-    # written under. resolve_run_id() is the same single precedence rule every other
-    # commit path already shares (explicit > AV_RUN_ID env > .av/run.json state).
+    # Stamps the active run (if any) at write time so `av context search --run ID` can
+    # scope notes to it. resolve_run_id() is the same precedence every commit path shares.
     entry = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "agent": agent or os.environ.get("AV_AUTHOR", "anonymous"),
@@ -57,12 +55,8 @@ def note(note: str, agent: str | None) -> None:
               help="Only notes at/after this ISO-8601 timestamp.")
 @click.option("--case-sensitive", is_flag=True, default=False)
 def search(query: str, run_id_filter: str | None, since_ts: str | None, case_sensitive: bool) -> None:
-    """Search context-memory notes by substring (todo.md item 8: "notes mentioning X").
-
-    Plain substring match over each note's text — no full-text index, this is a small
-    append-only JSONL file per repo, not a search-engine-scale corpus. --run and --since
-    narrow first; QUERY then filters by substring within whatever's left.
-    """
+    """Search context-memory notes by substring. Plain substring match, no full-text
+    index; --run and --since narrow first, then QUERY filters what's left."""
     from .handoff import _context_notes
 
     repo_root = ensure_repo()
@@ -214,9 +208,8 @@ def export(fmt: str, out: str | None) -> None:
 
     repo_root = ensure_repo()
     doc = build_handoff_dict(repo_root, None)
-    # v1.3.0 (todo.md item 8): validate on this read path too, not just at write time —
-    # a bug in build_handoff_dict() should surface here just as loudly as it would in
-    # `av handoff`, rather than silently exporting a document that fails the contract.
+    # Validate on this read path too, not just at write time -- a bug in
+    # build_handoff_dict() should surface here just as loudly as in `av handoff`.
     problems = validate_handoff(doc)
     if problems:
         fail(None, "validation",
@@ -254,10 +247,8 @@ def export(fmt: str, out: str | None) -> None:
             return
         click.secho(f"Wrote {out}", fg="green")
         return
-    # `--format` (avh/md/json) is this command's OWN content-type flag — independent of
-    # the global `--output json` envelope flag. When both are json-shaped, still wrap in
-    # the standard envelope (`data.document`) so this command doesn't leak a bare,
-    # un-enveloped JSON blob under --output json the way every other command wouldn't.
+    # `--format` is this command's own content-type flag, independent of the global
+    # `--output json` envelope flag -- still wrap in the standard envelope either way.
     if current_output_mode() == "json":
         emit_json(None, "context export", data={"format": fmt, "document": rendered})
         return

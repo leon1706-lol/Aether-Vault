@@ -1,11 +1,9 @@
-"""OIDC login (authorization code + PKCE) and the CLI's device-code flow — v1.3.3
-(WP-11/WP-12). Mounted into `server.py` via `include_router`; imports `authlib`/`pyjwt`
-lazily (the `[sso]` extra) so a deployment that never configures an OIDC provider never
-needs either installed.
-
-**JIT provisioning, claim mapping, and group→role mapping** are all per-provider,
-configurable via `sso_providers.config` (`av idp add`) — none of it is hardcoded here;
-this module is the protocol mechanics, `sso_common.py` is the policy.
+"""OIDC login (authorization code + PKCE) and the CLI's device-code flow — v1.3.3.
+Imports `authlib`/`pyjwt` lazily (the `[sso]` extra) so a deployment that never
+configures an OIDC provider never needs either installed. **JIT provisioning, claim
+mapping, and group→role mapping** are all per-provider, configurable via
+`sso_providers.config` -- this module is the protocol mechanics, `sso_common.py` is the
+policy.
 """
 from __future__ import annotations
 
@@ -29,11 +27,9 @@ from .sso_crypto import decrypt_config
 router = APIRouter()
 
 # Signed short-TTL state, carried as a cookie through the redirect round-trip to the IdP
-# and back — NOT server-side session storage (this server is otherwise stateless across
-# requests), and not a database row either (this state is meaningless the instant the
-# callback completes, and expires in minutes regardless). HMAC-signed with AV_SECRET_KEY
-# so a client can't forge a callback claiming a `code_verifier`/`nonce` it didn't
-# actually receive from `/login`.
+# and back -- not server-side session storage, not a database row either. HMAC-signed
+# with AV_SECRET_KEY so a client can't forge a callback claiming a `code_verifier`/
+# `nonce` it didn't actually receive from `/login`.
 STATE_TTL_SECS = 600
 STATE_COOKIE_PREFIX = "av_oidc_state_"
 
@@ -92,9 +88,8 @@ _METADATA_CACHE_TTL = 3600
 
 
 async def _oidc_metadata(issuer: str) -> dict:
-    """`.well-known/openid-configuration`, cached per-issuer for an hour — every login
-    would otherwise cost an extra round trip to the IdP for data that changes, in
-    practice, approximately never."""
+    """`.well-known/openid-configuration`, cached per-issuer for an hour -- every login
+    would otherwise cost an extra round trip for data that never changes in practice."""
     cached = _metadata_cache.get(issuer)
     if cached and time.time() < cached[0]:
         return cached[1]
@@ -236,10 +231,8 @@ async def oidc_callback(provider_id: str, request: Request,
 
         from .models import DBAuditLog
 
-        # A real login is exactly the kind of event this system's own "immutable
-        # audit trail" claim needs to actually cover -- this route is GET (an OAuth
-        # callback, per spec) so `tests/test_audit_coverage.py`'s POST/PUT/PATCH/DELETE
-        # sweep doesn't require it, but it's added anyway on the merits.
+        # This route is GET (an OAuth callback, per spec), so the audit sweep doesn't
+        # require it, but a real login is audited anyway on the merits.
         db.add(DBAuditLog(username=user.username, action="auth.oidc_login", project_id=None,
                           details={"provider_id": provider.id, "user_id": user.id,
                                    "device_flow": bool(device_user_code)}, status_code=200))
@@ -256,8 +249,7 @@ async def oidc_callback(provider_id: str, request: Request,
 
 async def _verify_id_token(id_token: str, config: dict, metadata: dict, expected_nonce: str) -> dict:
     """Full validation, not a bare decode: signature (against the IdP's live JWKS),
-    issuer, audience, expiry, and nonce (replay protection for this specific login
-    attempt) — every one of these is a real, separately-exploitable gap if skipped."""
+    issuer, audience, expiry, and nonce -- every one is a real, exploitable gap if skipped."""
     import jwt as pyjwt
     from jwt import PyJWKClient
 
@@ -274,9 +266,8 @@ async def _verify_id_token(id_token: str, config: dict, metadata: dict, expected
 
 
 # ---------------------------------------------------------------------------
-# Device-code flow (WP-12) — what `av login` actually drives; a browser redirect is
-# the wrong UX for a terminal. OIDC-provider-only (the concept doesn't generalize to
-# SAML the same way; every real-world device-flow IdP is OAuth/OIDC-based).
+# Device-code flow — what `av login` actually drives, since a browser redirect is the
+# wrong UX for a terminal. OIDC-provider-only.
 # ---------------------------------------------------------------------------
 
 @router.post("/api/auth/device/code")
@@ -304,11 +295,9 @@ async def device_code_start(body: dict):
 
 @router.get("/api/auth/device/verify")
 async def device_verify(user_code: str = Query(...)):
-    """The page/redirect a human visits (from the CLI's printed instructions) to
-    approve a pending device login — kicks off the NORMAL OIDC browser flow with the
-    device's user_code threaded through the signed state cookie, so the callback knows
-    to mark this device_code approved instead of (or alongside) setting a browser
-    cookie session."""
+    """The page/redirect a human visits to approve a pending device login -- kicks off
+    the normal OIDC browser flow with the device's user_code threaded through the signed
+    state cookie."""
     from . import device_flow
 
     pending = await device_flow.lookup_by_user_code(user_code)

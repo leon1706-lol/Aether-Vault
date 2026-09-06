@@ -4,22 +4,17 @@ Revision ID: 0012
 Revises: 0011
 Create Date: 2026-09-04
 
-Split from the NOT-NULL/FK/RLS phase (migration 0013) deliberately — the standard
-Postgres 3-phase pattern for widening a large live table, so no single transaction here
-holds a long lock across add-column + backfill + constrain + RLS-enable on tables the
-size `audit_log`/`events` can reach in a real deployment. See
-development/architecture.md's Tenancy Isolation contract section.
+Split from the NOT-NULL/FK/RLS phase (migration 0013) deliberately -- the standard
+Postgres 3-phase pattern for widening a large live table, so no single transaction holds
+a long lock across add-column + backfill + constrain + RLS-enable.
 
-Every column added here is NULLABLE with no default and is backfilled in a SEPARATE
-statement immediately after — every pre-existing row across every table lands in
-`DEFAULT_TENANT_ID` (models.py), the same well-known UUID migration 0011 seeded. This is
-what makes an unconfigured, pre-v1.3.2 deployment behave byte-identically after
-upgrading: there is exactly one tenant, and every row already belongs to it.
+Every column added here is NULLABLE with no default and backfilled in a SEPARATE
+statement immediately after -- every pre-existing row lands in `DEFAULT_TENANT_ID`,
+making an unconfigured deployment behave byte-identically after upgrading.
 
-`objects`/`trees` are NOT touched here — they get a different, PRIMARY-KEY-widening
-treatment (per-tenant CAS storage) in migration 0014, not a same-shape tenant_id column,
-because they are the one place a tenant_id column alone would silently corrupt the
-GLOBAL content-addressed dedup contract those two tables exist to provide.
+`objects`/`trees` are NOT touched here -- they get a different, PRIMARY-KEY-widening
+treatment in migration 0014, since a tenant_id column alone would silently corrupt the
+global content-addressed dedup contract those two tables provide.
 """
 from typing import Sequence, Union
 
@@ -43,19 +38,11 @@ _TENANT_SCOPED_TABLES = [
     "blackboard_entries", "sandbox_jobs", "tool_manifests", "action_logs",
 ]
 
-# Batched backfill for tables that can be genuinely large in a live deployment — chunked
-# the same way GC's own delete loop is (_GC_DELETE_BATCH, server.py), so one backfill
-# statement never holds a lock across an unbounded row count. Every other table backfills
-# in one UPDATE (small, bounded by nature — e.g. one row per project for project_freeze).
-#
-# The batched tables' PK column is hardcoded here (from models.py, the source of truth),
-# NOT discovered via `sa.inspect(conn)` — found live: Alembic's offline (`--sql`) render
-# mode runs every migration against a `MockConnection` that has no schema-reflection
-# capability at all (`sa.inspect()` raises `NoInspectionAvailable` immediately), which
-# would silently break `tests/test_migrations.py`'s offline DDL-rendering proof — the one
-# stack-free test that exists specifically to catch a bad op-level call before any real
-# database is involved. A hardcoded map is also strictly faster (no reflection round
-# trip) and works identically online and offline.
+# Batched backfill for tables that can be genuinely large in a live deployment, chunked
+# like GC's own delete loop, so one backfill statement never holds a lock across an
+# unbounded row count. The PK column is hardcoded from models.py rather than discovered
+# via `sa.inspect(conn)`, since Alembic's offline (`--sql`) mode has no schema-reflection
+# capability at all and would break the offline DDL-rendering test.
 _BATCH_SIZE = 5000
 _LARGE_TABLE_PKS = {
     "commits": "hash", "events": "id", "audit_log": "id",
@@ -68,13 +55,9 @@ def upgrade() -> None:
     for table in _TENANT_SCOPED_TABLES:
         op.add_column(table, sa.Column("tenant_id", sa.String(), nullable=True))
 
-    # Alembic's offline (`--sql`) mode executes every `conn.execute()` here against a
-    # `MockConnection` that renders DDL/DML text but never returns a real, meaningful
-    # `.rowcount` — a `while True: ... if result.rowcount == 0: break` loop driven by
-    # that value would either hang forever or terminate on the wrong iteration when
-    # rendering offline. `context.is_offline_mode()` is the documented way to tell the
-    # two apart; offline mode renders each batched statement exactly ONCE (enough to
-    # prove the SQL shape in `tests/test_migrations.py`'s offline DDL test), never loops.
+    # Offline (`--sql`) mode's MockConnection never returns a meaningful `.rowcount`, so
+    # a `while ... rowcount == 0: break` loop would hang or misfire there. Offline mode
+    # renders each batched statement exactly once instead of looping.
     offline = context.is_offline_mode()
     for table in _TENANT_SCOPED_TABLES:
         pk = _LARGE_TABLE_PKS.get(table)

@@ -495,12 +495,9 @@ def test_commit_with_tags_and_metrics(repo):
 
 
 def test_commit_queues_for_retry_instead_of_losing_it_when_token_is_rejected(repo, monkeypatch):
-    # Regression test for a real bug found via manual debugging (development/Probleme.md):
-    # server_available() is exempt from the auth gate (so it stays answerable with no
-    # credentials), which means it returning True does NOT mean this client's token is valid.
-    # upload_commit_objects() raising AuthenticationError used to propagate straight out of
-    # `commit()`, skipping the queue_pending_push() fallback entirely — the commit was created
-    # locally but silently never queued for retry, unlike every other kind of push failure.
+    # server_available() staying True doesn't mean this client's token is valid; an
+    # AuthenticationError used to propagate straight out of `commit()`, skipping the
+    # queue_pending_push() fallback and silently losing the commit instead of retrying it.
     from python.av_cli.client import AuthenticationError, VaultClient
 
     monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
@@ -521,10 +518,8 @@ def test_commit_queues_for_retry_instead_of_losing_it_when_token_is_rejected(rep
 
 
 def test_commit_ref_race_attributes_the_winning_run_and_gives_remediation(repo, monkeypatch):
-    # v1.3.0 (todo.md item 14): the commit-time ref race is the actual concurrent-write
-    # collision — before this, av pull/av merge's own race paths attributed the collision
-    # to a run id with copy-paste remediation, but THIS path (a losing compare-and-swap on
-    # av commit's own push) gave a generic "another agent updated X first" with neither.
+    # The commit-time ref race (a losing compare-and-swap on push) must attribute the
+    # collision to the winning run with copy-paste remediation, not a generic message.
     from python.av_cli.client import RefRaceError, VaultClient
 
     # A prior commit tagged with a run — this is the "winner" the race will report.
@@ -671,10 +666,8 @@ def test_checkout_rejects_ambiguous_short_hash_prefix(repo):
 # ---------------------------------------------------------------------------
 
 def test_doctor_on_healthy_repo_reports_ok(repo):
-    # No add/commit here: committing without a reachable server queues a pending-push entry
-    # (the tool's intended offline-resilient behavior, see `commit`/`queue_pending_push`), which
-    # would make "No commits pending push" a false assertion in this test environment. A fresh,
-    # untouched repo is enough to exercise the structure/core/index/pointer/tmp-file checks.
+    # No add/commit here: committing without a reachable server queues a pending-push
+    # entry, which would make "No commits pending push" a false assertion.
     result = invoke("doctor")
     assert result.exit_code == 0, result.output
     assert "Repository found at" in result.output
@@ -783,10 +776,8 @@ def test_doctor_fix_cannot_recover_truly_missing_object(repo, monkeypatch):
     obj_path = repo / ".av" / "objects" / entry["hash"][:2] / entry["hash"][2:]
     obj_path.unlink()
 
-    # Force "no server reachable" explicitly rather than relying on the test environment
-    # happening to have none running — a real av_server on localhost:8000 (e.g. for manual
-    # benchmark/webui testing) would otherwise make this object recoverable and flip the
-    # assertions below, exactly as it did when this test was last run with Docker up.
+    # Force "no server reachable" explicitly, since a real av_server happening to be up
+    # on localhost:8000 would make this object recoverable and flip the assertions below.
     import python.av_cli.main as main_module
     monkeypatch.setattr(main_module.VaultClient, "server_available", lambda self: False)
 
@@ -873,9 +864,8 @@ def test_doctor_dry_run_without_fix_is_a_noop(repo):
 
 
 # ---------------------------------------------------------------------------
-# av doctor --compose (v1.3.0, todo.md item 20): legacy two-container compose ->
-# consolidated one-container AV_ENGINE_ROLE=all migration tool. Doesn't need a repo
-# (ensure_repo() is never called on this branch) — a bare tmp_path compose file is enough.
+# av doctor --compose: legacy two-container compose -> consolidated one-container
+# AV_ENGINE_ROLE=all migration tool. Doesn't need a repo -- a bare tmp_path compose file is enough.
 # ---------------------------------------------------------------------------
 
 _LEGACY_COMPOSE = """\
@@ -986,10 +976,8 @@ def test_doctor_compose_rejects_invalid_yaml(tmp_path):
 # ---------------------------------------------------------------------------
 # av test
 # ---------------------------------------------------------------------------
-# The pytest invocation itself runs via subprocess.Popen (not subprocess.run) so its output can
-# be streamed live and captured for the README test-badge update (see _update_readme_test_badge)
-# — these tests fake Popen accordingly. npm/av-CLI calls inside `test_cmd` still go through
-# subprocess.run and are faked the same way as before.
+# The pytest invocation runs via subprocess.Popen (not .run) so output can stream live
+# and feed the README test-badge update; these tests fake Popen accordingly.
 
 def _fake_pytest_popen(returncode=0, summary="5 passed in 0.01s\n", captured_calls=None):
     """Build a fake replacement for subprocess.Popen that mimics just enough of the real
@@ -1342,9 +1330,7 @@ def test_test_command_with_dash_k_does_not_touch_readme_badge(tmp_path, monkeypa
 # av benchmark
 # ---------------------------------------------------------------------------
 # Mocks the module dispatch (importlib.import_module + module.run), not real subprocess
-# work — this suite only exercises av_cli's command-surface (--only/--vs/--markdown/error
-# handling), not bench_*.py's own real-tool timing logic (those are exercised by running
-# them directly, see benchmarks/README.md).
+# work -- this suite only exercises av_cli's command surface, not bench_*.py's own timing logic.
 
 class _FakeBenchModule:
     def __init__(self, name):
@@ -1436,12 +1422,9 @@ def test_benchmark_command_markdown_writes_file(repo, monkeypatch, tmp_path):
     import benchmarks.tool_runner as tool_runner_module
 
     monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _FakeBenchModule(name))
-    # render_doc_header() shells out to detect real tool versions (slow, and one tool — mlflow
-    # — is known to hang under non-interactive subprocess invocation until its own internal
-    # timeout fires) — fake it so this test stays fast and deterministic. Patched via the real
-    # module object (imported above, before the importlib.import_module patch above takes
-    # effect) rather than monkeypatch's string-target form — that form calls
-    # importlib.import_module internally too, which the patch above would intercept and break.
+    # render_doc_header() shells out to detect real tool versions (slow, and mlflow can hang
+    # under non-interactive invocation), so it's faked via the real module object rather
+    # than monkeypatch's string-target form, which would call the patched import_module above.
     monkeypatch.setattr(tool_runner_module, "render_doc_header", lambda *a, **k: "# fake header\n\n")
 
     out_path = tmp_path / "BENCHMARKS.md"
@@ -1520,8 +1503,7 @@ def test_benchmark_command_accepts_gc_throughput_via_only(repo, monkeypatch):
 # ---------------------------------------------------------------------------
 # av auth
 # ---------------------------------------------------------------------------
-# Docker itself is never touched here — restart_service/check_docker_running are mocked, same
-# convention as the docker_runtime tests for `av update --docker`.
+# Docker itself is never touched here -- restart_service/check_docker_running are mocked.
 
 def _sandbox_compose_dir(repo, monkeypatch):
     """`av auth set-token`/`clear` resolve a real compose file via _find_source_root() ->
@@ -1639,11 +1621,11 @@ def test_auth_status_reports_protected_without_printing_the_token(repo, monkeypa
 
 
 # ---------------------------------------------------------------------------
-# av auth add-user / list-users / remove-user — per-user tokens (v1.1.8)
+# av auth add-user / list-users / remove-user — per-user tokens
 # ---------------------------------------------------------------------------
 # Same sandbox convention as the single-token tests above: a dummy compose file makes
 # resolve_compose_file() treat the tmp repo as the dev checkout, so every .env read/write
-# lands in tmp_path; Docker itself is always mocked.
+# lands in tmp_path.
 
 def _stored_auth_users(repo):
     import json as json_module
@@ -1886,7 +1868,7 @@ def test_auth_doctor_flags_rejected_token(repo, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # main.run() — the console-script entry point wraps cli() with a one-shot
-# auto-update check at process exit (see python/av_cli/main.py's run() docstring)
+# auto-update check at process exit.
 # ---------------------------------------------------------------------------
 
 def test_run_calls_maybe_auto_update_exactly_once_after_cli_exits(monkeypatch):
@@ -2142,9 +2124,7 @@ def test_log_limit_and_empty_repo(repo):
     assert len(shown) == 2
 
     # Parse MESSAGES out of the bracketed lines instead of substring-matching them:
-    # short hex-y messages ("c1") otherwise collide with random short hashes — a run
-    # whose displayed hash contained "c1" (e.g. `[c11f8ca] c2`) failed this test on CI
-    # once every few dozen runs. See Probleme.md #74.
+    # short hex-y messages ("c1") otherwise collide with random short displayed hashes.
     def _message_after_hash(line: str) -> str:
         rest = line.split("] ", 1)[1].strip()
         if rest.startswith("("):  # ref decoration, e.g. "(HEAD, main) c3"

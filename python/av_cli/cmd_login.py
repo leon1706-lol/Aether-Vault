@@ -1,14 +1,8 @@
-"""av login/logout/whoami — SSO device-code login for the CLI (v1.3.3, WP-12/WP-15).
-
-A browser redirect is the wrong UX for a terminal, so this drives the OAuth2 device-code
-flow (`sso_oidc.py`'s `/api/auth/device/*` routes) rather than an authorization-code
-redirect: print a URL + short code, the user approves in their own browser, this process
-polls until approved. The resulting session is stored via `session_store.py`
-(`~/.aether-vault/session.json`) and picked up automatically by every other command
-through `resolve_remote()`'s v1.3.3 extension — no per-command wiring needed.
-
-`av auth *` (the `.env`-based OSS path) and `av token *` (DB-backed static tokens) are
-both untouched; this is the third, SSO-driven credential path alongside them.
+"""av login/logout/whoami — SSO device-code login for the CLI (v1.3.3). Drives the OAuth2
+device-code flow (print a URL + short code, poll until the user approves in their
+browser) since a redirect is the wrong UX for a terminal. The resulting session is stored
+via `session_store.py` and picked up automatically by every other command through
+`resolve_remote()` — a third credential path alongside `av auth *` and `av token *`.
 """
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
@@ -77,13 +71,9 @@ def login(provider_id: str | None, url_opt: str | None, no_browser: bool) -> Non
     verify_url = device["verification_uri_complete"]
     json_mode = current_output_mode() == "json"
     if not json_mode:
-        # v1.3.3 fix (found before this ever shipped, by writing this command's own
-        # --output json exit-code repro): printing this unconditionally would have
-        # broken test_contract_matrix.py's "exactly one clean JSON envelope" contract
-        # for every agent-facing caller of `av login --output json` -- the verification
-        # URL/code are still surfaced in JSON mode, just inside the eventual envelope
-        # (see the `data=` on both the success and the `login_required` failure below),
-        # never as loose stdout text ahead of it.
+        # Printing this unconditionally would break the "exactly one clean JSON envelope"
+        # contract for `av login --output json` -- the URL/code still surface in JSON
+        # mode, just inside the eventual envelope, never as loose text ahead of it.
         click.secho(f"To log in, open this URL in your browser:\n\n  {verify_url}\n", fg="cyan")
         click.secho(f"User code: {device['user_code']}", fg="cyan")
 

@@ -57,16 +57,13 @@ def make_safetensors(path: Path, layer_contents: dict[str, bytes]) -> None:
 
 
 def make_finetune_step_safetensors(path: Path, step: int) -> None:
-    """Writes a checkpoint for fine-tune step `step` (0-indexed): every `backbone.layer_i`
-    is byte-identical across every step (same name, same content, same hash); only
-    `classifier_head`'s bytes change per step. This is exactly the scenario layer-level
-    dedup exists for — only the head's layer should ever get re-stored.
+    """Writes a checkpoint for fine-tune step `step`: every `backbone.layer_i` is
+    byte-identical across steps; only `classifier_head`'s bytes change -- exactly the
+    scenario layer-level dedup exists for.
     """
     layer_size = SAFETENSORS_LAYER_SIZE_MB * 1024 * 1024
-    # Backbone layers use low byte values (0..N), the classifier head uses a disjoint high
-    # range (200+) — without this separation, a head's content can coincidentally collide
-    # byte-for-byte with a backbone layer's on some step, making CAS dedup them into the same
-    # object and silently understating that step's real storage delta.
+    # Backbone and head use disjoint byte-value ranges so their content can never
+    # coincidentally collide and get deduped into the same CAS object.
     layers = {f"backbone.layer_{i}": bytes([i]) * layer_size for i in range(SAFETENSORS_LAYER_COUNT - 1)}
     layers["classifier_head"] = bytes([200 + (step % 50)]) * layer_size
     make_safetensors(path, layers)

@@ -1,18 +1,8 @@
 """Skip-summary aggregation for `pytest_terminal_summary` (wired in tests/conftest.py).
 
-Skips-by-design are GOOD (the Docker registry stack and optional plugin extras are
-legitimately unavailable in most local runs) â€” but a bare "36 skipped" in pytest's tail
-reads as something being hidden. This module turns the raw skip reasons into an explicit,
-self-explanatory end-of-run block, e.g.:
-
-    - Skipped by design --------------------------------------------
-      36 skipped:
-      - 33 tests need the Docker registry stack (db/redis/server unreachable)
-        -> start it with: docker compose up -d db redis aether-vault-engine
-      - 3 optional-dependency guards (native core / plugin extras)
-
-Pure functions only â€” no pytest imports â€” so classification and rendering are unit-testable
-in isolation (tests/test_skipsummary.py).
+Turns raw skip reasons into an explicit, self-explanatory end-of-run block instead of a
+bare "36 skipped" that reads as something being hidden. Pure functions only, no pytest
+imports, so classification and rendering are unit-testable in isolation.
 """
 
 from __future__ import annotations
@@ -25,12 +15,8 @@ _PLUGIN_MARKERS = ("lightning", "transformers", "mlflow")
 
 
 def extract_reason(report) -> str:
-    """Best-effort skip-reason text from a pytest TestReport.
-
-    Skips raised via `pytest.skip(msg)` carry longrepr as a 3-tuple whose last element is
-    `"Skipped: <msg>"`; importorskip/skipif land in the same shape. Falls back to
-    longreprtext so nothing crashes on unexpected shapes.
-    """
+    """Best-effort skip-reason text from a pytest TestReport: `pytest.skip(msg)` carries
+    longrepr as a 3-tuple ending in `"Skipped: <msg>"`; falls back to longreprtext."""
     lr = getattr(report, "longrepr", None)
     if isinstance(lr, tuple) and len(lr) == 3:
         reason = str(lr[2])
@@ -43,11 +29,8 @@ def extract_reason(report) -> str:
 
 
 def classify_skip(reason: str) -> str:
-    """Maps one raw skip message to a bucket name.
-
-    Buckets: docker-stack (registry services not running), native-core (aether_core
-    extension missing), plugin-extras (lightning/transformers/mlflow guards), other.
-    """
+    """Maps one raw skip message to a bucket: docker-stack, native-core, plugin-extras,
+    or other."""
     r = (reason or "").lower()
     if any(marker in r for marker in _DOCKER_MARKERS):
         return "docker-stack"

@@ -1,18 +1,9 @@
 """v1.3.2 — Principal resolution: the DB-backed identity/RBAC layer alongside the
-existing `.env`-based `AV_API_TOKEN`/`AV_AUTH_USERS` credentials (`server.py`).
-
-Nothing here replaces `server.py::require_token`'s existing two credential sources — both
-keep working completely unchanged and resolve to a `Principal` here too (paths 1/2 below),
-so this module is purely additive, matching the same shape v1.3.1's `_scopes_for_identity()`
-used to make scopes additive: a token with no matching row in any new table resolves
-exactly as it always has.
-
-`Principal` is the single resolved-identity object every new enterprise surface (RBAC
-permission checks, tenancy enforcement in a later phase, audit attribution) reads instead
-of re-deriving identity its own way. `server.py::require_token` builds one per request and
-stores it on `request.state.principal`; existing code paths keep reading
-`request.state.username`/`request.state.scopes` exactly as before (see `_wire` below) —
-nothing that reads those two attributes today needs to change.
+existing `.env`-based `AV_API_TOKEN`/`AV_AUTH_USERS` credentials. Purely additive --
+both existing credential sources keep working unchanged and resolve to a `Principal`
+here too. `Principal` is the single resolved-identity object every enterprise surface
+(RBAC checks, tenancy enforcement, audit attribution) reads instead of re-deriving
+identity its own way.
 """
 from __future__ import annotations
 
@@ -36,22 +27,17 @@ def _utcnow_naive() -> datetime:
 
 def hash_token(raw_token: str) -> str:
     """The ONLY form an `api_tokens`/`sessions` token is ever compared against or stored
-    as — plaintext never touches the database (models.py::DBApiToken/DBSession docstrings).
-    Matches `av registry keygen`'s "the private key never round-trips back out" posture:
-    a token is shown once, at creation, and never again."""
+    as -- plaintext never touches the database. A token is shown once, at creation, and
+    never again."""
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
 class Principal:
     """One resolved identity for the lifetime of a request. `tenant_id` is `None` only
-    for a genuinely unauthenticated Anonymous-mode request (`auth_method="anonymous"`) —
-    every authenticated identity, `.env`-based or DB-based, resolves to a real tenant
-    (the seeded `DEFAULT_TENANT_ID` for every identity source that predates tenancy).
-    This is deliberate: a later phase's tenancy enforcement gates on `tenant_id is not
-    None`, and `None` must mean "truly no identity", never "identity exists but its
-    tenant is unknown" — those are different failure modes with different correct
-    responses (fail open vs. fail closed)."""
+    for a genuinely unauthenticated Anonymous-mode request -- every authenticated
+    identity resolves to a real tenant. Tenancy enforcement gates on `tenant_id is not
+    None`, so `None` must mean "truly no identity", never "tenant unknown"."""
 
     username: str
     tenant_id: str | None
@@ -71,22 +57,17 @@ def anonymous_principal() -> Principal:
 
 
 def env_principal(username: str, tenant_id: str, scopes: list[str]) -> Principal:
-    """Wraps an identity already resolved by `server.py`'s existing `_resolve_identity()`/
-    `_scopes_for_identity()` — the `.env`-based path (`AV_API_TOKEN`/`AV_AUTH_USERS`).
-    Always resolves to `DEFAULT_TENANT_ID`: every pre-v1.3.2 identity source, by
-    definition, predates multi-tenancy, and every pre-existing row across every table was
-    backfilled to that same tenant (migration 0011's seed / a later migration's backfill)
-    — so this is the one tenant such an identity could ever meaningfully mean."""
+    """Wraps an identity already resolved by `server.py`'s `.env`-based path
+    (`AV_API_TOKEN`/`AV_AUTH_USERS`). Always resolves to `DEFAULT_TENANT_ID`, since
+    every pre-v1.3.2 identity source predates multi-tenancy and was backfilled to it."""
     return Principal(username=username, tenant_id=tenant_id, auth_method="env_token",
                       scopes=scopes)
 
 
 # ---------------------------------------------------------------------------
-# DB-backed resolution (api_tokens, sessions) — new in v1.3.2. A small in-process TTL
-# cache keyed on the token hash keeps this off the hot path for repeat requests from the
-# same client; entries self-expire, and revocation (WP-8, `av token revoke`) additionally
-# clears the specific entry so a revoked token stops working immediately rather than
-# waiting out the TTL.
+# DB-backed resolution (api_tokens, sessions). A small in-process TTL cache keyed on the
+# token hash keeps this off the hot path for repeat requests; revocation additionally
+# clears the specific entry so a revoked token stops working immediately.
 # ---------------------------------------------------------------------------
 
 AUTH_CACHE_TTL_SECS = float(os.environ.get("AV_AUTH_CACHE_TTL_SECS", "30"))
@@ -109,19 +90,12 @@ def _cache_put(token_hash: str, principal: Principal | None) -> None:
 
 
 def invalidate_cached_token(raw_token: str) -> None:
-    """Callable ONLY where the raw token is actually in hand — `av login logout`'s own
-    session token, or a token creation flow revoking itself. Deliberately NOT called by
-    `POST /api/tokens/{id}/revoke` (admin-initiated revocation of SOMEONE ELSE's token):
-    the server stores only `token_hash` (models.py::DBApiToken's own docstring — the
-    plaintext is shown once, at creation, and never persisted), so an admin revoking a
-    token they don't hold cannot look up its cache entry to clear it. That path accepts
-    a bounded staleness window instead — AUTH_CACHE_TTL_SECS (30s default), the same
-    number already documented as this cache's performance bound. Revocation is still
-    permanent and takes effect on the very next uncached resolution; it is only the
-    *cached* copy that can outlive the revoke by up to one TTL window. Real remote
-    revocation within that window (a compromised token) should pair `av token revoke`
-    with lowering `AV_AUTH_CACHE_TTL_SECS` or restarting the engine, documented in
-    docs/rsi-operator-guide.md's enterprise-identity companion."""
+    """Callable ONLY where the raw token is actually in hand -- `av login logout`'s own
+    session token, or a token creation flow revoking itself. NOT called by admin-initiated
+    revocation of someone else's token (the server stores only `token_hash`, so it can't
+    look up that cache entry) -- that path accepts a bounded staleness window instead
+    (AUTH_CACHE_TTL_SECS). Revocation is still permanent on the next uncached resolution;
+    only the *cached* copy can outlive the revoke by up to one TTL window."""
     _principal_cache.pop(hash_token(raw_token), None)
 
 
@@ -129,21 +103,10 @@ async def _permissions_for_subject(
     db, tenant_id: str, subject_type: str, subject_id: str,
 ) -> tuple[list[str], list[str]]:
     """Every role bound to (subject_type, subject_id) within tenant_id, unioned into one
-    scopes list plus the role names themselves (surfaced for `av whoami`/audit detail).
-    `role.tenant_id IS NULL` includes the six built-in roles (migration 0011), which are
-    shared by every tenant rather than duplicated per-tenant.
-
-    v1.3.3 (WP-16/WP-18, SSO group→role mapping / SCIM group sync): for `subject_type
-    == "user"`, ALSO includes every role bound to any GROUP that user belongs to
-    (`group_members`) — `DBRoleBinding`'s own docstring already promised this
-    ("unions every binding's role's permissions that apply to the resolved subject"),
-    but this function only ever resolved the exact (subject_type, subject_id) pair
-    given, silently never expanding through group membership. Found live while wiring
-    up SSO's group→role mapping: a user placed in a group bound to `reviewer` got
-    NO extra permissions at all until this fix — group-based role bindings were
-    completely inert for actual permission resolution. Fixed here, once, so both the
-    SSO and SCIM group-membership paths (and any future one) benefit without each
-    needing its own copy of this logic."""
+    scopes list plus the role names themselves. `role.tenant_id IS NULL` includes the
+    six built-in roles, shared by every tenant rather than duplicated per-tenant. For
+    `subject_type == "user"`, also includes every role bound to any GROUP that user
+    belongs to, so SSO/SCIM group→role mappings actually grant permissions."""
     from .models import DBGroupMember, DBRole
 
     conditions = [
@@ -181,11 +144,9 @@ async def _permissions_for_subject(
 
 
 async def resolve_db_token(db, raw_token: str) -> Principal | None:
-    """`api_tokens` path (WP-8's `av token create`) — the remote-administrable
-    alternative to `.env`-based `AV_AUTH_USERS`, which requires `docker compose` shell
-    access on the host running the stack to create/rotate/revoke (`cmd_auth.py`).
-    Returns `None` (never raises) for any unknown/revoked/expired token — the caller
-    falls through to the next resolution path, exactly like a `.env` miss does today."""
+    """`api_tokens` path (`av token create`) -- the remote-administrable alternative to
+    `.env`-based `AV_AUTH_USERS`. Returns `None`, never raises, for any unknown/revoked/
+    expired token -- the caller falls through to the next resolution path."""
     token_hash = hash_token(raw_token)
     cached, principal = _cache_get(token_hash)
     if cached:
@@ -222,9 +183,8 @@ async def resolve_db_token(db, raw_token: str) -> Principal | None:
 
 
 async def resolve_session(db, raw_token: str) -> Principal | None:
-    """`sessions` path — an interactive SSO login (`av login`, or the webui's browser
-    flow, a later phase). Same shape as `resolve_db_token`, distinct table: a session is
-    shorter-lived and refreshable, a token is a long-lived credential minted directly."""
+    """`sessions` path -- an interactive SSO login. Same shape as `resolve_db_token`,
+    distinct table: a session is shorter-lived and refreshable."""
     token_hash = hash_token(raw_token)
     cache_key = f"session:{token_hash}"
     cached, principal = _cache_get(cache_key)

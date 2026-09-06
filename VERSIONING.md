@@ -171,7 +171,7 @@ artifacts, structured self-edit proposals, a dual promotion gate (model vs. impr
 signed/hash-chained policy-as-code, capability canaries, a held-out eval vault, budgets
 and auto-stop, a reviewer gate, causal lineage and strategy memory, a pluggable sandbox
 executor, and server-side anomaly detection — see `development/architecture.md`'s
-per-surface "RSI R1"–"RSI R6" contract sections for the full design reasoning.
+per-surface RSI contract sections for the full design reasoning.
 
 - **New exit codes**: `budget_exhausted` (17), `frozen` (18), `review_required` (19),
   `scope_denied` (20) — additive to the existing 10–16 registry. See
@@ -381,7 +381,7 @@ to 10/minute by default. Both pre-1.1.x behaviors remain available explicitly vi
    `Essential-Tasks: signed off` once `Aether-vault-Obsidian-Vault/Essential-Tasks.md` has
    actually been run end to end for this release — the `gate` job below checks for exactly
    that marker.
-3. Re-capture perf numbers (v1.3.0, todo.md item 22), IN THIS ORDER (the first step fully
+3. Re-capture perf numbers, IN THIS ORDER (the first step fully
    overwrites `BENCHMARKS.md`, so the second must come after it, not before):
    ```bash
    av benchmark --markdown development/BENCHMARKS.md
@@ -392,7 +392,7 @@ to 10/minute by default. Both pre-1.1.x behaviors remain available explicitly vi
    `perf-history.json` has no entry whose `version` matches the tag being released.
 4. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 5. The [`release.yml`](.github/workflows/release.yml) pipeline then automatically runs a
-   **`gate` job first** (v1.3.0, todo.md item 30) that every publish job depends on and
+   **`gate` job first** that every publish job depends on and
    that blocks the release if any of the following isn't true: the stack-free suite
    re-run passes; the tagged commit's `tests.yml` run is green (checked via `gh api`
    check-runs); `development/perf-history.json` has a row for this tag's version (step 3

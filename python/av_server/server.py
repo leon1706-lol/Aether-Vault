@@ -87,11 +87,11 @@ logger = logging.getLogger("av_server")
 # App setup
 # ---------------------------------------------------------------------------
 
-# Webhook delivery retry worker (v1.2.2): failed deliveries persist with a next_retry_at
-# and are re-driven on an interval until AV_WEBHOOK_MAX_ATTEMPTS is exhausted → dead-letter.
+# Webhook delivery retry worker: failed deliveries persist with a next_retry_at and are
+# re-driven on an interval until AV_WEBHOOK_MAX_ATTEMPTS is exhausted → dead-letter.
 WEBHOOK_MAX_ATTEMPTS = int(os.environ.get("AV_WEBHOOK_MAX_ATTEMPTS", "5"))
 WEBHOOK_RETRY_INTERVAL_SECS = int(os.environ.get("AV_WEBHOOK_RETRY_INTERVAL_SECS", "30"))
-# v1.2.5: exponential backoff cap and per-webhook auto-disable threshold.
+# Exponential backoff cap and per-webhook auto-disable threshold.
 WEBHOOK_RETRY_MAX_SECS = int(os.environ.get("AV_WEBHOOK_RETRY_MAX_SECS", "3600"))
 # 0 = off (default): a webhook never auto-disables regardless of consecutive failures.
 WEBHOOK_DISABLE_AFTER = int(os.environ.get("AV_WEBHOOK_DISABLE_AFTER", "0"))
@@ -117,10 +117,8 @@ async def lifespan(app: FastAPI):
     # Replaces the deprecated @app.on_event("startup") hook.
     await init_db()
     await cache.init_filter()
-    # v1.3.3 (WP-32): generates the server's audit-signing keypair on first boot if
-    # AV_AUDIT_SIGNING_KEY_PATH is set and no key exists there yet -- never regenerates
-    # over an existing one (see audit_signing.ensure_keypair's own docstring). A no-op,
-    # not a startup failure, when the env var is unset or `cryptography` isn't installed.
+    # Generates the server's audit-signing keypair on first boot if AV_AUDIT_SIGNING_KEY_PATH
+    # is set and no key exists yet. A no-op, not a startup failure, when unset/unavailable.
     try:
         audit_signing.ensure_keypair()
     except Exception:
@@ -134,53 +132,28 @@ async def lifespan(app: FastAPI):
             await worker
 
 
-# app = FastAPI(...) itself is constructed further down (right before the middleware
-# pipeline registration), not here — v1.3.2's `_enforce_project_tenant` global
-# dependency (search for that name) must exist BEFORE the constructor call that
-# references it (`dependencies=[Depends(_enforce_project_tenant)]`), and that function
-# is defined after the auth/scope machinery it depends on (`_principal`, `require_scope`).
-# Nothing between here and that constructor call references the module-level `app` name
-# itself (verified: no `@app.` decorator or `app.` attribute access anywhere in between)
-# so moving the construction site is safe.
+# app = FastAPI(...) itself is constructed further down, not here -- `_enforce_project_tenant`
+# (the global dependency passed to its constructor) must exist BEFORE that call, and it's
+# defined after the auth/scope machinery it depends on (`_principal`, `require_scope`).
 
 # --- Authentication ("Protected" mode) ------------------------------------------
-# Two credential sources, both optional, both read once at process start (matching
-# DATA_DIR below: `av auth ...` writes .env and restarts the service, so a fresh process
-# always picks up changes — no per-request re-read needed):
-#
+# Two credential sources, both optional, both read once at process start:
 #   AV_API_TOKEN   the owner's shared secret (legacy single-key mode, still fully valid)
 #   AV_AUTH_USERS  JSON map {"username": "token", ...} — per-user access tokens
-#                  (managed by `av auth add-user/list-users/remove-user`)
-#
 # A request is authenticated when its Bearer token matches EITHER source; the resolved
-# username ("owner" for the shared secret) is stored on request.state.username and used
-# by push_commit to attribute commits whose client sent author="anonymous". Both empty
-# = Anonymous mode: every route behaves exactly as it always has — no auth at all.
+# username is stored on request.state.username. Both empty = Anonymous mode.
 AV_API_TOKEN = os.environ.get("AV_API_TOKEN", "").strip()
 
-# Always reachable even in Protected mode:
-# - /api/health: Docker healthchecks and VaultClient.server_available() depend on this being
-#   checkable with no credentials — docker_runtime.restart_service()'s own readiness wait calls
-#   server_available(), so gating health would make a freshly-protected server look perpetually
-#   unreachable to the very code restarting it.
-# - /docs, /openapi.json, /redoc: FastAPI's bundled Swagger/ReDoc UI has no way to attach our
-#   custom Bearer header, so gating them would just break the webui's "API Docs" link with no
-#   real security benefit — they expose the API's shape, not any actual data.
-# v1.2.5: /api/ready joins the exemption list for the same reason as /api/health — a
-# readiness probe that itself requires auth to answer "am I ready" is useless to the
-# orchestration checking it before the server is known-good.
+# Always reachable even in Protected mode: health/ready probes must answer with no
+# credentials (or the orchestration restarting/checking the server can never succeed),
+# and the Swagger/ReDoc docs have no way to attach our custom Bearer header anyway.
 _AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/docs", "/openapi.json", "/redoc"}
 
 
 def _installed_version() -> str:
-    """v1.2.5: the real installed package version, from ONE source (importlib.metadata)
-    instead of a hardcoded literal — server.py:health_check() used to say "1.4.0" while
-    av_server/__init__.py separately said "1.0.0" and the CLI's own setuptools-scm-derived
-    version was a THIRD, different string; all three could silently drift from the
-    actual release. Deliberately NOT importing av_cli here (the server package has never
-    depended on it — see the run-summary endpoint's note on the same boundary) —
-    importlib.metadata reads the installed DISTRIBUTION's version, which both av_cli and
-    av_server ship as part of (one `aether-vault` package, one version, per pyproject.toml)."""
+    """The real installed package version, from ONE source (importlib.metadata) instead
+    of a hardcoded literal that could drift from the actual release. Deliberately NOT
+    importing av_cli here -- the server package has never depended on it."""
     try:
         from importlib.metadata import version as _pkg_version
 
@@ -190,24 +163,11 @@ def _installed_version() -> str:
 
 
 def _parse_auth_users(raw: str | None) -> dict[str, dict]:
-    """Parses the AV_AUTH_USERS JSON map. Invalid payloads fail startup loudly — a
-    silently ignored auth map would look exactly like Anonymous mode.
-
-    v1.3.0: each value is either a bare token string (unchanged, never expires — the
-    original and still-default shape) or an object {"token": "...", "expires_at":
-    "<ISO-8601>"} for an optional expiry (`av auth add-user NAME TOKEN --expires-in-days
-    N`). Returns {username: {"token": str, "expires_at": str|None}} either way, so every
-    downstream reader has one shape to handle.
-
-    v1.3.1: an object value MAY additionally carry "scopes": [str, ...] (`av auth add-user
-    NAME TOKEN --scope <s>` repeatable), restricting that token to specific permissions
-    (see `require_scope()` below). Deliberately NOT added to every entry unconditionally
-    — the returned dict omits the "scopes" key entirely when the raw value didn't specify
-    one, so `test_parse_accepts_a_valid_map`'s exact-shape assertion (and every other
-    caller comparing this dict's shape) stays byte-for-byte unchanged for every payload
-    that predates scopes. Absence is resolved to the unrestricted `["*"]` default by
-    `_scopes_for_identity()`, not baked in here.
-    """
+    """Parses the AV_AUTH_USERS JSON map. Invalid payloads fail startup loudly -- a
+    silently ignored auth map would look exactly like Anonymous mode. Each value is
+    either a bare token string or an object {"token", "expires_at", "scopes"}; the
+    returned dict normalizes to {username: {"token", "expires_at"}} either way, with
+    "scopes" added only when the raw value specified one."""
     if not raw or not raw.strip():
         return {}
     try:
@@ -244,10 +204,8 @@ def _is_expired(expires_at: str | None) -> bool:
     if not expires_at:
         return False
     try:
-        # _parse_iso_dt normalizes to naive UTC (this schema's storage convention) —
-        # datetime.utcnow() matches that shape; comparing against an aware now() here
-        # would raise (naive vs aware) and get silently swallowed below, making expiry
-        # never actually take effect.
+        # _parse_iso_dt normalizes to naive UTC (this schema's storage convention) --
+        # comparing against an aware now() would raise and get silently swallowed below.
         return _parse_iso_dt(expires_at, "expires_at") < datetime.now(timezone.utc).replace(tzinfo=None)
     except Exception:
         return False  # an unparseable expiry fails open on parsing, not on auth
@@ -255,13 +213,8 @@ def _is_expired(expires_at: str | None) -> bool:
 
 def _resolve_identity(supplied_token: str) -> str | None:
     """Bearer token → username ("owner" for the shared secret), or None when unknown OR
-    expired. compare_digest on every candidate — timing-safe even though the map is small.
-
-    Each `_AUTH_USERS` value is normally already normalized to {"token", "expires_at"} by
-    `_parse_auth_users()` — but tolerates a bare token string too (both this module's own
-    tests and any external code that pokes `_AUTH_USERS` directly, pre-v1.3.0 style, set
-    it that way), so this doesn't assume the dict shape unconditionally.
-    """
+    expired. compare_digest on every candidate -- timing-safe even though the map is
+    small. Tolerates a bare token string too, not just the normalized dict shape."""
     if AV_API_TOKEN and secrets.compare_digest(supplied_token, AV_API_TOKEN):
         return "owner"  # the shared secret has no expiry concept
     for name, entry in _AUTH_USERS.items():
@@ -273,15 +226,10 @@ def _resolve_identity(supplied_token: str) -> str | None:
 
 
 def _scopes_for_identity(username: str | None) -> list[str]:
-    """v1.3.1: scopes for an already-resolved identity — a second, independent step
-    from `_resolve_identity()` so that function's return shape (and every existing test
-    asserting it) never changes. "owner" (the shared secret, `AV_API_TOKEN`) is always
-    unrestricted. A per-user entry's scopes default to `["*"]` when it declared none
-    (every legacy/bare-string entry, and any entry created before this feature existed)
-    — additive: no existing deployment loses access to anything it could already reach.
-    Tolerates `_AUTH_USERS` values monkeypatched as bare strings (pre-v1.3.0/test style),
-    not just the normalized dict shape `_parse_auth_users()` produces.
-    """
+    """Scopes for an already-resolved identity — a second, independent step from
+    `_resolve_identity()` so that function's return shape never changes. "owner" is
+    always unrestricted; a per-user entry's scopes default to `["*"]` when it declared
+    none, so no existing deployment loses access to anything it could already reach."""
     if username == "owner":
         return ["*"]
     entry = _AUTH_USERS.get(username) if username else None
@@ -352,22 +300,11 @@ async def require_token(request: Request, call_next):
 
 
 def require_scope(scope: str):
-    """FastAPI dependency factory (v1.3.1): denies a route unless the caller's token
-    carries `scope` or the wildcard `"*"`.
-
-    In Anonymous mode — or for any token that resolved with no explicit `scopes` list,
-    which by design is every deployment predating this feature — `request.state.scopes`
-    is `["*"]` (see `_scopes_for_identity()`), so this is purely additive: nothing that
-    could already reach a route loses access by that route later declaring a required
-    scope. `request.state.scopes` can only be genuinely absent when Anonymous mode's
-    early return in `require_token()` skipped setting any request.state at all — treated
-    identically to `["*"]` here, for the same reason.
-
-    A denial here is a 403, never `require_token`'s 401: the caller authenticated fine,
-    they just lack this one permission. Recorded as its own `scope.denied` audit action
-    (with the required scope and the path) so "who couldn't even log in" stays
-    distinguishable from "whose token doesn't cover this."
-    """
+    """FastAPI dependency factory: denies a route unless the caller's token carries
+    `scope` or the wildcard `"*"`. Purely additive -- Anonymous mode or any token with
+    no explicit `scopes` list resolves to `["*"]`, so nothing that could already reach a
+    route loses access. A denial here is a 403, never `require_token`'s 401: the caller
+    authenticated fine, they just lack this one permission."""
     async def _dependency(request: Request, db: AsyncSession = Depends(get_session)) -> None:
         scopes = getattr(request.state, "scopes", None) or ["*"]
         if "*" in scopes or scope in scopes:
@@ -390,82 +327,34 @@ def require_scope(scope: str):
 
 
 def _principal(request: Request) -> identity_module.Principal:
-    """v1.3.2: the resolved Principal for this request (`require_token`'s new third
-    state attribute) — every identity source (env token, DB token, session) sets this
-    alongside the pre-existing `.username`/`.scopes`. Anonymous mode with no matching
-    credential leaves it unset, same as `.username`/`.scopes` — callers use the returned
-    anonymous Principal (`tenant_id=None`) rather than crashing on a missing attribute.
-    """
+    """The resolved Principal for this request -- every identity source sets this
+    alongside `.username`/`.scopes`. Anonymous mode with no matching credential leaves
+    it unset; callers get the anonymous Principal rather than crashing."""
     return getattr(request.state, "principal", None) or identity_module.anonymous_principal()
 
 
 async def _enforce_project_tenant(
     request: Request,
 ) -> Optional[str]:
-    """v1.3.2 (hard multi-tenancy) — the application-layer guard, wired as a GLOBAL
-    FastAPI dependency (`app = FastAPI(..., dependencies=[Depends(_enforce_project_tenant)])`
-    immediately below) rather than added to ~80 individual route decorators.
+    """The application-layer tenancy guard, wired as a GLOBAL FastAPI dependency rather
+    than added to ~80 individual route decorators -- a global dependency runs AFTER
+    routing has matched the route and populated `request.path_params`, unlike a
+    `BaseHTTPMiddleware` (which sees path params only inside `call_next()`, too late).
 
-    Two designs were tried, in order, before this one:
-    1. Per-route `dependencies=[Depends(_enforce_project_tenant)]` on every project_id-
-       taking route — rejected once the actual count of such routes (~80, found by
-       running the anti-drift sweep test against an empty exempt list) made that many
-       hand-edited decorators an error-prone surface a shared mechanism avoids entirely.
-    2. Folded into `require_token`'s `BaseHTTPMiddleware` (which already runs for every
-       request) — rejected after verifying LIVE (not assumed) that `request.path_params`
-       is EMPTY inside `BaseHTTPMiddleware.dispatch()` before `call_next()`: Starlette
-       only populates path params once routing actually matches a route, which for a
-       `BaseHTTPMiddleware`-wrapped app happens INSIDE `call_next()`, not before it. A
-       middleware-based check could only ever see query/body project_id, never a path
-       param one (`/api/freeze/{project_id}` and friends) — silently incomplete.
+    Postgres row-level security is the BACKSTOP behind this, not the reverse: RLS catches
+    a genuinely missed case; this is what shapes the actual HTTP response (a clean
+    403/404) for the normal case. Gated on `TENANCY_ENFORCE` and a real resolved tenant --
+    a genuine no-op otherwise. Resolves `project_id` from path → query → JSON body.
 
-    A global FastAPI dependency is the one shape that is both centralized (zero per-route
-    wiring) AND runs at the right point in the stack: FastAPI resolves `dependencies=[]`
-    passed to the `FastAPI()`/`APIRouter()` constructor as part of EVERY route's own
-    dependency graph, which executes AFTER routing has matched the route and populated
-    `request.path_params` — verified live the same way the middleware approach was ruled
-    out, not assumed. `require_scope()` already proves the pattern works for
-    `request.state` set by the earlier `require_token` middleware; this is the same
-    shape, reading `request.state.principal` the same way.
+    An UNSEEN `project_id` is lazily claimed for the caller's tenant (first writer wins),
+    since project_id is never server-side pre-registered. A project owned by a DIFFERENT
+    tenant is denied: a WRITE gets 403 `tenant_denied` (must never silently 404 -- offline-
+    queue semantics would quietly lose it); a READ gets a bare 404 (a 403 would turn the
+    route into a cross-tenant enumeration oracle).
 
-    Postgres row-level security (migration 0013) is the BACKSTOP behind this, not the
-    reverse: RLS catches a genuinely missed case (a future refactor that bypasses this
-    global dependency somehow); this is what actually shapes the HTTP response (a clean
-    403/404) for the normal case — an RLS mismatch alone would otherwise surface as an
-    opaque empty result set or a bare integrity failure.
-
-    Gated on `TENANCY_ENFORCE` and a real resolved tenant — genuinely a no-op (zero
-    queries attempted) whenever either is absent, matching `database.py`'s own
-    `_apply_tenant_guc` no-op contract for the exact same reasons (VERSIONING.md's
-    MINOR-release, byte-identical-when-unconfigured guarantee).
-
-    Resolves `project_id` from path → query → JSON body, in that order — all three
-    shapes exist across this codebase's project_id-taking routes (a path param on
-    `/api/freeze/{project_id}`, a query param on ~15 list endpoints, a JSON body field on
-    `push_commit` and most POST/PUT/PATCH routes). `request.json()` is safe to call ahead
-    of a route's own `Body(...)` parse — Starlette caches the raw body internally after
-    the first read, so this never double-consumes the stream.
-
-    An UNSEEN `project_id` is lazily claimed for the caller's tenant (first writer wins)
-    — `project_id` has never been server-side pre-registered (`av init` mints it
-    client-side with zero ceremony), so "unknown" cannot mean reject; it means "first
-    time this tenant has used it." A project already owned by a DIFFERENT tenant is
-    denied: a WRITE gets 403 `tenant_denied` (a write must never silently 404 — the
-    caller has to learn its work did not land, or offline-queue semantics would quietly
-    lose it, AGENTS.md non-negotiable #3); a READ gets a bare 404 (a 403 would confirm
-    the project exists under some tenant, turning the route into a cross-tenant
-    enumeration oracle — the same information-hiding tradeoff `/api/tokens/{id}/revoke`
-    already applies to a foreign token id).
-
-    Deliberately does NOT take `db: AsyncSession = Depends(get_session)` as a parameter,
-    even though every other route dependency in this file does — because this one is
-    now GLOBAL, that would make FastAPI eagerly open a real DB session for `/api/health`
-    on every single call, silently breaking that route's own documented "DB-free,
-    always green" liveness contract (`_AUTH_EXEMPT_PATHS`'s existing rationale; found
-    live while wiring this up, not anticipated). A session is opened by hand, via
-    `async_session_factory()`, and ONLY on the path that actually needs one — after
-    every earlier no-op check (TENANCY_ENFORCE off, no tenant, no project_id) has
-    already returned, which every exempt/irrelevant route hits before this point.
+    Deliberately does NOT take a DB session as a parameter, since being GLOBAL would make
+    FastAPI eagerly open one for `/api/health` on every call, breaking its DB-free
+    liveness contract -- a session opens by hand, only on the path that needs one.
     """
     if not TENANCY_ENFORCE:
         return None
@@ -512,17 +401,13 @@ app = FastAPI(title="Aether-Vault Server", version="1.4.0", lifespan=lifespan,
 
 
 # MIDDLEWARE PIPELINE — Starlette runs the LAST-added middleware OUTERMOST, so these
-# three registrations ARE the architecture; reorder them and you change what browsers
-# and floods experience (Probleme.md #75):
-#
+# registrations ARE the architecture; reorder them and you change what browsers and
+# floods experience:
 #   registration order:  auth  →  CORS  →  rate limit
 #   runtime order:       rate  →  CORS  →  auth  →  routes
-#
-# * CORS must sit OUTSIDE auth: browser preflights are credentialless by spec, and —
-#   the subtle part — auth's own 401 JSONResponses need ACAO headers too, or the
-#   browser can't even READ the 401 and TokenGate's entry prompt never fires (the webui
-#   rendered empty dashboards instead). The original v1.1.x order had auth outside
-#   CORS: Anonymous dashboards worked, Protected ones silently broke.
+# CORS must sit OUTSIDE auth: browser preflights are credentialless by spec, and auth's
+# own 401 JSONResponses need ACAO headers too, or the browser can't even READ the 401
+# and TokenGate's entry prompt never fires.
 app.add_middleware(BaseHTTPMiddleware, dispatch=require_token)
 
 _CORS_ORIGINS = [
@@ -542,16 +427,12 @@ app.add_middleware(
 
 # --- Rate limiting (outermost middleware: floods are rejected before any other work) ---
 # Defaults close the one destructive unauthenticated endpoint (GC) while leaving the data
-# plane unlimited — legitimate clients burst (8-worker object uploads, thousand-file
-# commits) and fixed global caps would false-positive on them. Operators opt the data
-# plane in via AV_RATE_LIMIT_DEFAULT; see python/av_server/rate_limit.py.
+# plane unlimited, since legitimate clients burst (8-worker uploads, thousand-file
+# commits) and fixed global caps would false-positive on them.
 _RATE_LIMITER = rate_limit.build_limiter_from_env()
 
-# v1.3.2 (HA — E5): AV_RATE_LIMIT_BACKEND=redis switches to a Redis-backed counter
-# (rate_limit.RedisWindowRateLimiter) shared across every replica, instead of each
-# replica enforcing its own independent in-process window. Default ("memory", or unset)
-# is byte-identical to pre-v1.3.2 — this whole block only ever constructs the in-process
-# limiter above, which is exactly what every existing test/deployment already gets.
+# AV_RATE_LIMIT_BACKEND=redis switches to a Redis-backed counter shared across every
+# replica, instead of each replica enforcing its own independent in-process window.
 _RATE_LIMIT_BACKEND = os.environ.get("AV_RATE_LIMIT_BACKEND", "memory")
 _REDIS_RATE_LIMITER = (
     rate_limit.build_redis_limiter_from_env(cache._client)
@@ -578,26 +459,19 @@ async def limit_request_rate(request: Request, call_next):
     return await call_next(request)
 
 
-# v1.3.3 (WP-35): registered LAST among the four `http` middlewares, which Starlette's
-# `add_middleware`/`@app.middleware("http")` both apply in REVERSE registration order —
-# this is deliberately the OUTERMOST layer (runs first on the way in, last on the way
-# out), so it observes EVERY request end to end: a 429 from the rate limiter above, a
-# 401 from `require_token` below, and every real route response, all get timed and
-# counted. Adds no response header and never touches the body, so it cannot interact
-# with the auth/CORS header ordering this file's own comment already flags as fragile —
-# purely read-only bookkeeping around `call_next`.
+# Registered LAST among the four `http` middlewares, which Starlette applies in REVERSE
+# registration order -- deliberately the OUTERMOST layer, so it observes every request
+# end to end. Adds no response header and never touches the body -- purely read-only
+# bookkeeping around `call_next`.
 @app.middleware("http")
 async def collect_metrics(request: Request, call_next):
     start = time.monotonic()
     response = await call_next(request)
     duration = time.monotonic() - start
 
-    # Starlette's router sets `scope["route"]` DURING route resolution, which happens
-    # inside the `call_next()` call above -- by the time it returns, this is populated
-    # for anything that actually reached a route. An early rejection (429/401 before
-    # routing) never sets it; falling back to the raw path there is an accepted, bounded
-    # cardinality risk (401s cluster on the paths clients actually try, not arbitrary
-    # user input) rather than silently mislabeling those requests as some other route.
+    # Starlette's router sets `scope["route"]` DURING route resolution, inside call_next()
+    # above. An early rejection (429/401 before routing) never sets it; falling back to
+    # the raw path there is an accepted, bounded cardinality risk.
     route = request.scope.get("route")
     path_template = route.path if route is not None else request.url.path
 
@@ -611,17 +485,11 @@ async def collect_metrics(request: Request, call_next):
 DATA_DIR = Path(os.environ.get("AV_DATA_DIR", "/data"))
 storage = CASStorage(DATA_DIR)
 
-# v1.3.3 (WP-21): physical per-tenant CAS object storage separation — OFF by default
-# ("shared", byte-identical to every pre-v1.3.3 deployment: one global dedup domain, the
-# exact behavior "shared" mode has always had). "isolated" physically separates every
-# tenant's objects/trees on disk AND in the Bloom filter, at a real, stated cost:
-# cross-tenant content-addressed deduplication is lost entirely (identical bytes held by
-# k tenants are stored k times) — intra-tenant dedup, the product's actual headline
-# claim, is completely unaffected either way. See development/architecture.md's Tenancy
-# Isolation Contract for the full design and why shipping storage separation WITHOUT
-# also fixing the existence-check/Bloom-filter/GC-sweep pieces together would have been
-# a real data-loss bug (a global "already exists" check silently skipping a second
-# tenant's upload) — this switch only ever ships as the complete WP-21 package.
+# Physical per-tenant CAS object storage separation — OFF by default ("shared": one
+# global dedup domain, as always). "isolated" physically separates every tenant's
+# objects/trees on disk AND in the Bloom filter, at a real cost: cross-tenant dedup is
+# lost entirely (identical bytes held by k tenants stored k times); intra-tenant dedup
+# is unaffected. See development/architecture.md's Tenancy Isolation Contract.
 CAS_ISOLATION: str = os.environ.get("AV_CAS_ISOLATION", "shared")
 if CAS_ISOLATION not in ("shared", "isolated"):
     raise RuntimeError(f"AV_CAS_ISOLATION must be 'shared' or 'isolated', got {CAS_ISOLATION!r}")
@@ -629,10 +497,8 @@ if CAS_ISOLATION not in ("shared", "isolated"):
 
 def _cas_tenant_id(request: Request) -> str | None:
     """The tenant_id CAS storage/cache/DB-existence-checks should scope to for THIS
-    request — `None` under the default `shared` isolation mode (every call site's
-    existing behavior, completely unchanged) or the caller's real tenant (falling back
-    to DEFAULT_TENANT_ID, matching every other tenant-resolution call site in this file)
-    once an operator opts into `AV_CAS_ISOLATION=isolated`."""
+    request -- `None` under the default `shared` isolation mode, or the caller's real
+    tenant once an operator opts into `AV_CAS_ISOLATION=isolated`."""
     if CAS_ISOLATION != "isolated":
         return None
     return _principal(request).tenant_id or DEFAULT_TENANT_ID
@@ -647,10 +513,8 @@ MAX_TAG_LEN = 200
 
 class RefUpdate(BaseModel):
     commit_hash: str
-    # v1.2.5, optional/additive: when set, update_ref only advances the ref if its
-    # CURRENT commit_hash equals expected_hash — compare-and-swap instead of the old
-    # unconditional last-write-wins. Omitted (None) preserves exact pre-1.2.5 behavior,
-    # so existing clients are unaffected. See architecture.md's Remote Sync Contract.
+    # Optional/additive: when set, update_ref only advances the ref if its CURRENT
+    # commit_hash equals expected_hash -- compare-and-swap instead of last-write-wins.
     expected_hash: Optional[str] = None
 
 
@@ -679,18 +543,11 @@ def validate_ref_name(ref_name: str) -> str:
 
 async def build_merkle_tree(db: AsyncSession, tree_data: Dict[str, Any],
                             cas_tenant_id: str | None = None) -> str:
-    """
-    Recursively converts the flat path→info dict (from a commit) into a
-    content-addressed Merkle Tree stored in DBTree rows.
-    Returns the root tree hash.
-
-    `cas_tenant_id` (v1.3.3, WP-21): None under the default `shared` isolation mode —
-    the "does this tree already exist" check below stays global, exactly as before.
-    Under `AV_CAS_ISOLATION=isolated`, scoped to the caller's own tenant so tenant B
-    never skips creating ITS OWN tree rows just because tenant A happens to have
-    identical (content-addressed, so identically-hashed) tree content — the same class
-    of cross-tenant existence-check bug WP-21's design review caught for objects.
-    """
+    """Recursively converts the flat path→info dict (from a commit) into a content-
+    addressed Merkle Tree stored in DBTree rows. Returns the root tree hash.
+    `cas_tenant_id`: None under `shared` isolation (the existence check stays global);
+    under `isolated`, scoped to the caller's tenant so tenant B never skips creating its
+    own tree rows just because tenant A has identical content."""
     nodes: Dict[str, Any] = {}
     for path, info in tree_data.items():
         parts = path.split("/", 1)
@@ -768,14 +625,10 @@ def health_check() -> dict:
 
 @app.get("/api/ready")
 async def readiness_check(db: AsyncSession = Depends(get_session)) -> Response:
-    """v1.2.5: readiness — DB connectivity, Redis reachability, and AV_DATA_DIR
-    writability. Targets the failure mode documented as "the most misleading in the
-    project" (development/infrastructure.md): /api/health stays green even when
-    AV_DATA_DIR is unwritable and every object upload 500s. Auth-exempt for the same
-    reason /api/health is (see _AUTH_EXEMPT_PATHS) — an orchestrator checking readiness
-    before the server is known-good can't be expected to already hold a valid token.
-    200 with `ready: true` when every check passes; 503 with per-check detail otherwise
-    — never raises, so a broken check reports itself instead of crashing the probe."""
+    """Readiness — DB connectivity, Redis reachability, and AV_DATA_DIR writability.
+    Targets the failure mode where /api/health stays green even when AV_DATA_DIR is
+    unwritable and every object upload 500s. 200 with `ready: true` when every check
+    passes; 503 with per-check detail otherwise -- never raises."""
     checks: dict[str, bool] = {}
 
     try:
@@ -785,10 +638,8 @@ async def readiness_check(db: AsyncSession = Depends(get_session)) -> Response:
         checks["database"] = False
 
     try:
-        # v1.2.5 fix: check_hash_exists() deliberately fails OPEN (returns True) on a
-        # Redis error -- correct for its actual caller (an optimistic skip-the-DB check)
-        # but means a downed Redis silently read as healthy here. cache.ping() is a raw
-        # connectivity probe that does not swallow the error (see RedisCache.ping()).
+        # cache.ping() is a raw connectivity probe that does not swallow errors, unlike
+        # check_hash_exists() which deliberately fails OPEN for its own optimistic use.
         await cache.ping()
         checks["redis"] = True
     except Exception:
@@ -810,15 +661,9 @@ async def readiness_check(db: AsyncSession = Depends(get_session)) -> Response:
 
 @app.get("/api/metrics", dependencies=[Depends(require_scope("admin"))])
 async def get_metrics(db: AsyncSession = Depends(get_session)) -> Response:
-    """v1.3.3 (WP-35): Prometheus text-exposition metrics. `admin`-scoped like every
-    other observability surface in this file — a real Prometheus scrape config points
-    `bearer_token`/`bearer_token_file` at an admin-scoped token (`av token create ...
-    --scope admin`), the same credential an operator already uses for `/api/admin/*`.
-
-    Per-process counters ONLY (see metrics.py's own docstring) — the two numbers below
-    (webhook queue depth, DB pool state) are live snapshots at scrape time, not
-    counters; everything else is this process's own running totals since it started.
-    """
+    """Prometheus text-exposition metrics. `admin`-scoped like every other observability
+    surface in this file. Per-process counters ONLY -- webhook queue depth and DB pool
+    state are live snapshots at scrape time, everything else is a running total."""
     from .database import app_engine, engine
 
     try:
@@ -832,7 +677,7 @@ async def get_metrics(db: AsyncSession = Depends(get_session)) -> Response:
     pool_stats = {}
     for name, target_engine in (("primary", engine), ("app", app_engine)):
         if name == "app" and target_engine is engine:
-            continue  # AV_APP_DATABASE_URL unset -- app_engine IS engine, don't double-report
+            continue  # AV_APP_DATABASE_URL unset -- don't double-report the same engine
         try:
             pool_stats[name] = {"checked_out": target_engine.pool.checkedout()}
         except Exception:
@@ -967,10 +812,8 @@ async def push_commit(
     if len(commit_data.get("message", "") or "") > MAX_MESSAGE_LEN:
         raise HTTPException(status_code=422, detail="Commit message too long")
 
-    # Per-project separation: every repo gets a project_id at `av init` (backfilled for repos
-    # initialized before this was added — see python/av_cli/main.py's load_config). Fall back
-    # to a single "legacy" bucket rather than rejecting the push outright, so an older client
-    # that hasn't picked up the backfill yet still syncs instead of erroring.
+    # Fall back to a single "legacy" bucket rather than rejecting the push outright, so
+    # an older client that hasn't picked up the project_id backfill still syncs.
     project_id = commit_data.get("project_id") or "legacy"
     project_name = commit_data.get("project_name") or "Legacy / Unknown"
     if not isinstance(project_id, str) or len(project_id) > 128 or not isinstance(project_name, str) or len(project_name) > 200:
@@ -1002,13 +845,11 @@ async def push_commit(
     try:
         root_tree_hash = await build_merkle_tree(db, raw_tree, _cas_tenant_id(request))
         parents: List[str] = commit_data.get("parents", [])
-        # Merge commits carry parents[1:] in extra_parents (JSON string); parent_hash stays
-        # parents[0] for backward compatibility with every existing consumer (webui graph,
-        # older clients) that only understands a single parent.
+        # Merge commits carry parents[1:] in extra_parents (JSON string); parent_hash
+        # stays parents[0] for backward compatibility with single-parent-only consumers.
         extra_parents = json.dumps(parents[1:]) if len(parents) > 1 else None
-        # Per-user attribution: an authenticated user pushing with the default "anonymous"
-        # author gets their username stamped; explicit client-set authors (AV_AUTHOR) are
-        # respected — scripts own their attribution. Anonymous mode has no identity.
+        # An authenticated user pushing with the default "anonymous" author gets their
+        # username stamped; explicit client-set authors (AV_AUTHOR) are respected.
         author = commit_data.get("author", "anonymous")
         username = getattr(request.state, "username", None)
         if author == "anonymous" and username:
@@ -1025,13 +866,11 @@ async def push_commit(
             project_id=project_id,
             project_name=project_name,
         )
-        # v1.2.2 signed commits: the client's signature blob rides along verbatim so
-        # `av verify` keeps working on cloned/pulled copies, not just in the authoring repo.
+        # The client's signature blob rides along verbatim so `av verify` keeps working
+        # on cloned/pulled copies, not just in the authoring repo.
         raw_signature = commit_data.get("signature")
         if isinstance(raw_signature, dict):
             new_commit.signature = json.dumps(raw_signature, sort_keys=True)
-        # env_snapshot_id is part of the hashed/signed payload — persist it so cloned
-        # payloads stay byte-equal to the authoring ones (signature validity + replay).
         env_id = commit_data.get("env_snapshot_id")
         if isinstance(env_id, str) and re.match(r"^[a-f0-9]{64}$", env_id):
             new_commit.env_snapshot_id = env_id
@@ -1045,9 +884,8 @@ async def push_commit(
         if run_id:
             run_row = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
             if not run_row:
-                # Lazy-create: multi-agent pushes must never fail on ordering — a run the
-                # server hasn't seen yet (client registered offline) is created in
-                # 'created' state and linked, exactly as if it had been registered first.
+                # Lazy-create: a run the server hasn't seen yet (client registered
+                # offline) is created in 'created' state and linked immediately.
                 run_row = DBRun(
                     id=run_id, project_id=project_id,
                     created_by=username or author,
@@ -1061,8 +899,8 @@ async def push_commit(
                     merged.update(metrics)
                     run_row.metrics_summary = merged
                 run_row.updated_at = utcnow_naive()
-            # v1.2.2 env snapshot/replay: a commit carrying env_snapshot_id back-fills the
-            # linked run's pointer when the run doesn't have one yet (first-link wins).
+            # A commit carrying env_snapshot_id back-fills the linked run's pointer when
+            # the run doesn't have one yet (first-link wins).
             env_snapshot_id = commit_data.get("env_snapshot_id")
             if env_snapshot_id and not run_row.env_snapshot_id:
                 run_row.env_snapshot_id = str(env_snapshot_id)
@@ -1083,19 +921,14 @@ async def push_commit(
         return Response(status_code=201)
     except IntegrityError as exc:
         await db.rollback()
-        # An IntegrityError here is NOT necessarily "this commit hash already exists" — it can
-        # equally be a FK violation on DBTree.object_hash (a tree entry references an object
-        # that the client hasn't uploaded yet) or on DBRef in a later request. Blindly mapping
-        # every IntegrityError to 409 previously caused commits referencing not-yet-uploaded
-        # objects to be silently dropped: the client (which treats 409 as idempotent success,
-        # by design, for genuine duplicate-hash races) believed the push succeeded while the
-        # commit/tree never actually made it into the database. Re-check what actually
+        # An IntegrityError here is NOT necessarily "this commit hash already exists" --
+        # it can equally be a FK violation on an object the client hasn't uploaded yet.
+        # Blindly mapping every IntegrityError to 409 (idempotent-success to the client)
+        # would silently drop a commit that never actually landed. Re-check what actually
         # happened before deciding the response.
         recheck = await db.execute(select(DBCommit).where(DBCommit.hash == commit_hash))
         if recheck.scalar_one_or_none():
             return Response(status_code=409, content="Commit already exists")
-        # Anything other than 201/409 is treated as a failed push by the client (it retries /
-        # keeps the commit queued) — unlike the bug above, this must NOT be 409.
         raise HTTPException(
             status_code=500,
             detail=(
@@ -1109,14 +942,9 @@ async def push_commit(
 
 
 async def resolve_tree(db: AsyncSession, root_hash: str) -> dict:
-    """Rebuilds a commit's full file tree from the DB Merkle Tree.
-
-    Level-order traversal with one batched query per depth level (was one query per node, i.e.
-    N+1). Because identical subtrees are deduplicated, the same tree_hash can appear under
-    several paths, so we carry a list of path prefixes per hash for each level. Factored out of
-    `get_commit` (module-level, not nested) so `list_commits`'s `include_layers` option can
-    reuse the exact same logic instead of duplicating it.
-    """
+    """Rebuilds a commit's full file tree from the DB Merkle Tree. Level-order traversal
+    with one batched query per depth level (was one query per node, i.e. N+1). Factored
+    out of `get_commit` so `list_commits`'s `include_layers` option can reuse it."""
     tree_data: dict = {}
     frontier: list[tuple[str, str]] = [(root_hash, "")]  # (tree_hash, path_prefix)
     while frontier:
@@ -1221,12 +1049,9 @@ async def get_commit(
 async def get_commit_diff(
     base_hash: str, target_hash: str, db: AsyncSession = Depends(get_session)
 ) -> dict:
-    """v1.3.0 (todo.md item 3): the semantic diff between any two commits, server-side —
-    previously the only server-side semantic diff lived inside GET /api/runs/{id}/summary
-    (bounded to a run's own linked commits). Feeds the WebUI's arbitrary two-commit
-    weight-diff compare. Full semdiff-1.0 schema shape via the same
-    _summarize_tree_diff() the run-summary endpoint uses — one implementation, two
-    call sites."""
+    """The semantic diff between any two commits, server-side. Feeds the WebUI's
+    arbitrary two-commit weight-diff compare, via the same `_summarize_tree_diff()` the
+    run-summary endpoint uses -- one implementation, two call sites."""
     for h in (base_hash, target_hash):
         if not re.match(r"^[a-f0-9]{64}$", h):
             raise HTTPException(status_code=400, detail="Invalid hash format")
@@ -1258,8 +1083,7 @@ async def update_ref(
     ref_name = validate_ref_name(ref_name)
     project_id = ref_name.split("/", 1)[0] if "/" in ref_name else None
     # SELECT ... FOR UPDATE serializes concurrent writers on this ref row; the
-    # expected_hash check below (v1.2.5) is what makes that serialization meaningful —
-    # previously the second writer of a race just silently won (last-write-wins).
+    # expected_hash check below is what makes that serialization meaningful.
     stmt = select(DBRef).where(DBRef.name == ref_name).with_for_update()
     result = await db.execute(stmt)
     ref = result.scalar_one_or_none()
@@ -1304,9 +1128,8 @@ async def get_ref(
 
 @app.get("/api/refs")
 async def list_refs(project_id: Optional[str] = None, db: AsyncSession = Depends(get_session)) -> dict:
-    # Refs are namespaced "<project_id>/<branch>" by the client (see av_cli/main.py's
-    # `commit` command) rather than via a DB column, since the ref-name path parameter
-    # already supports slashes and is already validated — no schema change needed here.
+    # Refs are namespaced "<project_id>/<branch>" by the client rather than via a DB
+    # column, since the ref-name path parameter already supports slashes.
     query = select(DBRef)
     if project_id:
         query = query.where(DBRef.name.like(f"{project_id}/%"))
@@ -1326,9 +1149,8 @@ async def list_refs(project_id: Optional[str] = None, db: AsyncSession = Depends
 
 @app.get("/api/stats")
 async def get_stats(db: AsyncSession = Depends(get_session)) -> dict:
-    # Previously this walked the entire CAS objects directory and stat()ed every shard on
-    # every call — and the Web UI polls it every ~15s. Use indexed DB aggregates instead;
-    # fall back to the filesystem only when the DB has no objects yet (legacy/empty state).
+    # Use indexed DB aggregates instead of walking the CAS objects directory (the Web UI
+    # polls this every ~15s); fall back to the filesystem only when the DB has no objects yet.
     total_objects = (await db.execute(select(func.count(DBObject.hash)))).scalar_one()
     if total_objects == 0:
         return storage.get_storage_stats()
@@ -1349,11 +1171,9 @@ async def get_stats(db: AsyncSession = Depends(get_session)) -> dict:
 # ---------------------------------------------------------------------------
 
 # Objects newer than this many seconds are never collected, even if no commit references
-# them yet. A client uploads object shards first and pushes the commit afterwards, so a GC
-# running inside that window would otherwise delete a live object whose commit is still
-# in-flight. This grace period closes that race without needing a global GC/upload lock.
-# Env-overridable (AV_GC_GRACE_SECONDS, integer) so ops — and the e2e suite — can shrink
-# it for drills; defaults to the production hour.
+# them yet -- a client uploads shards before pushing the commit, so GC running inside
+# that window would otherwise delete a live, in-flight object. Closes the race without a
+# global GC/upload lock.
 GC_GRACE_SECONDS = int(os.environ.get("AV_GC_GRACE_SECONDS", "3600"))
 
 # Delete in batches to stay well under driver bind-parameter limits (asyncpg ~32k).
@@ -1383,9 +1203,8 @@ def _collect_alive_in_memory(
                 for layer in entry.layers:
                     if isinstance(layer, dict) and "hash" in layer:
                         alive.add(layer["hash"])
-            # CDC chunk shards (opaque .pt/.pth/.ckpt checkpoints) live as their own objects,
-            # exactly like safetensors layer shards — unmarked here, GC would reap the pieces
-            # a chunked checkpoint needs to reassemble.
+            # CDC chunk shards live as their own objects, like safetensors layer shards --
+            # unmarked here, GC would reap the pieces a chunked checkpoint needs to reassemble.
             chunks = getattr(entry, "chunks", None) or []
             for chunk in chunks:
                 if isinstance(chunk, dict) and "hash" in chunk:
@@ -1409,15 +1228,10 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
     try:
         gc_cutoff = utcnow_naive() - timedelta(seconds=GC_GRACE_SECONDS)
 
-        # --- Mark phase: PER-TENANT trees/marks always (v1.3.3, WP-21) — a single query
-        # shape that serves both isolation modes without two divergent implementations.
-        # `alive_hashes`/`visited_trees` (the union across every tenant) are what SHARED
-        # mode's dead-computation and the LEGACY flat-directory sweep use below —
-        # mathematically identical to this route's pre-v1.3.3 flat computation, because
-        # each tenant's own commits only ever reference trees THAT SAME tenant fully
-        # wrote (the single-materialization-path invariant guarantees a referenced tree
-        # is never partially written) — merging per-tenant sets back into one flat set
-        # loses nothing a truly-flat walk would have found.
+        # --- Mark phase: PER-TENANT trees/marks always -- one query shape serves both
+        # isolation modes. `alive_hashes`/`visited_trees` (the union across every tenant)
+        # is mathematically identical to a flat computation, since each tenant's commits
+        # only ever reference trees that tenant fully wrote.
         all_trees = (await db.execute(select(DBTree))).scalars().all()
         trees_by_tenant: Dict[str, Dict[str, list]] = {}
         for entry in all_trees:
@@ -1439,11 +1253,8 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
         obj_rows = (await db.execute(select(DBObject.tenant_id, DBObject.hash, DBObject.created_at))).all()
         if CAS_ISOLATION == "isolated":
             # Tenant-scoped: a row is dead only if ITS OWN tenant's commit history no
-            # longer references it. Using the flat union here would be WRONG under
-            # isolated mode specifically -- see this route's own module-level design
-            # note (CAS_ISOLATION) for the cross-tenant scenario this would otherwise
-            # mishandle. Safe under isolated mode precisely because uploads/dedup never
-            # cross the tenant boundary there, so each row's tenant_id is authoritative.
+            # longer references it. The flat union would be WRONG here -- safe under
+            # isolated mode precisely because uploads/dedup never cross the tenant boundary.
             dead_pairs = {
                 (t, h) for (t, h, created_at) in obj_rows
                 if h not in alive_by_tenant.get(t, set()) and (created_at is None or created_at < gc_cutoff)
@@ -1455,12 +1266,9 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
                     await db.execute(delete(DBObject).where(DBObject.tenant_id == t, DBObject.hash == h))
         else:
             # Shared mode (default): a hash is dead only if NO tenant's commit history
-            # references it anywhere -- the flat union, exactly this route's pre-v1.3.3
-            # behavior. A per-tenant check here would be wrong: in shared mode, tenant B
-            # can reference an object whose ONE DBObject row happens to carry tenant A's
-            # id (A uploaded it first; B's identical-content upload was correctly
-            # rejected as a duplicate) -- checking only against A's own alive set could
-            # delete a row B still needs.
+            # references it anywhere -- a per-tenant check would be wrong here, since
+            # tenant B can reference an object whose one DBObject row carries tenant A's
+            # id (A uploaded it first; B's identical upload was rejected as a duplicate).
             dead_hashes = {
                 h for (_t, h, created_at) in obj_rows
                 if h not in alive_hashes and (created_at is None or created_at < gc_cutoff)
@@ -1478,22 +1286,15 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
 
         # --- Sweep physical shard files (skip alive + recently-written, off the event loop) ---
         loop = asyncio.get_running_loop()
-        # gc_cutoff is a *naive* datetime that represents UTC (see utcnow_naive()'s docstring).
-        # Calling .timestamp() directly on a naive datetime makes Python treat it as *local*
-        # time, silently shifting the resulting epoch by the host's UTC offset — on a host
-        # ahead of UTC this makes grace_ts artificially too early, so st_mtime (a real,
-        # correctly-UTC-based epoch) almost never looks "old enough" and physical shards are
-        # never actually swept; on a host behind UTC it would do the opposite and delete
-        # objects *before* their real grace window expires. Attaching tzinfo=utc first makes
-        # .timestamp() compute the correct epoch regardless of the host's local timezone.
+        # gc_cutoff is a *naive* datetime representing UTC -- calling .timestamp()
+        # directly on it would make Python treat it as *local* time, silently shifting
+        # the epoch by the host's UTC offset. Attaching tzinfo=utc first fixes that.
         grace_ts = gc_cutoff.replace(tzinfo=timezone.utc).timestamp()
 
         def purge_orphans():
             count = 0
-            # Legacy flat layout (objects_dir/xx/yyyy...) -- exists in BOTH modes (an
-            # isolated deployment can still be serving objects uploaded before it
-            # switched, per storage.py's own fallback-read design) and is always swept
-            # against the FLAT union, matching how content there was originally written.
+            # Legacy flat layout (objects_dir/xx/yyyy...) -- exists in BOTH modes and is
+            # always swept against the FLAT union, matching how it was originally written.
             for obj_path in storage.objects_dir.glob("*/*"):
                 if obj_path.is_file():
                     h = obj_path.parent.name + obj_path.name
@@ -1503,11 +1304,9 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
                         continue
                     obj_path.unlink()
                     count += 1
-            # Tenant-scoped layout (objects_dir/<tenant_id>/xx/yyyy...) -- only ever
-            # populated under isolated mode, but the walk is harmless (finds nothing) if
-            # a deployment has never used it. `*/*/*` requires exactly 3 path segments
-            # under objects_dir, which the flat layout's own `*/*` glob above can never
-            # match (2 segments) -- the two globs are naturally disjoint, no double-sweep.
+            # Tenant-scoped layout (objects_dir/<tenant_id>/xx/yyyy...) -- harmless
+            # no-op if never used. `*/*/*` (3 segments) is naturally disjoint from the
+            # flat layout's `*/*` glob above (2 segments), so there's no double-sweep.
             for obj_path in storage.objects_dir.glob("*/*/*"):
                 if not obj_path.is_file():
                     continue
@@ -1524,9 +1323,8 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
         deleted_count = await loop.run_in_executor(None, purge_orphans)
 
         # Rebuild the Bloom Filter(s) from the surviving set(s). Shared mode: just the
-        # global filter, from the flat union (unchanged pre-v1.3.3 behavior). Isolated
-        # mode: the global filter too (still needed for the legacy flat directory) PLUS
-        # each tenant's own filter, from that tenant's own alive set.
+        # global filter. Isolated mode: the global filter too (legacy flat directory)
+        # plus each tenant's own filter.
         await cache.reset_filter()
         await cache.init_filter()
         if CAS_ISOLATION == "isolated":
@@ -1538,11 +1336,9 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
         for h in alive_hashes:
             await cache.add_hash(h)
 
-        # Retention sweeps for the autonomous-loop surfaces:
-        # - events (default 30 days, AV_EVENT_RETENTION_DAYS)
-        # - audit_log (default 90 days, AV_AUDIT_RETENTION_DAYS)
-        # - terminal-status webhook deliveries (delivered/dead) ride the event window;
-        #   stuck pending/failed rows are never swept here — the retry worker owns them.
+        # Retention sweeps: events (30d default), audit_log (90d default). Terminal-status
+        # webhook deliveries ride the event window; stuck pending/failed rows are never
+        # swept here -- the retry worker owns them.
         from datetime import timedelta as _td
 
         event_cutoff = utcnow_naive() - _td(days=EVENT_RETENTION_DAYS)
@@ -1643,37 +1439,17 @@ async def list_commits(
     include_layers: bool = False,
     db: AsyncSession = Depends(get_session)
 ) -> dict:
-    """Paginated commit list for the Web UI dashboard, newest first.
+    """Paginated commit list for the Web UI dashboard, newest first. Optionally scoped to
+    a single project via ?project_id=. When TENANCY_ENFORCE is on, filtered explicitly to
+    the caller's tenant here -- NOT left to RLS alone, since this repo's own default
+    docker-compose.yml connects as a Postgres superuser, which unconditionally bypasses
+    row-level security (verified live, not assumed).
 
-    Optionally scoped to a single project via ?project_id= — without it, commits from every
-    project on this shared registry are returned (matches the dashboard's pre-existing
-    behavior so it doesn't break for callers that don't know about projects yet).
-
-    v1.3.2: when TENANCY_ENFORCE is on, "every project" above narrows to "every project
-    THE CALLER'S TENANT owns". Filtered explicitly here — NOT left to RLS (migration
-    0013) alone — because this repo's own default docker-compose.yml connects as
-    `av_user`, which Postgres auto-creates as a SUPERUSER (the official postgres image's
-    POSTGRES_USER behavior); superusers unconditionally bypass row-level security, and
-    no `FORCE ROW LEVEL SECURITY` can override that (found live: a real two-tenant test
-    against this exact deployment topology, not a doc reference — RLS's own policy was
-    confirmed correctly defined and forced, and still did not filter). RLS remains real
-    defense-in-depth for any deployment that connects as a genuinely non-superuser role,
-    and still fully backstops every route with an explicit single `project_id` target
-    (`_enforce_project_tenant`'s own write/read checks, unaffected by this since those
-    denials happen in application code before RLS is ever relevant) — but an UNFILTERED
-    list route is exactly the shape that had no other protection under this topology,
-    so it gets one here directly, matching `list_projects`'s own fix.
-
-    ?include_layers=true additionally resolves each returned commit's full tree (same shape
-    GET /api/commits/{hash} already returns) in this single response — added specifically to
-    replace WeightDiffPanel.tsx's old N-parallel-requests pattern (one GET /api/commits/{hash}
-    per candidate checkpoint) with one round trip. Trees are resolved sequentially here (NOT
-    via asyncio.gather) — get_session() hands out one AsyncSession per request, backed by a
-    single underlying connection, and concurrent queries on the same connection aren't safe
-    (asyncpg raises "another operation is in progress"). The win this endpoint provides is
-    collapsing N HTTP round trips into one; resolve_tree() itself already eliminated the
-    expensive per-node N+1 *within* a single tree, which is the part that actually scales with
-    tree size — sequential-but-one-request is still a large improvement over N full requests.
+    ?include_layers=true additionally resolves each returned commit's full tree in this
+    single response, replacing WeightDiffPanel.tsx's old N-parallel-requests pattern.
+    Trees are resolved sequentially (NOT via asyncio.gather) since get_session() hands
+    out one AsyncSession per request backed by a single connection, and concurrent
+    queries on it aren't safe.
     """
     query = select(DBCommit)
     count_query = select(func.count(DBCommit.hash))
@@ -1724,32 +1500,16 @@ async def list_commits(
 @app.get("/api/projects")
 async def list_projects(request: Request, db: AsyncSession = Depends(get_session)) -> dict:
     """Every project that has ever pushed a commit to this registry, for the Web UI's
-    Projects tab (lets a user discover and switch between local repos sharing this server).
+    Projects tab. A full-table enumeration with no single `project_id`, so
+    `_enforce_project_tenant` treats it as a legitimate no-op -- needs its own explicit
+    tenant filter below.
 
-    v1.3.2: a full-table enumeration with no single `project_id` to check ownership of —
-    exactly the shape `_enforce_project_tenant`'s docstring calls out as a legitimate
-    no-op (`return None  # route doesn't target a single project`), so it needs its own
-    explicit filter, applied directly below.
-
-    **This is NOT covered by RLS alone in this repo's own default deployment — verified
-    live, not assumed, and the assumption it WOULD be is exactly what a first draft of
-    this comment claimed before that live test caught it being wrong.** RLS (migration
-    0013) is correctly enabled, forced, and its policy correctly defined — confirmed
-    directly via `pg_class.relrowsecurity`/`relforcerowsecurity` and the rendered policy
-    expression — but Postgres unconditionally exempts SUPERUSERS from row-level security,
-    and no `FORCE ROW LEVEL SECURITY` can override that exemption. `docker-compose.yml`'s
-    `av_user` IS a superuser (the official `postgres` image auto-grants superuser to
-    whatever `POSTGRES_USER` names), so RLS is currently INERT for every query this app
-    issues under this repo's own shipped default topology. RLS still has real value as
-    defense-in-depth for any deployment that connects as a genuinely non-superuser role
-    (a real, common production pattern — e.g. a managed Postgres whose app user is
-    deliberately unprivileged) — but every list route in THIS deployment needs its own
-    explicit tenant filter to be correct, the same way this one and `list_commits` now
-    have. Flagged in this phase's own docs as a residual item: the remaining unfiltered
-    list routes this phase did not individually touch (`GET /api/runs`, `GET /api/events`,
-    and others) are NOT currently tenant-filtered under this topology, and a genuine fix
-    — connecting as a dedicated non-superuser role — is an infrastructure change, not a
-    migration, and is called out explicitly rather than silently left unfixed."""
+    **NOT covered by RLS alone in this repo's own default deployment** -- verified live:
+    Postgres unconditionally exempts SUPERUSERS from row-level security, and this repo's
+    default `docker-compose.yml` connects as one. RLS still has real value as defense-in-
+    depth for a deployment connecting as a genuinely non-superuser role. Some other
+    unfiltered list routes (`GET /api/runs`, `GET /api/events`) are not yet fixed the same
+    way -- a genuine fix (a dedicated non-superuser role) is an infrastructure change."""
     stmt = (
         select(
             DBCommit.project_id,
@@ -1844,51 +1604,34 @@ import hmac as hmac_mod  # noqa: E402
 EVENT_RETENTION_DAYS = int(os.environ.get("AV_EVENT_RETENTION_DAYS", "30"))
 _WEBHOOK_TIMEOUT_SECS = 10
 
-# --- v1.3.1 RSI R6 (todo.md I.38, WP-36): server-side anomaly detectors ------------
+# --- RSI R6: server-side anomaly detectors ------------
 #
-# Each detector emits its own `kind="anomaly"` event (payload always carries a `"type"`
-# discriminator) ALONGSIDE whatever event the mutation already emits — a dedicated,
-# low-noise feed a monitoring webhook can subscribe to by kind alone, without filtering
-# the full event stream itself. No new delivery path: `_emit_event()` already fans every
-# event out to active webhooks (see its own docstring above); anomalies ride the exact
-# same mechanism as `commit`/`policy`/`run` events.
+# Each detector emits its own `kind="anomaly"` event (payload carries a `"type"`
+# discriminator) ALONGSIDE whatever event the mutation already emits -- a dedicated,
+# low-noise feed a monitoring webhook can subscribe to by kind alone. No new delivery
+# path: anomalies ride the exact same `_emit_event()` mechanism as `commit`/`run` events.
 AV_ANOMALY_METRIC_JUMP_RATIO = float(os.environ.get("AV_ANOMALY_METRIC_JUMP_RATIO", "3.0"))
 AV_ANOMALY_MASS_REWRITE_FILES = int(os.environ.get("AV_ANOMALY_MASS_REWRITE_FILES", "200"))
 AV_ANOMALY_AUTH_SPIKE_THRESHOLD = int(os.environ.get("AV_ANOMALY_AUTH_SPIKE_THRESHOLD", "5"))
 AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS = float(os.environ.get("AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS", "60"))
 
-# In-process sliding window of recent auth failures, keyed by client identifier (resolved
-# username for a scope denial; client host for an unauthenticated 401, where no identity
-# exists yet). Intentionally NOT Redis-backed: this is a single-process best-effort
-# signal ("this process just saw a burst"), not a durable security record — the audit
-# log (`_audit()`) already IS the durable record of every individual denial; this only
-# decides when a BURST of them is itself worth a dedicated anomaly event. Resets after
-# tripping so one burst raises exactly one anomaly, not one per subsequent failure.
+# In-process sliding window of recent auth failures, keyed by client identifier.
+# Intentionally NOT Redis-backed by default: a single-process best-effort signal, not a
+# durable security record -- the audit log is already that. Resets after tripping so one
+# burst raises exactly one anomaly, not one per subsequent failure.
 _AUTH_FAILURE_WINDOW: dict[str, list[float]] = {}
 
 
-# v1.3.2 (HA — E5): AV_AUTH_SPIKE_BACKEND=redis makes the burst count itself accurate
-# across N replicas, for operators who want that specifically — the in-process default
-# above remains the deliberate choice for everyone else (its own comment's reasoning —
-# "a single-process best-effort signal, not a durable security record" — still holds;
-# this is the lowest-severity of the three cross-replica gaps this phase found, since an
-# under-counted burst degrades detection sensitivity, it does not cause wrong behavior
-# the way the webhook-duplicate-delivery bug did). Same Lua INCR+EXPIRE primitive and
-# fail-open posture as the rate limiter (rate_limit.py), reused rather than reinvented.
+# AV_AUTH_SPIKE_BACKEND=redis makes the burst count accurate across N replicas, reusing
+# the same Lua INCR+EXPIRE primitive and fail-open posture as the rate limiter.
 _AUTH_SPIKE_BACKEND = os.environ.get("AV_AUTH_SPIKE_BACKEND", "memory")
 
 
 async def _note_auth_failure(key: str) -> bool:
     """Records one auth failure for `key`; returns True the moment this failure pushes
-    the recent count (within the window) over the threshold — the caller emits an
-    anomaly exactly then, and only then.
-
-    Now async (was sync) — both call sites already `await` it unconditionally, so the
-    default (in-process) path pays one coroutine-scheduling hop it didn't before; the
-    in-process branch itself does zero actual I/O either way, so this is not a
-    meaningfully different cost, and keeping ONE call shape for both backends (rather
-    than a sync/async split by backend) is simpler and less error-prone than the
-    alternative."""
+    the recent count (within the window) over the threshold -- the caller emits an
+    anomaly exactly then, and only then. One async call shape for both backends is
+    simpler than a sync/async split."""
     if _AUTH_SPIKE_BACKEND == "redis":
         try:
             redis_key = f"av:authfail:{key}"
@@ -1919,9 +1662,8 @@ async def _note_auth_failure(key: str) -> bool:
 
 
 async def _emit_auth_spike_anomaly(identifier: str, reason: str) -> None:
-    """Called from `require_token`'s 401 branch (raw ASGI middleware, no `db` dependency
-    injected) — opens its own short-lived session, same fire-and-forget shape as
-    `_emit_event()`'s own webhook-delivery task, so a burst of bad tokens never adds
+    """Called from `require_token`'s 401 branch (no `db` dependency injected) -- opens
+    its own short-lived session, fire-and-forget, so a burst of bad tokens never adds
     latency to the 401 response itself."""
     try:
         async with async_session_factory() as session:
@@ -1937,9 +1679,8 @@ async def _emit_auth_spike_anomaly(identifier: str, reason: str) -> None:
 
 def _detect_metric_jump(old_metrics: dict | None, new_metrics: dict | None) -> list[dict]:
     """Flags any metric present in both commits whose magnitude changed by more than
-    `AV_ANOMALY_METRIC_JUMP_RATIO`x — a coarse, dependency-free proxy for "something
-    unusual just happened to training," not a statistical outlier model. `old` == 0 is
-    treated as "any nonzero new value is a jump" rather than dividing by zero."""
+    `AV_ANOMALY_METRIC_JUMP_RATIO`x -- a coarse proxy, not a statistical outlier model.
+    `old` == 0 is treated as "any nonzero new value is a jump" rather than dividing by zero."""
     old_metrics, new_metrics = old_metrics or {}, new_metrics or {}
     jumps = []
     for key, new_val in new_metrics.items():
@@ -1978,12 +1719,7 @@ async def _detect_commit_anomalies(db: AsyncSession, project_id: str, commit_has
             old_tree = await resolve_tree(db, parent.root_tree_hash)
             new_tree = await resolve_tree(db, new_tree_hash)
             diff = _summarize_tree_diff(old_tree, new_tree)
-            # v1.3.1 WP-44 fix (found live): _summarize_tree_diff() nests these three
-            # lists under "files" (`{"files": {"added": [...], ...}}`) — reading them as
-            # top-level keys always returned [], so changed_count was always 0 and this
-            # detector never fired, on any input, ever (metric_jump's own detector sits
-            # right above this and was unaffected, which is why unit tests never caught
-            # this: no stack-free test exercises the live tree-diff path this reuses).
+            # _summarize_tree_diff() nests these three lists under "files", not top-level.
             diff_files = diff.get("files") or {}
             changed_count = (len(diff_files.get("added") or []) + len(diff_files.get("removed") or [])
                             + len(diff_files.get("changed") or []))
@@ -2080,8 +1816,7 @@ async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict,
         delivery.response_code = status_code
         delivery.last_error = None
         delivery.next_retry_at = None
-        # v1.2.5 per-webhook health: a success clears the failure streak — a webhook
-        # that fails 4 times then succeeds is healthy again, not "3 away from disabled".
+        # A success clears the failure streak -- healthy again, not "N away from disabled".
         hook.last_success_at = now
         hook.consecutive_failures = 0
     else:
@@ -2096,15 +1831,13 @@ async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict,
                            delivery.attempt)
         else:
             delivery.status = "failed"
-            # v1.2.5 exponential backoff (was a fixed WEBHOOK_RETRY_INTERVAL_SECS every
-            # time): attempt 1->interval, 2->2x, 3->4x, ... capped at WEBHOOK_RETRY_MAX_SECS
-            # so a chronically-broken endpoint doesn't hammer itself OR its subscriber.
+            # Exponential backoff: attempt 1->interval, 2->2x, 3->4x, ... capped at
+            # WEBHOOK_RETRY_MAX_SECS so a chronically-broken endpoint doesn't hammer itself.
             backoff = min(WEBHOOK_RETRY_INTERVAL_SECS * (2 ** (delivery.attempt - 1)),
                           WEBHOOK_RETRY_MAX_SECS)
             delivery.next_retry_at = now + timedelta(seconds=backoff)
-        # v1.2.5 disable-after-N: 0 (default) = never auto-disable. A webhook that's
-        # already inactive stays as the caller left it — this only ever transitions
-        # active -> disabled, never touches a webhook a human already turned off.
+        # 0 (default) = never auto-disable. Only ever transitions active -> disabled,
+        # never touches a webhook a human already turned off.
         if (WEBHOOK_DISABLE_AFTER > 0 and hook.active
                 and hook.consecutive_failures >= WEBHOOK_DISABLE_AFTER):
             hook.active = False
@@ -2119,9 +1852,7 @@ async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict,
                     "webhook_id": hook.id, "url": hook.url,
                     "consecutive_failures": hook.consecutive_failures,
                 })
-                # System-triggered (no HTTP request in the retry-worker path) — username
-                # None reads correctly in the trail as "not a human action", same as any
-                # other Anonymous-mode entry.
+                # System-triggered -- username None reads as "not a human action".
                 _audit(db, None, "webhook.auto_disable", hook.project_id, {
                     "webhook_id": hook.id, "consecutive_failures": hook.consecutive_failures,
                 }, status_code=200)
@@ -2129,34 +1860,19 @@ async def _deliver_one(hook, delivery: DBWebhookDelivery, event: dict,
 
 async def process_due_webhook_deliveries() -> int:
     """Re-drives every due pending/failed delivery (called by the interval worker and
-    exposed to tests). Returns how many rows were re-attempted.
+    exposed to tests). Returns how many rows were re-attempted. Uses
+    `system_session_factory` (bypass-RLS), since this worker is legitimately
+    cross-tenant -- every tenant's due deliveries must be re-driven.
 
-    v1.3.2: uses `system_session_factory`, not `async_session_factory` / `get_session` —
-    this worker is legitimately cross-tenant by design (every tenant's due deliveries
-    must be re-driven, not just one), so it needs the bypass-RLS session (see
-    database.py's own docstring on why bypass is GUC-based, not a second Postgres role).
+    `.with_for_update(skip_locked=True)` is what makes this safe under N replicas:
+    without it, every replica's interval timer would independently re-deliver the SAME
+    due rows. SKIP LOCKED makes this a claim-a-batch queue-consumer pattern instead --
+    N replicas processing DIFFERENT due rows in parallel. Degrades to today's
+    single-replica behavior at N=1.
 
-    v1.3.2 (HA — the E5 webhook-retry-worker fix): `.with_for_update(skip_locked=True)`
-    is the difference between this being safe under N replicas and not. Before this fix,
-    the plain SELECT here had no row-claiming at all — every replica's own interval
-    timer would independently select and re-deliver the SAME due rows, N-fold duplicate
-    webhook POSTs per tick. `SKIP LOCKED` makes this a claim-a-batch queue-consumer
-    pattern instead: N replicas processing DIFFERENT due rows in parallel, each row
-    delivered by exactly one replica. Chosen over leader election deliberately — this is
-    a claim-a-batch workload (independent rows, no single global decision to serialize),
-    not a single-decision one, so N replicas doing useful parallel work beats one elected
-    leader doing all of it serially, with no leader-crash/lock-timeout failure mode to
-    reason about. Degrades to exactly today's single-replica behavior at N=1. The same
-    `with_for_update()` pattern the ref-update path (`update_ref`) and budget spend
-    (`consume_budget`) already use elsewhere in this file — not a new idiom.
-
-    Deliberately the MINIMAL fix, not the full claim/deliver-split hardening a later
-    pass could add (a short claim transaction releasing its lock before the actual
-    outbound HTTP calls, versus holding the row lock across all 100 deliveries in this
-    batch as it does today) — `SKIP LOCKED` alone already closes the DUPLICATION bug,
-    which is the correctness-critical half; the lock-hold-duration concern is a
-    throughput/contention refinement, not a correctness one, and is explicitly flagged
-    here as unbuilt rather than silently implied.
+    Deliberately the MINIMAL fix: holds the row lock across all 100 deliveries in this
+    batch rather than releasing it before the outbound HTTP calls -- SKIP LOCKED alone
+    already closes the duplication bug, which is the correctness-critical half.
     """
     now = utcnow_naive()
     delivered = 0
@@ -2193,13 +1909,9 @@ async def process_due_webhook_deliveries() -> int:
 
 async def _deliver_webhooks(db: AsyncSession, hooks: list, event: dict) -> None:
     """POSTs the event to every matching active webhook, signed, in worker threads.
-
-    v1.2.2: every attempt is persisted in webhook_deliveries BEFORE the request goes
-    out and updated after — failed deliveries are retried by the background worker
-    (startup + interval) until AV_WEBHOOK_MAX_ATTEMPTS exhausts into a dead-letter.
-    Delivery rows ride the MUTATION's own session/transaction, so a rolled-back
-    mutation never leaves phantom delivery records. Per-URL try/except stays inside
-    _deliver_one: a dead subscriber must never fail the original mutation."""
+    Every attempt is persisted in webhook_deliveries BEFORE the request goes out and
+    updated after; delivery rows ride the MUTATION's own transaction, so a rolled-back
+    mutation never leaves phantom delivery records."""
     matching = [
         h for h in hooks
         if (h.project_id is None or h.project_id == event.get("project_id"))
@@ -2220,23 +1932,19 @@ async def _deliver_webhooks(db: AsyncSession, hooks: list, event: dict) -> None:
         await _deliver_one(hook, delivery, event, db)
 
 
-# v1.3.3 (WP-32): a monotonic counter stamped onto each new DBAuditLog row at CREATION
-# time, read (not written) by database.py's `_chain_audit_log` before_flush listener to
-# chain multiple rows added within the SAME flush in the order `_audit()` was actually
-# called — `session.new` itself has no ordering guarantee. Module-level, not per-request,
-# since ordering only needs to be locally consistent within one flush, and a single
-# ever-increasing counter trivially guarantees that regardless of which request created
-# which row.
+# A monotonic counter stamped onto each new DBAuditLog row at CREATION time, read by
+# database.py's `_chain_audit_log` before_flush listener to chain multiple rows added
+# within the SAME flush in the order `_audit()` was actually called -- `session.new`
+# itself has no ordering guarantee.
 _audit_seq_counter = itertools.count()
 
 
 def _audit(db: AsyncSession, username: str | None, action: str,
            project_id: str | None, details: dict | None = None,
            status_code: int | None = None):
-    """Records one mutation. v1.2.2: `status_code` captures the HTTP outcome the caller
-    is about to return, so the trail answers "did it land?" — not just "was it tried".
-    v1.3.3: the row's `chain_hash`/`signature` are populated later, by database.py's
-    `before_flush` listener — never here — see that listener's own docstring."""
+    """Records one mutation. `status_code` captures the HTTP outcome the caller is about
+    to return, so the trail answers "did it land?", not just "was it tried". The row's
+    `chain_hash`/`signature` are populated later, by database.py's `before_flush` listener."""
     if AUDIT_ENABLED:
         row = DBAuditLog(username=username, action=action,
                          project_id=project_id, details=details,
@@ -2245,29 +1953,17 @@ def _audit(db: AsyncSession, username: str | None, action: str,
         db.add(row)
 
 
-# v1.2.5: (method, path) pairs for mutating routes DELIBERATELY not audited, each with
-# a reason — kept alongside a coverage test (tests/test_audit_coverage.py) that walks
-# every POST/PUT/PATCH/DELETE route in `app.routes` and asserts it's either audited (an
-# `_audit(` call in its endpoint source) or listed here. This is how the WP-2 "guaranteed
-# coverage matrix" from the V1.2.5 plan stays true after the fact, not just at review time.
+# (method, path) pairs for mutating routes DELIBERATELY not audited, each with a reason
+# -- kept alongside a coverage test (tests/test_audit_coverage.py) that walks every
+# mutating route and asserts it's either audited or listed here.
 AUDIT_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset({
-    # High-frequency, content-addressed, idempotent (identical bytes -> identical hash;
-    # a 409 "already exists" is a normal, harmless outcome, not a notable event). The
-    # meaningful "who changed what" signal for an upload is captured by the commit.push
-    # audit row that references these object hashes — auditing every individual object/
-    # chunk PUT would dominate the audit_log table without adding attribution value.
+    # High-frequency, content-addressed, idempotent -- the meaningful signal is captured
+    # by the commit.push audit row that references these object hashes.
     ("POST", "/api/objects/{hash}"),
-    # Existence-check only (client asks "which of these hashes do you already have?"
-    # before uploading) — never creates, deletes, or mutates anything itself. Same
-    # high-frequency rationale as object upload.
+    # Existence-check only -- never creates, deletes, or mutates anything.
     ("POST", "/api/sync/batch-objects"),
-    # v1.3.3 (WP-12): both device-code endpoints (sso_oidc.py) mutate only an ephemeral
-    # Redis record (a pending/polled device code, minutes-lived) -- never a `DBAuditLog`-
-    # backed row. The security-relevant event is the login itself, which IS audited
-    # (`auth.oidc_login`, added in `oidc_callback`'s own body) once the device-code flow
-    # actually succeeds; auditing "someone started a login attempt" and "a CLI polled"
-    # separately would add noise with no attribution value the eventual login row
-    # doesn't already carry.
+    # Both device-code endpoints mutate only an ephemeral Redis record; the
+    # security-relevant event is the login itself, audited as `auth.oidc_login`.
     ("POST", "/api/auth/device/code"),
     ("POST", "/api/auth/device/token"),
 })
@@ -2291,15 +1987,9 @@ async def list_events(
     db: AsyncSession = Depends(get_session),
 ):
     """Resumable ordered event feed. wait=<secs> long-polls for at least one new row.
-
-    v1.3.0: `run_id` joins `project_id`/`kinds` as one stable query model (todo.md item
-    9) — matches events whose payload carries that run id (currently `commit` and `run`
-    kind events; a kind with no run_id in its payload simply never matches). Response
-    also gains `gap` (todo.md item 9's backlog-honesty half): true when `since` predates
-    this project's oldest retained event id (AV_EVENT_RETENTION_DAYS already swept it) —
-    a resuming consumer can tell "I missed events" apart from "there are simply no new
-    ones yet", which a stale cursor used to make silently indistinguishable.
-    """
+    `run_id` matches events whose payload carries that run id. Response also carries
+    `gap`: true when `since` predates this project's oldest retained event id, so a
+    resuming consumer can tell "I missed events" apart from "there are simply no new ones"."""
     kind_list = [k.strip() for k in kinds.split(",")] if kinds else None
     waited = 0.0
 
@@ -2447,20 +2137,10 @@ _DATASET_EXTS = {".parquet", ".csv", ".h5", ".hdf5", ".npz", ".npy", ".arrow",
 
 
 def _summarize_tree_diff(old_tree: dict, new_tree: dict) -> dict:
-    """v1.2.5, full-schema parity v1.3.0: a server-OWNED semantic summary for the
-    run-detail endpoint — deliberately NOT importing python/av_cli/semdiff.py (the
-    server package has never depended on av_cli; it ships and deploys standalone, see
-    docker/engine-entrypoint.sh and the Plugin/Release contracts).
-
-    v1.3.0 (todo.md item 3): this used to return only files/totals — a strict SUBSET of
-    `av_cli.semdiff.diff_trees()`'s schema, silently missing models/chunks/datasets for
-    any WebUI consumer that wanted them. Now produces the FULL semdiff-1.0 schema shape,
-    independently re-implemented (same "no av_cli dependency" rule as before) but
-    algorithmically identical — proven identical on identical input by
-    tests/test_server.py::test_server_side_summary_matches_client_side_semdiff_on_the_same_trees
-    (a shared golden fixture both implementations are run against), so the two can never
-    silently drift apart again the way the files-only version already had.
-    """
+    """A server-OWNED semantic summary for the run-detail endpoint — deliberately NOT
+    importing python/av_cli/semdiff.py (the server package has never depended on av_cli).
+    Independently re-implemented but algorithmically identical, proven so by a shared
+    golden fixture test so the two can never silently drift apart."""
     old_tree = old_tree or {}
     new_tree = new_tree or {}
     old_keys, new_keys = set(old_tree), set(new_tree)
@@ -2555,24 +2235,18 @@ def _summarize_tree_diff(old_tree: dict, new_tree: dict) -> dict:
     }
 
 
-# v1.2.5: caps how many linked commits a run-summary resolves trees/metrics for — same
-# rationale and same number as the WebUI's client-side MAX_DETAIL_COMMITS precedent
-# (webui/src/components/RunsPanel.tsx): bound the response size, never silently drop
-# data without saying so (the endpoint reports total_commits vs commits returned).
+# Caps how many linked commits a run-summary resolves trees/metrics for -- bound the
+# response size, never silently drop data without saying so (reports total_commits too).
 _RUN_SUMMARY_MAX_COMMITS = 20
-# Same precedent (RunsPanel.tsx) for how far up the parent_run_id chain to walk.
 _RUN_SUMMARY_MAX_LINEAGE_DEPTH = 10
 
 
 @app.get("/api/runs/{run_id}/summary")
 async def get_run_summary(run_id: str, db: AsyncSession = Depends(get_session)):
-    """v1.2.5: one aggregate request for the WebUI run-detail view — lineage chain,
-    linked commits (message + metrics, newest first), a SERVER-COMPUTED semantic summary
-    over the two most-recently-linked commits' trees, the env_snapshot_id pointer, and
-    (when the repo owner has opted in via `av handoff --publish`) the avh_object_id
-    pointer for context-memory notes. Replaces the WebUI's previous N individual
-    GET /api/commits/{hash} calls (client-side re-composition in
-    webui/src/lib/runDetail.ts, kept as the pure-function fallback/test surface)."""
+    """One aggregate request for the WebUI run-detail view — lineage chain, linked
+    commits, a SERVER-COMPUTED semantic summary over the two most recent commits' trees,
+    and the env_snapshot_id/avh_object_id pointers. Replaces N individual
+    GET /api/commits/{hash} calls."""
     r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -2636,9 +2310,8 @@ async def _fetch_run(db: AsyncSession, run_id: str) -> Optional[DBRun]:
     return (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
 
 
-# v1.3.0 (todo.md item 7): full per-commit metric series and full lineage chain, both
-# cursor-paginated — `/summary` keeps its capped inline copy (bounded response size for
-# the common case), these two exist for a WebUI/agent that wants to page past the cap.
+# Full per-commit metric series and full lineage chain, both cursor-paginated --
+# `/summary` keeps its capped inline copy; these exist for paging past the cap.
 _RUN_METRICS_DEFAULT_LIMIT = 50
 _RUN_METRICS_MAX_LIMIT = 500
 _RUN_LINEAGE_DEFAULT_DEPTH = 50
@@ -2668,10 +2341,8 @@ def _decode_run_commit_cursor(cursor: str) -> tuple[datetime, str]:
 async def get_run_metrics(run_id: str, limit: int = _RUN_METRICS_DEFAULT_LIMIT,
                           cursor: Optional[str] = None,
                           db: AsyncSession = Depends(get_session)):
-    """v1.3.0: the full per-commit metric series for a run, oldest-linked-first (chart
-    order), cursor-paginated on (run_commits.created_at, commit_hash) — `/summary`'s
-    inline `commits` copy is capped at `_RUN_SUMMARY_MAX_COMMITS` and newest-first; this
-    is the uncapped complement for a WebUI chart or an agent that wants every point."""
+    """The full per-commit metric series for a run, oldest-linked-first (chart order),
+    cursor-paginated. The uncapped complement to `/summary`'s capped, newest-first copy."""
     r = await _fetch_run(db, run_id)
     if not r:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -2707,10 +2378,9 @@ async def get_run_metrics(run_id: str, limit: int = _RUN_METRICS_DEFAULT_LIMIT,
 async def get_run_lineage(run_id: str, depth: int = _RUN_LINEAGE_DEFAULT_DEPTH,
                           cursor: Optional[str] = None,
                           db: AsyncSession = Depends(get_session)):
-    """v1.3.0: the full parent_run_id chain, depth- and cursor-bounded per page —
-    `/summary`'s inline `lineage` copy is capped at `_RUN_SUMMARY_MAX_LINEAGE_DEPTH`; this
-    is the uncapped complement. `cursor` (opaque: a run id) resumes the walk from that run
-    inclusive, so a caller pages by re-issuing with `next_cursor` until it comes back null."""
+    """The full parent_run_id chain, depth- and cursor-bounded per page -- the uncapped
+    complement to `/summary`'s capped copy. `cursor` (a run id) resumes the walk from
+    that run inclusive."""
     r = await _fetch_run(db, run_id)
     if not r:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -2747,11 +2417,8 @@ async def get_run_lineage(run_id: str, depth: int = _RUN_LINEAGE_DEFAULT_DEPTH,
 async def set_run_policy_outcome(run_id: str, request: Request,
                                  body: Dict[str, Any] = Body(...),
                                  db: AsyncSession = Depends(get_session)):
-    """v1.3.0 (todo.md item 7): records the most recent `av promote`/`enforce_policy`
-    decision for this run's active commit — best-effort telemetry the CLI calls right
-    after deciding, never a gate itself (see cmd_policy.py::_report_policy_outcome, which
-    swallows every failure from this call rather than let a reporting failure block a
-    promotion)."""
+    """Records the most recent `av promote`/`enforce_policy` decision for this run's
+    active commit -- best-effort telemetry, never a gate itself."""
     decision = body.get("decision")
     if decision not in ("allow", "deny"):
         raise HTTPException(status_code=422, detail="decision must be 'allow' or 'deny'")
@@ -2771,10 +2438,9 @@ async def set_run_policy_outcome(run_id: str, request: Request,
 async def set_run_integrity_signals(run_id: str, request: Request,
                                     body: Dict[str, Any] = Body(...),
                                     db: AsyncSession = Depends(get_session)):
-    """v1.3.1 (RSI R2, todo.md B.10): records metric-gaming detection signals for a run —
-    `av run integrity-check` computes these client-side (train/eval metric gap, eval-only
-    improvement, data overlap) and reports them here, same best-effort telemetry contract
-    as `policy-outcome` above: never a gate, a reporting failure never blocks anything."""
+    """Records metric-gaming detection signals for a run -- `av run integrity-check`
+    computes these client-side and reports them here, same best-effort telemetry
+    contract as `policy-outcome` above."""
     signals = body.get("signals")
     if not isinstance(signals, dict):
         raise HTTPException(status_code=422, detail="signals must be a JSON object")
@@ -2792,9 +2458,8 @@ async def set_run_integrity_signals(run_id: str, request: Request,
 @app.post("/api/runs/{run_id}/plan")
 async def link_run_plan(run_id: str, request: Request, body: Dict[str, Any] = Body(...),
                         db: AsyncSession = Depends(get_session)):
-    """v1.3.1 (RSI R3, todo.md D.16): attaches an experiment plan to a run — can happen
-    at `av run start --plan ID` or any time after via `av plan attach`, since planning
-    legitimately happens both before and mid-run."""
+    """Attaches an experiment plan to a run -- can happen at `av run start --plan ID` or
+    any time after via `av plan attach`, since planning happens both before and mid-run."""
     plan_id = body.get("plan_id")
     r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
     if not r:
@@ -2833,11 +2498,9 @@ async def link_run_budget(run_id: str, request: Request, body: Dict[str, Any] = 
 async def link_run_avh(run_id: str, request: Request,
                        body: Dict[str, Any] = Body(...),
                        db: AsyncSession = Depends(get_session)):
-    """v1.2.5: explicit, OPT-IN pointer from a run to a published `.avh` context-memory
-    object — set only by `av handoff --publish`, never implicitly by a normal commit or
-    push. Context notes can hold private reasoning, so nothing about this route is
-    automatic; the object itself already had to be uploaded through the normal object
-    flow (POST /api/objects/{hash}) before this call links it to the run."""
+    """Explicit, OPT-IN pointer from a run to a published `.avh` context-memory object --
+    set only by `av handoff --publish`, never implicitly. The object itself must already
+    be uploaded via POST /api/objects/{hash} before this call links it."""
     avh_object_id = body.get("avh_object_id")
     if not avh_object_id or not re.match(r"^[a-f0-9]{64}$", avh_object_id):
         raise HTTPException(status_code=422, detail="avh_object_id must be a sha256 hex hash")
@@ -2890,21 +2553,15 @@ async def _finish_run(run_id: str, request: Request, status: str, body: dict, db
 
 
 # ---------------------------------------------------------------------------
-# RSI R1 (v1.3.1, migration 0006): improver versioning, self-edit change sets, signed
-# policy packs, capability canaries, project freeze. See development/architecture.md's
-# Improver Artifact / Dual-Gate Promotion / Project Freeze contract sections.
-#
-# Every artifact row here indexes a CAS object (`python/av_cli/casobj.py`) uploaded
-# through the normal `POST /api/objects/{hash}` flow BEFORE this call — mirrors
-# `link_run_avh()`'s existing "must already exist" check above, not a new pattern.
+# RSI R1 (v1.3.1): improver versioning, self-edit change sets, signed policy packs,
+# capability canaries, project freeze. Every artifact row here indexes a CAS object
+# uploaded through the normal object flow BEFORE this call, mirroring `link_run_avh()`.
 # ---------------------------------------------------------------------------
 
 async def _object_exists(db: AsyncSession, object_id: str, cas_tenant_id: str | None = None) -> bool:
-    """`cas_tenant_id` (v1.3.3, WP-21): None under `shared` isolation (default) — every
-    call site's original, unscoped behavior. Under `isolated` mode, scoped to the
-    caller's own tenant so a caller can't "prove" they hold an object merely because
-    SOME OTHER tenant uploaded identical content — every one of this helper's ~11 call
-    sites passes `_cas_tenant_id(request)` for exactly this reason."""
+    """`cas_tenant_id`: None under `shared` isolation (unscoped). Under `isolated` mode,
+    scoped to the caller's own tenant so a caller can't "prove" they hold an object
+    merely because some other tenant uploaded identical content."""
     stmt = select(DBObject.hash).where(DBObject.hash == object_id)
     if cas_tenant_id is not None:
         stmt = stmt.where(DBObject.tenant_id == cas_tenant_id)
@@ -2922,7 +2579,7 @@ def _require_uploaded_object_id(field: str, object_id: Optional[str]) -> str:
 @app.post("/api/improvers", dependencies=[Depends(require_scope("improver:write"))])
 async def create_improver_version(request: Request, body: Dict[str, Any] = Body(...),
                                   db: AsyncSession = Depends(get_session)):
-    """Registers one improver version — idempotent by client-generated id, same
+    """Registers one improver version -- idempotent by client-generated id, same
     lazy/ordering-safe contract as `POST /api/runs`."""
     improver_id = body.get("id") or _new_uuid()
     project_id = body.get("project_id")
@@ -3170,8 +2827,7 @@ async def create_policy_pack(request: Request, body: Dict[str, Any] = Body(...),
     await _emit_event(db, project_id, "policy",
                       {"action": "published", "policy_pack_id": pack_id, "prev_id": prev_id})
     # A policy change is itself a security-relevant signal worth a dedicated anomaly
-    # feed, regardless of direction (tightened or loosened) — a monitoring webhook
-    # watching `kind=anomaly` alone should never miss "the promotion rules just changed."
+    # feed, regardless of direction (tightened or loosened).
     await _emit_event(db, project_id, "anomaly", {
         "type": "policy_change", "policy_pack_id": pack_id, "prev_id": prev_id,
     })
@@ -3295,11 +2951,9 @@ async def get_freeze_state(project_id: str, db: AsyncSession = Depends(get_sessi
 @app.post("/api/freeze/{project_id}", dependencies=[Depends(require_scope("admin"))])
 async def set_freeze_state(project_id: str, request: Request, body: Dict[str, Any] = Body(...),
                            db: AsyncSession = Depends(get_session)):
-    """Global per-project kill-switch (todo.md C.15/I.40): while frozen, `_AuthRetryGroup`
-    (client-side) AND this scope-gated route (server-side) both refuse every write except
-    reads and rollback — a compromised or rogue local client can't just skip the client-
-    side check. Requires the `admin` scope so an improver-level identity can never
-    freeze/unfreeze its own promotion gate."""
+    """Global per-project kill-switch: while frozen, both the client and this scope-gated
+    route refuse every write except reads and rollback -- a rogue local client can't
+    just skip the client-side check. Requires the `admin` scope."""
     frozen = bool(body.get("frozen"))
     row = (await db.execute(
         select(DBProjectFreeze).where(DBProjectFreeze.project_id == project_id)
@@ -3325,9 +2979,8 @@ async def set_freeze_state(project_id: str, request: Request, body: Dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# RSI R2 (v1.3.1, migration 0007): task/eval registry, eval integrity, held-out eval
-# vault, blind scoring, external adapters. See development/architecture.md's
-# Eval Registry & Integrity contract section.
+# RSI R2 (v1.3.1): task/eval registry, eval integrity, held-out eval vault, blind
+# scoring, external adapters.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/eval/suites", dependencies=[Depends(require_scope("eval:write"))])
@@ -3392,9 +3045,8 @@ async def get_eval_suite(suite_id: str, db: AsyncSession = Depends(get_session))
 @app.put("/api/eval/suites/{suite_id}", dependencies=[Depends(require_scope("eval:write"))])
 async def update_eval_suite(suite_id: str, request: Request, body: Dict[str, Any] = Body(...),
                             db: AsyncSession = Depends(get_session)):
-    """todo.md B.7 (eval immutability locks): rejects ANY mutation of a frozen suite with
-    409 — a training run may not modify the eval it's scored against, enforced here
-    server-side rather than by convention."""
+    """Rejects ANY mutation of a frozen suite with 409 -- a training run may not modify
+    the eval it's scored against, enforced server-side rather than by convention."""
     row = await _fetch_eval_suite(db, suite_id)
     if not row:
         raise HTTPException(status_code=404, detail="Eval suite not found")
@@ -3437,11 +3089,9 @@ async def freeze_eval_suite(suite_id: str, request: Request,
 @app.post("/api/eval/results", dependencies=[Depends(require_scope("scorer"))])
 async def create_eval_result(request: Request, body: Dict[str, Any] = Body(...),
                              db: AsyncSession = Depends(get_session)):
-    """todo.md F.25 (held-out eval vault): requiring the `scorer` scope IS the
-    enforcement — a trainer's token (no `scorer` scope) is rejected here with 403,
-    regardless of which project it targets. No separate mechanism is needed: point a
-    training agent's token at one project and a scorer's token at another (or the same
-    project with different tokens) and this route is the actual vault wall."""
+    """Requiring the `scorer` scope IS the held-out eval vault's enforcement -- a
+    trainer's token (no `scorer` scope) is rejected here with 403. No separate
+    mechanism needed."""
     project_id = body.get("project_id")
     suite_id = body.get("suite_id")
     if not project_id or not suite_id:
@@ -3467,9 +3117,7 @@ async def create_eval_result(request: Request, body: Dict[str, Any] = Body(...),
 
 def _eval_result_to_dict(r: DBEvalResult, redact: bool) -> dict:
     """`redact=True` (a non-scorer reader against an unrevealed blind result) hides the
-    score/details entirely — the reader learns a result EXISTS, not its VALUE. This is
-    todo.md F.26 (blind/delayed scoring): the agent sees training metrics live, the final
-    held-out score only after reveal."""
+    score/details entirely -- the reader learns a result EXISTS, not its VALUE."""
     if redact and not r.revealed:
         return {"id": r.id, "project_id": r.project_id, "suite_id": r.suite_id,
                 "run_id": r.run_id, "revealed": False, "score": None, "details": None}
@@ -3611,8 +3259,7 @@ async def update_task_status(task_id: str, request: Request, body: Dict[str, Any
 
 
 # ---------------------------------------------------------------------------
-# RSI R3 (v1.3.1, migration 0008): experiment plans, budget accounts, scheduler hooks.
-# See development/architecture.md's Research Control Contract section.
+# RSI R3 (v1.3.1): experiment plans, budget accounts, scheduler hooks.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/plans")
@@ -3732,10 +3379,9 @@ def _budget_exceeded_dims(row: DBBudget) -> List[str]:
 @app.post("/api/budgets/{budget_id}/consume")
 async def consume_budget(budget_id: str, request: Request, body: Dict[str, Any] = Body(...),
                          db: AsyncSession = Depends(get_session)):
-    """Increments usage counters (never decrements — a budget is spent, not refunded) and
-    reports whether any limit is now exceeded, so `av budget consume`/an autonomous loop's
-    own auto-stop check can react in the SAME round trip that recorded the spend, rather
-    than a separate read-after-write that could race another consumer."""
+    """Increments usage counters (never decrements) and reports whether any limit is now
+    exceeded, so the caller can react in the SAME round trip that recorded the spend,
+    rather than a separate read-after-write that could race another consumer."""
     row = (await db.execute(
         select(DBBudget).where(DBBudget.id == budget_id).with_for_update()
     )).scalar_one_or_none()
@@ -3757,10 +3403,9 @@ async def consume_budget(budget_id: str, request: Request, body: Dict[str, Any] 
 @app.post("/api/runs/{run_id}/stop")
 async def stop_run(run_id: str, request: Request, body: Dict[str, Any] = Body(default={}),
                    db: AsyncSession = Depends(get_session)):
-    """External stop (a scheduler, an auto-stop check) — distinct from `/complete`/`/fail`:
-    `status` becomes `"stopped"` (not `"failed"`) and `stop_reason` records why, so a
-    dashboard/lineage query can tell "the training genuinely failed" apart from "something
-    outside the run decided to end it" (plateau, divergence, NaN, canary failure, budget)."""
+    """External stop (a scheduler, an auto-stop check) -- distinct from `/complete`/
+    `/fail`: `status` becomes `"stopped"`, not `"failed"`, so a dashboard can tell
+    "training genuinely failed" apart from "something outside decided to end it"."""
     r = (await db.execute(select(DBRun).where(DBRun.id == run_id))).scalar_one_or_none()
     if not r:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -3779,9 +3424,8 @@ async def stop_run(run_id: str, request: Request, body: Dict[str, Any] = Body(de
 @app.get("/api/scheduler/queue")
 async def scheduler_queue(project_id: Optional[str] = None, limit: int = 100,
                           db: AsyncSession = Depends(get_session)):
-    """The live set of running runs a scheduler can act on — same fields as
-    `GET /api/runs` but purpose-named so a scheduler doesn't have to guess which generic
-    listing endpoint models "what's currently in flight"."""
+    """The live set of running runs a scheduler can act on -- same fields as
+    `GET /api/runs` but purpose-named for "what's currently in flight"."""
     stmt = select(DBRun).where(DBRun.status == "running").order_by(DBRun.created_at.asc())
     if project_id:
         stmt = stmt.where(DBRun.project_id == project_id)
@@ -3790,9 +3434,8 @@ async def scheduler_queue(project_id: Optional[str] = None, limit: int = 100,
 
 
 # ---------------------------------------------------------------------------
-# RSI R4 (v1.3.1, migration 0009): causal graphs, strategy memory, distilled lessons,
-# cross-run search, reviewer gate, critiques, shared blackboard. See
-# development/architecture.md's Multi-Agent & Strategy Memory Contract section.
+# RSI R4 (v1.3.1): causal graphs, strategy memory, distilled lessons, cross-run search,
+# reviewer gate, critiques, shared blackboard.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/causal-links")
@@ -3870,9 +3513,8 @@ def _strategy_to_dict(r: DBStrategyEntry) -> dict:
 async def search_strategy(project_id: Optional[str] = None, technique: Optional[str] = None,
                           outcome: Optional[str] = None, q: Optional[str] = None,
                           limit: int = 50, db: AsyncSession = Depends(get_session)):
-    """`q` does a simple case-insensitive substring match over `technique` — the
-    "searchable store" todo.md E.22 asks for, without pulling in a full-text engine for
-    what is, in practice, a small table an agent skims rather than fuzzy-searches."""
+    """`q` does a simple case-insensitive substring match over `technique`, without
+    pulling in a full-text engine for what is, in practice, a small table."""
     stmt = select(DBStrategyEntry).order_by(DBStrategyEntry.created_at.desc())
     if project_id:
         stmt = stmt.where(DBStrategyEntry.project_id == project_id)
@@ -3954,13 +3596,10 @@ async def _reviewable_target(target_type: str, target_id: str, db: AsyncSession)
 @app.post("/api/reviews", dependencies=[Depends(require_scope("review"))])
 async def create_review(request: Request, body: Dict[str, Any] = Body(...),
                         db: AsyncSession = Depends(get_session)):
-    """Requires the `review` scope. The reviewer must NOT be the target's own proposer —
-    a self-review is rejected with 422, not silently accepted, so "another agent (or
-    human) must approve" (todo.md H.34) is an enforced fact, not a convention.
-    `target_type` ∈ {"change_set","improver"}: `av improver promote`'s dual gate checks
-    reviews against the CANDIDATE IMPROVER id directly (target_type="improver"), since one
-    improver version can be the eventual promotion target regardless of which change set
-    (if any) produced it; change-set-targeted reviews exist for earlier-stage sign-off."""
+    """Requires the `review` scope. The reviewer must NOT be the target's own proposer --
+    a self-review is rejected with 422, not silently accepted. `target_type` ∈
+    {"change_set","improver"}: `av improver promote`'s dual gate checks reviews against
+    the candidate improver id directly."""
     decision = body.get("decision")
     target_type = body.get("target_type")
     target_id = body.get("target_id")
@@ -4075,8 +3714,7 @@ async def resolve_critique(critique_id: str, request: Request, body: Dict[str, A
 async def waive_critique(critique_id: str, request: Request, body: Dict[str, Any] = Body(default={}),
                          db: AsyncSession = Depends(get_session)):
     """Waiving (as opposed to resolving) means the objection stands but is deliberately
-    overridden — requires the `review` scope, and (like every other mutation) is audited,
-    so a waiver is always a visible, attributable decision, never a silent bypass."""
+    overridden -- requires the `review` scope, and is audited like every mutation."""
     return await _set_critique_status(critique_id, "waived", request, body, db)
 
 
@@ -4142,12 +3780,9 @@ async def resolve_blackboard_entry(entry_id: str, request: Request,
 async def search_runs(project_id: Optional[str] = None, metric: str = "",
                       direction: str = "up", min_delta: float = 0.0, limit: int = 50,
                       db: AsyncSession = Depends(get_session)):
-    """A structured (not free-text) predicate: runs whose `metric` moved `direction`
-    ("up"|"down") by at least `min_delta` relative to their PARENT run's latest value for
-    that same metric — e.g. "all runs where eval_acc rose after the change that produced
-    them." Deterministic, no LLM, no external index: a bounded scan over one project's
-    runs plus one parent lookup each, which is exactly the shape `av search runs` needs
-    for a project sized like the ones this tool targets."""
+    """A structured predicate: runs whose `metric` moved `direction` by at least
+    `min_delta` relative to their PARENT run's latest value for that metric.
+    Deterministic, no LLM, no external index -- a bounded scan plus one parent lookup each."""
     if not metric:
         raise HTTPException(status_code=422, detail="metric is required")
     if direction not in ("up", "down"):
@@ -4178,16 +3813,14 @@ async def search_runs(project_id: Optional[str] = None, metric: str = "",
 
 
 # ---------------------------------------------------------------------------
-# RSI R5 (v1.3.1, migration 0010): sandbox jobs, tool manifests, action logs. See
-# development/architecture.md's Sandbox Execution Contract section.
+# RSI R5 (v1.3.1): sandbox jobs, tool manifests, action logs.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/sandbox/jobs", dependencies=[Depends(require_scope("improver:write"))])
 async def create_sandbox_job(request: Request, body: Dict[str, Any] = Body(...),
                              db: AsyncSession = Depends(get_session)):
-    """Records a job submission — the driver itself (see `python/av_cli/sandbox/`)
-    already started (or ran) the real job by the time this is called; this is the
-    server-side index/audit row, not the execution itself."""
+    """Records a job submission -- the driver itself already started (or ran) the real
+    job by the time this is called; this is the index/audit row, not the execution."""
     job_id = body.get("id")
     project_id = body.get("project_id")
     driver = body.get("driver")
@@ -4262,9 +3895,8 @@ async def list_sandbox_jobs(project_id: Optional[str] = None, state: Optional[st
 @app.post("/api/sandbox/jobs/{job_id}/cancel", dependencies=[Depends(require_scope("improver:write"))])
 async def cancel_sandbox_job_record(job_id: str, request: Request,
                                     db: AsyncSession = Depends(get_session)):
-    """Records that a cancellation was requested/performed — the actual cancel() call
-    against the driver happens client-side (`av sandbox cancel`) before this is called;
-    same "driver executes, server indexes" split as job creation above."""
+    """Records that a cancellation was requested/performed -- the actual cancel() call
+    happens client-side before this is called; same split as job creation above."""
     row = (await db.execute(select(DBSandboxJob).where(DBSandboxJob.id == job_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Sandbox job not found")
@@ -4439,8 +4071,8 @@ def _audit_row_dict(a: "DBAuditLog") -> dict:
     return {"id": a.id, "ts": a.ts.isoformat() if a.ts else None, "username": a.username,
             "action": a.action, "project_id": a.project_id, "details": a.details,
             "status_code": a.status_code,
-            # v1.3.3 (WP-32): exported/listed alongside everything else so an offline
-            # `av audit verify --export` has what it needs without a second round trip.
+            # Exported/listed alongside everything else so an offline `av audit verify
+            # --export` has what it needs without a second round trip.
             "chain_hash": a.chain_hash, "signature": a.signature}
 
 
@@ -4460,20 +4092,11 @@ async def get_audit_log(
     until: Optional[str] = None,
     db: AsyncSession = Depends(get_session),
 ):
-    """Trust surface: recent mutating-call trail with outcome capture. Auth-gated like
-    every other route; in Anonymous mode usernames are simply None entries.
-
-    Filters (v1.2.2): action (exact match), project_id, since/until (ISO-8601 ts bounds).
-    Filters (v1.2.5): action_prefix (route family, e.g. "commit." matches "commit.push"),
-    username (actor), status_code (exact), outcome ("ok" = 2xx/3xx, "error" = 4xx/5xx).
-
-    Pagination: `offset` (legacy, kept working — a page N stays valid even as new rows are
-    inserted ahead of it, since `id DESC` ordering is stable) OR `cursor` (v1.2.5, stable
-    under concurrent inserts: opaque, encodes the last row's id, and `id < cursor` is exact
-    regardless of how many new rows landed since the previous page was fetched — offset-N
-    can skip or repeat rows under concurrent inserts, cursor cannot). Passing both is a 422;
-    `cursor` is the recommended path for agents polling this endpoint repeatedly.
-    """
+    """Trust surface: recent mutating-call trail with outcome capture. Filters: action
+    (exact), action_prefix (route family), project_id, username, status_code, outcome
+    ("ok"/"error"), since/until (ISO-8601). Pagination: `offset` (legacy) OR `cursor`
+    (stable under concurrent inserts, unlike offset-N which can skip/repeat rows) --
+    passing both is a 422."""
     if cursor and offset:
         raise HTTPException(status_code=422, detail="Pass either `cursor` or `offset`, not both.")
     stmt = _apply_audit_filters(
@@ -4512,10 +4135,9 @@ async def export_audit_log(
     until: Optional[str] = None,
     db: AsyncSession = Depends(get_session),
 ):
-    """v1.2.5: streams the FILTERED set (same filters as the list endpoint, no
-    pagination) as jsonl or csv for compliance export — `av audit export` is the CLI
-    surface. Ordered oldest-first (unlike the list endpoint's newest-first) so a csv/jsonl
-    file reads as a natural audit timeline top to bottom."""
+    """Streams the FILTERED set (same filters as the list endpoint, no pagination) as
+    jsonl or csv for compliance export. Ordered oldest-first (unlike the list endpoint)
+    so the file reads as a natural timeline top to bottom."""
     import csv
     import io
     import json as _json
@@ -4556,11 +4178,8 @@ async def prune_audit_log(request: Request, before_days: int = Query(AUDIT_RETEN
                           dry_run: bool = Query(False),
                           db: AsyncSession = Depends(get_session)):
     """Manual audit-trail pruning; the same window is swept automatically during GC.
-
-    v1.3.0: dry_run=true reports the count that WOULD be deleted (a plain SELECT count)
-    without touching anything — no audit row is written for a dry run either, since
-    nothing actually happened.
-    """
+    dry_run=true reports the count that WOULD be deleted without touching anything --
+    no audit row is written for a dry run either."""
     cutoff = utcnow_naive() - timedelta(days=max(before_days, 0))
     if dry_run:
         count = (await db.execute(
@@ -4581,19 +4200,11 @@ async def verify_audit_chain(
     limit: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_session),
 ):
-    """v1.3.3 (WP-32): walks the hash chain from `since_id` (exclusive) forward,
-    recomputing each row's chain_hash and comparing against the stored value — the
-    FIRST mismatch is reported as a break (everything after it is definitionally
-    suspect too, but the first break is where an investigation starts). `since_id=0`
-    (default) verifies the WHOLE table from the beginning; passing a previous check's
-    `last_id` lets a repeat caller only re-verify what's new since then. `limit=0`
-    (default) means no cap — verify everything from `since_id` to the end.
-
-    Also reports how many rows in the checked range carry a signature and whether it
-    verifies against this server's OWN public key (`GET .../public-key`) — a
-    self-consistency check, not independent third-party verification (a real external
-    verifier needs their own recomputation using an exported copy of the log plus the
-    public key, which is exactly what `av audit verify` is for)."""
+    """Walks the hash chain from `since_id` (exclusive) forward, recomputing each row's
+    chain_hash and comparing against the stored value -- the FIRST mismatch is reported
+    as a break. Also reports how many rows carry a signature and whether it verifies
+    against this server's OWN public key -- a self-consistency check, not independent
+    third-party verification (that's what `av audit verify` is for)."""
     from .audit_chain import compute_chain_hash
 
     prev_hash = None
@@ -4642,10 +4253,8 @@ async def verify_audit_chain(
 
 @app.get("/api/admin/audit/public-key", dependencies=[Depends(require_scope("admin"))])
 async def audit_signing_public_key():
-    """The server's audit-signing public key, hex-encoded — what an external verifier
-    (or `av audit verify --export`) checks signatures against. 404 when
-    AV_AUDIT_SIGNING_KEY_PATH isn't configured; chain-hash verification above works
-    regardless of whether signing is configured at all."""
+    """The server's audit-signing public key, hex-encoded -- what an external verifier
+    checks signatures against. 404 when AV_AUDIT_SIGNING_KEY_PATH isn't configured."""
     key = audit_signing.public_key_hex()
     if key is None:
         raise HTTPException(status_code=404, detail="audit signing is not configured on this server")
@@ -4692,9 +4301,8 @@ async def list_webhooks(db: AsyncSession = Depends(get_session)):
 
 @app.post("/api/webhooks/{webhook_id}/enable")
 async def enable_webhook(webhook_id: str, request: Request, db: AsyncSession = Depends(get_session)):
-    """v1.2.5: re-enables a webhook — the explicit counterpart to auto-disable. Clears the
-    failure streak so it starts from a clean slate rather than being one failure from
-    disabling itself again immediately."""
+    """Re-enables a webhook -- the explicit counterpart to auto-disable. Clears the
+    failure streak so it starts from a clean slate."""
     row = (await db.execute(select(DBWebhook).where(DBWebhook.id == webhook_id))).scalar_one_or_none()
     if not row:
         raise HTTPException(status_code=404, detail="Webhook not found")
@@ -4757,9 +4365,8 @@ async def list_webhook_deliveries(
     db: AsyncSession = Depends(get_session),
 ):
     """Delivery-ledger observability: attempts, outcomes, retry schedule, dead-letters.
-
-    v1.2.5 additions: `event_kind`, `since`/`until` filters, and `cursor` pagination
-    (same opaque-id scheme as /api/admin/audit — see its docstring for the rationale)."""
+    Supports `event_kind`, `since`/`until` filters, and `cursor` pagination (same
+    opaque-id scheme as /api/admin/audit)."""
     if cursor and offset:
         raise HTTPException(status_code=422, detail="Pass either `cursor` or `offset`, not both.")
     stmt = select(DBWebhookDelivery)
@@ -4797,10 +4404,9 @@ async def list_webhook_deliveries(
           dependencies=[Depends(require_scope("admin"))])
 async def replay_webhook_delivery(delivery_id: int, request: Request,
                                   db: AsyncSession = Depends(get_session)):
-    """v1.2.5: re-queues one failed/dead delivery for immediate retry — the CLI/admin
-    counterpart to waiting for the interval worker (or for a dead row, which the worker
-    never touches again on its own). Resets the attempt counter so a manually-replayed
-    delivery gets the full AV_WEBHOOK_MAX_ATTEMPTS budget again, not just what was left."""
+    """Re-queues one failed/dead delivery for immediate retry -- the counterpart to
+    waiting for the interval worker (which never touches a dead row again on its own).
+    Resets the attempt counter to the full AV_WEBHOOK_MAX_ATTEMPTS budget."""
     row = (await db.execute(
         select(DBWebhookDelivery).where(DBWebhookDelivery.id == delivery_id)
     )).scalar_one_or_none()
@@ -4822,14 +4428,9 @@ async def replay_webhook_delivery(delivery_id: int, request: Request,
 
 # ---------------------------------------------------------------------------
 # v1.3.2 — Enterprise identity: DB-backed API tokens (`av token`). The remote-
-# administrable alternative to `AV_AUTH_USERS`, which requires `docker compose` shell
-# access on the host running the stack to create/rotate/revoke (`cmd_auth.py`). A token
-# minted here works from any machine that can reach this registry over HTTP, resolved by
-# `identity.py::resolve_db_token` inside `require_token` — see that module's docstring
-# for the full resolution order relative to `.env`-based credentials.
-#
-# `token:write` gates every mutation here (granted by the built-in `admin` role,
-# migration 0011) — creating/revoking a credential is itself an admin action, distinct
+# administrable alternative to `AV_AUTH_USERS`, resolved by
+# `identity.py::resolve_db_token` inside `require_token`. `token:write` gates every
+# mutation here -- creating/revoking a credential is itself an admin action, distinct
 # from whatever scopes the MINTED token ends up carrying.
 # ---------------------------------------------------------------------------
 
@@ -4848,31 +4449,18 @@ def _token_row_dict(row: DBApiToken) -> dict:
 @app.post("/api/tokens", dependencies=[Depends(require_scope("token:write"))])
 async def create_api_token(request: Request, body: Dict[str, Any] = Body(...),
                            db: AsyncSession = Depends(get_session)):
-    """Mints a new DB-backed bearer token, scoped to the CALLER's own tenant — never a
-    tenant the caller merely names in the body, so a caller can only ever grow their own
-    tenant's credential surface, not someone else's (the tenant comes from the resolved
-    Principal, `_principal(request).tenant_id`, not from `body`).
-
-    The plaintext token is returned exactly once, here, and never again — only its
-    sha256 (`identity.py::hash_token`) and an 8-char display prefix are persisted
-    (models.py::DBApiToken's own docstring), matching `av registry keygen`'s "the
-    private key never round-trips back out" posture.
+    """Mints a new DB-backed bearer token, scoped to the CALLER's own tenant -- never a
+    tenant merely named in the body, so a caller can only ever grow their own tenant's
+    credential surface. The plaintext token is returned exactly once, here, and never
+    again -- only its sha256 and an 8-char display prefix are persisted.
     """
     import secrets as secrets_module
 
     principal = _principal(request)
-    # v1.3.2 fix (found by the mandatory manual real-CLI repro, AGENTS.md non-negotiable
-    # #5 — no live test caught this because every existing test exercised Protected mode
-    # via scoped_users): a genuinely Anonymous server (no AV_API_TOKEN/AV_AUTH_USERS at
-    # all — the overwhelmingly common single-operator OSS case) resolves EVERY caller to
-    # `anonymous_principal()`, `tenant_id=None`. The original code rejected that outright
-    # with a 422, which made `av token create` completely unusable on the exact
-    # deployment shape most likely to use it first — nobody could ever mint a first
-    # token to bootstrap into Protected-by-DB-tokens mode. Anonymous mode implicitly
-    # means "there is exactly one tenant" (the same reasoning `env_principal()` already
-    # applies to every `.env`-based identity, which always resolves to DEFAULT_TENANT_ID,
-    # never None) — so a token minted here with no resolved tenant falls back to the same
-    # default tenant, not a hard failure.
+    # A genuinely Anonymous server (no AV_API_TOKEN/AV_AUTH_USERS at all) resolves every
+    # caller to `anonymous_principal()`, `tenant_id=None`. Anonymous mode implicitly means
+    # "there is exactly one tenant" (same reasoning `env_principal()` applies), so a token
+    # minted with no resolved tenant falls back to the default tenant, not a hard failure.
     tenant_id = principal.tenant_id or DEFAULT_TENANT_ID
 
     name = body.get("name")
@@ -4905,11 +4493,9 @@ async def create_api_token(request: Request, body: Dict[str, Any] = Body(...),
 
 @app.get("/api/tokens", dependencies=[Depends(require_scope("token:write"))])
 async def list_api_tokens(request: Request, db: AsyncSession = Depends(get_session)):
-    """Lists tokens for the CALLER's own tenant only — never another tenant's, and never
-    the token hash itself (only the display `prefix`, matching `av auth list-users`'
-    existing masked-token convention). Anonymous-mode callers (no resolved tenant) see
-    the default tenant's tokens — the same fallback `create_api_token` uses to mint
-    them in the first place; see that route's docstring for the full reasoning."""
+    """Lists tokens for the CALLER's own tenant only -- never the token hash itself, only
+    the display `prefix`. Anonymous-mode callers see the default tenant's tokens, the
+    same fallback `create_api_token` uses to mint them."""
     principal = _principal(request)
     tenant_id = principal.tenant_id or DEFAULT_TENANT_ID
     rows = (await db.execute(
@@ -4923,10 +4509,8 @@ async def list_api_tokens(request: Request, db: AsyncSession = Depends(get_sessi
 async def revoke_api_token(token_id: str, request: Request,
                            db: AsyncSession = Depends(get_session)):
     """Revokes immediately for any FUTURE resolution; a copy already cached by
-    `identity.py`'s TTL cache can outlive this by up to `AV_AUTH_CACHE_TTL_SECS` (default
-    30s) — see `identity_module.invalidate_cached_token`'s docstring for why an
-    admin-initiated revoke cannot clear that cache entry directly (the server never
-    stores the plaintext token the cache is keyed on)."""
+    `identity.py`'s TTL cache can outlive this by up to `AV_AUTH_CACHE_TTL_SECS`, since
+    the server never stores the plaintext token the cache is keyed on."""
     principal = _principal(request)
     tenant_id = principal.tenant_id or DEFAULT_TENANT_ID
     row = (await db.execute(
@@ -4934,9 +4518,7 @@ async def revoke_api_token(token_id: str, request: Request,
     )).scalar_one_or_none()
     if not row or row.tenant_id != tenant_id:
         # 404, not 403: a token in another tenant is treated as not existing, not as a
-        # permission you lack — the same information-hiding tradeoff a later tenancy
-        # phase applies uniformly elsewhere (see development/architecture.md's Tenancy
-        # Isolation contract section).
+        # permission you lack -- the same information-hiding tradeoff applied elsewhere.
         raise HTTPException(status_code=404, detail="Token not found")
     if row.revoked_at is None:
         row.revoked_at = utcnow_naive()
@@ -4947,13 +4529,10 @@ async def revoke_api_token(token_id: str, request: Request,
 
 
 # ---------------------------------------------------------------------------
-# v1.3.2 — Enterprise identity: tenants, users, roles, role bindings (`av tenant`/
-# `av user`/`av role`). Every route here that names a specific tenant to act on resolves
-# it from the CALLER's own Principal, exactly like `/api/tokens*` above — never from a
-# client-supplied tenant_id in the body — so a caller can only ever administer their own
-# tenant. There is deliberately no "platform superadmin can manage every tenant" surface
-# yet: that needs a real platform-operator identity concept this phase does not build,
-# and is called out honestly rather than faked with an implicit trust assumption.
+# v1.3.2 — Enterprise identity: tenants, users, roles, role bindings. Every route here
+# resolves the tenant to act on from the CALLER's own Principal, never a client-supplied
+# tenant_id in the body, so a caller can only ever administer their own tenant. There is
+# deliberately no "platform superadmin manages every tenant" surface yet.
 # ---------------------------------------------------------------------------
 
 def _effective_tenant_id(request: Request) -> str:
@@ -4963,12 +4542,9 @@ def _effective_tenant_id(request: Request) -> str:
 @app.post("/api/tenants", dependencies=[Depends(require_scope("admin"))])
 async def create_tenant(request: Request, body: Dict[str, Any] = Body(...),
                         db: AsyncSession = Depends(get_session)):
-    """Provisions a NEW tenant — a genuinely platform-level bootstrap operation (standing
-    up a fresh customer), deliberately left behind the same `admin` scope every other
-    admin route uses rather than inventing a separate "platform superadmin" identity
-    tier this phase doesn't otherwise build (see this section's own module-level note).
-    An operator's existing unrestricted owner/admin credential is what creates the
-    tenant a new customer's own admin then takes over."""
+    """Provisions a NEW tenant -- a platform-level bootstrap operation, deliberately
+    left behind the same `admin` scope every other admin route uses rather than
+    inventing a separate "platform superadmin" identity tier."""
     slug = body.get("slug")
     name = body.get("name")
     if not slug or not isinstance(slug, str) or not name or not isinstance(name, str):
@@ -4986,9 +4562,8 @@ async def create_tenant(request: Request, body: Dict[str, Any] = Body(...),
 
 @app.get("/api/tenants/me")
 async def get_my_tenant(request: Request, db: AsyncSession = Depends(get_session)):
-    """The caller's own tenant — needs no scope beyond being authenticated at all
-    (or Anonymous mode's implicit default tenant), matching `/api/freeze/{id}`'s GET
-    precedent that reads need no scope even in Protected mode."""
+    """The caller's own tenant -- needs no scope beyond being authenticated at all,
+    matching the "reads need no scope" precedent elsewhere in this file."""
     tenant_id = _effective_tenant_id(request)
     row = (await db.execute(select(DBTenant).where(DBTenant.id == tenant_id))).scalar_one_or_none()
     if not row:
@@ -5007,9 +4582,9 @@ def _user_row_dict(row: DBUser) -> dict:
 @app.post("/api/users", dependencies=[Depends(require_scope("user:write"))])
 async def create_user(request: Request, body: Dict[str, Any] = Body(...),
                       db: AsyncSession = Depends(get_session)):
-    """Provisions a LOCAL user (source='local') directly — the manual counterpart to
-    JIT provisioning via SSO login or SCIM `POST /scim/v2/Users` (a later phase), for
-    operators who want to create accounts by hand."""
+    """Provisions a LOCAL user (source='local') directly -- the manual counterpart to
+    JIT provisioning via SSO login or SCIM, for operators who want to create accounts
+    by hand."""
     tenant_id = _effective_tenant_id(request)
     username = body.get("username")
     if not username or not isinstance(username, str):
@@ -5042,10 +4617,9 @@ async def list_users(request: Request, db: AsyncSession = Depends(get_session)):
 
 @app.post("/api/users/{user_id}/suspend", dependencies=[Depends(require_scope("user:write"))])
 async def suspend_user(user_id: str, request: Request, db: AsyncSession = Depends(get_session)):
-    """Sets status='suspended' (never a hard delete — audit history and existing
-    commit/run authorship attribution must survive) and revokes every live session AND
-    api_token issued to this user, so a suspension takes effect immediately rather than
-    only on next token expiry."""
+    """Sets status='suspended' (never a hard delete, since audit/authorship attribution
+    must survive) and revokes every live session AND api_token for this user, so
+    suspension takes effect immediately."""
     tenant_id = _effective_tenant_id(request)
     row = (await db.execute(
         select(DBUser).where(DBUser.id == user_id, DBUser.tenant_id == tenant_id)
@@ -5074,10 +4648,8 @@ async def suspend_user(user_id: str, request: Request, db: AsyncSession = Depend
 
 @app.get("/api/roles")
 async def list_roles(request: Request, db: AsyncSession = Depends(get_session)):
-    """Every role visible to the caller's tenant: the six built-in roles (`tenant_id`
-    NULL, shared by all tenants) plus any custom roles the tenant defined itself. Needs
-    no scope — seeing what roles EXIST is not itself a sensitive operation; granting one
-    (`POST /api/role-bindings`) is."""
+    """Every role visible to the caller's tenant: the six built-in roles plus any custom
+    ones. Needs no scope -- seeing what roles EXIST isn't sensitive; granting one is."""
     tenant_id = _effective_tenant_id(request)
     rows = (await db.execute(
         select(DBRole).where(or_(DBRole.tenant_id.is_(None), DBRole.tenant_id == tenant_id))
@@ -5090,7 +4662,7 @@ async def list_roles(request: Request, db: AsyncSession = Depends(get_session)):
 @app.post("/api/role-bindings", dependencies=[Depends(require_scope("user:write"))])
 async def create_role_binding(request: Request, body: Dict[str, Any] = Body(...),
                               db: AsyncSession = Depends(get_session)):
-    """Grants ROLE to a user/group/token, at tenant or project scope — see
+    """Grants ROLE to a user/group/token, at tenant or project scope -- see
     `identity.py::_permissions_for_subject` for how this is read back at auth time."""
     tenant_id = _effective_tenant_id(request)
     subject_type = body.get("subject_type")
@@ -5153,10 +4725,8 @@ async def revoke_role_binding(binding_id: str, request: Request,
 
 @app.get("/api/auth/whoami")
 async def auth_whoami(request: Request) -> Dict[str, Any]:
-    """`av whoami`'s data source, and what `av login` calls right after a device-code
-    flow completes to report who it just logged in as. No scope required -- the whole
-    point is telling ANY caller, including a genuinely anonymous one, what identity (if
-    any) the server resolved them as."""
+    """`av whoami`'s data source. No scope required -- the whole point is telling ANY
+    caller, including a genuinely anonymous one, what identity the server resolved them as."""
     principal = _principal(request)
     return {
         "username": principal.username,
@@ -5169,11 +4739,9 @@ async def auth_whoami(request: Request) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# v1.3.3 — SSO providers (`av idp add/list/show/test/remove`). CRUD only here; the
-# actual OIDC/SAML protocol handlers (login/callback/ACS/device-code) live in
-# `sso_oidc.py`/`sso_saml.py`, mounted below via `include_router` — kept in their own
-# modules since they need `authlib`/`pyjwt`/`pysaml2` (the optional `[sso]`/`[saml]`
-# extras), which this file itself must never require just to define these CRUD routes.
+# v1.3.3 — SSO providers. CRUD only here; the actual OIDC/SAML protocol handlers live in
+# `sso_oidc.py`/`sso_saml.py`, mounted below, since they need the optional `[sso]`/`[saml]`
+# extras this file itself must never require.
 # ---------------------------------------------------------------------------
 
 @app.post("/api/sso-providers", dependencies=[Depends(require_scope("admin"))])
@@ -5250,8 +4818,7 @@ async def delete_sso_provider(provider_id: str, request: Request, db: AsyncSessi
 @app.get("/api/sso-providers/{provider_id}/test", dependencies=[Depends(require_scope("admin"))])
 async def test_sso_provider(provider_id: str, request: Request, db: AsyncSession = Depends(get_session)):
     """`av idp test` — reachability only (fetches the IdP's own metadata document), never
-    a full login round trip (that needs a real human/browser). Reports what it can
-    verify without one: the issuer/metadata endpoint is reachable and well-formed."""
+    a full login round trip (that needs a real human/browser)."""
     tenant_id = _effective_tenant_id(request)
     row = (await db.execute(
         select(DBSsoProvider).where(DBSsoProvider.id == provider_id, DBSsoProvider.tenant_id == tenant_id)
@@ -5291,19 +4858,13 @@ try:
     app.include_router(sso_saml.router)
 except ImportError:
     # pysaml2 (the [saml] extra) is not installed -- SAML routes simply don't exist on
-    # this server, matching every other optional-dependency pattern in this codebase
-    # (av watch/av doctor --compose/etc.): a 404 for an unmounted route, not a crash.
+    # this server: a 404 for an unmounted route, not a crash.
     logger.info("pysaml2 not installed -- SAML SSO routes are not mounted")
 except Exception as exc:
-    # v1.3.4 (found live -- Probleme.md #137): pysaml2 IS installed, but importing it
-    # transitively imports pyOpenSSL's own `OpenSSL.crypto`, which raises `AttributeError:
-    # module 'lib' has no attribute 'GEN_EMAIL'` at IMPORT TIME under a real pyOpenSSL/
-    # cryptography version combination this environment resolved (see Probleme.md for the
-    # full investigation) -- an installed-but-broken optional dependency, not an ABSENT
-    # one, which the bare `except ImportError` above was never written to catch. Before
-    # this fix, that AttributeError propagated all the way up and crashed the ENTIRE
-    # server at startup -- SSO/OIDC, the base registry, everything -- over a SAML-only
-    # compatibility problem. Degrades exactly like the ImportError case above: SAML
+    # pysaml2 IS installed, but importing it can transitively fail at IMPORT TIME under
+    # a broken pyOpenSSL/cryptography version combination -- an installed-but-broken
+    # optional dependency, not an ABSENT one, which the bare `except ImportError` above
+    # was never written to catch. Degrades exactly like the ImportError case: SAML
     # routes don't mount, everything else keeps working.
     logger.warning(
         "pysaml2 is installed but failed to import cleanly (%s: %s) -- SAML SSO routes "

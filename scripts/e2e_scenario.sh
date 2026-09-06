@@ -2,31 +2,28 @@
 # ============================================================================
 # Aether-Vault end-to-end scenario suite (CI).
 #
-# Drives the REAL `av` CLI against a REAL uvicorn server on live Postgres +
-# Redis service containers — the same topology production runs. Covers the
-# flows unit/TestClient tests structurally cannot:
+# Drives the REAL `av` CLI against a REAL uvicorn server on live Postgres + Redis
+# service containers -- the same topology production runs. Covers the flows unit/
+# TestClient tests structurally cannot:
 #
-#   A. clone → diverge → conflicting merge → --theirs resolution → two-parent push
-#   B. offline resilience: server killed mid-flow → queue → restart → drain
+#   A. clone -> diverge -> conflicting merge -> --theirs resolution -> two-parent push
+#   B. offline resilience: server killed mid-flow -> queue -> restart -> drain
 #   C. legacy-volume upgrade: pre-Alembic shape heals + stamps on real boot
 #   D. protected mode with per-user tokens: join, attribution, revocation, 401 queueing
 #   E. GC drill with a zeroed grace period: orphan swept, live objects survive
 #   F-K. SDK run lifecycle, event stream, promotion policy, signed commits, audit trail
-#   L-N. chaos drills (v1.3.0, M2 added v1.3.4) — gated behind AV_E2E_CHAOS=1, see their
-#        own section below: real redis outage, unwritable storage, a genuinely FULL
-#        filesystem (real ENOSPC via a tmpfs mount), server SIGKILLed mid-push
+#   L-N. chaos drills, gated behind AV_E2E_CHAOS=1: real redis outage, unwritable
+#        storage, a genuinely full filesystem, server SIGKILLed mid-push
 #
-# Every phase prints PASS/FAIL lines; any failure aborts with a nonzero exit.
-# The compose-restart plumbing of `av auth add-user` (writes .env, restarts a
-# Docker service) stays covered by its fake-based CLI unit tests — CI has no
-# Docker daemon; this suite proves the env-var behavior production actually runs.
+# Every phase prints PASS/FAIL lines; any failure aborts with a nonzero exit. CI has no
+# Docker daemon, so this suite proves the env-var behavior production actually runs;
+# the Docker-restart plumbing itself stays covered by fake-based CLI unit tests.
 # ============================================================================
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d /tmp/av-e2e-XXXXXX)"
-# Under Git Bash/MSYS, mktemp hands back a virtual /tmp path that Windows-native children
-# (python, psql) cannot open. Convert to a real mixed-mode path where cygpath exists.
+# Git Bash/MSYS mktemp hands back a virtual /tmp path that Windows-native children can't open.
 command -v cygpath >/dev/null 2>&1 && WORK="$(cygpath -m "$WORK")"
 SERVER_LOG="$WORK/server.log"
 SERVER_PID=""
@@ -36,8 +33,7 @@ API="http://localhost:8000"
 PSQL_URL="${E2E_PSQL_URL:-${DB_URL_ASYNC/postgresql+asyncpg:\/\//postgresql://}}"
 
 cleanup() {
-  # Keep the server log at a fixed, job-uploadable location even after $WORK vanishes.
-  cp "$SERVER_LOG" /tmp/server-e2e.log 2>/dev/null || true
+  cp "$SERVER_LOG" /tmp/server-e2e.log 2>/dev/null || true  # keep the log after $WORK vanishes
   stop_server || true
 }
 trap cleanup EXIT
@@ -46,8 +42,7 @@ log()  { printf '\n\033[1;36m[e2e]\033[0m %s\n' "$*"; }
 pass() { printf '\033[1;32m[PASS]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# python3 is standard on Linux runners; some dev environments only expose `python` — and
-# Windows ships a non-functional "python3" Store alias that resolves but cannot run, so
+# Windows ships a non-functional "python3" Store alias that resolves but can't run, so
 # candidates are execution-verified rather than just looked up.
 PY=""
 for _cand in python3 python; do
@@ -61,23 +56,10 @@ done
 jsonget() { "$PY" -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
 
 start_server() { # start_server <name> [ENV=VAL ...]
-  # ONE persistent CAS data dir across every restart — storage must survive server
-  # lifecycles exactly like production's volume; a fresh dir per phase would desync it
-  # from the persistent Postgres. <name> only tags the process in logs.
-  #
-  # The subshell EXPORTS then EXECs python: the backgrounded PID becomes python itself,
-  # not a wrapper — otherwise stop_server kills the wrapper and orphans the server.
-  #
-  # `cd "$REPO_ROOT"` below is NOT itself inside that subshell (uvicorn's own module
-  # resolution needs it to happen in a real `cd`, not a subshell's, on this project's
-  # setup) — which means it silently changes the CALLING shell's cwd too, since this is
-  # a plain function, not a subshell. Every phase that calls `start_server` mid-phase
-  # already has to know this and route around it with an explicit `av "$WORK/repoX" ...`
-  # instead of the shorter `av . ...` (see Phase A/B/D's own calls) — save/restore the
-  # caller's original cwd here instead, so `av .` stays correct after ANY start_server
-  # call, in this phase or any future one, without every caller needing to remember this
-  # (found live: Phase M's recovery step didn't, and `av . push` ran from $REPO_ROOT
-  # instead of the actual repo — see development/Probleme.md).
+  # ONE persistent CAS data dir across every restart, matching production's volume.
+  # `cd "$REPO_ROOT"` below runs in the calling shell, not a subshell, so it would
+  # silently change the caller's cwd too -- save/restore it here so `av .` stays correct
+  # after any start_server call without every caller needing to remember this.
   local name="$1"; shift
   local _caller_cwd; _caller_cwd="$PWD"
   cd "$REPO_ROOT"
@@ -97,8 +79,8 @@ stop_server() {
     kill -9 "$SERVER_PID" 2>/dev/null || true
   fi
   SERVER_PID=""
-  # Port MUST actually be free before the next phase binds it — a stale server silently
-  # answering /api/health here would make every later assertion exercise the WRONG process.
+  # Port must actually be free before the next phase binds it, or every later assertion
+  # would exercise the wrong process.
   for _ in $(seq 1 30); do
     if ! curl -s -o /dev/null --max-time 1 "$API/api/health" 2>/dev/null; then
       sleep 1   # grace so the next bind never races the port release
@@ -122,16 +104,12 @@ wait_health() {
 
 av() { (cd "$1" && shift && command av "$@"); }   # av <repo-dir> <args...>
 api_status() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
-# Options BEFORE the connection argument: under MSYS/POSIX-style option parsing, a
-# positional connection URI placed first makes getopt stop scanning, so `-c "SQL"`
-# after it is silently ignored (every query would no-op with only a stderr warning).
+# Options before the connection argument: MSYS/POSIX-style option parsing stops
+# scanning once it hits the positional URI, silently ignoring a "-c" placed after it.
 psqlq() { psql -Atqc "$1" "$PSQL_URL"; }
 
 project_of() { "$PY" -c "import json;print(json.load(open('$1/.av/config'))['project_id'])"; }
-pending_count() {
-  # .av/pending_push is a single JSON file holding the queue (absent when empty).
-  [[ -s "$1/.av/pending_push" ]] && echo 1 || echo 0
-}
+pending_count() { [[ -s "$1/.av/pending_push" ]] && echo 1 || echo 0; }  # single JSON queue file, absent when empty
 
 # ============================================================================
 log "Phase A — clone, diverge, conflicting merge resolved via --theirs"
@@ -156,12 +134,9 @@ av "$WORK/repoB" push >/dev/null
 echo "repoA's divergent line" > "$WORK/repoA/shared.txt"
 av "$WORK/repoA" add shared.txt >/dev/null
 av "$WORK/repoA" commit -m "repoA edits shared" >/dev/null
-# v1.2.5: repoB already advanced "main" on the server (above), so this push now loses the
-# ref-race compare-and-swap -- it queues locally instead of silently overwriting repoB's
-# push (see Probleme.md). This means the divergence to discover/resolve is now on
-# repoA's side (its local ref points at a commit the server never accepted), not
-# repoB's -- repoB already matches the server exactly, so a pull there would report
-# "Already up to date". Everything below operates from repoA instead of repoB.
+# repoB already advanced "main" on the server, so this push loses the ref-race
+# compare-and-swap and queues locally instead of overwriting repoB's push -- the
+# divergence to resolve is therefore on repoA's side, not repoB's.
 av "$WORK/repoA" push >/dev/null
 
 set +e
@@ -184,8 +159,6 @@ av "$WORK/repoA" push >/dev/null
 TIP_B="$(cat "$WORK/repoA/.av/refs/heads/main")"
 PARENTS="$(curl -sf "$API/api/commits/$TIP_B" | jsonget "len(d['parents'])")"
 [[ "$PARENTS" == "2" ]] || die "merge commit should carry TWO parents over the wire, got $PARENTS"
-# The merge's own ref update must actually land (not re-race against "ours", which never
-# reached the server) -- confirming the core.py::_finalize_commit fix above.
 SERVER_TIP="$(curl -sf "$API/api/refs/$PROJ_A/main" | jsonget "d['commit_hash']")"
 [[ "$SERVER_TIP" == "$TIP_B" ]] || die "merge push should have landed on the server ref, got $SERVER_TIP (expected $TIP_B — still queued?)"
 pass "Phase A: clone/diverge/conflict/--theirs/two-parent-push"
@@ -219,13 +192,8 @@ start_server legacy-C     # boot must detect the pre-Alembic shape, heal, stamp
 
 [[ "$(psqlq "SELECT count(*) FROM information_schema.columns WHERE table_name='commits' AND column_name='extra_parents'")" == "1" ]] \
   || die "legacy boot did not restore commits.extra_parents"
-# v1.3.4 (W0.6): this used to be a hardcoded literal ("0016") -- the 6th "touch place" a
-# new migration has to remember (development/Probleme.md's own incident entry said so
-# explicitly: "the checklist itself should read '6 places' going forward"). Derived at
-# runtime from the SAME alembic ScriptDirectory the server itself resolves against, so
-# adding migration 0017 can never make this assertion silently stale again -- it now
-# checks "the server actually reached its own current head", not "the server reached the
-# head THIS SCRIPT was written against".
+# Derived at runtime from the same alembic ScriptDirectory the server resolves against,
+# so a new migration can never make this assertion silently stale.
 EXPECTED_HEAD="$("$PY" -c "
 from av_server.database import _alembic_config
 from alembic.script import ScriptDirectory
@@ -325,8 +293,7 @@ pass "Phase F: SDK-driven run/commit lifecycle"
 # ============================================================================
 log "Phase G — event stream reacts to pushes (cursor + kind filtering)"
 
-# Still inside the Protected-mode server from Phase E — every read needs credentials.
-AUTH="Authorization: Bearer owner-secret-xyz"
+AUTH="Authorization: Bearer owner-secret-xyz"  # still inside the Protected-mode server from Phase E
 BEFORE=$(curl -s -H "$AUTH" "$API/api/events?limit=1" | "$PY" -c "import json,sys; d=json.load(sys.stdin); print(d['next_cursor'])")
 echo "trigger" > "$WORK/repoC/trigger.txt"
 av "$WORK/repoC" add trigger.txt >/dev/null
@@ -349,8 +316,8 @@ pass "Phase G: event stream cursor + kind filter react to real pushes"
 log "Phase H — promotion policy: live ALLOW path (deny semantics unit-tested)"
 
 cd "$WORK/repoA"
-# A metric-bearing BASELINE commit first, then anchor the policy to its hash
-# (branch-relative baselines would compare the candidate against itself once it IS the tip).
+# A metric-bearing baseline commit first, then anchor the policy to its hash -- a
+# branch-relative baseline would compare the candidate against itself once it is the tip.
 echo b > metrics_src.txt; av . add metrics_src.txt >/dev/null
 av . commit -m "baseline" --metric val_loss=0.5 >/dev/null
 BASE_HASH="$(cat .av/refs/heads/main)"
@@ -398,7 +365,7 @@ if [[ "${SKIP_J:-0}" != "1" ]]; then
   VERIFY_OUT="$(av . registry verify "$SIGNED_HASH" 2>&1)" || true
   grep -q "VERIFIED" <<<"$VERIFY_OUT" || die "verify should pass pre-tamper: $VERIFY_OUT"
 
-  # Tamper AFTER signing — exactly what signing exists to catch:
+  # Tamper after signing -- exactly what signing exists to catch:
   "$PY" - <<PYJ
 import json
 p = ".av/commits/$SIGNED_HASH.json"
@@ -442,11 +409,9 @@ grep -q "commit.push" <<<"$AV_AUDIT_OUT" || die "av audit list failed: $AV_AUDIT
 pass "Phase K: audit outcome capture + filters live (server + CLI)"
 
 # ============================================================================
-# Phases O-T — v1.3.1 RSI control plane, live (todo.md's 46-item backlog, WP-43).
-# Each phase restarts the server itself rather than threading through the substrate
-# phases' state above, matching the chaos phases' own convention — the RSI surfaces
-# below are independent of A-K's git/merge/auth narrative and reads more clearly with
-# a clean slate per concern.
+# Phases O-T — RSI control plane, live. Each phase restarts the server itself rather
+# than threading through the substrate phases' state above, since the RSI surfaces are
+# independent of A-K's git/merge/auth narrative and read more clearly with a clean slate.
 # ============================================================================
 log "Phase O — improver lifecycle: register -> propose -> apply -> rollback"
 
@@ -590,9 +555,9 @@ FROZEN_AFTER="$(av . --output json freeze status | jsonget "d['data']['frozen']"
 pass "Phase T: freeze blocks promote/self-edit (exit 18) while reads/rollback stay available"
 
 # ============================================================================
-# Phases L/M/N — chaos drills (v1.3.0, todo.md item 28). Gated behind AV_E2E_CHAOS=1
-# (default off) so the plain `e2e-suite` CI job / a local run is unaffected; the
-# dedicated `chaos-drills` CI job sets it. Runnable locally the same way:
+# Phases L/M/N — chaos drills. Gated behind AV_E2E_CHAOS=1 (default off) so the plain
+# `e2e-suite` CI job / a local run is unaffected; the dedicated `chaos-drills` CI job
+# sets it. Runnable locally the same way:
 #   AV_E2E_CHAOS=1 AV_TEST_DATABASE_URL=... AV_TEST_REDIS_URL=... bash scripts/e2e_scenario.sh
 # ============================================================================
 if [[ "${AV_E2E_CHAOS:-0}" == "1" ]]; then
@@ -601,23 +566,15 @@ stop_server
 
 # ----------------------------------------------------------------------------
 log "Phase L — Redis unreachable: readiness degrades, pushes still succeed, restart recovers"
-# NOT "the client queues" (todo.md's shorthand doesn't match this codebase's actual
-# design): redis_cache.py's check_hash_exists()/add_hash() deliberately catch their own
-# connection errors and degrade to DB-only checks (see that module's own docstring) — a
-# commit push is NOT redis-dependent at all, only the dedup-shortcut optimization is. The
-# real, verified contract this phase proves instead: /api/ready correctly reports the
-# outage (used by orchestrators to stop routing traffic) while /api/health and the write
-# path both keep working — exactly the liveness/readiness split
-# development/infrastructure.md documents, under a REAL unreachable Redis rather than a
-# hypothetical one.
+# redis_cache.py deliberately catches its own connection errors and degrades to DB-only
+# checks -- a commit push is not redis-dependent at all, only the dedup-shortcut is.
+# This phase proves /api/ready correctly reports the outage while /api/health and the
+# write path both keep working, under a real unreachable Redis.
 start_server chaos-L-noredis REDIS_URL="redis://this-host-is-intentionally-absent:6379/0"
 
 READY_CODE="$(api_status "$API/api/ready")"
 [[ "$READY_CODE" == "503" ]] || die "Phase L: expected /api/ready 503 with redis unreachable, got $READY_CODE"
-# NOT curl -f: -f discards the response body on any non-2xx status, and /api/ready's
-# whole point here is a 503 body we need to actually read (found live: -f made this line
-# fail every time, on a correctly-behaving server, since /api/ready correctly 503s).
-curl -s "$API/api/ready" | grep -q '"redis": *false' || die "Phase L: /api/ready did not report the redis check as failing"
+curl -s "$API/api/ready" | grep -q '"redis": *false' || die "Phase L: /api/ready did not report the redis check as failing"  # not -f: needs the 503 body
 curl -sf "$API/api/health" >/dev/null 2>&1 || die "Phase L: /api/health must stay up regardless of readiness"
 
 mkdir -p "$WORK/repoL" && cd "$WORK/repoL"
@@ -638,23 +595,11 @@ pass "Phase L: /api/ready degraded independently of /api/health under a real red
 
 # ----------------------------------------------------------------------------
 log "Phase M — storage write failure: upload fails honestly, nothing partial lands, client queues"
-# A genuinely FULL disk isn't reliably producible/safe in CI — a read-only AV_DATA_DIR
-# produces the identical observable failure (the storage layer's write call fails), which
-# is what this phase actually needs to prove: the failure surfaces honestly (no silent
-# data loss, no partially-written object) and the client's offline-queue path takes over,
-# exactly as it does for any other unreachable-server case (Phase B).
-stop_server
-READONLY_DATA="$WORK/data-readonly"
-# Pre-create the three top-level dirs CASStorage.__init__ itself creates at import time
-# (objects/commits/refs) BEFORE locking the tree down — its own `mkdir(exist_ok=True)`
-# calls only need to STAT an already-existing path, not write a new one, so the server can
-# still boot against a read-only data dir. Locking down the FULL tree (-R), not just the
-# top level, is what then makes the real write this phase cares about — a NEW per-object
-# shard subdirectory created during an actual upload — fail honestly instead of quietly
-# succeeding into an already-writable subdirectory. (Found live: the non-recursive,
-# subdirs-not-precreated version of this crashed the whole server at import/startup with
-# an uncaught PermissionError instead of the intended "server's up, one write fails"
-# scenario — see development/Probleme.md.)
+# A genuinely full disk isn't reliably producible/safe in CI -- a read-only AV_DATA_DIR
+# produces the identical observable failure (the storage write call fails). Pre-create
+# CASStorage's own top-level dirs before locking the tree down read-only, so the server
+# can still boot (its own mkdir(exist_ok=True) only needs to stat them) while a NEW
+# per-object shard dir created during upload fails honestly instead of succeeding.
 mkdir -p "$READONLY_DATA/objects" "$READONLY_DATA/commits" "$READONLY_DATA/refs"
 chmod -R 555 "$READONLY_DATA"
 if ! ( : > "$READONLY_DATA/write-probe" ) 2>/dev/null; then
@@ -685,31 +630,23 @@ fi
 chmod -R 755 "$READONLY_DATA" 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
-# v1.3.4 (todo.md item 10, W3e): Phase M above proves an UNWRITABLE data dir fails
-# honestly and queues -- it does NOT prove a genuinely FULL one does, which is a
-# meaningfully different failure (ENOSPC on the write syscall itself, not EACCES/EPERM
-# rejected before the write is even attempted; a storage layer that only checks
-# writability up front, e.g. via os.access(), would pass Phase M while still corrupting
-# data on a real full-disk write). A real ENOSPC needs an actual filesystem with a real
-# size limit — a tiny tmpfs mount is the standard, safe way to get one in CI without
-# touching the runner's real disk at all.
+# Phase M above proves an unwritable data dir fails honestly and queues -- it does not
+# prove a genuinely full one does (real ENOSPC on the write syscall, not EACCES rejected
+# up front). A tiny tmpfs mount is the standard, safe way to get a real size limit in CI.
 log "Phase M2 — genuine ENOSPC: a real full filesystem fails the write honestly, client queues, drains once space is freed"
 TMPFS_MOUNT="$WORK/data-enospc"
 mkdir -p "$TMPFS_MOUNT"
 if sudo mount -t tmpfs -o size=2m tmpfs "$TMPFS_MOUNT" 2>/dev/null; then
   stop_server 2>/dev/null || true
-  # Pre-create CASStorage's own top-level dirs (same reasoning as Phase M above) and burn
-  # most of the 2 MiB budget with a filler file BEFORE the server ever touches it, so the
-  # very first real object write lands on an already-ENOSPC filesystem, not a race against
-  # exactly how much a fresh CASStorage.__init__ itself consumes.
+  # Burn most of the 2 MiB budget with a filler file before the server ever touches it,
+  # so the first real object write lands on an already-ENOSPC filesystem.
   mkdir -p "$TMPFS_MOUNT/objects" "$TMPFS_MOUNT/commits" "$TMPFS_MOUNT/refs"
   if dd if=/dev/zero of="$TMPFS_MOUNT/filler" bs=1M count=1 status=none 2>/dev/null; then
     start_server chaos-M2-full AV_DATA_DIR="$TMPFS_MOUNT"
 
     mkdir -p "$WORK/repoM2" && cd "$WORK/repoM2"
     av . init --mode local --yes --no-repl >/dev/null
-    # Bigger than the ~1 MiB of tmpfs headroom left after the filler file above --
-    # guaranteed to hit ENOSPC on write, not merely "might, depending on overhead".
+    # Bigger than the ~1 MiB of tmpfs headroom left after the filler file above.
     dd if=/dev/urandom of=big-file.bin bs=1M count=2 status=none
     av . add big-file.bin >/dev/null
     set +e
@@ -747,9 +684,8 @@ for i in 1 2 3 4 5; do
 done
 [[ "$(pending_count "$WORK/repoN")" -ge 1 ]] || die "Phase N: setup commits should be queued before the push even starts"
 
-# Push in the background, then SIGKILL the server almost immediately — no graceful
-# shutdown, no drain window, proving atomic local writes (core.py's temp-file+fsync+
-# os.replace pattern) rather than a clean-stop path this suite already covers (Phase B).
+# Push in the background, then SIGKILL the server almost immediately -- proving atomic
+# local writes rather than the clean-stop path Phase B already covers.
 ( av . push >/dev/null 2>&1 || true ) &
 PUSH_PID=$!
 sleep 0.05
@@ -757,8 +693,8 @@ kill -9 "$SERVER_PID" 2>/dev/null || true
 wait "$PUSH_PID" 2>/dev/null || true
 SERVER_PID=""
 
-# pending_push must be well-formed JSON no matter how much of the push landed before the
-# kill — a torn/partial write here would be the real bug this phase exists to catch.
+# pending_push must be well-formed JSON regardless of how much of the push landed before
+# the kill -- a torn/partial write here would be the real bug this phase exists to catch.
 if [[ -s "$WORK/repoN/.av/pending_push" ]]; then
   "$PY" -c "import json; json.load(open('$WORK/repoN/.av/pending_push'))" \
     || die "Phase N: .av/pending_push is corrupted after the server was killed mid-push"
@@ -774,14 +710,11 @@ pass "Phase N: pending_push survived a SIGKILL mid-push intact; full drain on th
 fi  # AV_E2E_CHAOS
 
 # ============================================================================
-# Phase U — DR: real backup -> destroy -> restore drill (v1.3.2, WP-30). Gated behind
-# AV_E2E_DR=1 (default off), same pattern as AV_E2E_CHAOS -- needs either `pg_dump`/
-# `pg_restore` on PATH, or a reachable Postgres CONTAINER named by E2E_DB_CONTAINER (this
-# repo's own docker-compose.yml names it "aether-vault-db"; unset it to force the
-# on-PATH client tools instead, which is what CI's dedicated job does). Destroys and
-# restores ONLY the e2e's own AV_TEST_DATABASE_URL database (never the real dev
-# `aether_vault` database, even when both live on the same shared local Postgres
-# container) and the e2e's own $WORK/data CAS directory -- never anything outside $WORK.
+# Phase U — DR: real backup -> destroy -> restore drill. Gated behind AV_E2E_DR=1
+# (default off), same pattern as AV_E2E_CHAOS -- needs `pg_dump`/`pg_restore` on PATH, or
+# a reachable Postgres container named by E2E_DB_CONTAINER. Destroys and restores ONLY
+# the e2e's own AV_TEST_DATABASE_URL database and $WORK/data CAS directory, never
+# anything outside $WORK.
 #   AV_E2E_DR=1 AV_TEST_DATABASE_URL=... AV_TEST_REDIS_URL=... bash scripts/e2e_scenario.sh
 # ============================================================================
 if [[ "${AV_E2E_DR:-0}" == "1" ]]; then

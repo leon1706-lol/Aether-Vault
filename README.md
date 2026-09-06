@@ -184,7 +184,7 @@ graph TD
     CLI -- "update --docker: Pulls Latest Image & Restarts Local Backend" --> GHCR
 ```
 
-> The "Local CLI Architecture" diagram represents **any number** of independent `av init` repos on the same (or different) machines — they all default to sharing the one Dockerized registry. Each repo gets its own `project_id` (see [Phase 14](development/CHANGELOG.md#phase-14--per-project-registry-separation--real-world-fixes)), so the registry's commits/branches stay attributable per project even though the object store is intentionally deduplicated across all of them. Use `av config --remote-url` to point a repo at a different registry instead.
+> The "Local CLI Architecture" diagram represents **any number** of independent `av init` repos on the same (or different) machines — they all default to sharing the one Dockerized registry. Each repo gets its own `project_id`, so the registry's commits/branches stay attributable per project even though the object store is intentionally deduplicated across all of them. Use `av config --remote-url` to point a repo at a different registry instead.
 
 For the full subsystem contracts (staging, commit, sync, merge, restore, GC, auth, transport, webui, plugins, release), see [`development/architecture.md`](development/architecture.md).
 
@@ -206,7 +206,8 @@ and how it's wired in, this table is the index.
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
-| `docker/` | Runtime assets of the consolidated engine image (v1.2.2) | [README](docker/README.md) |
+| `docker/` | Runtime assets of the consolidated engine image | [README](docker/README.md) |
+| `docs/` | Operator/agent guides, contracts, DR, SLA/SLO, runbooks — indexed by topic | [README](docs/README.md) |
 
 ---
 
@@ -290,7 +291,7 @@ For full methodology, every raw number, and the rating legend, see [`development
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs 1,276 tests across 69 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the v1.3.1 RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
+The full suite (`av test` or `pytest tests/ -q`) runs 1,276 tests across 69 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
 
 ```bash
 av test                  # full suite
@@ -310,10 +311,9 @@ Aether-Vault is built so autonomous agents are first-class operators. Four stabl
 1. **JSON envelopes + exit codes** — `av --output json <cmd>` emits
    `{"ok": true, "data": {…}, "error": null, "meta": {"command": "…"}}`;
    failures set `ok:false` with `error.code` in {not_a_repo, nothing_to_commit,
-   auth_failed, unreachable_queued, merge_conflict, validation, policy_denied} and exit
-   codes 10–16; v1.3.1 adds `budget_exhausted` (17), `frozen` (18), `review_required`
-   (19), and `scope_denied` (20) for the RSI control plane — full table in
-   [`docs/for-agents.md`](docs/for-agents.md).
+   auth_failed, unreachable_queued, merge_conflict, validation, policy_denied,
+   budget_exhausted, frozen, review_required, scope_denied} and exit codes 10–20 —
+   full table in [`docs/for-agents.md`](docs/for-agents.md).
 2. **Python SDK** — `from av_sdk import Repo`: add/commit/push/log/diff/runs/context with
    typed `SDKError`; drives the same single-writer path as the CLI.
 3. **Event stream + webhooks** — resumable ordered feed:
@@ -365,9 +365,9 @@ av auth add-user <name>        # grant NAME its own token (generated + printed o
 av auth add-user <name> <tok>  # ...or with a specific token
 av auth list-users             # masked list of per-user tokens
 av auth remove-user <name>     # revoke NAME's personal token
-av auth rotate                 # (v1.3.0) mint a fresh owner token, invalidating the old one immediately
-av auth rotate --user <name>   # (v1.3.0) rotate one user's personal token instead
-av auth doctor                 # (v1.3.0) diagnose Protected-mode onboarding: token configured? server reachable? token actually authenticates?
+av auth rotate                 # mint a fresh owner token, invalidating the old one immediately
+av auth rotate --user <name>   # rotate one user's personal token instead
+av auth doctor                 # diagnose Protected-mode onboarding: token configured? server reachable? token actually authenticates?
 ```
 
 Per-user flow: run `av auth add-user alice`, share Alice her token over a trusted channel; she puts it in her own repo via `av auth set-token <her-token>` and pushes as usual — her commits show up attributed to `alice` without any shared secret leaving your machine. Per-user tokens work everywhere the shared secret does, including the webui's token prompt.
@@ -445,8 +445,8 @@ av file --avattributes   # writes a .avattributes template
 
 Refuses to overwrite an existing file. `.avattributes` is gitattributes-style: glob patterns with staging directives, a later matching line's flags *replace* an earlier line's for the same path (they don't merge). Supported flags:
 
-- `no-chunk` — store as a whole-file blob instead of content-defined chunks. Applies above the LFS threshold to the default chunkable set: `.pt .pth .ckpt .npz .h5 .hdf5 .pb .msgpack .bin .onnx .model .arrow .feather .pkl .pickle` (broadened from 8 to 15 extensions in v1.2.5 — uncompressed/block-structured formats where a local edit only shifts nearby chunk boundaries).
-- `chunk` (v1.2.5) — force-enable CDC for a glob outside that default set, e.g. a dataset export you've confirmed is edited append-only. `no-chunk` on the same matching line always wins over `chunk`. Deliberately *not* a default for compressed/columnar containers (`.parquet` with per-column compression, `.zip`/`.gz`/`.tar`/`.7z`) — a small logical edit there usually rewrites the whole compressed stream, so chunk boundaries don't survive and chunking adds overhead with no dedup payoff unless you've verified your export path is safe.
+- `no-chunk` — store as a whole-file blob instead of content-defined chunks. Applies above the LFS threshold to the default chunkable set: `.pt .pth .ckpt .npz .h5 .hdf5 .pb .msgpack .bin .onnx .model .arrow .feather .pkl .pickle` (uncompressed/block-structured formats where a local edit only shifts nearby chunk boundaries).
+- `chunk` — force-enable CDC for a glob outside that default set, e.g. a dataset export you've confirmed is edited append-only. `no-chunk` on the same matching line always wins over `chunk`. Deliberately *not* a default for compressed/columnar containers (`.parquet` with per-column compression, `.zip`/`.gz`/`.tar`/`.7z`) — a small logical edit there usually rewrites the whole compressed stream, so chunk boundaries don't survive and chunking adds overhead with no dedup payoff unless you've verified your export path is safe.
 - `no-layer-split` — never split `.safetensors` into per-layer shards; store the whole file.
 
 Worked example — a repo mixing model checkpoints, a safetensors head, and a parquet dataset the export pipeline only appends to:
@@ -585,8 +585,8 @@ av context note "baseline established; next agent should tune LR"
 av context note "dataset v3 fixed the NaN rows" --agent alice
 av context show
 av context validate              # structural check against the .avh v2 contract (jsonschema when installed, structural fallback otherwise)
-av context search "LR schedule"                  # (v1.3.0) substring search over every note left so far
-av context search "LR" --run <run-id> --since 2026-08-01  # (v1.3.0) scope to one run and/or a time window
+av context search "LR schedule"                  # substring search over every note left so far
+av context search "LR" --run <run-id> --since 2026-08-01  # scope to one run and/or a time window
 av context export --format md --out CONTEXT.md   # also: avh | json
 ```
 
@@ -597,11 +597,11 @@ Promotion guardrails for autonomous loops: arm a per-branch metric policy, evalu
 ```bash
 av policy set main val_loss "<" --baseline-ref "main~1"
 av policy set release val_loss "<" --threshold 0.35
-av policy set main --require-signature                          # (v1.2.5) signature-only gate, no metric
-av policy set release val_loss "<" --threshold 0.35 --require-signature   # (v1.2.5) both gates
+av policy set main --require-signature                          # signature-only gate, no metric
+av policy set release val_loss "<" --threshold 0.35 --require-signature   # both gates
 av policy list / av policy remove main
 av promote <candidate> --into main      # evaluate → checkout main → merge (two-parent)
-av promote <candidate> --into main --dry-run   # (v1.3.0) preview the decision + deciding rule, touch nothing — exits 0 either way
+av promote <candidate> --into main --dry-run   # preview the decision + deciding rule, touch nothing — exits 0 either way
 av promote <candidate> --force          # conscious bypass, recorded in the merge message
 av merge <target> --force               # same bypass at merge level (exit code 16 on deny)
 ```
@@ -610,19 +610,19 @@ av merge <target> --force               # same bypass at merge level (exit code 
 
 #### `av env`
 
-Recipe-exact environment snapshots and reproduction recipes. Snapshots are content-addressed (the canonical snapshot's hash IS its id) and upload through the normal object flow at push, so any clone can reproduce an experiment's environment. Since v1.2.5 (`snapshot_version: 2`) the id hashes only reproducibility-relevant identity (python, pins, seeds, CUDA toolkit version, a critical-env-var set) — machine-specific context (GPU model, driver, hostname, conda env, interpreter path) is captured but excluded, so equivalent environments on different machines/OSes share an id.
+Recipe-exact environment snapshots and reproduction recipes. Snapshots are content-addressed (the canonical snapshot's hash IS its id) and upload through the normal object flow at push, so any clone can reproduce an experiment's environment. The id (`snapshot_version: 2`) hashes only reproducibility-relevant identity (python, pins, seeds, CUDA toolkit version, a critical-env-var set) — machine-specific context (GPU model, driver, hostname, conda env, interpreter path) is captured but excluded, so equivalent environments on different machines/OSes share an id.
 
 ```bash
 av env snapshot              # python + curated package pins → .av/env_snapshot.json + CAS
 av env snapshot --full       # include complete pip freeze
 av env replay                # print the reproduction recipe for the latest local snapshot
 av env replay --dockerfile   # emit a multi-stage, non-root Dockerfile draft
-av env replay --dockerfile --cuda 12.1.0   # nvidia/cuda base instead of python:slim (v1.2.5)
-av env replay --out FILE     # write the recipe/Dockerfile to a file instead of stdout (v1.2.5)
+av env replay --dockerfile --cuda 12.1.0   # nvidia/cuda base instead of python:slim
+av env replay --out FILE     # write the recipe/Dockerfile to a file instead of stdout
 av env replay <target>       # TARGET = run id, commit hash, or snapshot id
-av env replay --validate     # resolve every pin against PyPI WITHOUT installing (v1.2.5)
+av env replay --validate     # resolve every pin against PyPI WITHOUT installing
 av env replay --execute      # installs into a clean .av/replay-venv/<snapshot>/ by default
-                             # (v1.3.0) — never the interpreter running `av` itself
+                             # never the interpreter running `av` itself
 av env replay --execute --target-venv PATH   # create (if absent) + install into this venv instead
 av env replay --execute --conda-env NAME     # install via `conda run -n NAME` instead
 av env replay --execute --into-current       # explicit opt-out: install into the running
@@ -657,20 +657,20 @@ av attest  <commit-hash>               # HMAC attestation tag via metadata commi
 av verify  <commit-hash>               # verify the ed25519 commit signature (or a legacy attestation
                                        # tag); tampering after signing exits non-zero. Unsigned commits
                                        # are valid — tamper evidence, not a trust network
-av verify  <hash> --signature FILE     # verify a DETACHED signature record instead (v1.2.5) — no
+av verify  <hash> --signature FILE     # verify a DETACHED signature record instead — no
                                        # local config/registry access needed by the verifier
 av registry keygen                     # generate an ed25519 signing keypair (.av/keys/, private 0600;
                                        # requires the [sign] extra) — commits are then AUTO-SIGNED
-av registry keys list                  # every signing key this repo knows (active + archived) (v1.2.5)
-av registry keys fingerprint           # this repo's active-key fingerprint, scriptable (v1.2.5)
-av registry keys rotate                # archive the current key, generate a fresh one (v1.2.5) — old
+av registry keys list                  # every signing key this repo knows (active + archived)
+av registry keys fingerprint           # this repo's active-key fingerprint, scriptable
+av registry keys rotate                # archive the current key, generate a fresh one — old
                                        # commits keep verifying against their embedded old key
-av registry export-signature <hash>    # standalone signature record for external audit (v1.2.5)
+av registry export-signature <hash>    # standalone signature record for external audit
 ```
 
 #### `av webhooks`
 
-Signed event-webhook subscriptions on the registry — a subscriber gets an HMAC-SHA256-signed POST for every matching event, with per-webhook delivery health, exponential backoff, and dead-letter replay (v1.2.5).
+Signed event-webhook subscriptions on the registry — a subscriber gets an HMAC-SHA256-signed POST for every matching event, with per-webhook delivery health, exponential backoff, and dead-letter replay.
 
 ```bash
 av webhooks add <url> --secret <secret>            # subscribe (--project to scope, --kind repeatable)
@@ -697,16 +697,16 @@ av audit list                          # newest entries
 av audit list --action commit.push     # exact action filter
 av audit list --project <project-id>   # scope to one project
 av audit list --since 2026-08-01 --limit 100
-av audit list --username alice --outcome error     # (v1.2.5) actor + 4xx/5xx-only filter
-av audit list --action-prefix commit.  --cursor <next_cursor>   # (v1.2.5) route-family filter, stable pagination
+av audit list --username alice --outcome error     # actor + 4xx/5xx-only filter
+av audit list --action-prefix commit.  --cursor <next_cursor>   # route-family filter, stable pagination
 
-av audit export --format jsonl --out audit.jsonl   # (v1.2.5) filtered export for compliance (jsonl or csv)
-av audit prune --before-days 90                    # (v1.2.5) admin-only, irreversible; prompts unless --yes
-av audit prune --before-days 90 --dry-run          # (v1.3.0) report what WOULD be deleted, delete nothing, no prompt
+av audit export --format jsonl --out audit.jsonl   # filtered export for compliance (jsonl or csv)
+av audit prune --before-days 90                    # admin-only, irreversible; prompts unless --yes
+av audit prune --before-days 90 --dry-run          # report what WOULD be deleted, delete nothing, no prompt
 
-av audit verify                                    # (v1.3.3) verify the hash chain is intact; reports the first broken row, if any
-av audit verify --since-id <id>                    # (v1.3.3) only re-verify what's new since a previous check
-av audit verify --export audit.jsonl               # (v1.3.3) verify OFFLINE from a local export — no server trust required for the chain itself
+av audit verify                                    # verify the hash chain is intact; reports the first broken row, if any
+av audit verify --since-id <id>                    # only re-verify what's new since a previous check
+av audit verify --export audit.jsonl               # verify OFFLINE from a local export — no server trust required for the chain itself
 ```
 
 Every row is hash-chained (`chain_hash`, migration `0016`) so tampering or deleting a row breaks verification from that point forward — see `development/architecture.md`'s Audit Log Hash-Chain Contract. Optional ed25519 signing (`AV_AUDIT_SIGNING_KEY_PATH`, server-side) adds non-repudiation for an export handed to a party with no database access.
@@ -798,8 +798,8 @@ av doctor                    # diagnose only
 av doctor --fix              # repair what's safely recoverable
 av doctor --fix --dry-run    # preview what --fix would do, without changing anything
 av doctor --speed            # also print a read-only timing snapshot of this repo's hot paths
-av doctor --compose docker-compose.yml            # (v1.3.0) preview migrating a legacy two-container compose file to the consolidated engine image
-av doctor --compose docker-compose.yml --write    # (v1.3.0) apply that rewrite in place — see docs/migrate-engine-image.md
+av doctor --compose docker-compose.yml            # preview migrating a legacy two-container compose file to the consolidated engine image
+av doctor --compose docker-compose.yml --write    # apply that rewrite in place — see docs/migrate-engine-image.md
 ```
 
 `--fix` re-links orphaned/stale `.av-pointer` files back to their objects (downloading from the remote if needed), clears `*.tmp.*` leftovers, and clears pending-push entries whose commit no longer exists locally while retrying the rest. Anything it can't safely recover is left as `[WARN]` rather than fabricated or silently dropped. `--speed` times `Index.load()`, `load_config()`, a working-tree scan, and local object-store stats — a quick way to spot where a specific user's repo is actually slow, as opposed to `av test --speed`'s synthetic, cross-machine-comparable numbers.
@@ -844,7 +844,7 @@ av benchmark --baseline prior.json --save-json new.json   # regression-track av'
 
 Every result is a real measured number from a real subprocess/HTTP call — a tool that isn't on `PATH`, or whose primitive doesn't apply to a given benchmark, is shown as `not installed`/`N/A` with a footnote, never guessed at.
 
-#### RSI control plane (v1.3.1)
+#### RSI control plane
 
 Versioning the improver (agent code/prompts/tools/policy), not just the model it
 produces — see [`docs/rsi-operator-guide.md`](docs/rsi-operator-guide.md) for the full
@@ -879,7 +879,7 @@ hash-chained policy-as-code; publishing a new pack is itself an audited, version
 loop end to end through `av_sdk.Repo` — propose → sandbox-apply → canary → dual-gate
 promotion (denied, then reviewed and allowed) → lessons → a budget that stops itself.
 
-#### `av tenant` / `av user` / `av role` / `av token` (v1.3.2)
+#### `av tenant` / `av user` / `av role` / `av token`
 
 DB-backed identity and RBAC, administrable remotely (no shell access to the registry
 host needed) — the enterprise-path counterpart to `av auth`'s `.env`-based tokens, which
@@ -905,7 +905,7 @@ guard, and Postgres row-level security enforced via a dedicated non-superuser DB
 gated behind `AV_TENANCY_ENFORCE` (server-side env var, off by default) — see
 `development/architecture.md`'s Tenancy Isolation section.
 
-#### `av login` / `av idp` / `av scim` (v1.3.3)
+#### `av login` / `av idp` / `av scim`
 
 SSO (OIDC + SAML 2.0) and SCIM 2.0 provisioning. An admin registers an IdP once
 (`av idp add`); every user after that authenticates against it directly — no shared
@@ -929,7 +929,7 @@ picked up automatically by every other command via `resolve_remote()` — no sep
 "login mode" flag needed once you've run `av login`. `av init --mode enterprise` drives
 the same device-code flow during repo setup.
 
-#### `av admin backup` (v1.3.2)
+#### `av admin backup`
 
 Operator-facing disaster recovery — not repo-scoped, run against infrastructure
 directly. See [`docs/dr.md`](docs/dr.md) for the full picture, including the real

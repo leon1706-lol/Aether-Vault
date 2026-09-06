@@ -5,20 +5,11 @@ Revises: 0005
 Create Date: 2026-09-03
 
 Additive: two new nullable columns on `runs` (`kind`, `improver_id`) plus five new
-tables. No existing row is touched — `runs.kind` defaults server-side to "train" for
-every pre-v1.3.1 row via a `server_default`, so a healed legacy volume never has a NULL
-kind; `improver_id` stays nullable/unset. See docs/rsi-operator-guide.md and
-development/architecture.md's Improver Artifact / Dual-Gate Promotion contract sections.
-
-Every new artifact table (`improver_versions`, `change_sets`, `policy_packs`) stores its
-actual content as a CAS object (`.av/objects/<hh>/<rest>`, `python/av_cli/casobj.py`) —
-these rows are lightweight server-side index/lineage records over that content, exactly
-like `runs.env_snapshot_id` already is for env snapshots. No new persistence mechanism.
-
-Deliberately NO foreign keys on any `*_id`/`parent_id`/`prev_id` column here, matching
-this schema's existing convention for `commits.parent_hash` and `runs.parent_run_id`
-(`models.py`'s own comments): pushes/proposals can be shallow or arrive out of order, and
-enforcing a FK would reject a genuinely valid out-of-order write.
+tables. `runs.kind` defaults server-side to "train" via `server_default`, so a healed
+legacy volume never has a NULL kind. Every new artifact table stores its actual content
+as a CAS object -- these rows are lightweight index/lineage records over that content,
+same pattern as `runs.env_snapshot_id`. Deliberately NO foreign keys on any `*_id`
+column, matching `commits.parent_hash`'s existing shallow/out-of-order-write convention.
 """
 from typing import Sequence, Union
 

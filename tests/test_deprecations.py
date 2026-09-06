@@ -96,10 +96,8 @@ def test_real_entry_is_schema_valid(entry):
 
 
 def test_no_real_pending_entry_is_overdue_against_this_repos_own_version():
-    # This repo's own current version (from git tags via setuptools-scm, same source
-    # release_gate.py's checks already trust) -- a "pending" entry whose remove_in this
-    # repo has already reached but never actually removed is a real, actionable finding,
-    # not a false positive.
+    # A "pending" entry whose remove_in this repo has already reached but never removed
+    # is a real, actionable finding, not a false positive.
     from python.av_cli import __version__
 
     bare_version = __version__.split("+")[0].split(".dev")[0]

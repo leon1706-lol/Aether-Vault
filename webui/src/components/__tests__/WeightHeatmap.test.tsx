@@ -23,13 +23,9 @@ describe("WeightHeatmap", () => {
   });
 
   it("progressively reveals a large layer set instead of permanently hiding the tail", async () => {
-    // v1.3.0 (todo.md item 25): replaces the old hard MAX_RENDERED_LAYERS truncation —
-    // every layer eventually renders, just spread over a couple of animation frames.
-    // 1200 (not a much larger number) keeps this test's real jsdom node count — and
-    // therefore its wall-clock render cost per frame — small enough to resolve within
-    // waitFor's default timeout even on a slow CI/dev machine; the contract being
-    // proven (progressive reveal completes, nothing stays permanently hidden) doesn't
-    // need thousands of frames to demonstrate.
+    // Every layer eventually renders, spread over a couple of animation frames. 1200
+    // keeps this test's jsdom render cost low enough to resolve within waitFor's
+    // default timeout without needing thousands of frames to prove the contract.
     const layers: LayerDiff[] = Array.from({ length: 1200 }, (_, i) => ({
       name: `layer${i}`,
       status: "unchanged" as const,

@@ -1,8 +1,7 @@
 // lib/diffWeights.ts — client-side per-layer weight diff
 //
-// Pure port of python/av_cli/handoff.py's diff_model_weights(): no network calls, operates
-// purely on two already-fetched Commit["tree"] objects (the server already returns per-layer
-// hashes in GET /api/commits/{hash}, see DBTree.layers in python/av_server/models.py).
+// Pure port of python/av_cli/handoff.py's diff_model_weights(): no network calls,
+// operates purely on two already-fetched Commit["tree"] objects.
 
 import type { Commit, TreeLayer } from "./api";
 
@@ -68,10 +67,8 @@ export function diffFile(fromTree: Tree | undefined, toTree: Tree | undefined, r
     return { rel_path: relPath, status: "removed", layers: [], changedCount: 0, totalCount: 0 };
   }
 
-  // aether_core.split_and_hash_safetensors emits a synthetic "__header__" pseudo-layer
-  // alongside the real tensors (its hash covers the safetensors JSON header, used for
-  // reconstruction integrity) — it is not a model weight, so it is excluded here to avoid
-  // polluting the visual diff with a non-tensor entry.
+  // The synthetic "__header__" pseudo-layer (covers the safetensors JSON header, not a
+  // real tensor) is excluded here to avoid polluting the visual diff.
   const fromLayers = (fromEntry.layers ?? []).filter((l) => l.name !== "__header__");
   const toLayers = (toEntry.layers ?? []).filter((l) => l.name !== "__header__");
 

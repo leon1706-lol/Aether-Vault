@@ -4,31 +4,22 @@
 #
 # AV_ENGINE_ROLE dispatch:
 #   all    (default) uvicorn registry (:8000) AND Next.js webui (:3000) in this
-#          container. v1.2.5: a dying subservice no longer always takes the
-#          whole container down — see "Supervision (v1.2.5)" below.
+#          container. A dying subservice no longer always takes the whole
+#          container down — see "Supervision" below.
 #   server uvicorn only (legacy alias containers from pre-1.2.2 compose files).
 #   webui  node standalone server only (same legacy path).
 #
-# Legacy auto-detect: old two-service compose files never set AV_ENGINE_ROLE but
-# shape each container's environment differently — DATABASE_URL only exists in
-# the server container, NEXT_PUBLIC_API_URL only in the webui one. Detecting on
-# those keeps the aliased legacy images behaving exactly like the split images
-# they replace, with zero changes to pinned installs. v1.2.5: this path now
-# prints a deprecation warning (the aliases themselves are unaffected — see
-# VERSIONING.md's deprecation-candidates entry for the removal runway).
+# Legacy auto-detect: old two-service compose files never set AV_ENGINE_ROLE but shape
+# each container's environment differently (DATABASE_URL only in the server container,
+# NEXT_PUBLIC_API_URL only in the webui one) — detecting on those keeps aliased legacy
+# images behaving like the split images they replace, with a deprecation warning.
 #
-# Supervision (v1.2.5):
-#   - Shutdown (TERM/INT) forwards the signal to both children and waits up to
-#     AV_ENGINE_STOP_GRACE_SECS (default 25s) for them to exit before SIGKILL.
-#     Docker's own default stop-timeout is 10s, which would SIGKILL before a
-#     25s drain finishes — both compose files set `stop_grace_period: 30s` on
-#     this service so the grace window actually gets honored.
-#   - In role=all, ONE subservice dying restarts just that subservice
-#     (AV_ENGINE_RESTART_SUBSERVICE=1, default on) instead of tearing the whole
-#     engine down — a restart budget (AV_ENGINE_MAX_RESTARTS within
-#     AV_ENGINE_RESTART_WINDOW_SECS, default 5 within 300s) still shuts the
-#     engine down on a genuinely broken build, so this can't silently
-#     crash-loop forever without ever surfacing as unhealthy.
+# Supervision: shutdown (TERM/INT) forwards the signal to both children and waits up to
+# AV_ENGINE_STOP_GRACE_SECS (default 25s) before SIGKILL (both compose files set
+# `stop_grace_period: 30s` so this window is actually honored). In role=all, one
+# subservice dying restarts just that subservice, bounded by a restart budget
+# (AV_ENGINE_MAX_RESTARTS within AV_ENGINE_RESTART_WINDOW_SECS) so a genuinely broken
+# build still shuts the engine down instead of crash-looping forever.
 # ============================================================================
 set -u
 
@@ -101,14 +92,10 @@ start_server() {
   SERVER_PID=$!
 }
 
-# v1.2.5: sliding-window restart budget shared by both subservices — prunes entries
-# older than RESTART_WINDOW_SECS, appends `now`, and sets RESTART_COUNT to the count
-# AFTER pruning. Sets a global instead of `echo`ing a return value: calling this via
-# command substitution (`count=$(record_restart)`) would fork a SUBSHELL for the
-# function call, so the RESTART_TIMES mutation below would vanish the instant the
-# subshell exited — the budget would silently never accumulate across restarts and
-# AV_ENGINE_MAX_RESTARTS would never actually trip. Caught empirically while testing
-# this script in isolation, not by reading it — a real, easy-to-miss bash gotcha.
+# Sliding-window restart budget shared by both subservices. Sets a global instead of
+# `echo`ing a return value: `count=$(record_restart)` would fork a subshell, so the
+# RESTART_TIMES mutation would vanish the instant it exited and the budget would never
+# accumulate across restarts.
 RESTART_TIMES=()
 RESTART_COUNT=0
 record_restart() {

@@ -83,10 +83,8 @@ def test_documented_command_and_flags_exist_in_the_live_cli(doc, line_no, raw):
     assert tokens and tokens[0] == "av", f"{doc}:{line_no}: expected to start with 'av', got: {raw!r}"
 
     leaf_cmd, remaining = _resolve(tokens[1:])
-    # A Group is only wrong here if it can't be invoked bare — some (av handoff, av stash,
-    # the top-level `av` itself) declare invoke_without_command=True specifically so the
-    # group name alone plus its own flags is a real, complete invocation (no subcommand
-    # token was consumed for these, so `remaining` is everything after the group name).
+    # A Group is only wrong here if it can't be invoked bare -- some (av handoff, av
+    # stash, the top-level `av`) declare invoke_without_command=True for exactly that.
     if isinstance(leaf_cmd, click.Group):
         assert leaf_cmd.invoke_without_command, (
             f"{doc}:{line_no}: {raw!r} resolves to a GROUP ({leaf_cmd.name}) that requires "
@@ -109,11 +107,8 @@ def test_at_least_one_command_was_found_in_each_doc_file():
     walkthrough — an empty result for one of those is itself a bug worth catching."""
     found_docs = {doc for doc, _, _ in ALL_DOC_COMMANDS}
     all_docs = {p.name for p in DOCS_DIR.glob("*.md")}
-    # README.md is a pure index; contracts.md/avattributes.md are reference docs about a
-    # schema/syntax, not CLI walkthroughs. slo.md/sla.md (v1.3.2) are policy/measurement
-    # documents, not CLI walkthroughs either — none of the five has `av` examples of its
-    # own (support.md, the third new v1.3.2 doc, DOES use `av support-bundle` and needs
-    # no exemption).
+    # README.md is a pure index; the rest are reference/policy docs, not CLI walkthroughs,
+    # so none of them has `av` examples of its own.
     NO_COMMANDS_EXPECTED = {"README.md", "contracts.md", "avattributes.md", "slo.md", "sla.md"}
     expected_with_commands = all_docs - NO_COMMANDS_EXPECTED
     missing = expected_with_commands - found_docs

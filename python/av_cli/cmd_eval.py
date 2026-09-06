@@ -1,13 +1,7 @@
 """av eval — task/eval registry, integrity locks, held-out vault, blind scoring, external
-adapters (v1.3.1, RSI R2: todo.md B.6-B.8, B.10, F.25-F.28).
-
-A suite definition is a CAS object (`casobj.py`), same pattern as everything else in this
-release — the server keeps a lightweight index row (`eval_suites`) with `frozen`/`blind`
-flags. `POST /api/eval/results` requires the `scorer` scope server-side: THAT is the held-
-out eval vault's actual enforcement (todo.md F.25) — point a training agent's token at a
-project with no `scorer` scope and it is rejected with 403/`scope_denied`, not by
-convention. Blind suites (todo.md F.26) create results with `revealed=False`; a non-
-`scorer` reader sees that a result exists but not its score until `av eval reveal`.
+adapters (v1.3.1). A suite definition is a CAS object (`casobj.py`); `POST /api/eval/results`
+requires the `scorer` scope server-side, which is the held-out vault's actual enforcement,
+not just convention. Blind suites create results with `revealed=False` until `av eval reveal`.
 """
 import json
 

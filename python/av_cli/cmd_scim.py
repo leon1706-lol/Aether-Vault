@@ -1,13 +1,7 @@
-"""av scim — SCIM provisioning-token administration (v1.3.3, WP-18).
-
-SCIM itself (`/scim/v2/*`, `python/av_server/scim.py`) is driven by the IdP directly, not
-by this CLI — there is no `av scim sync` because a human never manually walks that
-protocol. What this CLI needs to do is the one thing an IdP admin genuinely can't do
-through the SCIM wire protocol itself: mint the `scim`-scoped token the IdP authenticates
-with in the first place. Reuses `av token create --scope scim` under the hood (the
-existing DB-backed token machinery, `cmd_token.py`) rather than inventing a second token
-system — `scim` is just another scope string in the same vocabulary `require_scope()`
-already understands.
+"""av scim — SCIM provisioning-token administration (v1.3.3). SCIM itself is driven by
+the IdP directly, not by this CLI; what this CLI does is mint the `scim`-scoped token the
+IdP authenticates with, reusing the existing DB-backed token machinery (`cmd_token.py`)
+rather than inventing a second token system.
 """
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)

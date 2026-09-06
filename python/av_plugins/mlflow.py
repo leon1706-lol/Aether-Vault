@@ -26,22 +26,11 @@ def import_run(
     tag: str | None = None,
 ) -> None:
     """Downloads an existing MLflow run's artifacts and commits them into Aether-Vault.
-
-    Numeric metrics are attached via `--metric`; simple string params are attached as
-    additional `--tag key=value` labels. Raises if the run has no artifacts to import.
-
-    Artifacts are downloaded into `<repo_root>/mlflow_imports/<run_id>/` rather than a system
-    temp directory — `av add` requires every staged path to live under the repo root, and
-    MLflow's own artifact store (e.g. `~/mlruns/...`) is typically outside it.
-
-    `repo_root` is REQUIRED (v1.3.0) — unlike `import_checkpoint()` in the other plugin
-    modules, an MLflow run has no artifact path of its own to resolve a root from before
-    any files are downloaded, so this used to fall back to `resolve_repo_root(Path.cwd())`
-    — the one `Path.cwd()` use left anywhere in this package, and a direct violation of
-    this package's own contract ("never Path.cwd()", see the module README). Callers
-    (the `av import-mlflow` CLI command, or your own script) must resolve and pass it
-    explicitly, exactly like every other plugin entry point already does.
-    """
+    Numeric metrics are attached as commit metrics; string params become tags. Artifacts
+    download into `<repo_root>/mlflow_imports/<run_id>/` since `av add` requires every
+    staged path to live under the repo root. `repo_root` is required -- unlike
+    `import_checkpoint()`, an MLflow run has no artifact path of its own to resolve a root
+    from before any files are downloaded."""
     resolved_root = resolve_repo_root(Path(repo_root))
 
     client = MlflowClient(tracking_uri=tracking_uri)
@@ -69,7 +58,7 @@ def import_run(
     if tag:
         tags.append(tag)
     # Scoped so the import commits exactly the run's artifacts — unrelated staged files
-    # keep their pending state (Probleme.md #38). Internal seam (v1.2.2) — no CLI hop.
+    # keep their pending state.
     commit_scoped(resolved_root, artifact_paths,
                   f"Imported MLflow run {run_id}",
                   tags=tuple(tags), metrics=metrics)

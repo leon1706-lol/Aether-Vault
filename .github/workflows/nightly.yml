@@ -1,17 +1,15 @@
 name: Nightly Compatibility
 
-# The push matrix only covers the floor (3.10) + ceiling (3.14) — the in-between versions
-# cost minutes every push without covering distinct failure modes most days. Nightly runs
-# the FULL range so a regression in 3.11–3.13 surfaces within a day instead of at release.
-# Also serves as the manual "run everything stack-free across versions" button
-# (workflow_dispatch) before cutting a release.
+# The push matrix only covers the floor (3.10) + ceiling (3.14); nightly runs the full
+# range so a regression in 3.11–3.13 surfaces within a day instead of at release. Also
+# serves as the manual "run everything stack-free across versions" button before a release.
 
 on:
   schedule:
     - cron: "0 3 * * *"   # daily 03:00 UTC
   workflow_dispatch:
 
-# v1.3.4 (W1b): least-privilege default — both jobs only checkout + run pytest.
+# Least-privilege default — both jobs only checkout + run pytest.
 permissions:
   contents: read
 
@@ -43,11 +41,9 @@ jobs:
           AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: pytest tests/ -q
 
-  # v1.3.0: no leg anywhere in CI ever ran on macOS before this — the env-snapshot and
-  # CDC-chunking golden-hash fixtures assert cross-machine determinism (todo.md items
-  # 11/1) but had only ever proven it across Windows (push CI) and Linux (nightly's
-  # `compat` job above), never a third OS. Scoped to just those tests (-k), not the
-  # whole suite — this leg exists to prove ONE property, not to duplicate `compat`.
+  # The env-snapshot and CDC-chunking golden-hash fixtures assert cross-machine
+  # determinism, but had only ever proven it across Windows/Linux, never macOS. Scoped
+  # to just those tests (-k), not the whole suite.
   golden-fixtures-macos:
     runs-on: macos-latest
     timeout-minutes: 15
@@ -60,15 +56,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install Aether-Vault (builds the C++ core via pybind11)
-        # `src/core.cpp` uses C++17 <filesystem> (fs::path/exists/file_size/
-        # last_write_time) -- Apple's libc++ marks every one of those symbols
-        # unavailable before macOS 10.15, but setuptools' default deployment target on
-        # this runner's Python build is 10.14 (baked into the interpreter, not this
-        # repo's own build config -- confirmed via `docker inspect`-style investigation:
-        # no `-mmacosx-version-min`/`MACOSX_DEPLOYMENT_TARGET` is set anywhere in this
-        # repo), so the compile fails with "'path' is unavailable: introduced in macOS
-        # 10.15" before this env var is set. 10.15 is the minimum that actually compiles;
-        # not raised further to stay maximally compatible.
+        # src/core.cpp uses C++17 <filesystem>, which Apple's libc++ marks unavailable
+        # before macOS 10.15 -- this runner's default deployment target is 10.14, so the
+        # compile fails without this env var. 10.15 is the minimum that compiles.
         env:
           MACOSX_DEPLOYMENT_TARGET: "10.15"
         run: pip install -e .[dev]
@@ -78,12 +68,9 @@ jobs:
           AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: pytest tests/test_env_snapshot.py tests/test_dataset_cdc.py tests/test_core.py -q -k "golden or cdc_boundary_stability or cdc_determinism"
 
-  # v1.3.4 (todo.md item 9): the wheel/sdist install path (package-build,
-  # smoke-wheel-linux, smoke-sdist-windows in tests.yml) never had a macOS leg — the
-  # `infrastructure.md` CI Job Map's own "Known residuals" line said so explicitly
-  # ("no macOS install smoke"). golden-fixtures-macos above proves the C++ core BUILDS on
-  # macOS; this proves a real wheel INSTALLS and the CLI actually runs, matching the
-  # Linux/Windows install-smoke jobs' own bar.
+  # The wheel/sdist install path never had a macOS leg. golden-fixtures-macos above
+  # proves the C++ core builds on macOS; this proves a real wheel installs and the CLI
+  # actually runs, matching the Linux/Windows install-smoke jobs' own bar.
   macos-install-smoke:
     runs-on: macos-latest
     timeout-minutes: 15
@@ -124,11 +111,9 @@ jobs:
           "$AV" commit -m "macos-wheel-smoke"
           "$AV" log | grep "macos-wheel-smoke"
 
-  # v1.3.4 (todo.md item 40, W3f): scripts/e2e_scenario.sh's Phase U (real backup ->
-  # destroy -> restore drill, `av admin backup create/verify/restore`) has existed since
-  # v1.3.2 but was wired to NOTHING in CI -- gated behind AV_E2E_DR=1, default off, it has
-  # never actually run here. Nightly (not every push): genuinely destructive against its
-  # own throwaway database/CAS dir, and slower than the push-gating jobs should be.
+  # scripts/e2e_scenario.sh's Phase U (real backup -> destroy -> restore drill), gated
+  # behind AV_E2E_DR=1. Nightly, not every push: genuinely destructive against its own
+  # throwaway database/CAS dir, and slower than push-gating jobs should be.
   dr-drill:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -161,11 +146,8 @@ jobs:
       AV_TEST_REDIS_URL: redis://localhost:6379/0
       E2E_PSQL_URL: postgresql://av_user:av_password@localhost:5432/aether_vault_test
       AV_E2E_DR: "1"
-      # No container named "aether-vault-db" exists in THIS job's topology (a service
-      # container, not docker-compose.yml's dev stack) -- unset so Phase U's own
-      # `docker inspect`-then-fallback logic takes the pg_dump/pg_restore-on-PATH path
-      # (installed below) instead of trying to `docker inspect` a container that isn't
-      # there.
+      # No container named "aether-vault-db" exists in this job's service-container
+      # topology, so unset this to take the pg_dump/pg_restore-on-PATH fallback path.
       E2E_DB_CONTAINER: ""
 
     steps:
@@ -192,12 +174,9 @@ jobs:
           path: /tmp/server-e2e.log
           if-no-files-found: ignore
 
-  # v1.3.4 (todo.md item 39, W3g): old-binary-vs-new-schema rolling-upgrade drill (see
-  # scripts/compat_drill.sh's own header for exactly what this proves and its honest
-  # current limitation — it self-calibrates its expected outcome against whether the
-  # OLD tag it drills actually contains Probleme.md #136's fix, so it never produces a
-  # false failure regardless of tag history; it only becomes a REAL regression gate for
-  # that fix once a tag past it exists).
+  # Old-binary-vs-new-schema rolling-upgrade drill (see scripts/compat_drill.sh's own
+  # header for its honest current limitation): self-calibrates its expected outcome
+  # against whether the old tag it drills contains the fix being proven.
   compat-drill:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -233,11 +212,9 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_compat_drill
         run: bash scripts/compat_drill.sh
 
-  # v1.3.4 (todo.md item 18, W6b): the deprecation registry's own dry-run — prints every
-  # entry's status and, for "pending" ones, whether they'd be overdue at the NEXT MAJOR
-  # (this repo's removal-only-at-MAJOR policy, VERSIONING.md). Purely informational
-  # (`--dry-run`, always exits 0 per scripts/check_deprecations.py's own judgment call);
-  # tests/test_deprecations.py is what actually gates a real overdue entry, on every push.
+  # The deprecation registry's own dry-run: prints every entry's status. Purely
+  # informational (always exits 0); tests/test_deprecations.py gates a real overdue
+  # entry on every push.
   deprecation-dry-run:
     runs-on: ubuntu-latest
     timeout-minutes: 10

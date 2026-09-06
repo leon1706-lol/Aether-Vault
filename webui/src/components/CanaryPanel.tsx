@@ -9,11 +9,8 @@ interface Props {
   limit?: number;
 }
 
-// v1.3.1 (RSI R6, WP-38): canary status + trend, the WebUI counterpart of
-// `av canary status`/`av canary run` — see development/architecture.md's "Capability
-// Canary Contract". Embedded inside the Regression tab rather than its own top-level
-// nav entry (see page.tsx) — a standalone component either way, matching the plan's
-// naming, just not a separate sidebar destination for one small status widget.
+// Canary status + trend, the WebUI counterpart of `av canary status`/`av canary run`.
+// Embedded inside the Regression tab rather than its own top-level nav entry.
 export function CanaryPanel({ projectId, limit = 20 }: Props) {
   const [results, setResults] = useState<CanaryResult[]>([]);
   const [loading, setLoading] = useState(true);

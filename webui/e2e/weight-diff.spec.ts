@@ -1,10 +1,9 @@
 import { expect, test } from "@playwright/test";
 
-// Exercises the Weight Diff tab against the two commits seeded by webui/e2e/seed_data.py
-// (layer1 unchanged, layer2 changed between the seeded v1 -> v2). Selects checkpoints by click
-// (not drag-and-drop, for CI reliability) using a distinctive filename
-// ("e2e-weight-diff.safetensors") so this test isn't thrown off by unrelated checkpoints that
-// may already exist in the shared dev registry from past manual-testing sessions.
+// Exercises the Weight Diff tab against the two commits seeded by seed_data.py (layer1
+// unchanged, layer2 changed between v1 -> v2). Selects checkpoints by click (not
+// drag-and-drop, for CI reliability) using a distinctive filename so unrelated
+// checkpoints in the shared dev registry don't interfere.
 test("Weight Diff: comparing the seeded checkpoints renders a real layer diff", async ({ page }) => {
   await page.goto("/");
   await page.click("#nav-weight-diff");
@@ -47,8 +46,8 @@ test("Weight Diff: comparing the seeded checkpoints renders a real layer diff", 
 });
 
 test("Weight Diff: a ?tab=weight-diff&a=&b=&path= URL reopens the same comparison directly", async ({ page }) => {
-  // Selects the seeded checkpoints once (same as the test above) purely to discover their
-  // real commit hashes from the DOM — the row's title attribute is "<path> @ <hash>".
+  // Selects the seeded checkpoints once to discover their real commit hashes from the
+  // DOM — the row's title attribute is "<path> @ <hash>".
   await page.goto("/");
   await page.click("#nav-weight-diff");
   const seededRows = page.locator(".checkpoint-row", { hasText: "e2e-weight-diff.safetensors" });
@@ -60,9 +59,7 @@ test("Weight Diff: a ?tab=weight-diff&a=&b=&path= URL reopens the same compariso
   const hashB = titleB!.split(" @ ")[1];
 
   // A fresh navigation straight to the deep link — no clicking — should resolve and
-  // render the same diff, including a slot possibly outside the eagerly-fetched window
-  // (exercised for real here since the seeded v1 checkpoint is always older than whatever
-  // the shared dev registry's most recent 100 commits happen to be).
+  // render the same diff, including a slot possibly outside the eagerly-fetched window.
   await page.goto(
     `/?tab=weight-diff&a=${hashA}&b=${hashB}&path=${encodeURIComponent("weights/e2e-weight-diff.safetensors")}`
   );

@@ -1,21 +1,8 @@
-"""av admin backup — operator-facing backup/restore for the whole registry (v1.3.2,
-WP-28/29/30). Two parts, always taken and restored together: a Postgres logical dump
-(`pg_dump -Fc`) and the CAS objects tree (a plain tar, gzip-compressed when available).
-
-**Deliberately requires an EXPLICIT database target — no auto-detection of "the local
-docker stack".** `av auth`'s `docker_runtime.resolve_compose_file(_find_source_root())`
-auto-detection is exactly the mechanism behind a real incident this repo hit (see
-development/Probleme.md): a command run from anywhere silently targets whatever local
-checkout's compose file it finds, which was the wrong (real, in-use) stack. Backup is
-lower-risk than that incident (it's non-destructive), but `restore` is NOT — it can
-overwrite a real database — so this module takes the safer default from the start: the
-operator must name the target explicitly (`--database-url`/`DATABASE_URL`, or
-`--db-container` naming a specific container), every time, for every subcommand.
-
-Either `pg_dump`/`pg_restore`/`psql` on PATH (the portable path — works against any
-reachable Postgres, containerized or not) OR `--db-container NAME` (execs those same
-binaries inside a named Postgres container, which always has them since they ship with
-the server package) — never both silently tried, no fallback chain to get wrong.
+"""av admin backup — operator-facing backup/restore for the whole registry (v1.3.2): a
+Postgres logical dump (`pg_dump -Fc`) plus the CAS objects tree, always taken/restored
+together. Every subcommand requires an EXPLICIT database target (`--database-url` or
+`--db-container`) rather than auto-detecting "the local stack" — `restore` is destructive
+and a wrong auto-detected target has bitten this repo before (development/Probleme.md).
 """
 
 import datetime
@@ -118,12 +105,9 @@ def backup_create(output_dir, database_url, data_dir, db_container, engine_conta
 
     # --- Part 1: Postgres logical dump (pg_dump -Fc — the custom format pg_restore needs).
     if db_container:
-        # Dump INSIDE the container (it always has pg_dump matching its own server
-        # version) to a temp path, then docker cp it out -- avoids any host/container
-        # network-reachability assumption entirely. A random suffix, not a fixed
-        # "/tmp/av-backup-db.dump" name (bandit B108) -- a predictable path in shared
-        # container temp space is a real (if narrow, single-tenant-container) symlink/
-        # race-condition surface, and costs nothing to avoid.
+        # Dump INSIDE the container (matching pg_dump version) then docker cp it out,
+        # avoiding any host/container network-reachability assumption. Random suffix, not
+        # a fixed name (bandit B108) -- avoids a predictable-path symlink/race surface.
         remote_dump = f"/tmp/av-backup-db-{secrets.token_hex(8)}.dump"  # nosec B108 -- random suffix, ephemeral inside a container we exec into exclusively for this command's duration, always removed below
         subprocess.run(
             ["docker", "exec", db_container, "pg_dump", _to_libpq_url(database_url),
@@ -143,9 +127,8 @@ def backup_create(output_dir, database_url, data_dir, db_container, engine_conta
         with open(db_dump_path, "wb") as f:
             subprocess.run(["pg_dump", _to_libpq_url(database_url), "-Fc"], check=True, stdout=f)
 
-    # --- Part 2: the CAS objects tree, plain tar, gzip'd when available (never claiming
-    # a codec that wasn't actually used -- an earlier draft of this plan named this file
-    # objects.tar.zst unconditionally; the manifest records the REAL codec instead).
+    # --- Part 2: the CAS objects tree, plain tar, gzip'd when available. The manifest
+    # records the REAL codec used, never an assumed one.
     objects_archive_path = out / "objects.tar.gz"
     if engine_container:
         with open(objects_archive_path, "wb") as f:
@@ -176,11 +159,9 @@ def backup_create(output_dir, database_url, data_dir, db_container, engine_conta
     except subprocess.CalledProcessError:
         tenant_ids = []
     try:
-        # pg_stat_user_tables.n_live_tup is an APPROXIMATE row count (updated by
-        # autovacuum/analyze, not a live COUNT(*)) -- deliberately used instead of a real
-        # per-table COUNT(*) sweep, which would mean N sequential full-table scans on a
-        # database that could be large; this is metadata for a human/manifest.json
-        # sanity-check, not a correctness-critical number.
+        # pg_stat_user_tables.n_live_tup is an APPROXIMATE row count, used deliberately
+        # instead of a real per-table COUNT(*) sweep -- this is a manifest sanity-check
+        # value, not a correctness-critical number.
         raw_counts = _psql_scalar(
             database_url,
             "SELECT string_agg(relname || ':' || n_live_tup, ',') FROM pg_stat_user_tables",
@@ -291,12 +272,8 @@ def backup_verify(backup_dir) -> None:
 @click.option("--force", is_flag=True, help="Restore even if the target database is not empty.")
 def backup_restore(backup_dir, database_url, data_dir, db_container, engine_container, force) -> None:
     """Restore a backup written by `backup create` into a target database/data dir.
-
-    Refuses to run against a non-empty database without --force -- a restore is
-    destructive by nature (it OVERWRITES the objects tree entirely and loads the dump
-    on top of whatever tables already exist), and this command has no way to know
-    whether "non-empty" means "an old test DB" or "the wrong production database".
-    """
+    Refuses to run against a non-empty database without --force -- this command has no
+    way to know if "non-empty" means an old test DB or the wrong production one."""
     database_url = database_url or os.environ.get("DATABASE_URL")
     if not database_url:
         fail(None, "validation",
@@ -369,30 +346,16 @@ def backup_restore(backup_dir, database_url, data_dir, db_container, engine_cont
         data_path = Path(data_dir)
         data_path.mkdir(parents=True, exist_ok=True)
         with tarfile.open(objects_archive_path, "r:gz") as tf:
-            # `filter="data"` (PEP 706 — rejects absolute paths/path traversal/device
-            # files during extraction) is unconditionally passed here in every prior
-            # version of this line, which raises `TypeError: extractall() got an
-            # unexpected keyword argument 'filter'` on any Python before the filter
-            # mechanism existed at all (3.10/3.11, this repo's own declared floor and an
-            # actual CI matrix entry — found live, not by reading changelogs: CI's
-            # `test (3.10)` job). `hasattr(tarfile, "data_filter")` (not a hardcoded
-            # version-number check) correctly picks up the early point-release backports
-            # too (3.8.17+/3.9.17+/3.10.12+/3.11.4+ all shipped the filter mechanism as a
-            # security patch before 3.12 made it the norm), so this only silently drops
-            # the hardening on a Python old enough to genuinely lack it, never on a
-            # patched-forward 3.10/3.11.
+            # `filter="data"` (PEP 706 hardening) errors on any Python without it (3.10/
+            # 3.11 point releases before their security backport). `hasattr(tarfile,
+            # "data_filter")` detects the backport correctly instead of a hardcoded
+            # version check, so hardening is only skipped on a genuinely too-old Python.
             if hasattr(tarfile, "data_filter"):
                 tf.extractall(data_path, filter="data")
             else:
-                # v1.3.4 (bandit B202, found live once security.yml's python-static job
-                # ran for the first time -- Probleme.md #135/#137): an interpreter old
-                # enough to lack `data_filter` entirely gets no automatic path-traversal
-                # protection from tarfile itself (CVE-2007-4559's own class of bug) --
-                # this manually rejects any member whose resolved path would land
-                # outside `data_path` (absolute paths, `../` traversal, symlink/hardlink
-                # targets that escape it) before extracting, rather than trusting the
-                # archive blindly. `data_path.resolve()` once, outside the loop -- the
-                # directory itself doesn't move mid-extraction.
+                # No `data_filter` means no automatic path-traversal protection (CVE-2007-4559's
+                # class of bug) -- manually reject any member resolving outside data_path
+                # (absolute paths, `../` traversal, escaping symlinks) before extracting.
                 base = data_path.resolve()
                 for member in tf.getmembers():
                     target = (base / member.name).resolve()

@@ -1,6 +1,6 @@
-# RSI operator guide: one continuous human + agent path (v1.3.1)
+# RSI operator guide: one continuous human + agent path
 
-A single walkthrough through the whole RSI control plane added in v1.3.1 — the same
+A single walkthrough through the whole RSI control plane — the same
 continuous-path convention `docs/tutorial.md` established for the substrate, applied to
 the surfaces that version the IMPROVER (the agent's own code/prompts/tools/policy)
 rather than the model it produces. Every command below is real; `tests/test_docs_commands.py`
@@ -91,7 +91,7 @@ av canary run core-capability --improver <improver-id>
 
 ## 5. Arm the dual-gate promotion policy
 
-The MODEL gate (`av promote`, unchanged since v1.2.0) and the IMPROVER gate are separate
+The MODEL gate (`av promote`) and the IMPROVER gate are separate
 concerns — one file each (`.av/policies.json` vs. `.av/improver_policy.json`), so arming
 one never touches the other:
 

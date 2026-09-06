@@ -1,11 +1,8 @@
 """Shared infra for the `av benchmark` suite: tool detection, result rating, and table
 printing. Used by every bench_*.py script and the `av benchmark` Click command.
 
-Mirrors the "skip and label, never fabricate" pattern already established by
-scripts/run_benchmark_comparison.py and av_cli.speedcheck's --speed diagnostics: a tool
-that isn't on PATH gets labeled NOT_INSTALLED, and a benchmark whose primitive simply
-doesn't map onto a given tool gets labeled NOT_APPLICABLE (set explicitly per-benchmark,
-never inferred), instead of guessing at a number for either case.
+A tool not on PATH is labeled NOT_INSTALLED; a benchmark whose primitive doesn't map onto
+a tool is labeled NOT_APPLICABLE -- never guessed at.
 """
 
 import datetime
@@ -27,12 +24,7 @@ class ToolStatus(Enum):
     AVAILABLE = "available"
     NOT_INSTALLED = "not installed"
     NOT_APPLICABLE = "N/A"
-    # v1.3.0 (Probleme.md): distinct from NOT_INSTALLED. A benchmark that reached a real,
-    # reachable tool/server but had the operation itself fail (e.g. a connection reset under
-    # concurrent load) must say so honestly rather than claim the tool "wasn't installed" —
-    # that was actively misleading on a real capture where av was installed and the server
-    # was up the whole time.
-    FAILED = "failed"
+    FAILED = "failed"  # distinct from NOT_INSTALLED: a reachable tool whose operation itself failed
 
 
 @dataclass
@@ -53,12 +45,8 @@ def detect_tools(names: list[str] | None = None) -> dict[str, ToolHandle]:
 
 
 def time_subprocess(args: list[str], cwd: Path) -> float:
-    """Times a subprocess call in milliseconds.
-
-    Deliberately no `capture_output=True` — matches av_cli.speedcheck.run_av_cli_probes's
-    calling convention, which tests/test_cli.py's `fake_run(args, cwd=None)` mock signature
-    depends on (capture_output broke that mock once already).
-    """
+    """Times a subprocess call in milliseconds. Deliberately no `capture_output=True` --
+    matches speedcheck.run_av_cli_probes's calling convention, which a test mock depends on."""
     start = time.perf_counter()
     subprocess.run(args, cwd=cwd)
     return (time.perf_counter() - start) * 1000
@@ -84,18 +72,13 @@ class BenchmarkResult:
 
 
 # av must be this many times better/worse than the best real competitor number to earn a
-# GOOD/BAD verdict instead of OK. Single-run, single-machine timings are noisy enough that
-# a difference under 1.5x isn't a reliable signal either way (same caveat already on the
-# README's existing Benchmark Comparison section).
+# GOOD/BAD verdict instead of OK -- single-run timings are too noisy for a smaller margin.
 VERDICT_THRESHOLD = 1.5
 
 
 def rate(av_value: float | None, competitor_values: dict[str, float | None]) -> str:
-    """Rates Aether's number against the best real competitor number. Lower is better for
-    every metric in this suite (time or bytes — costs, not throughput rates).
-
-    No real competitor number to compare against -> "ok" (nothing to claim a win against).
-    """
+    """Rates Aether's number against the best real competitor number (lower is better for
+    every metric here). No real competitor number to compare against -> "ok"."""
     if av_value is None:
         return "ok"
     real_competitors = [v for v in competitor_values.values() if v is not None]
@@ -162,11 +145,8 @@ def result_to_markdown(result: BenchmarkResult) -> str:
     return "\n".join(lines)
 
 
-# Narrative, not data-derived — explains *why* certain cells are N/A or non-monotonic, not
-# something that changes between captures. Kept as a hand-edited constant (update by hand
-# when methodology genuinely changes) but always included by render_doc_header()'s caller,
-# so a `--markdown` run never again silently drops this section the way a bare-tables-only
-# write used to (the staleness that motivated this whole module).
+# Narrative, not data-derived -- explains *why* certain cells are N/A or non-monotonic.
+# Hand-edited; update when methodology genuinely changes.
 METHODOLOGY_NOTES = """## Methodology notes (resolved open questions)
 
 - **Hashing throughput, MLflow column:** MLflow has no exposed file-hashing primitive
@@ -198,9 +178,8 @@ METHODOLOGY_NOTES = """## Methodology notes (resolved open questions)
 
 def _tool_version(which_path: str | None, version_args: list[str]) -> str:
     """Runs `<tool> <version_args>` and extracts a bare X.Y.Z version number from whichever
-    of stdout/stderr has output — each tool's raw banner is noisy (e.g. git-lfs's includes
-    platform/go-toolchain info), so a regex pulls out just the number to match the doc's
-    existing "git-lfs 3.7.1, dvc 3.67.1, ..." style rather than dumping the whole banner."""
+    of stdout/stderr has output -- each tool's raw banner is noisy, so a regex pulls out
+    just the number."""
     if which_path is None:
         return "not installed"
     import re
@@ -214,12 +193,8 @@ def _tool_version(which_path: str | None, version_args: list[str]) -> str:
 
 
 def detect_tool_versions() -> dict[str, str]:
-    """Best-effort version string per tool for the doc header's Captured line.
-
-    Mirrors detect_tool()'s "skip and label, never fabricate" pattern — a tool not on PATH
-    reports "not installed" rather than an empty/guessed string. `av`'s own version comes
-    from its installed package metadata (it has no `--version` CLI flag), not a subprocess.
-    """
+    """Best-effort version string per tool for the doc header's Captured line. `av`'s own
+    version comes from its installed package metadata, since it has no `--version` flag."""
     tools = detect_tools()
     versions = {"av": "not installed"}
     if tools["av"].status == ToolStatus.AVAILABLE:
@@ -250,10 +225,8 @@ def _git_short_sha(repo_root: Path) -> str:
 
 
 def _total_ram_gb() -> str:
-    """Best-effort, dependency-free (no psutil) total RAM — a real reference-machine fact
-    every published number here should be read against, since these are single-machine
-    timings (see the Caveat line). "unknown" rather than a wrong guess when the platform-
-    specific path isn't available."""
+    """Best-effort, dependency-free (no psutil) total RAM. Returns "unknown" rather than
+    a wrong guess when the platform-specific path isn't available."""
     try:
         if platform.system() == "Windows":
             import ctypes
@@ -271,8 +244,7 @@ def _total_ram_gb() -> str:
             status.dwLength = ctypes.sizeof(_MEMSTATUS)
             ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
             return f"{status.ullTotalPhys / (1024 ** 3):.0f} GB"
-        # Linux/macOS: /proc/meminfo exists on Linux; macOS has no equivalent without a
-        # subprocess (sysctl) — try both, fall back to unknown rather than guess.
+        # /proc/meminfo exists on Linux; macOS needs sysctl instead -- try both.
         meminfo = Path("/proc/meminfo")
         if meminfo.exists():
             for line in meminfo.read_text().splitlines():
@@ -288,9 +260,8 @@ def _total_ram_gb() -> str:
 
 
 def render_machine_profile() -> str:
-    """v1.3.0 (todo.md item 4): none of the numbers in this doc were reproducible before
-    this existed — CPU model, core count, RAM, and OS are exactly the variables that make
-    a "hash 10MB file" timing mean something different on two different machines."""
+    """CPU model, core count, RAM, and OS -- the variables that make a "hash 10MB file"
+    timing mean something different on two different machines."""
     cpu = platform.processor() or platform.machine() or "unknown"
     return f"""## Reference machine
 
@@ -306,11 +277,8 @@ def render_machine_profile() -> str:
 
 def render_doc_header(repo_root: Path, tool_versions: dict[str, str] | None = None) -> str:
     """Generates the whole BENCHMARKS.md preamble (title, intro, Captured line, Caveat,
-    Legend) so `--markdown` can write a complete, ready-to-commit file in one shot instead
-    of bare tables that need the surrounding prose manually re-spliced in after every run —
-    the gap that let the committed numbers drift stale from the code they're supposed to
-    measure (see development/Probleme.md for the incident this fixed).
-    """
+    Legend) so `--markdown` writes a complete, ready-to-commit file in one shot instead of
+    bare tables needing the surrounding prose re-spliced in by hand."""
     tool_versions = tool_versions if tool_versions is not None else detect_tool_versions()
     today = datetime.date.today().isoformat()
     sha = _git_short_sha(repo_root)
@@ -354,14 +322,9 @@ def results_to_json(results: list[BenchmarkResult]) -> dict:
 
 
 def compare_to_baseline(results: list[BenchmarkResult], baseline: dict) -> list[dict]:
-    """Compares this run's `av` values against a prior results_to_json() snapshot.
-
-    Only flags a regression where BOTH this run and the baseline have a real `av` number —
-    a row that's None in either (server unreachable, tool not installed) is skipped rather
-    than treated as a regression, since that's a missing-data case, not a timing signal.
-    Uses the same VERDICT_THRESHOLD already used for GOOD/OK/BAD so "regression" means the
-    same thing here as it does in the normal competitor-comparison verdicts.
-    """
+    """Compares this run's `av` values against a prior results_to_json() snapshot. Only
+    flags a regression where BOTH runs have a real `av` number; uses the same
+    VERDICT_THRESHOLD as the normal competitor-comparison verdicts."""
     findings = []
     for result in results:
         baseline_ops = baseline.get(result.name, {})

@@ -1,23 +1,13 @@
 #!/bin/bash
-# Real streaming-replication bootstrap for the HA topology's Postgres standby
-# (docker-compose.ha.yml's db-replica service) -- NOT a second independent database.
-# The official postgres image has no built-in "run as a replica of X" mode the way
-# Redis' own image supports `replicaof`, so this replaces its entrypoint entirely with
-# the standard pg_basebackup-based bootstrap:
+# Real streaming-replication bootstrap for the HA topology's Postgres standby -- the
+# official postgres image has no built-in "run as a replica of X" mode, so this replaces
+# its entrypoint entirely with the standard pg_basebackup-based bootstrap: on first boot
+# (empty $PGDATA), wait for the primary then `pg_basebackup -R` (copies the data
+# directory and writes standby.signal + primary_conninfo for us); every boot, fix
+# ownership and exec postgres via `gosu`, same as the official entrypoint.
 #
-#   1. First boot only (empty $PGDATA -- the idempotence guard below): wait for the
-#      primary to accept connections, then `pg_basebackup -R`, which both COPIES the
-#      primary's current data directory AND writes standby.signal + primary_conninfo
-#      into postgresql.auto.conf for us (the -R flag, PG12+) -- no manual
-#      recovery.conf hand-authoring needed.
-#   2. Every boot (fresh or already-replicated): fix ownership (pg_basebackup here
-#      runs as root, matching how the official entrypoint itself starts as root before
-#      dropping privileges) and exec postgres as the `postgres` user via `gosu`, the
-#      exact mechanism the official entrypoint uses -- this container ships it already.
-#
-# This is a genuine hot standby: `pg_isready`/SQL reads against db-replica succeed once
-# it catches up, and promoting it (`pg_ctl promote`) is what scripts/ha_drill.sh's
-# primary-failure step actually exercises.
+# A genuine hot standby: reads against db-replica succeed once it catches up, and
+# promoting it (`pg_ctl promote`) is what scripts/ha_drill.sh's primary-failure step exercises.
 set -euo pipefail
 
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"

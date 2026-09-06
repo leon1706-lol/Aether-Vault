@@ -160,8 +160,8 @@ def test_context_memory_note_survives_handoff_and_export_md(repo):
 
 
 # ---------------------------------------------------------------------------
-# v1.3.0 (todo.md item 8): .avh validation on every write/read, run finish guarantees
-# the handoff exists, context search, notes stamp their active run.
+# .avh validation on every write/read, run finish guarantees the handoff exists,
+# context search, notes stamp their active run.
 # ---------------------------------------------------------------------------
 
 def test_context_note_stamps_the_active_run_id(repo):
@@ -407,11 +407,8 @@ def test_policy_set_list_remove_roundtrip(repo):
 
 
 def test_policy_set_require_signature_alone_is_a_valid_standalone_policy(repo):
-    # v1.2.5: before this, the ONLY way to arm a signature-only policy was to hand-edit
-    # .av/policies.json directly (METRIC/OP were required positional args) — every
-    # require_signature test drove it that way, and `av policy set --require-signature`
-    # with no METRIC/OP had never actually been exercised through the CLI. Real gap, not
-    # a hypothetical: see development/Probleme.md.
+    # `av policy set --require-signature` with no METRIC/OP must work through the CLI
+    # directly, not just by hand-editing .av/policies.json.
     jinv("--output", "json", "policy", "set", "main", "--require-signature")
     pol = jinv("--output", "json", "policy", "list")["data"]["policies"]
     assert pol["main"] == {"require_signature": True}

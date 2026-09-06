@@ -1,17 +1,12 @@
 """Benchmark #1 — hashing throughput at scale.
 
 Times each tool's real hashing primitive over the same single large file, at several
-sizes ("small tier": 10/50/100/200MB — see fixtures.HASH_BENCH_FILE_SIZES_MB for why not
-literal GB). Headline framing: "Nx faster at every size tested," not a specific GB claim.
+sizes (see fixtures.HASH_BENCH_FILE_SIZES_MB).
 
 - av: `hash_file_safe()` in-process (the exact function `av add` calls).
-- git-lfs: `git lfs clean` — the real filter git-lfs invokes on `git add` to hash+pointer a
-  file, run directly via stdin/stdout redirection (its actual calling convention).
+- git-lfs: `git lfs clean` — the real filter git-lfs invokes on `git add`.
 - dvc: `dvc add <file>` — the real primitive; hashes the file as part of staging it.
-- mlflow: N/A — MLflow has no exposed file-hashing primitive comparable to the other
-  three (`log_artifact()` copies/uploads a file, it doesn't expose a content hash step a
-  caller can time independently). Approximating it via `log_artifact()` would misrepresent
-  what MLflow actually does, so this benchmark marks it N/A rather than guess.
+- mlflow: N/A — no exposed file-hashing primitive comparable to the other three.
 """
 
 import shutil
@@ -61,14 +56,8 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
     tool_order = tool_order or ["av", "git-lfs", "dvc", "mlflow"]
     rows: list[Row] = []
 
-    # ignore_cleanup_errors=True (v1.3.0, Probleme.md): DVC can still hold a file handle
-    # open inside its own repo directory on Windows right as this `with` block exits —
-    # without this, cleanup itself raises PermissionError and crashes the whole
-    # `av benchmark` run, even though every real measurement already succeeded. Same fix
-    # applied uniformly across every bench_*.py that uses TemporaryDirectory (some already
-    # worked around a narrower version of this via manual mkdtemp — see bench_commit_push_
-    # latency.py's mlflow helper — this is the simpler stdlib-native equivalent, available
-    # since Python 3.10, this project's own floor).
+    # ignore_cleanup_errors=True: DVC can still hold a file handle open on Windows right
+    # as this `with` block exits, which would otherwise crash the whole run on cleanup.
     with tempfile.TemporaryDirectory(prefix="bench-hashing-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
         git_lfs_repo = root / "git-lfs-repo"

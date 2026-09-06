@@ -64,36 +64,27 @@ def test_nothing_to_commit_exits_11_json(repo):
 
 
 # ---------------------------------------------------------------------------
-# 12 — auth_failed. _AuthRetryGroup (core.py) catches AuthenticationError from ANY
-# subcommand in one place; under CliRunner, ui.is_interactive() is always False (no real
-# tty), so the non-interactive branch (fail(ctx, "auth_failed", ...)) fires regardless of
-# --output json — proving the same code path both modes actually share, rather than
-# needing two different simulations.
+# 12 — auth_failed. _AuthRetryGroup (core.py) catches AuthenticationError from any
+# subcommand in one place; under CliRunner, ui.is_interactive() is always False, so the
+# non-interactive branch fires regardless of --output json.
 # ---------------------------------------------------------------------------
 
 def _make_push_401(monkeypatch, repo):
     from python.av_cli.client import AuthenticationError, VaultClient
 
-    # Force unreachable for the setup commit — a real dev stack may genuinely be up on
-    # localhost:8000 (Docker Desktop), and if it were, this commit would push for real
-    # against it instead of queuing, leaving nothing pending for the `push` below to retry
-    # (and, worse, writing test data into a real server). "No server configured" must never
-    # be simulated by just not mocking anything.
+    # Force unreachable for the setup commit, so it queues (giving `push` below something
+    # to retry) instead of pushing for real against a dev stack that may genuinely be up.
     monkeypatch.setattr(VaultClient, "server_available", lambda self: False)
     (repo / "f.txt").write_text("v1")
     invoke("add", "f.txt")
-    # Queues (same shape as the unreachable_queued test above) — gives `push` a pending
-    # commit to retry.
     invoke("commit", "-m", "queued for auth-failed repro")
     monkeypatch.setattr(VaultClient, "server_available", lambda self: True)
 
     def _raise(*args, **kwargs):
         raise AuthenticationError("Server rejected the request (401)")
 
-    # cmd_history.py does `from .core import *` at import time, so `flush_pending_push`
-    # is a name bound in cmd_history's own module namespace by now — patching
-    # core.flush_pending_push itself would not affect the already-resolved reference
-    # push() actually calls.
+    # cmd_history.py does `from .core import *` at import time, so patching
+    # core.flush_pending_push wouldn't affect the already-resolved reference push() calls.
     monkeypatch.setattr("python.av_cli.cmd_history.flush_pending_push", _raise)
 
 
@@ -115,15 +106,9 @@ def test_auth_failed_exits_12_json(repo, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # 13 — unreachable_queued: `commit`/`push` deliberately exit 0 when queued (queued is a
-# SAFE, complete local outcome by design — AGENTS.md non-negotiable #3, and `av push`
-# already behaves this way for "reachable": False). What WAS broken: `av --output json
-# commit`'s "queued"/"queued_reason" fields were silently wrong (always false/None unless
-# --no-upload) because the JSON result_sink fired before the push-or-queue logic ran and
-# mutated the result it had already captured. Fixed by deferring that capture to the end
-# of _finalize_commit (core.py) — this test proves the DATA is now accurate; exit 13
-# itself is reserved for read-path commands where reachability is the primary outcome
-# (av audit list / av webhooks list — see those modules' own fail("unreachable_queued")
-# call sites, unaffected by this fix).
+# safe, complete local outcome by design). This proves `--output json commit`'s
+# "queued"/"queued_reason" fields are accurate, not just the exit code; exit 13 itself is
+# reserved for read-path commands where reachability is the primary outcome.
 # ---------------------------------------------------------------------------
 
 def test_commit_json_reports_queued_accurately_when_server_unreachable(repo, unreachable_client):
@@ -217,15 +202,10 @@ def test_policy_denied_exits_16(repo):
 
 
 def test_policy_denied_exits_16_json(repo):
-    """v1.3.1 fix (Probleme.md): the deny branch used to `click.secho(..., err=True)`
-    unconditionally even in JSON mode, leaking human text after the envelope — never
-    caught before because no prior test parsed a JSON-mode DENY as strict JSON.
-
-    Note the envelope's `ok:true`/`error:null` here is the EXISTING, unchanged contract
-    for this specific denial (it reports the decision via `data.allowed`, not
-    `error.code`, unlike `av merge`'s policy denial which does go through `fail()`) —
-    this test locks in the leak fix, not a reshaping of that envelope, which would be a
-    separate, deliberately out-of-scope breaking-contract question (see Probleme.md)."""
+    """The deny branch used to `click.secho(..., err=True)` unconditionally even in JSON
+    mode, leaking human text after the envelope. Note `ok:true`/`error:null` here is the
+    existing, unchanged contract for this denial (reported via `data.allowed`, not
+    `error.code`) -- this locks in the leak fix, not a reshaping of the envelope."""
     (repo / "m.txt").write_text("v1")
     invoke("add", "m.txt")
     invoke("commit", "-m", "baseline", "--metric", "val_loss=1.0")
@@ -244,8 +224,8 @@ def test_policy_denied_exits_16_json(repo):
 
 
 # ---------------------------------------------------------------------------
-# promote --dry-run (v1.3.0, todo.md item 12): exits 0 for BOTH decisions, touches
-# nothing either way — a script branches on data.decision, not the exit code.
+# promote --dry-run: exits 0 for both decisions, touches nothing either way — a script
+# branches on data.decision, not the exit code.
 # ---------------------------------------------------------------------------
 
 def _armed_repo_with_regressed_tip(repo):
@@ -389,10 +369,8 @@ def test_review_present_allows_promotion(repo, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 18 — frozen (v1.3.1): `av promote` unconditionally checks freeze state (after any
-# promote-policy evaluation, before landing) regardless of whether a promote policy is
-# armed — freeze and the model-gate policy are independent, and freeze wins even over
-# --force on the policy itself.
+# 18 — frozen: `av promote` unconditionally checks freeze state, regardless of whether a
+# promote policy is armed — freeze wins even over --force on the policy itself.
 # ---------------------------------------------------------------------------
 
 def test_frozen_exits_18(repo, monkeypatch):
@@ -458,13 +436,9 @@ def test_scope_denied_exits_20_json(repo, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 21 — login_required (v1.3.3): `av login`'s device-code flow (cmd_login.py) timed out
-# with no browser approval -- distinct from auth_failed (12), a REJECTED credential, not
-# a missing one. `requests.post` is monkeypatched directly (not via `_fake_registry_client`,
-# which only fakes `VaultClient` -- `cmd_login.py` talks to the registry with a bare
-# `requests` call since it has no session/token yet to construct a VaultClient with).
-# `expires_in: 0` makes the poll loop's deadline already-past on its first check, so the
-# repro runs instantly rather than actually waiting out a real timeout.
+# 21 — login_required: `av login`'s device-code flow timed out with no browser approval
+# -- distinct from auth_failed (12), a rejected credential rather than a missing one.
+# `expires_in: 0` makes the poll loop's deadline already-past on its first check.
 # ---------------------------------------------------------------------------
 
 def test_login_required_exits_21(monkeypatch):
@@ -526,13 +500,9 @@ def test_login_required_exits_21_json(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 22 — tenant_denied (v1.3.2): the server's 403 {"error":"tenant_denied"} from
-# `server.py::_enforce_project_tenant`'s global dependency (AV_TENANCY_ENFORCE=1 only)
-# maps to this exit code. Reuses the same `/api/freeze/{project_id}` route as
-# scope_denied's own repro above — that route can now produce EITHER 403 shape, and
-# cmd_freeze.py::_set_freeze branches on the response body's "error" field to tell them
-# apart (a caller with the right scope but the wrong tenant still needs a different
-# remediation message than one with the wrong scope).
+# 22 — tenant_denied: the server's 403 {"error":"tenant_denied"} from
+# `_enforce_project_tenant` maps to this exit code, distinct from scope_denied's 403 —
+# cmd_freeze.py branches on the response body's "error" field to tell them apart.
 # ---------------------------------------------------------------------------
 
 def test_tenant_denied_exits_22(repo, monkeypatch):

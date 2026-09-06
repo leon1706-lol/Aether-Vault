@@ -1,12 +1,10 @@
 import { expect, test } from "@playwright/test";
 
-// Browser-level Protected-mode coverage. Runs AFTER dashboard/weight-diff specs against
-// the SAME webui build and the SAME seeded database — the workflow restarts the server in
-// Protected mode (AV_API_TOKEN + AV_AUTH_USERS) before this file executes.
-//
-// Covers the wiring no component test can: ?av_token= consumption → localStorage
-// persistence → URL stripped → authenticated data renders; and a cleared browser showing
-// the manual entry prompt instead of registry data.
+// Browser-level Protected-mode coverage. Runs after dashboard/weight-diff specs against
+// the same seeded database — the workflow restarts the server in Protected mode before
+// this file executes. Covers the wiring no component test can: ?av_token= consumption →
+// localStorage persistence → URL stripped → authenticated data renders; and a cleared
+// browser showing the manual entry prompt instead of registry data.
 
 const TOKEN_KEY = "aether-vault:api-token";
 const OWNER_TOKEN = "owner-browser-secret";
@@ -51,13 +49,8 @@ test("second visit without the param stays unlocked via localStorage", async ({ 
 test("unknown browser shows the entry prompt instead of registry data", async ({ page }) => {
   await page.goto("/");
   // First fetches fire without a token → 401 → setUnauthorizedHandler shows the prompt.
-  // { exact: true } (v1.3.0, Probleme #127): WP-18's per-panel error states now render the
-  // SAME UnauthorizedError message verbatim ("This registry is protected — a valid access
-  // token is required.") in every panel that 401s, alongside TokenGate's own shorter title
-  // ("This registry is protected", no trailing text) — a real, live dashboard genuinely
-  // shows both simultaneously (the panels underneath the gate keep fetching and 401ing).
-  // A substring locator now matches all of them; only an exact match on TokenGate's own
-  // title text is still unambiguous.
+  // { exact: true }: per-panel error states render the same "This registry is protected"
+  // message too, so only an exact match on TokenGate's own shorter title is unambiguous.
   await expect(
     page.getByText("This registry is protected", { exact: true })
   ).toBeVisible({ timeout: 15_000 });

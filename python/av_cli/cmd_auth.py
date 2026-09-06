@@ -1,8 +1,6 @@
-"""Protected-mode token management (auth group).
-
-Bodies moved verbatim from main.py (Point-13 split). Patch-target names owned by
-main.py (`_find_source_root`, `_update_readme_test_badge`) are accessed late-bound via
-`_root.<name>` so test monkeypatching on the main namespace stays effective.
+"""Protected-mode token management (auth group). Patch-target names owned by main.py are
+accessed late-bound via `_root.<name>` so test monkeypatching on the main namespace stays
+effective.
 """
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
@@ -12,29 +10,19 @@ from . import main as _root
 
 @click.group()
 def auth() -> None:
-    """Manage the optional access-token gate ("Protected" mode).
-
-    Unset/empty (the default) means the registry is "Anonymous" — every route behaves exactly
-    as it always has, no credentials needed. Setting a token switches the server to
-    "Protected" — every route (reads included) then requires it. The owner uses a shared
-    secret (`set-token`); teammates get their own revocable tokens via `add-user`. See
-    `av init`'s Anonymous/Protected prompt for the same choice at setup time.
-    """
+    """Manage the optional access-token gate ("Protected" mode). Unset/empty (the default)
+    means "Anonymous" — no credentials needed; setting a token switches every route
+    (reads included) to require it. The owner uses a shared secret (`set-token`);
+    teammates get their own revocable tokens via `add-user`."""
 
 
 def _restart_server_for_token_change(repo_root: Path) -> bool:
-    """Best-effort restart of the running server after `.env`'s AV_API_TOKEN changes, so the
-    new value takes effect immediately instead of only on the next manual restart. Returns
-    False (with a clear message already printed) if Docker isn't reachable or the restart
-    itself fails — `write_env_token` has already succeeded by the time this runs, so a failed
-    restart here just means "takes effect next time the stack starts," not data loss.
-    """
+    """Best-effort restart of the running server after `.env`'s AV_API_TOKEN changes, so
+    the new value takes effect immediately. Returns False if Docker isn't reachable or the
+    restart fails -- `write_env_token` has already succeeded, so this is never data loss."""
     from . import docker_runtime
 
-    # v1.3.0 fix (Probleme.md, same bug class as #105-107/114/115): these two lines used
-    # to secho unconditionally — a JSON-mode caller (auth set-token/clear/rotate) whose
-    # restart failed leaked plain text ahead of its own emit_json envelope. Every call
-    # site here is JSON-mode-aware, so gate on the same global this whole codebase uses.
+    # A JSON-mode caller must never get plain text leaked ahead of its emit_json envelope.
     json_mode = current_output_mode() == "json"
     if docker_runtime.check_docker_running() != docker_runtime.DockerCheckResult.RUNNING:
         if not json_mode:
@@ -58,10 +46,9 @@ def _restart_server_for_token_change(repo_root: Path) -> bool:
 
 
 def _generate_and_apply_token(repo_root: Path, token: str | None = None) -> str:
-    """Generates (if not given) and applies a token: writes it to .env next to whichever
-    compose file is in play, saves it to this repo's config, and restarts the running server
-    so it takes effect immediately. Shared by `av auth set-token` and `av init`'s "Generate a
-    new token" choice so the two don't duplicate this logic."""
+    """Generates (if not given) and applies a token: writes it to .env, saves it to this
+    repo's config, and restarts the running server. Shared by `av auth set-token` and
+    `av init`'s "Generate a new token" choice."""
     import secrets as secrets_module
 
     from . import docker_runtime
@@ -82,15 +69,9 @@ def _generate_and_apply_token(repo_root: Path, token: str | None = None) -> str:
 @auth.command(name="set-token")
 @click.argument("token", required=False, default=None)
 def auth_set_token(token: str | None) -> None:
-    """Set (or rotate) the access token, generating one if TOKEN is omitted.
-
-    Writes it to the .env file next to whichever docker-compose file is in play, saves the
-    same value to this repo's local config so the CLI starts sending it immediately, and
-    restarts the running server so the change takes effect right away. Re-running this with a
-    new value (or none, to generate a fresh one) is also the "I forgot it" path — there's no
-    password-reset flow since this is a shared secret, not a real account: recovery is simply
-    "you have shell access to the machine running the server."
-    """
+    """Set (or rotate) the access token, generating one if TOKEN is omitted. There's no
+    password-reset flow since this is a shared secret, not a real account -- re-running
+    this command IS the recovery path."""
     repo_root = ensure_repo()
     token = _generate_and_apply_token(repo_root, token)
     if current_output_mode() == "json":
@@ -249,14 +230,9 @@ def auth_status() -> None:
 # ---------------------------------------------------------------------------
 
 def _read_auth_users(compose_file: Path) -> dict:
-    """Reads the AV_AUTH_USERS JSON map from .env; empty dict when absent/unset.
-
-    v1.3.0: a value is either a bare token string (unchanged) or {"token": "...",
-    "expires_at": "..."} for a user with optional expiry — see server.py's
-    _parse_auth_users, the source of truth this mirrors. Values ride through as-is
-    (no longer coerced to str()) so a dict value survives the round trip; use
-    `_user_token()`/`_user_expiry()` below wherever the code needs the plain string.
-    """
+    """Reads the AV_AUTH_USERS JSON map from .env; empty dict when absent/unset. A value
+    is either a bare token string or {"token", "expires_at"} -- use `_user_token()`/
+    `_user_expiry()` below to normalize."""
     from . import docker_runtime
 
     raw = docker_runtime.read_env_token(compose_file, key="AV_AUTH_USERS")
@@ -282,8 +258,7 @@ def _user_expiry(value) -> str | None:
 
 
 def _user_scopes(value) -> list[str] | None:
-    """v1.3.1: this user's declared scopes, or None when unrestricted (the default for
-    every bare-string/legacy entry and any entry that never set --scope)."""
+    """This user's declared scopes, or None when unrestricted (the default)."""
     if isinstance(value, dict):
         scopes = value.get("scopes")
         if isinstance(scopes, list) and scopes:
@@ -314,13 +289,8 @@ def _write_auth_users(compose_file: Path, users: dict) -> None:
                    " see docs/rsi-operator-guide.md for the scope vocabulary.")
 def auth_add_user(name: str, token: str | None, expires_in_days: int | None,
                    scopes: tuple[str, ...]) -> None:
-    """Grant NAME its own access token (generating one if TOKEN is omitted).
-
-    Per-user tokens work alongside the owner's shared secret: each teammate puts their
-    personal token into their own repo (`av auth set-token <their-token>` on their
-    machine) and their pushes are attributed to NAME when they don't set a custom
-    AV_AUTHOR. The token prints once — share it over a trusted channel.
-    """
+    """Grant NAME its own access token (generating one if TOKEN is omitted). Per-user
+    tokens work alongside the owner's shared secret; the token prints once."""
     import secrets as secrets_module
 
     from . import docker_runtime

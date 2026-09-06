@@ -159,12 +159,9 @@ def test_build_limiter_from_env_malformed_fails_loudly():
 
 
 # ---------------------------------------------------------------------------
-# v1.3.2 (HA — E5): RedisWindowRateLimiter, the cross-replica-safe backend. A fake async
-# Redis client stands in for the real thing — same "pure logic, no network" philosophy
-# this file's own docstring states, extended to cover the Redis-backed class too. The
-# live TestClient-level proof (a real Redis, AV_RATE_LIMIT_BACKEND=redis end to end)
-# lives in tests/test_server.py behind the standard reachability skip, same convention
-# as the in-process limiter's own integration test.
+# RedisWindowRateLimiter, the cross-replica-safe backend. A fake async Redis client
+# stands in for the real thing; the live TestClient-level proof (real Redis end to end)
+# lives in tests/test_server.py behind the standard reachability skip.
 # ---------------------------------------------------------------------------
 
 import asyncio

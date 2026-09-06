@@ -62,10 +62,8 @@ def test_hot_paths_within_budget(tmp_path):
     results = speedcheck.run_synthetic_probes_sampled(load_config, iter_working_files, tmp_path)
     assert results, "speedcheck produced no probes"
     labels = [label for label, *_ in results]
-    # The semdiff probe (v1.2.2) and the per-surface probes (v1.2.5) must be part of the
-    # gated family -- these assertions exist so a probe silently dropping out of the
-    # battery (e.g. an exception swallowed somewhere upstream) fails loudly here instead of
-    # quietly shrinking gate coverage.
+    # These assertions exist so a probe silently dropping out of the battery fails
+    # loudly here instead of quietly shrinking gate coverage.
     assert any(label.startswith("semdiff.diff_trees()") for label in labels), \
         "semdiff probe missing from speedcheck synthetic probes"
     assert any(label.startswith("commit_staged()") for label in labels), \

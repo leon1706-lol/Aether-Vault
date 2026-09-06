@@ -25,11 +25,9 @@ from python.av_cli.index import Index
 
 aether_core = pytest.importorskip("aether_core")
 
-# A seeded-random payload: big enough for several chunks at reduced params (real params
-# are min 512KB/avg 2MB — we pass small ones explicitly, exactly like test_core.py does,
-# so fixtures stay tiny). Real entropy matters here: a periodic payload can yield ONE
-# chunk spanning the whole file, whose hash then equals the whole-file hash and breaks
-# the "no whole-file blob alongside shards" invariant by construction.
+# A seeded-random payload, big enough for several chunks at reduced params so fixtures
+# stay tiny. Real entropy matters: a periodic payload can yield one chunk spanning the
+# whole file, breaking the "no whole-file blob alongside shards" invariant.
 import random
 
 PAYLOAD = random.Random(0xA17C5EED).randbytes(3 * 1024 * 1024)
@@ -81,8 +79,7 @@ def test_cdc_determinism_identical_bytes_identical_boundaries(tmp_path, ext):
 
 
 # ---------------------------------------------------------------------------
-# Staging-level matrix: every extension actually takes the CDC path above threshold,
-# and .avattributes overrides are honored per path.
+# Every extension takes the CDC path above threshold; .avattributes overrides are honored per path.
 # ---------------------------------------------------------------------------
 
 def _stage(repo_root, name, content):

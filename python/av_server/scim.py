@@ -1,28 +1,15 @@
-"""SCIM 2.0 (RFC 7643/7644) provisioning — v1.3.3 (WP-17), under `/scim/v2`.
-
-Deliberately does NOT import anything from `.server` (server.py imports THIS module at
-the very bottom of its own file — a top-level `from .server import ...` here would be a
-genuine load-time circular import, not merely a style choice) — auth, tenant
+"""SCIM 2.0 (RFC 7643/7644) provisioning — v1.3.3, under `/scim/v2`. Deliberately does
+NOT import anything from `.server` (server.py imports THIS module at the bottom of its
+own file, so a top-level import here would be a genuine circular import) -- auth, tenant
 resolution, and audit logging are done locally with the same primitives `.identity`
-already exposes to server.py itself, not by reaching back into server.py's
-request-scoped helpers. `server.py`'s `try/except ImportError` around mounting this
-module is defensive plumbing for consistency with `sso_saml.py`'s genuinely-optional
-import; this module itself only uses core (non-optional) dependencies, so that except
-branch should never actually fire.
+exposes to server.py itself.
 
-Authenticated by a dedicated `api_tokens` row carrying the `scim` scope (minted via
-`av scim token create`) — a provisioning credential, deliberately separate from any
-human user's session. Scope resolution happens identically to every other scope in this
-codebase (`require_token` middleware already ran before any route here executes and
-populated `request.state.scopes` the same way for a SCIM token as for any other DB
-token), so this module's own `_require_scim_scope` mirrors `server.py::require_scope`'s
-exact wildcard/no-scopes-means-"*" semantics rather than reinventing them differently.
+Authenticated by a dedicated `api_tokens` row carrying the `scim` scope, a provisioning
+credential deliberately separate from any human user's session.
 
-Error envelope is the SCIM standard shape (`urn:ietf:params:scim:api:messages:2.0:Error`)
-— deliberately NOT this codebase's own `av` JSON envelope. SCIM is a foreign, versioned
-wire format an IdP (Okta/Entra/etc.) parses by spec; matching that spec is the whole
-point of implementing SCIM at all. This is a documented exemption from the leakage
-sweep's envelope convention, not an oversight.
+Error envelope is the SCIM standard shape, deliberately NOT this codebase's own `av`
+JSON envelope -- SCIM is a foreign, versioned wire format an IdP parses by spec. A
+documented exemption from the leakage sweep's envelope convention, not an oversight.
 """
 from __future__ import annotations
 
@@ -47,14 +34,8 @@ SCHEMA_GROUP = "urn:ietf:params:scim:schemas:core:2.0:Group"
 SCHEMA_LIST_RESPONSE = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
 SCHEMA_ERROR = "urn:ietf:params:scim:api:messages:2.0:Error"
 
-# Mirrors server.py's own `AUDIT_ENABLED`/`_audit()` shape exactly (same env var, same
-# `_chain_seq` stamping for database.py's `_chain_audit_log` before_flush listener) --
-# duplicated rather than imported specifically to avoid a load-time circular import
-# (server.py imports THIS module at the bottom of its own file; see this module's
-# top-of-file docstring). `tests/test_audit_coverage.py`'s sweep looks for the literal
-# substring `_audit(` in a mutating route's own source, so this local helper is what
-# makes every SCIM mutation genuinely show up in that coverage sweep, not just look
-# audited to a human reader.
+# Mirrors server.py's own `AUDIT_ENABLED`/`_audit()` shape exactly -- duplicated rather
+# than imported, to avoid a load-time circular import (see this module's docstring).
 AUDIT_ENABLED = os.environ.get("AV_AUDIT_LOG", "1") not in ("", "0", "false")
 _audit_seq_counter = itertools.count()
 
@@ -80,11 +61,8 @@ def _scim_actor(request: Request) -> str:
 
 async def _require_scim_scope(request: Request) -> None:
     """Mirrors `server.py::require_scope`'s exact posture: a token with no explicit
-    `scopes` list (every pre-SCIM token, and Anonymous mode) resolves to `["*"]`, so this
-    is additive -- nothing that could already reach a route loses access because SCIM
-    routes now declare a required scope. A real deployment gates SCIM behind a
-    dedicated `scim`-scoped token in practice, but that is an operator choice, not
-    something this dependency forces on an unconfigured/legacy deployment."""
+    `scopes` list resolves to `["*"]`, so this is additive -- nothing that could
+    already reach a route loses access because SCIM routes now declare a required scope."""
     scopes = getattr(request.state, "scopes", None) or ["*"]
     if "*" in scopes or "scim" in scopes:
         return
@@ -154,10 +132,8 @@ def _group_resource(group: DBGroup, members: list[dict], base_url: str) -> dict:
     }
 
 
-# eq is the only operator real IdPs send for the two attributes SCIM's own spec calls
-# out as required-to-support (userName, externalId) -- ne/co/sw/gt/etc. and boolean
-# `and`/`or` combinators are real SCIM filter grammar this does NOT implement; an
-# unsupported filter is reported as 400 invalidFilter rather than silently ignored.
+# eq is the only operator real IdPs send for the two required-to-support attributes
+# (userName, externalId); an unsupported filter is reported as 400 invalidFilter.
 _FILTER_RE = re.compile(r'^\s*([\w.]+)\s+eq\s+"((?:[^"\\]|\\.)*)"\s*$', re.IGNORECASE)
 
 
@@ -181,11 +157,9 @@ def _list_response(resources: list[dict], total: int, start_index: int, count: i
 
 
 async def _set_user_active(db: AsyncSession, user: DBUser, active: bool) -> None:
-    """The deprovisioning path a real IdP actually drives (`PATCH {"active": false}`),
-    per this codebase's own established convention (`server.py::suspend_user`):
-    suspend, never hard-delete -- audit history and commit/run authorship attribution
-    must survive. Revokes every live session immediately so a deprovision takes effect
-    at once, not merely on next token expiry."""
+    """The deprovisioning path a real IdP drives (`PATCH {"active": false}`): suspend,
+    never hard-delete, so audit history and authorship attribution survive. Revokes
+    every live session immediately."""
     was_suspended = user.status == "suspended"
     user.status = "active" if active else "suspended"
     if not active and not was_suspended:
@@ -288,10 +262,9 @@ async def scim_get_user(user_id: str, request: Request, db: AsyncSession = Depen
 @router.post("/scim/v2/Users")
 async def scim_create_user(request: Request, body: dict = Body(...), db: AsyncSession = Depends(get_session),
                            _: None = Depends(_require_scim_scope)):
-    """A 409 uniqueness conflict on a repeat POST (rather than silently updating or
-    silently succeeding) is what makes IdP retries safe: the standard SCIM client
-    behavior on 409 is to fall back to a GET+PATCH against the existing resource, so a
-    retried provisioning sync converges on one row, never a duplicate."""
+    """A 409 uniqueness conflict on a repeat POST is what makes IdP retries safe: the
+    standard SCIM client behavior on 409 is to fall back to GET+PATCH, so a retried
+    provisioning sync converges on one row, never a duplicate."""
     tenant_id = _tenant_id(request)
     username = body.get("userName")
     if not username:
@@ -348,11 +321,8 @@ async def scim_replace_user(user_id: str, request: Request, body: dict = Body(..
 async def scim_patch_user(user_id: str, request: Request, body: dict = Body(...),
                           db: AsyncSession = Depends(get_session), _: None = Depends(_require_scim_scope)):
     """Handles the shapes real IdPs actually send: a `path`-qualified single-attribute
-    op (`{"op": "replace", "path": "active", "value": false}` -- Okta's and Entra's
-    deprovisioning PATCH) and a path-less whole-object `replace` (`{"op": "replace",
-    "value": {"active": false, "displayName": "..."}}`). Full SCIM PATCH path-filter
-    grammar (`emails[type eq "work"].value`) is intentionally not implemented -- neither
-    IdP needs it for the attributes this server actually stores."""
+    op (Okta's/Entra's deprovisioning PATCH) and a path-less whole-object `replace`.
+    Full SCIM PATCH path-filter grammar is intentionally not implemented."""
     tenant_id = _tenant_id(request)
     user = (await db.execute(
         select(DBUser).where(DBUser.id == user_id, DBUser.tenant_id == tenant_id)
@@ -393,11 +363,9 @@ async def scim_patch_user(user_id: str, request: Request, body: dict = Body(...)
 @router.delete("/scim/v2/Users/{user_id}", status_code=204)
 async def scim_delete_user(user_id: str, request: Request, db: AsyncSession = Depends(get_session),
                            _: None = Depends(_require_scim_scope)):
-    """Per this codebase's own convention (matching `PATCH {"active": false}` above): a
-    SCIM DELETE suspends and revokes sessions rather than physically removing the row,
-    so audit history and authorship attribution survive. Documented deviation from a
-    literal reading of RFC 7644 §3.6, made for the same reason `server.py::suspend_user`
-    never hard-deletes a user either."""
+    """A SCIM DELETE suspends and revokes sessions rather than physically removing the
+    row, so audit history and authorship attribution survive -- a documented deviation
+    from a literal reading of RFC 7644 §3.6."""
     tenant_id = _tenant_id(request)
     user = (await db.execute(
         select(DBUser).where(DBUser.id == user_id, DBUser.tenant_id == tenant_id)

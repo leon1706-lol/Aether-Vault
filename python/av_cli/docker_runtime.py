@@ -21,15 +21,9 @@ from pathlib import Path
 
 from . import ui
 
-# Images published by .github/workflows/release.yml (tagged releases) and docker-edge.yml
-# (rolling :edge builds from master) — keep these names in sync with both workflows and with
-# docker/docker-compose.release.yml, which references the same image by name.
-#
-# v1.2.2 engine consolidation: ONE image runs ALL subservices (registry + webui) inside one
-# container dispatched by AV_ENGINE_ROLE (see docker/engine-entrypoint.sh). The historical
-# aether-vault-server/-webui images stay published as aliases of this same engine image for
-# ONE transition cycle — this map deliberately lists only the canonical name, so `av update
-# --docker` pulls the engine and stops pulling the aliases.
+# Images published by .github/workflows/release.yml and docker-edge.yml -- keep these
+# names in sync with both workflows and docker/docker-compose.release.yml. One image runs
+# ALL subservices (registry + webui) dispatched by AV_ENGINE_ROLE (engine-entrypoint.sh).
 RELEASE_IMAGE = "ghcr.io/leon1706-lol/aether-vault-engine:latest"
 RELEASE_IMAGES = {
     "aether-vault-engine": RELEASE_IMAGE,
@@ -156,15 +150,10 @@ def resolve_compose_file(source_root: Path) -> tuple[Path, bool]:
 
 
 def pull_latest_image(compose_file: Path, service: str, image: str) -> tuple[bool, str | None]:
-    """Pulls the given service's image. Returns (changed, old_image_id).
-
-    Compares `docker images -q <image>` before and after the pull — covers both "first pull"
-    (before is empty) and "newer image available" (before/after IDs differ) without depending on
-    parsing `docker compose pull`'s text output. `old_image_id` is returned (non-empty) only when
-    the image actually changed, so the caller can remove the now-dangling old image afterward —
-    surgically, by exact ID, never a blanket prune (this machine has plenty of unrelated images
-    from other projects that must not be touched).
-    """
+    """Pulls the given service's image. Returns (changed, old_image_id). Compares `docker
+    images -q <image>` before and after the pull rather than parsing compose's text
+    output; `old_image_id` lets the caller remove the dangling old image surgically,
+    never a blanket prune."""
     before = _image_id(image)
     try:
         subprocess.run(
@@ -191,13 +180,9 @@ def _image_id(image: str) -> str:
 
 def restart_service(compose_file: Path, service: str) -> bool:
     """Recreates the container against whatever image is now cached locally for it.
-
-    `docker compose up -d` starts the service fresh if it isn't running at all, and recreates
-    it if it is — so this doubles as "start" when called against a stopped stack (e.g. right
-    after `av auth set-token` writes a new .env value before anything has been started yet).
-    Returns False on any failure (Docker unreachable, compose error, timeout) — callers should
-    check this and report a clear message rather than assume the new config is live.
-    """
+    `docker compose up -d` doubles as "start" when called against a stopped stack.
+    Returns False on any failure -- callers should report a clear message rather than
+    assume the new config is live."""
     try:
         proc = subprocess.run(
             ["docker", "compose", "-f", str(compose_file), "up", "-d", service],
@@ -209,14 +194,9 @@ def restart_service(compose_file: Path, service: str) -> bool:
 
 
 def _quote_env_value(value: str) -> str:
-    """Wraps a .env value in double quotes, escaping embedded backslashes/quotes.
-
-    Tokens this project generates itself (secrets.token_urlsafe) never need this — they're
-    plain base64-urlsafe characters. A user-*supplied* token (`av auth set-token <value>`, or
-    the `--token` join-existing path) could contain anything, including `#` (a comment marker
-    in .env files if unquoted) or embedded quotes — always quoting, rather than only when
-    "needed", avoids having to detect every character that would otherwise require it.
-    """
+    """Wraps a .env value in double quotes, escaping embedded backslashes/quotes. A
+    user-supplied token could contain anything (`#`, embedded quotes) -- always quoting
+    avoids having to detect every character that would require it."""
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
@@ -242,13 +222,9 @@ def read_env_token(compose_file: Path, key: str = "AV_API_TOKEN") -> str | None:
 
 def write_env_token(compose_file: Path, token: str | None, key: str = "AV_API_TOKEN") -> None:
     """Read-modify-write the .env file next to `compose_file`, setting/removing `key`.
-
-    Preserves every other line already in the file (other env vars a user may have added) —
-    only the one matching line is replaced (or appended if absent, or dropped if `token` is
-    falsy). `token` must be a non-empty string to be written; an empty/None token removes the
-    line entirely rather than writing `KEY=""`, so `AV_API_TOKEN` being unset (the env var
-    server.py actually reads) stays the single source of truth for "Anonymous mode."
-    """
+    Preserves every other line already in the file. An empty/None token removes the line
+    entirely rather than writing `KEY=""`, so unset stays the single source of truth for
+    "Anonymous mode."""
     env_path = compose_file.parent / ".env"
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
 
@@ -260,13 +236,9 @@ def write_env_token(compose_file: Path, token: str | None, key: str = "AV_API_TO
 
 
 def remove_old_images(image_ids: list[str]) -> None:
-    """Removes specific, exact image IDs left dangling after an update — never a blanket prune.
-
-    Called only after the new container is confirmed running on the new image, so the old image
-    has no running container referencing it anymore. Failures (e.g. still in use, or already
-    removed) are silently ignored — this is best-effort cleanup, not something that should fail
-    the whole update if it can't tidy up.
-    """
+    """Removes specific, exact image IDs left dangling after an update -- never a blanket
+    prune. Called only after the new container is confirmed running; failures are
+    silently ignored, this is best-effort cleanup."""
     for image_id in image_ids:
         if not image_id:
             continue
@@ -275,12 +247,8 @@ def remove_old_images(image_ids: list[str]) -> None:
 
 def check_for_docker_update(source_root: Path) -> DockerUpdateResult:
     """Pulls the latest published images and reports whether anything actually changed.
-
-    Only does real work against the release (image-based) compose file — a dev/source checkout's
-    `build:`-based compose file has nothing meaningful to "pull" (its services aren't tied to a
-    published image tag at all), so that case no-ops with guidance instead of silently pulling
-    unrelated base images.
-    """
+    Only does real work against the release (image-based) compose file -- a dev/source
+    checkout's `build:`-based compose file has nothing meaningful to pull."""
     compose_file, is_dev_checkout = resolve_compose_file(source_root)
     if is_dev_checkout:
         return DockerUpdateResult(
@@ -288,8 +256,8 @@ def check_for_docker_update(source_root: Path) -> DockerUpdateResult:
             message="Running from a source checkout — use `git pull` + `av webui --rebuild` instead.",
         )
 
-    # Fail fast and clearly instead of letting `docker compose pull` hang/time out (up to 600s
-    # per service) against a daemon that isn't even running — found via manual debugging.
+    # Fail fast and clearly instead of letting `docker compose pull` hang against a daemon
+    # that isn't even running.
     docker_state = check_docker_running()
     if docker_state != DockerCheckResult.RUNNING:
         return DockerUpdateResult(
@@ -319,15 +287,9 @@ def ensure_local_backend_running(
     api_token: str | None = None,
 ) -> DockerOnboardingResult:
     """Top-level orchestrator: not running -> image missing -> start -> wait -> connect.
-
-    v1.2.2: the engine is ONE container (aether-vault-engine) running both the
-    registry (:8000) and the webui (:3000), so waiting for the webui URL proves
-    the whole engine came up.
-
-    `api_token`, when the caller already has one configured (`.av/config`'s
-    `remote_api_token`), is passed through to `_open_browser` so the webui never shows its
-    own manual token-entry prompt when launched this way — see `_open_browser`'s docstring.
-    """
+    The engine is ONE container running both the registry and the webui, so waiting for
+    the webui URL proves the whole engine came up. `api_token`, when already configured,
+    is passed through to `_open_browser` so the webui skips its manual token-entry prompt."""
     compose_file, _ = resolve_compose_file(source_root)
 
     ui.print_step("Checking Docker…", status="info")
@@ -383,10 +345,8 @@ def ensure_local_backend_running(
 
 
 def _open_browser(url: str, token: str | None = None) -> None:
-    """Opens the webui. When `token` is given (the CLI already knows it — e.g. set via
-    `av init`/`av auth set-token`), appends it as a one-time `av_token` query param so
-    TokenGate.tsx can save it straight to localStorage and strip it from the URL on load,
-    instead of showing its manual entry prompt. Never shown again after that first load."""
+    """Opens the webui. When `token` is given, appends it as a one-time `av_token` query
+    param so TokenGate.tsx can save it to localStorage and strip it from the URL on load."""
     full_url = url
     if token:
         full_url = f"{url}{'&' if '?' in url else '?'}av_token={urllib.parse.quote(token)}"

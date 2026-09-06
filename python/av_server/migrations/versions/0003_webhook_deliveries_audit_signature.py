@@ -10,9 +10,8 @@ All additive, mirroring models.py:
 - commits.signature: ed25519 signature blob (canonical-form signing) so signatures
   survive clone/pull round trips.
 
-No existing row is touched; legacy healed volumes upgrade zero-touch exactly like fresh
-ones. Databases adopted from the pre-Alembic create_all era get the new columns via the
-startup heal path (_LEGACY_COLUMNS) instead of a replay — see python/av_server/database.py.
+No existing row is touched; legacy volumes get the new columns via the startup heal
+path (_LEGACY_COLUMNS) instead of a replay.
 """
 from typing import Sequence, Union
 

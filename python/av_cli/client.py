@@ -12,10 +12,9 @@ class AuthenticationError(Exception):
 
 
 class RefRaceError(Exception):
-    """v1.2.5: raised when update_ref(expected_hash=...) loses a compare-and-swap race — the
-    server's current commit_hash for the ref no longer matches what this client believed it
-    was advancing from. `.current`/`.expected` carry both hashes so the caller can attribute
-    the race (e.g. to a run id) instead of just reporting a generic push failure."""
+    """Raised when update_ref(expected_hash=...) loses a compare-and-swap race. `.current`/
+    `.expected` carry both hashes so the caller can attribute the race instead of just
+    reporting a generic push failure."""
 
     def __init__(self, ref_name: str, current: str | None, expected: str):
         self.ref_name = ref_name
@@ -60,12 +59,8 @@ class VaultClient:
             pass
 
     def upload_object(self, file_path: Path, sha256_hash: str, known_missing: bool = False) -> bool:
-        """Upload `file_path` as object `sha256_hash`.
-
-        Pass known_missing=True when the caller already confirmed (e.g. via
-        batch_check_objects) that the server doesn't have this hash, to skip the HEAD
-        existence check and go straight to the POST.
-        """
+        """Upload `file_path` as object `sha256_hash`. Pass known_missing=True to skip the
+        HEAD existence check when the caller already confirmed it's missing."""
         url = f"{self.server_url}/api/objects/{sha256_hash}"
         try:
             if not known_missing:
@@ -114,12 +109,8 @@ class VaultClient:
             return False
 
     def batch_check_objects(self, sha256_hashes: list[str]) -> set[str]:
-        """Return the subset of `sha256_hashes` that already exist on the server.
-
-        Single round trip via `/api/sync/batch-objects` instead of one HEAD request per
-        hash — callers uploading many objects (e.g. a commit) should check existence here
-        before falling back to per-object HEAD checks.
-        """
+        """Subset of `sha256_hashes` that already exist on the server, in a single round
+        trip instead of one HEAD request per hash."""
         if not sha256_hashes:
             return set()
         url = f"{self.server_url}/api/sync/batch-objects"
@@ -154,15 +145,9 @@ class VaultClient:
             return None
 
     def update_ref(self, ref_name: str, commit_hash: str, expected_hash: str | None = None) -> bool:
-        """Advances `ref_name` to `commit_hash`.
-
-        `expected_hash` (v1.2.5, optional) requests compare-and-swap: the server only
-        applies the update if its CURRENT commit_hash for this ref equals `expected_hash`.
-        Omitted (default) preserves the pre-1.2.5 unconditional last-write-wins behavior —
-        existing callers are unaffected. On a lost race the server returns 409, which this
-        raises as `RefRaceError` (caught by `_finalize_commit`, never a bare `return False`,
-        so a race is distinguishable from an ordinary network/server failure).
-        """
+        """Advances `ref_name` to `commit_hash`. `expected_hash` (optional) requests
+        compare-and-swap; a lost race (server returns 409) raises `RefRaceError` rather
+        than a bare False, so it's distinguishable from an ordinary network failure."""
         url = f"{self.server_url}/api/refs/{ref_name}"
         payload: dict = {"commit_hash": commit_hash}
         if expected_hash is not None:
@@ -193,7 +178,7 @@ class VaultClient:
             return None
 
     def list_refs(self, project_id: str | None = None) -> dict:
-        """{ref_name: commit_hash} — optionally scoped to one project's `<id>/<branch>` refs."""
+        """{ref_name: commit_hash}, optionally scoped to one project's refs."""
         url = f"{self.server_url}/api/refs"
         params = {"project_id": project_id} if project_id else None
         try:
@@ -207,11 +192,9 @@ class VaultClient:
             return {}
 
     def server_available(self) -> bool:
-        # /api/health is always exempt from auth (server.py's require_token middleware), even
-        # in Protected mode — never raises AuthenticationError, deliberately: this is the one
-        # probe that must keep working with zero credentials so "is the server up at all" stays
-        # answerable before anyone has a token configured (and so restart_service's own
-        # readiness wait, which calls this, never deadlocks against a freshly-protected server).
+        # /api/health is always exempt from auth, deliberately — this probe must keep
+        # working with zero credentials so callers can ask "is the server up" before
+        # anyone has a token configured.
         url = f"{self.server_url}/api/health"
         try:
             resp = self.session.get(url, timeout=2)
@@ -220,12 +203,9 @@ class VaultClient:
             return False
 
     def report_run_policy_outcome(self, run_id: str, decision: str, rule: str | None) -> bool:
-        """Best-effort telemetry (v1.3.0): records a promote()/enforce_policy() decision
-        against the active run so the WebUI's run-detail view can show a policy-outcome
-        badge. Never raises and callers must treat a False return as a no-op — a
-        promotion/merge must never be blocked or fail just because this pointer write
-        couldn't reach the server (offline resilience is sacred; this is reporting, not a
-        gate)."""
+        """Best-effort telemetry: records a promote()/enforce_policy() decision against the
+        active run. Never raises — a False return is a no-op, never a block on the
+        promotion/merge itself."""
         url = f"{self.server_url}/api/runs/{run_id}/policy-outcome"
         try:
             resp = self.session.post(url, json={"decision": decision, "rule": rule})
@@ -270,12 +250,8 @@ class VaultClient:
         return refs
 
     def list_projects(self) -> list[dict]:
-        """Every project that has pushed to this registry.
-
-        Returns the raw `/api/projects` rows: {project_id, project_name, commit_count,
-        last_push}. Empty list on any failure — callers (av clone) surface a clear
-        "project not found" rather than a stack trace.
-        """
+        """Every project that has pushed to this registry: {project_id, project_name,
+        commit_count, last_push} rows. Empty list on any failure."""
         url = f"{self.server_url}/api/projects"
         try:
             resp = self.session.get(url)
@@ -289,13 +265,8 @@ class VaultClient:
 
     def list_commits(self, project_id: str, limit: int = 500, offset: int = 0,
                      include_layers: bool = False) -> dict | None:
-        """One page of a project's commits, newest first (`/api/commits`).
-
-        Returns the raw envelope {commits, total, limit, offset, next_offset} or None on
-        failure. `include_layers=True` attaches each commit's fully-resolved tree so clones
-        are self-sufficient offline — one paginated request stream instead of one
-        `/api/commits/{hash}` round trip per commit.
-        """
+        """One page of a project's commits, newest first. `include_layers=True` attaches
+        each commit's fully-resolved tree so clones are self-sufficient offline."""
         url = f"{self.server_url}/api/commits"
         try:
             resp = self.session.get(url, params={

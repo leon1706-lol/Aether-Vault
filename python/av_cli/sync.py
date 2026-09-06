@@ -1,16 +1,8 @@
-"""Remote-sync primitives behind `av clone` and `av pull`.
-
-Deliberately a separate module (not more main.py): everything here is pure logic over an
-injected `VaultClient`, so the CLI layer stays thin and tests can drive clone/pull against
-fakes without any HTTP. Latency notes baked into the design:
-
-- Project + ref discovery are single round trips (`/api/projects`, `/api/refs?project_id=`).
-- History comes down as paginated `/api/commits?include_layers=true` batches (500/page) —
-  one request stream for the whole project instead of one call per commit, so clones are
-  fully self-sufficient offline afterwards.
-- Object pre-fetch batch-checks every referenced hash in ONE `batch-objects` call, then
-  downloads only what's actually missing, in parallel (network-bound work → small thread
-  pool, mirroring upload_commit_objects' 8-worker pattern).
+"""Remote-sync primitives behind `av clone` and `av pull`. Deliberately a separate module:
+everything here is pure logic over an injected `VaultClient`, so the CLI layer stays thin
+and tests can drive clone/pull against fakes without any HTTP. History comes down as
+paginated batches (one stream for the whole project); object pre-fetch batch-checks every
+hash in one call, then downloads only what's missing, in parallel.
 """
 
 from __future__ import annotations

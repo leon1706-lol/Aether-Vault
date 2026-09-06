@@ -48,11 +48,9 @@ def test_chunk_reuse_ratio_and_dedup_efficiency():
     old = {"ckpt.pt": _entry(chunks=ch_old)}
     new = {"ckpt.pt": _entry("9" * 64, chunks=ch_new)}
     sd = diff_trees(old, new)
-    # v1.2.2: dedup_efficiency = reused / (reused + new); None when no chunks exist.
-    # v1.2.5: `status` is additive and ALWAYS present ("measured"/"no_chunks") — a
-    # stable field .avh/agent consumers can branch on without null-checking the float.
-    # v1.3.0: reused_bytes/new_bytes/dedup_efficiency_bytes are additive siblings — every
-    # chunk in this fixture is size=1, so they match the count-based figures exactly here.
+    # dedup_efficiency = reused / (reused + new); `status` is always present so
+    # consumers can branch without null-checking the float. Every chunk in this fixture
+    # is size=1, so the byte-based figures match the count-based ones exactly here.
     assert sd["chunks"] == {"reused": 6, "new": 2, "dedup_efficiency": 0.75, "status": "measured",
                              "reused_bytes": 6, "new_bytes": 2, "dedup_efficiency_bytes": 0.75}
     empty = diff_trees(None, None)

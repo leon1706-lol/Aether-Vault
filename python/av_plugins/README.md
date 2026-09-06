@@ -11,12 +11,12 @@ artifacts that already exist. Installed via extras:
 - `mlflow.py` - `import_run()` - pulls artifacts and metrics from an MLflow server.
 - `_shared.py` - the seam every plugin is built on: `commit_scoped()` delegates to
   `av_cli.core.commit_scoped_paths()` (direct staging + single-writer commit, no CLI
-  hop, no chdir); `push_pending()` (v1.2.5) delegates to `av_cli.core.flush_pending_push()`
+  hop, no chdir); `push_pending()` delegates to `av_cli.core.flush_pending_push()`
   the same way, for the training-end flush — every framework's staging AND push are
-  zero-chdir, zero-CLI-hop as of v1.2.5. The deprecated `run_av()`/`build_metric_args()`
-  shims' one-release grace window (VERSIONING.md) closed at the v1.3.0 MINOR boundary;
-  both are removed from this package (the test suite keeps its own private `_run_av()`
-  CLI-invocation helper for parity tests, unrelated to this production seam).
+  zero-chdir, zero-CLI-hop. The deprecated `run_av()`/`build_metric_args()` shims'
+  one-release grace window (VERSIONING.md) has closed; both are removed from this
+  package (the test suite keeps its own private `_run_av()` CLI-invocation helper for
+  parity tests, unrelated to this production seam).
 
 ## Contracts
 
@@ -27,7 +27,7 @@ artifacts that already exist. Installed via extras:
   human-staged files keep their pending state, unchanged re-imports stay
   "Nothing to commit" no-ops, missing paths are skipped silently (Lightning fires
   `on_save_checkpoint` before writing - the next save picks stragglers up).
-- AV_RUN_ID flows through `av_cli.core.resolve_run_id()` (v1.2.5: explicit arg > env >
+- AV_RUN_ID flows through `av_cli.core.resolve_run_id()` (explicit arg > env >
   `.av/run.json` state — the single precedence rule shared with `av commit`/`av watch`)
   exactly like CLI commits; parity between seam, SDK, and CLI payload shape/schema, run
   linkage, env_snapshot_id, queued semantics, and error codes is pinned by
@@ -59,8 +59,8 @@ staging/commit/push logic. Using `transformers.py` as the template:
    functions directly or shell out to the CLI.
 3. **A training-end flush**: call `_shared.push_pending(repo_root)` from whatever
    end-of-training hook your framework offers (mirrors `lightning.py`/`transformers.py`'s
-   `on_train_end`). `run_av()` no longer exists in this package (removed at the v1.3.0
-   MINOR boundary) — never shell out to the CLI.
+   `on_train_end`). `run_av()` no longer exists in this package — never shell out to
+   the CLI.
 4. **A symmetric `import_*()` backfill function** for artifacts that already exist
    outside a live training run (mirrors `mlflow.py::import_run()` or the
    `import_checkpoint()` functions in `lightning.py`/`transformers.py`) — same

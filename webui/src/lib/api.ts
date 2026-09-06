@@ -3,10 +3,8 @@
 const API_BASE =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-// "Protected" mode support — see TokenGate.tsx. The token lives in localStorage (not a build-
-// time env var) because it's set at runtime via `av auth set-token`/`av init`, long after the
-// webui image has already been built and pulled from GHCR for real pip-install users — baking
-// it in at build time would mean every token change requires rebuilding the image.
+// "Protected" mode support — see TokenGate.tsx. The token lives in localStorage, not a
+// build-time env var, since it's set at runtime long after the webui image is built.
 export const API_TOKEN_STORAGE_KEY = "aether-vault:api-token";
 
 export function getStoredApiToken(): string | null {
@@ -153,16 +151,14 @@ export interface Run {
   // v1.2.5: opt-in pointer to a published .avh context-memory object (`av handoff
   // --publish`) — null unless the repo owner explicitly published one.
   avh_object_id?: string | null;
-  // v1.3.0 (todo.md item 7): the most recent `av promote`/merge policy decision made for
-  // this run's active commit (POST /api/runs/{id}/policy-outcome) — null until the first
-  // decision for this run.
+  // The most recent `av promote`/merge policy decision made for this run's active
+  // commit; null until the first decision for this run.
   policy_outcome?: { decision: "allow" | "deny"; rule: string | null; at: string } | null;
 }
 
-// v1.2.5: server-computed semantic summary shape returned by GET /api/runs/{id}/summary
-// — a smaller sibling of webui/src/lib/runDetail.ts's client-side TreeDiffSummary (no
-// chunk-dedup/layer-movement fields; those stay a CLI/`.avh` concern per the Semantic
-// Diff Contract). null when the run has fewer than two linked commits with tree data.
+// Server-computed semantic summary shape returned by GET /api/runs/{id}/summary — a
+// smaller sibling of runDetail.ts's client-side TreeDiffSummary (no chunk-dedup/
+// layer-movement fields). null when the run has fewer than two linked commits with tree data.
 export interface RunServerSemanticSummary {
   files: { added: string[]; removed: string[]; changed: string[] };
   totals: { bytes_before: number; bytes_after: number };
@@ -190,10 +186,9 @@ export interface RunSummary {
   avh_object_id: string | null;
 }
 
-// v1.2.5: ONE request for the run-detail view (lineage + linked commits + a
-// server-computed semantic summary) — replaces the previous fetchRun() + N
-// fetchCommit() fan-out. webui/src/lib/runDetail.ts's pure client-side functions stay
-// as the fallback/test surface and are still exercised by RunsPanel's own tests.
+// One request for the run-detail view (lineage + linked commits + a server-computed
+// semantic summary); runDetail.ts's pure client-side functions stay as the
+// fallback/test surface.
 export async function fetchRunSummary(runId: string): Promise<RunSummary> {
   return fetchJSON<RunSummary>(`/api/runs/${encodeURIComponent(runId)}/summary`);
 }
@@ -206,13 +201,9 @@ export interface RunMetricPoint {
   linked_at: string | null;
 }
 
-// v1.3.0 (todo.md item 7): the FULL per-commit metric series for a run, oldest-linked-
-// first — GET /api/runs/{id}/summary's inline `commits` is capped at 20 and newest-first
-// (bounded response size for the common case); this pages through the uncapped
-// GET /api/runs/{id}/metrics endpoint fully, for a run-detail chart that shouldn't lose
-// history past the cap. `maxPoints` bounds how much this will ever fetch/hold in memory
-// for one run (a runaway run with tens of thousands of linked commits must not hang the
-// tab) — matches this file's other defensive caps (e.g. CHECKPOINT_FETCH_LIMIT's sibling).
+// The full per-commit metric series for a run, oldest-linked-first, paging through the
+// uncapped GET /api/runs/{id}/metrics endpoint. `maxPoints` bounds memory use so a
+// runaway run with tens of thousands of linked commits can't hang the tab.
 export async function fetchRunMetrics(
   runId: string,
   { pageLimit = 200, maxPoints = 5000 }: { pageLimit?: number; maxPoints?: number } = {}
@@ -242,8 +233,8 @@ export async function fetchRuns(
   return data.runs ?? [];
 }
 
-// v1.2.2 Run detail: single run incl. linked commit hashes (the panel composes
-// lineage/metrics/semantic summary client-side from this + fetchCommit — no new endpoint).
+// Single run incl. linked commit hashes; the panel composes lineage/metrics/semantic
+// summary client-side from this + fetchCommit.
 export async function fetchRun(runId: string): Promise<Run> {
   return fetchJSON<Run>(`/api/runs/${encodeURIComponent(runId)}`);
 }
@@ -282,10 +273,9 @@ export interface CommitListResponse {
   next_offset: number | null;
 }
 
-// Fetch the most recent commits in a SINGLE request. The server already returns them
-// newest-first with parent_hash for graph edges, so there is no need to walk the parent
-// chain one commit at a time (the previous fetchCommitsForBranches did N sequential
-// round-trips — a request waterfall that scaled with history length).
+// Fetch the most recent commits in a single request. The server already returns them
+// newest-first with parent_hash for graph edges, so there's no need to walk the parent
+// chain one commit at a time.
 export async function fetchCommits(limit = 40, projectId?: string | null): Promise<Commit[]> {
   const qs = projectId ? `&project_id=${encodeURIComponent(projectId)}` : "";
   const data = await fetchJSON<CommitListResponse>(`/api/commits?limit=${limit}${qs}`);
@@ -293,11 +283,8 @@ export async function fetchCommits(limit = 40, projectId?: string | null): Promi
 }
 
 // Same endpoint as fetchCommits, but with ?include_layers=true — returns full per-commit
-// trees (including split-safetensors layer data) in this ONE request, instead of the old
-// WeightDiffPanel pattern of fetchCommits() + N parallel fetchCommit() calls (see
-// development/Probleme.md's now-fixed "checkpoint list resolves N commits via N parallel
-// requests" entry). Capped lower than fetchCommits' default since each commit's response is
-// much heavier with its full tree attached.
+// trees in one request. Capped lower than fetchCommits' default since each commit's
+// response is much heavier with its full tree attached.
 export async function fetchCommitsWithLayers(limit = 30, projectId?: string | null): Promise<Commit[]> {
   const qs = projectId ? `&project_id=${encodeURIComponent(projectId)}` : "";
   const data = await fetchJSON<CommitListResponse>(
@@ -318,18 +305,13 @@ export async function fetchCommitsPage(
   return fetchJSON<CommitListResponse>(`/api/commits?limit=${limit}&offset=${offset}${qs}`);
 }
 
-// projectId is optional — when unset, the dashboard shows commits/refs from every project
-// on this shared registry (the pre-existing behavior), exactly as before the Projects tab
-// was added. Stats stay unscoped: they describe the shared object store, which is
-// deliberately deduplicated *across* projects (see development/Probleme.md).
+// projectId is optional — when unset, the dashboard shows commits/refs from every
+// project on this shared registry. Stats stay unscoped: they describe the shared object
+// store, which is deliberately deduplicated across projects.
 export async function fetchDashboardData(projectId?: string | null): Promise<DashboardData> {
-  // v1.3.0: each sub-fetch already caught its own rejection (a safe empty fallback, so
-  // one flaky endpoint doesn't blank the whole dashboard) — but that meant NOTHING ever
-  // reached the outer try/catch below, so `error` stayed null even on a real 401/500/
-  // network failure. A genuinely empty registry and an unreachable one were then
-  // indistinguishable to every panel reading this data. Each fetch below now records
-  // its own failure reason instead of silently discarding it, and `error` is set
-  // whenever at least one sub-fetch actually failed.
+  // Each sub-fetch catches its own rejection (a safe empty fallback so one flaky
+  // endpoint doesn't blank the whole dashboard) but must still record the failure, or a
+  // genuinely empty registry and an unreachable one would look identical to every panel.
   const failures: string[] = [];
   const describe = (label: string) => (err: unknown) => {
     failures.push(`${label}: ${err instanceof Error ? err.message : String(err)}`);
@@ -371,10 +353,8 @@ export async function fetchDashboardData(projectId?: string | null): Promise<Das
 }
 
 // ---------------------------------------------------------------------------
-// RSI control plane (v1.3.1, RSI R6, WP-38): improver lineage, self-edits, canaries,
-// and the anomaly feed — the WebUI counterparts of `av improver`/`av canary`/the
-// server-side anomaly detectors (see development/architecture.md's "Improver Artifact",
-// "Capability Canary", and "Anomaly Alerts" contract sections).
+// RSI control plane: improver lineage, self-edits, canaries, and the anomaly feed — the
+// WebUI counterparts of `av improver`/`av canary`/the server-side anomaly detectors.
 // ---------------------------------------------------------------------------
 
 export interface ImproverVersion {

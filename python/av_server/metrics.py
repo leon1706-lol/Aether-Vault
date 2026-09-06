@@ -1,17 +1,9 @@
-"""In-process Prometheus text-exposition metrics (v1.3.3, WP-35) — hand-rolled, no new
-dependency, the same judgment call `rate_limit.py` already made for its own
-fixed-window limiter rather than pulling in a library.
-
-**Per-process only, honestly**, like the in-process rate limiter's own documented
-N-replica caveat: a real multi-replica deployment scrapes each replica independently
-(Prometheus's normal multi-target model) — this file makes no attempt to aggregate
-across replicas, and `docs/slo.md` says so plainly rather than implying otherwise.
-
-Plain module-level dicts, no lock: every mutation here happens inside a single
-`await`-free code path (the metrics middleware's synchronous bookkeeping around
-`call_next`), so asyncio's single-threaded interleaving makes each increment atomic —
-the exact same reasoning `rate_limit.py`'s own module docstring already established for
-this codebase.
+"""In-process Prometheus text-exposition metrics (v1.3.3) — hand-rolled, no new
+dependency, matching `rate_limit.py`'s own judgment call. **Per-process only**: a
+multi-replica deployment scrapes each replica independently, no cross-replica
+aggregation attempted. Plain module-level dicts, no lock: every mutation happens inside
+a single `await`-free code path, so asyncio's single-threaded interleaving makes each
+increment atomic.
 """
 from __future__ import annotations
 
@@ -28,8 +20,7 @@ _REQUEST_DURATION_COUNT: dict[tuple[str, str], int] = {}
 # is diagnostic instrumentation, not a tuned SLO dashboard input.
 DURATION_BUCKETS: tuple[float, ...] = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
 # (method, path_template, bucket_or_inf) -> count of observations <= that bucket --
-# incremented for EVERY qualifying bucket at record time, so each entry already holds
-# its final cumulative value; render time never re-accumulates (that would double count).
+# incremented for every qualifying bucket at record time; render time never re-accumulates.
 _REQUEST_DURATION_BUCKETS: dict[tuple[str, str, float], int] = {}
 _TENANT_REQUEST_COUNTS: dict[str, int] = {}
 

@@ -1,11 +1,7 @@
-"""v1.3.0 (todo.md item 30): the `gate` job's checks, factored out of release.yml so
-they're unit-testable (tests/test_release_gate.py) instead of living only as bash in a
-workflow file no test suite ever exercises. Every publish job in release.yml (`publish-pypi`,
-`github-release`, `build-and-push-docker`) depends on the `gate` job succeeding — this
-script IS that job's substance. Read-only toward PRs by construction: every check here
-only reads state (git, the filesystem, `gh api`) and exits non-zero to block the release;
-none of them ever merge, approve, open, or push anything (see tests/test_ci_policy.py's
-standing no-bots/no-auto-merge guard, which this script must never violate).
+"""The `gate` job's checks, factored out of release.yml so they're unit-testable
+(tests/test_release_gate.py). Every publish job in release.yml depends on this script's
+success; it is read-only by construction -- every check only reads state and exits
+non-zero to block the release, never merges/approves/opens/pushes anything.
 
 Usage: python scripts/release_gate.py --tag vX.Y.Z [--repo-root PATH] [--skip-gh-check]
                                         [--skip-tests] [--report PATH]
@@ -42,11 +38,9 @@ def check_perf_history_has_tag(repo_root: Path, version: str) -> tuple[bool, str
 
 
 def check_changelog_has_signed_off_entry(repo_root: Path) -> tuple[bool, str]:
-    """The MOST RECENT `## Phase N` entry in `development/CHANGELOG.md` must end with the
-    literal `Essential-Tasks: signed off` marker. This project APPENDS new entries at the
-    BOTTOM of the file (Phase 1 is the first `## ` header, the newest phase is the LAST) —
-    so "most recent" means `headers[-1]`, not `headers[0]` (verified against the real file
-    before writing this, not assumed from a generic "changelog" convention)."""
+    """The most recent `## Phase N` entry in `development/CHANGELOG.md` must end with the
+    literal `Essential-Tasks: signed off` marker. New entries are appended at the bottom
+    of the file, so "most recent" means `headers[-1]`, not `headers[0]`."""
     path = repo_root / "development" / "CHANGELOG.md"
     if not path.exists():
         return False, f"{path} does not exist"
@@ -66,14 +60,9 @@ def check_changelog_has_signed_off_entry(repo_root: Path) -> tuple[bool, str]:
 
 
 def check_benchmarks_captured_sha_is_an_ancestor(repo_root: Path, tag: str) -> tuple[bool, str]:
-    """`development/BENCHMARKS.md`'s `**Captured:** ..., Aether-Vault @ \\`<sha>\\`, ...`
-    line must name a real commit that's an ancestor of (or equal to) the tag being
-    released — proving the captured numbers genuinely predate this release rather than
-    being stale from an unrelated branch or, worse, a commit that doesn't even exist in
-    this release's history. This is a proxy for "current", not a freshness guarantee by
-    itself (a very old but still-ancestor sha would still pass on its own — see the
-    stricter MINOR-release check below, which this one feeds into) — combined with the
-    perf-history.json check above, which DOES pin down the actual release version."""
+    """`development/BENCHMARKS.md`'s captured commit must be a real ancestor of (or equal
+    to) the tag being released -- proving the numbers genuinely predate this release. A
+    proxy for "current", not freshness by itself; see the stricter MINOR-release check below."""
     path = repo_root / "development" / "BENCHMARKS.md"
     if not path.exists():
         return False, f"{path} does not exist"
@@ -99,10 +88,8 @@ def _parse_semver(tag: str) -> tuple[int, ...]:
 
 
 def _previous_tag(repo_root: Path, tag: str) -> str | None:
-    """The most recent tag reachable from `tag`'s own parent — i.e. "whatever was tagged
-    right before this one". None when `tag` is the very first tag in the repo (nothing
-    to compare against, so every freshness/sync check below treats that as vacuously ok
-    rather than failing a release that has no predecessor to be out of sync with)."""
+    """Whatever was tagged right before this one. None when `tag` is the repo's first tag,
+    which every freshness/sync check below treats as vacuously ok."""
     result = subprocess.run(
         ["git", "describe", "--tags", "--abbrev=0", f"{tag}^"],
         cwd=repo_root, capture_output=True, text=True,
@@ -118,16 +105,10 @@ def _is_minor_or_above(repo_root: Path, tag: str) -> bool:
 
 
 def check_benchmarks_fresh_on_minor(repo_root: Path, tag: str) -> tuple[bool, str]:
-    """todo.md item 22: on a MINOR-or-above release, the ancestor check above ISN'T
-    enough on its own — an ancient-but-still-ancestor captured sha (say, from three
-    releases ago) passes it trivially. This additionally requires the captured commit to
-    be STRICTLY NEWER than whatever the PREVIOUS tag's own benchmarks were captured
-    against (i.e. re-measured at least once since then), OR an explicit
-    `Benchmarks: unchanged` attestation line in this release's own CHANGELOG entry for
-    the cases where nothing perf-relevant actually changed. A PATCH-only release is
-    exempt entirely — VERSIONING.md's own bump table already scopes PATCH to
-    "bug fixes, perf, docs... — safe", not something this gate should force a
-    re-benchmark for."""
+    """On a MINOR-or-above release, the ancestor check above isn't enough alone -- an
+    ancient-but-still-ancestor sha passes it trivially. This additionally requires the
+    captured commit to be strictly newer than the previous tag's own benchmarks, or an
+    explicit `Benchmarks: unchanged` CHANGELOG attestation. PATCH-only releases are exempt."""
     if not _is_minor_or_above(repo_root, tag):
         return True, f"{tag} is PATCH-only (no MINOR/MAJOR change) — benchmark freshness not required"
 
@@ -165,15 +146,11 @@ def check_benchmarks_fresh_on_minor(repo_root: Path, tag: str) -> tuple[bool, st
 
 
 def check_changelog_versioning_sync(repo_root: Path, tag: str) -> tuple[bool, str]:
-    """todo.md item 21: refuse a tag if CHANGELOG.md/VERSIONING.md are out of sync with
-    it. (1) the newest CHANGELOG phase entry's own header must mention this release's
-    version. (2) on a MINOR-or-above release, VERSIONING.md must have a matching
-    '## v<version> additive surfaces' section — this repo's own established convention
-    (see the real v1.3.1/v1.3.2/v1.3.3 sections), keyed to the FULL tag version, not just
-    major.minor: this project has repeatedly shipped genuinely additive surfaces under a
-    patch-position version number (VERSIONING.md's own documented v1.3.1 policy
-    exception), so every MINOR-or-above tag gets its own section by established practice,
-    not one shared per major.minor."""
+    """Refuse a tag if CHANGELOG.md/VERSIONING.md are out of sync with it: the newest
+    CHANGELOG entry's header must mention this release's version, and on a MINOR-or-above
+    release VERSIONING.md must have a matching '## v<version> additive surfaces' section,
+    keyed to the full tag version since this project has shipped additive surfaces under
+    a patch-position version before."""
     changelog_path = repo_root / "development" / "CHANGELOG.md"
     if not changelog_path.exists():
         return False, f"{changelog_path} does not exist"
@@ -204,11 +181,9 @@ def check_changelog_versioning_sync(repo_root: Path, tag: str) -> tuple[bool, st
 
 
 def _fetch_required_contexts_live(repo: str, gh_token: str | None) -> list[str] | None:
-    """The live `required_status_checks.contexts` list on `master` — the actual set
-    branch protection enforces right now. Returns None (not an empty list — a real
-    "master requires zero checks" is implausible and would otherwise silently make
-    `check_required_checks_green` vacuously pass) on any failure, so the caller falls
-    back to `.github/required-checks.txt`."""
+    """The live `required_status_checks.contexts` list on `master`. Returns None (not an
+    empty list, which would make the caller vacuously pass) on any failure, so the caller
+    falls back to `.github/required-checks.txt`."""
     import urllib.error
     import urllib.request
 
@@ -245,13 +220,9 @@ def _required_contexts(repo_root: Path, repo: str, gh_token: str | None) -> tupl
 
 def check_required_checks_green(repo: str, tag: str, gh_token: str | None,
                                  repo_root: Path) -> tuple[bool, str]:
-    """v1.3.4 (todo.md item 20, W4a): the ORIGINAL version of this check
-    (`check_tagged_commit_tests_green`) filtered check-runs by `"test" in name.lower()` —
-    which silently ignored `ha-drill`, `e2e-suite`, `chaos-drills`, `helm-lint`,
-    `e2e-engine-smoke`, `package-build`, every `security.yml` job, and everything CodeQL
-    adds. A release could ship with any of those genuinely red and this check would still
-    pass. Now requires EVERY context the live (or fallback) required-checks list names,
-    not a name-substring guess. Read-only (GET only) — never touches a PR."""
+    """Requires EVERY context the live (or fallback) required-checks list names to be
+    green, not a name-substring guess (an earlier version filtered by "test" in the name
+    and silently ignored several real CI jobs). Read-only (GET only)."""
     import urllib.error
     import urllib.request
 
@@ -305,9 +276,8 @@ def run_stack_free_suite(repo_root: Path) -> tuple[bool, str]:
 
 
 def write_report(report_path: Path, tag: str, checks: list[tuple[str, tuple[bool, str]]]) -> None:
-    """todo.md item 23: the Essential-Tasks/gate outcome as an ARTIFACT, not just a claim
-    in a workflow log — attached to the GitHub Release itself (github-release job) so the
-    sign-off is evidence a later reader can actually open, not just trust."""
+    """The gate outcome as an artifact attached to the GitHub Release, not just a claim
+    in a workflow log."""
     import datetime
 
     lines = [
@@ -341,7 +311,7 @@ def main() -> int:
     parser.add_argument("--skip-tests", action="store_true",
                         help="Skip re-running the stack-free suite (it's what CI's own `test` job just ran — for a fast local dry run)")
     parser.add_argument("--report", type=Path, default=None,
-                        help="Write a Markdown report of every check's outcome to this path (todo.md item 23)")
+                        help="Write a Markdown report of every check's outcome to this path")
     args = parser.parse_args()
 
     import os

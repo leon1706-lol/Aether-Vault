@@ -1,47 +1,44 @@
 # AGENTS.md — guidance for AI coding agents working in this repository
 
-You are working on **Aether-Vault**, a high-performance artifact version-control system
-for ML (models/datasets) with an autonomous-training focus. Read this before changing
-anything. `Aether-vault-Obsidian-Vault/Essential-Tasks.md` is the wrap-up checklist this
-file defers to — treat it as part of this contract, not optional extra credit.
+**Aether-Vault**: high-performance artifact version-control for ML (models/datasets),
+autonomous-training focus. Read this before changing anything.
+`Aether-vault-Obsidian-Vault/Essential-Tasks.md` is the wrap-up checklist this file
+defers to — part of the contract, not optional.
 
 ## Before touching anything
 
-- **`todo.md`** (repo root) — the owner's live planning canvas: current objective(s) and
-  personal notes, in plain language. Check it first — it's the closest thing to a standing
-  work order in this repo. It is not a generated or permanent backlog; it gets rewritten or
-  cleared as objectives change, so don't treat its absence of content as "nothing to do" —
-  ask, or fall back to `development/CHANGELOG.md`'s most recent phase for context.
-- **Sub-readmes** — every folder has a short one; read the one for whatever you're touching.
-- **`development/*.md`** — read all of them; they hold the structure/plan context.
-- **`Aether-vault-Obsidian-Vault/`** — a generated dependency/function graph for orientation.
-  Cross-check against source before relying on it; it can be stale.
+- **`todo.md`** (repo root) — owner's live planning canvas, current objective(s) in plain
+  language. Check first. Not a generated/permanent backlog — gets rewritten/cleared as
+  objectives change, so an empty file isn't "nothing to do": ask, or fall back to
+  `development/CHANGELOG.md`'s latest phase for context.
+- **Sub-readmes** — every folder has one; read it before touching that folder.
+- **`development/*.md`** — structure/plan context, read all of them.
+- **`Aether-vault-Obsidian-Vault/`** — generated dependency/function graph for
+  orientation; can be stale, cross-check against source.
 
 ## Non-negotiables
 
-1. **Single commit writer.** Every commit — CLI, SDK, watch, plugins — must funnel
-   through `python/av_cli/core.py::commit_staged()` → `_finalize_commit()`. Never build
-   a second payload/persist path.
-2. **Single restore/materialization path.** Working-tree writes go through
-   `_materialize_tree()`.
-3. **Offline resilience is sacred.** Any network failure must queue work
-   (`.av/pending_push`), never lose it. `unreachable_queued` = safe, not an error.
-4. **Contracts are versioned.** JSON envelope shapes, exit codes 10–20 + 22 (17-20 added
-   v1.3.1, 22 added v1.3.2 — 21 is reserved, not yet registered; see docs/for-agents.md),
-   `.avh` (`avh_version`), and HTTP payloads are user-facing contracts. Additive
-   changes only, with a MINOR bump + CHANGELOG entry.
-5. **Nothing is done until it's verified.** New behavior ships with its own tests
-   (`pytest tests/ -q` green) *and* a manual, real-CLI repro in a scratch repo outside
-   this checkout — unit tests alone have repeatedly missed real bugs here. Full sequence
-   — manual debug → tests → docs → vault regen → sanity check — lives in
-   `Aether-vault-Obsidian-Vault/Essential-Tasks.md`; run it before declaring done.
+1. **Single commit writer.** Every commit (CLI, SDK, watch, plugins) funnels through
+   `python/av_cli/core.py::commit_staged()` → `_finalize_commit()`. No second payload/persist path.
+2. **Single restore path.** Working-tree writes go through `_materialize_tree()`.
+3. **Offline resilience is sacred.** A network failure queues work (`.av/pending_push`),
+   never loses it. `unreachable_queued` = safe, not an error.
+4. **Contracts are versioned.** JSON envelope shapes, exit codes 10–22 (17-20 are the RSI
+   additions, 22 is tenancy, 21 is reserved-then-activated — see `docs/for-agents.md`),
+   `.avh` (`avh_version`), and HTTP payloads are user-facing. Additive only, MINOR bump +
+   CHANGELOG entry.
+5. **Nothing is done until verified.** New behavior needs its own tests (`pytest tests/ -q`
+   green) *and* a manual real-CLI repro in a scratch repo outside this checkout — unit
+   tests alone have missed real bugs here before. Full sequence (debug → tests → docs →
+   vault regen → sanity check) is in `Aether-vault-Obsidian-Vault/Essential-Tasks.md`; run
+   it before declaring done.
 
 ## Where things live
 
 | Area | Path |
 |---|---|
 | CLI commands | `python/av_cli/cmd_*.py` (registered in `main.py`) |
-| Shared logic | `python/av_cli/core.py` (incl. `commit_staged`, envelope helpers, exit codes) |
+| Shared logic | `python/av_cli/core.py` (`commit_staged`, envelope helpers, exit codes) |
 | Semantic diffs | `python/av_cli/semdiff.py` |
 | Agent SDK | `python/av_sdk/` (`from av_sdk import Repo`) |
 | Server | `python/av_server/server.py`, models in `models.py`, migrations in `migrations/versions/` |
@@ -49,18 +46,25 @@ file defers to — treat it as part of this contract, not optional extra credit.
 ## Conventions
 
 - Commands: click, module-per-feature, lazy imports inside function bodies.
-- Agent-facing output: use `emit_json/fail` from core; never print human text in json mode.
+- Agent-facing output: `emit_json/fail` from core; never print human text in json mode.
 - DB changes: append an Alembic revision (`0003…`), update `test_migrations.py` heads.
-- Docs move with code: README CLI reference, architecture.md contract section,
-  infrastructure.md env vars, CHANGELOG.md phase entry, Probleme.md only for real bugs found.
+- Docs move with code: README CLI reference, architecture.md contracts,
+  infrastructure.md env vars, CHANGELOG.md phase entry, Probleme.md only for real bugs.
+- **Comments: short and precise.** A comment earns its place by telling a
+  reader something the code can't — a non-obvious *why*, an invariant, a real gotcha.
+  Useless (restates the code, or narrates process — "found live", "see Probleme.md #N")
+  → delete; that history belongs in git log/CHANGELOG/Probleme.md. Somewhat useful →
+  state the fact in ≤2 sentences. Genuinely important (safety/security/concurrency
+  invariants, a bug class that recurs without the reasoning, a cross-file contract) →
+  keep in full — use judgment, don't cap by rule. Applies to every non-`.md` file;
+  never touch a vendored file's own comments (e.g. `src/json.hpp`).
 
 ---
 
 ## Agent contracts (stable, versioned)
 
-Aether-Vault treats agents as first-class operators. Everything below is a stable,
-versioned contract: breaking changes follow the same MINOR-grace policy as the CLI
-(see VERSIONING.md).
+Agents are first-class operators. Everything below is a stable, versioned contract —
+breaking changes follow the CLI's MINOR-grace policy (see VERSIONING.md).
 
 ### JSON envelopes + exit codes
 
@@ -71,45 +75,41 @@ Prefix any agent-surface command with `--output json`:
  "meta": {"command": "commit", "version": "1.2.0"}}
 ```
 
-Failures return `ok:false` with `error.code ∈ {not_a_repo, nothing_to_commit,
-auth_failed, unreachable_queued, merge_conflict, validation, policy_denied}` and exit
-codes `10–16` respectively (`0` ok, `2` usage). `unreachable_queued` means the work is
-SAFE — persisted locally and queued for `av push`. v1.3.1 adds `budget_exhausted` (17,
-`av budget consume` over a limit), `frozen` (18, `av freeze on` pauses promotions/
-self-edits), `review_required` (19, `av improver promote`'s reviewer gate denied), and
-`scope_denied` (20, a server-side token-scope 403) to the same registry. v1.3.2 adds
-`tenant_denied` (22, a credential authenticated fine but doesn't own the target
-`project_id` — `AV_TENANCY_ENFORCE=1` deployments only). v1.3.3 activates `login_required`
-(21, `av login`'s SSO device-code flow timed out with no approval — distinct from
-`auth_failed`, which is a *rejected*, not missing, credential). See `docs/for-agents.md`'s
-full table.
+Failures: `ok:false`, `error.code ∈ {not_a_repo, nothing_to_commit, auth_failed,
+unreachable_queued, merge_conflict, validation, policy_denied}`, exit codes `10–16`
+respectively (`0` ok, `2` usage). `unreachable_queued` = safe, persisted locally and
+queued for `av push`. RSI additions: `budget_exhausted` (17, `av budget consume` over a
+limit), `frozen` (18, `av freeze on` pauses promotions/self-edits), `review_required`
+(19, `av improver promote`'s reviewer gate denied), `scope_denied` (20, server-side
+token-scope 403). `tenant_denied` (22, credential valid but doesn't own the target
+`project_id` — `AV_TENANCY_ENFORCE=1` only). `login_required` (21, `av login`'s SSO
+device-code flow timed out — distinct from `auth_failed`, a *rejected* not missing
+credential). Full table: `docs/for-agents.md`.
 
-Supported commands: every CLI command supports `--output json` except `watch`
-(streams one envelope per auto-commit — NDJSON, not one envelope per invocation) and the
-dev-only `test`/`benchmark`/`webui` (see `docs/contracts.md`'s leakage-exemption list for
-why). Originally-agent-facing core: status · add · commit · push · diff · run
+Every CLI command supports `--output json` except `watch` (NDJSON — one envelope per
+auto-commit, not per invocation) and the dev-only `test`/`benchmark`/`webui` (see
+`docs/contracts.md`'s exemption list). Core: status · add · commit · push · diff · run
 start/finish/list/show · context note/show/validate/export/search · env snapshot/replay ·
 policy set/list/remove/promote --dry-run · registry export/keygen/attest/verify · auth
-doctor/rotate · audit list/export/prune --dry-run. **v1.3.1 RSI control plane** (see
+doctor/rotate · audit list/export/prune --dry-run. **RSI control plane** (see
 `docs/rsi-operator-guide.md`): improver register/propose/review/apply/rollback/promote/
 lineage · canary register/run/status · freeze on/off/status · incident rollback · eval
 register/freeze/score/reveal/adapter · task propose/accept/reject · plan create/attach/
 validate · budget set/consume · scheduler queue · review approve/reject · critique add/
 resolve/waive · lineage link/show · search runs · strategy add/search · lessons update/
-show · blackboard post/resolve · sandbox run/status/cancel/logs/queue ·
-replay-actions · tools manifest show/set/verify · policy pack publish/show/log/verify.
-**v1.3.2 enterprise readiness** (see `docs/enterprise-operator-guide.md`): tenant
+show · blackboard post/resolve · sandbox run/status/cancel/logs/queue · replay-actions ·
+tools manifest show/set/verify · policy pack publish/show/log/verify. **Enterprise
+readiness** (see `docs/enterprise-operator-guide.md`): tenant
 create/list/show/update/suspend · user list/show/create/suspend/delete · role
 list/show/create/grant/revoke · token create/list/revoke · admin backup
-create/verify/restore. **v1.3.3** (SSO/SCIM/audit integrity): login/logout/whoami · idp
-add/list/show/test/remove · scim status/token create/revoke · audit verify. A generic
-anti-leakage test (`tests/test_contract_matrix.py`) walks every command and asserts
-`--output json` never mixes human text with the envelope — see that file before adding a
-new command.
+create/verify/restore. **SSO/SCIM/audit integrity**: login/logout/whoami · idp
+add/list/show/test/remove · scim status/token create/revoke · audit verify.
+`tests/test_contract_matrix.py` walks every command asserting `--output json` never
+mixes human text with the envelope — check it before adding a new command.
 
 ### Python SDK — `from av_sdk import Repo`
 
-Drives the same single commit path as the CLI; returns the same dict payloads.
+Drives the same single commit path as the CLI; same dict payloads.
 
 ```python
 from av_sdk import Repo
@@ -127,10 +127,9 @@ Errors raise `SDKError` with `.code/.message/.exit_code`.
 
 ### Runs & lineage
 
-`av run start` → every commit is filed under the run server-side (lazy-created if the
-server hasn't seen it yet). `AV_RUN_ID=<id>` joins ANY process' commits with zero
-integration. Lineage: `--parent <run-id>`; code provenance captured automatically
-(git remote/sha/dirty) when available.
+`av run start` → every commit files under the run server-side (lazy-created if unseen).
+`AV_RUN_ID=<id>` joins any process' commits with zero integration. Lineage: `--parent
+<run-id>`; code provenance (git remote/sha/dirty) captured automatically when available.
 
 ### Event stream + webhooks
 
@@ -139,24 +138,23 @@ curl "http://localhost:8000/api/events?since=0&project_id=…&kinds=commit&wait=
 ```
 
 Ordered, resumable by event `id`; long-poll with `wait`. Webhooks: POST signed
-`X-AV-Signature: hex(hmac-sha256(secret, body))`; manage via the
-`av webhooks add/list/remove/test` CLI (v1.2.1). Since v1.2.2 failed deliveries persist
-in a server-side ledger with automatic retry + dead-lettering — observe via
-`GET /api/admin/webhook-deliveries`.
+`X-AV-Signature: hex(hmac-sha256(secret, body))`; manage via `av webhooks
+add/list/remove/test`. Failed deliveries persist in a server-side ledger with automatic
+retry + dead-lettering — observe via `GET /api/admin/webhook-deliveries`.
 
-### Signed commits + audit (v1.2.2)
+### Signed commits + audit
 
 `av registry keygen` (needs `[sign]`) → commits auto-signed (ed25519 over the canonical
-payload; the signature rides clone/pull) and `av verify <hash>` checks them anywhere —
-tamper evidence, not a trust network. Query who-did-what-with-what-outcome via
-`GET /api/admin/audit?action=…&since=…` or `av audit list --action commit.push`.
+payload, rides clone/pull); `av verify <hash>` checks anywhere — tamper evidence, not a
+trust network. Query who-did-what-with-what-outcome: `GET
+/api/admin/audit?action=…&since=…` or `av audit list --action commit.push`.
 
 ### `.avh` v2 — context memory
 
-`av handoff` writes `handoff.avh` containing: lineage (run + git code pointer),
-semantic_summary of the latest change, replay recipe, metric trend tail, and the
-append-only `context_memory.notes`. Read it to inherit predecessor intent; extend it
-with `av context note`. Validate any document: `av context validate`.
+`av handoff` writes `handoff.avh`: lineage (run + git code pointer), semantic_summary of
+the latest change, replay recipe, metric trend tail, append-only
+`context_memory.notes`. Read it to inherit predecessor intent; extend with `av context
+note`. Validate any document: `av context validate`.
 
 ### Guardrails you should arm
 
@@ -184,8 +182,8 @@ av promote <candidate> --into main     # exit 16 on DENY
 ## Wrap-up checklist
 
 Run the full sequence in `Aether-vault-Obsidian-Vault/Essential-Tasks.md` (scratch-repo
-debug → tests → docs → vault regen → sanity check) — it's the canonical detail, don't
-duplicate it here. Two things it doesn't say explicitly:
+debug → tests → docs → vault regen → sanity check) — canonical detail, don't duplicate
+here. Two things it doesn't say explicitly:
 
 - Update `av --help` / README CLI reference for any added or changed command.
 - Ask, don't act: tell the user if the Docker image needs rebuilding or a commit should

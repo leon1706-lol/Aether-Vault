@@ -1,6 +1,6 @@
 """Shared session-issuance/user-provisioning logic for BOTH OIDC (`sso_oidc.py`) and
-SAML (`sso_saml.py`) — v1.3.3 (WP-11/WP-13). One function each so session issuance,
-audit, and group→role mapping exist ONCE, not once per protocol.
+SAML (`sso_saml.py`) — v1.3.3. One function each so session issuance, audit, and
+group→role mapping exist ONCE, not once per protocol.
 """
 from __future__ import annotations
 
@@ -64,14 +64,11 @@ async def _resolve_role_by_name(db, tenant_id: str, role_name: str) -> DBRole | 
 async def sync_groups_and_role_bindings(
     db, provider: DBSsoProvider, user: DBUser, group_names: list[str],
 ) -> None:
-    """Mirrors the IdP's current group list onto `groups`/`group_members` (source=`sso`)
-    and, for any group present in `provider.config["group_role_map"]`, ensures a
-    `role_bindings` row exists granting that role at tenant scope. Membership is
-    replaced wholesale on every login (the IdP's assertion/claims are authoritative for
-    "right now") — a group the user is no longer in gets its `group_members` row
-    removed, which `identity.py::_permissions_for_subject`'s group-expansion (v1.3.3
-    fix) means their EFFECTIVE permissions shrink immediately on next resolution, not
-    just their group list."""
+    """Mirrors the IdP's current group list onto `groups`/`group_members` and, for any
+    group present in `provider.config["group_role_map"]`, ensures a `role_bindings` row
+    exists granting that role at tenant scope. Membership is replaced wholesale on every
+    login -- a group the user is no longer in has its row removed, shrinking their
+    effective permissions immediately on next resolution."""
     group_role_map: dict = (provider.config or {}).get("group_role_map") or {}
 
     existing_group_ids = {
@@ -129,14 +126,9 @@ async def upsert_user_from_claims(
     email: str | None, name: str | None, groups: list[str] | None,
 ) -> DBUser:
     """The ONE place an IdP's asserted identity becomes a local `DBUser` — shared by
-    OIDC's ID-token claims and SAML's assertion attributes alike, so a subject already
-    linked via one protocol and later logging in via the other (unusual, but the schema
-    allows it: `user_identities` keys on (provider_id, subject), not the user) still
-    resolves correctly.
-
-    JIT provisioning is opt-in PER PROVIDER (`provider.config["jit_provisioning"]`) —
-    off means an unknown (provider_id, subject) pair is rejected outright rather than
-    silently creating a user, exactly as the design called for."""
+    OIDC's ID-token claims and SAML's assertion attributes alike. JIT provisioning is
+    opt-in PER PROVIDER -- off means an unknown (provider_id, subject) pair is rejected
+    outright rather than silently creating a user."""
     identity_row = (await db.execute(
         select(DBUserIdentity).where(
             DBUserIdentity.provider_id == provider.id, DBUserIdentity.subject == subject,
@@ -189,10 +181,9 @@ async def upsert_user_from_claims(
 async def issue_session(
     db, user: DBUser, ip: str | None = None, user_agent: str | None = None,
 ) -> str:
-    """Returns the RAW session token (shown/redirected exactly once, never persisted in
-    plaintext — matches `api_tokens`' own rule). `resolve_session()` (identity.py,
-    already built and wired into `require_token`) is what checks it back in on every
-    subsequent request."""
+    """Returns the RAW session token, shown/redirected exactly once, never persisted in
+    plaintext. `resolve_session()` (identity.py) checks it back in on every subsequent
+    request."""
     raw = secrets.token_urlsafe(32)
     db.add(DBSession(
         user_id=user.id, tenant_id=user.tenant_id, token_hash=hash_token(raw),

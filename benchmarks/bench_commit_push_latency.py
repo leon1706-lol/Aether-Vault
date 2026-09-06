@@ -1,10 +1,8 @@
 """Benchmark #3 — commit + push latency, end-to-end.
 
-Extends scripts/run_benchmark_comparison.py's existing init/add/commit comparison (same
-fixture, same av_cli.speedcheck building blocks) with an explicit push step and a fourth
-tool, MLflow. Where a tool has no separate "push" step (MLflow: logging an artifact *is*
-the remote write, there's no local-then-sync two-phase flow), that cell is marked N/A with
-a footnote rather than left blank or guessed at.
+Extends scripts/run_benchmark_comparison.py's init/add/commit comparison with an explicit
+push step and a fourth tool, MLflow. A tool with no separate "push" step (MLflow: logging
+an artifact *is* the remote write) gets that cell marked N/A with a footnote.
 """
 
 import shutil
@@ -98,9 +96,8 @@ def _bench_mlflow() -> dict[str, float | None] | None:
         return None
     import mlflow
 
-    # Manual mkdtemp + ignore_errors cleanup, not TemporaryDirectory's context manager:
-    # mlflow's sqlite backend can still hold the DB file open on Windows when the `with`
-    # block exits, turning an otherwise-successful run into a crash during cleanup.
+    # Manual mkdtemp + ignore_errors cleanup: mlflow's sqlite backend can still hold the
+    # DB file open on Windows when TemporaryDirectory's `with` block would try to clean up.
     root = Path(tempfile.mkdtemp(prefix="bench-push-mlflow-"))
     try:
         fixture_dir = root / "fixture"
@@ -115,8 +112,7 @@ def _bench_mlflow() -> dict[str, float | None] | None:
         with mlflow.start_run(experiment_id=experiment_id):
             mlflow.log_artifacts(str(fixture_dir), artifact_path="fixture")
         commit_ms = (time.perf_counter() - start) * 1000
-        # MLflow's log_artifacts() already writes directly to the tracking/artifact store —
-        # there's no separate local-commit-then-push step the way git/dvc/av have.
+        # log_artifacts() writes directly to the store; no separate push step.
         return {"init": init_ms, "add": 0.0, "commit": commit_ms, "push": None}
     finally:
         shutil.rmtree(root, ignore_errors=True)

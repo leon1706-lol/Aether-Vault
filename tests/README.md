@@ -12,7 +12,7 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
   checkout/branch/stash/log/doctor/file/attributes, short-hash checkout, chunk-dedup
   round-trips.
 - `test_sync.py` - clone/pull against a fake in-process registry built on the real
-  `VaultClient`; signatures/env ids survive clone (v1.2.2).
+  `VaultClient`; signatures/env ids survive clone.
 - `test_merge.py` - pure three-way merge + merge-base, plus CLI-level FF/two-parent/
   conflict paths.
 - `test_server.py` - live Postgres+Redis suite (lazy TCP reachability skip): wire
@@ -42,7 +42,7 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
   freshness, every required check green) and the permanent no-dependency-bots/no-
   auto-merge/every-action-SHA-pinned guard over `.github/`.
 - `test_ci_map.py`, `test_ci_summary.py`, `test_deprecations.py`, `test_flake_registry.py`,
-  `test_helm_chart.py` (v1.3.4) - CI-map/budget doc-vs-YAML consistency,
+  `test_helm_chart.py` - CI-map/budget doc-vs-YAML consistency,
   `scripts/ci_summary.py`'s pure logic, `development/deprecations.yml`'s schema + overdue
   guard, the flake-quarantine policy, and the Helm chart's default image matching its
   real publisher.
@@ -56,7 +56,7 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
   README.md's test-count mentions against the real `tests/test_*.py` file count; the
   companion check on the actual test *counts* (which need a real run, not just
   collection) lives in `scripts/check_readme_test_freshness.py`, wired into the `test`
-  CI job instead (v1.3.3.9).
+  CI job instead.
 
 ## Conventions
 

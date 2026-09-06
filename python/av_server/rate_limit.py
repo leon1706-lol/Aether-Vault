@@ -1,26 +1,11 @@
-"""Fixed-window rate limiting for the av_server API — zero dependencies.
-
-Why hand-rolled instead of slowapi: the only endpoint that genuinely needs a hard
-default limit is the destructive unauthenticated-by-default `POST /api/admin/gc`, and
-the data plane must tolerate legitimate bursts (clients upload objects through an
-8-worker pool; a 1000-file commit is hundreds of rapid POSTs). A ~80-line fixed-window
-limiter with per-bucket configuration covers both without pulling in a library that
-couples us to specific starlette versions.
-
-Design:
-- Buckets are keyed by `(client_host, bucket_class)`; the bucket class comes from the
-  request path (`gc` for `/api/admin/gc`, `default` for everything else under `/api/`).
-- Each bucket has its own `Limit` (parsed from env like `"10/minute"`); an absent or
-  disabled limit means the class passes through WITHOUT recording state (so disabled
-  limiter = zero memory growth).
-- Fixed window (not sliding log): constant memory, trivially correct, and the classic
-  boundary burst is acceptable here — this guards against accidental/abusive hammering,
-  not determined attackers (that is what Protected mode is for).
-- The check-and-increment is deliberately synchronous with no awaits inside, so it is
-  atomic under asyncio's single-threaded interleaving — no locks required.
-
-Pure logic + injectable clock (`now_fn`) makes every behavior unit-testable without
-networks or real time.
+"""Fixed-window rate limiting for the av_server API — zero dependencies, hand-rolled
+instead of slowapi so a ~80-line limiter covers both the destructive `POST /api/admin/gc`
+(needs a hard default limit) and the data plane (must tolerate legitimate upload bursts)
+without coupling to specific starlette versions. Buckets are keyed by (client_host,
+bucket_class); fixed window (not sliding log) for constant memory and trivial
+correctness -- this guards against accidental/abusive hammering, not determined
+attackers. Check-and-increment is synchronous with no awaits inside, so it's atomic
+under asyncio's single-threaded interleaving.
 """
 
 from __future__ import annotations
@@ -79,8 +64,7 @@ def bucket_class_for(path: str) -> str | None:
     if path == _GC_PREFIX or path.startswith(_GC_PREFIX + "/"):
         return "gc"
     if path.startswith("/api/events") or path.startswith("/api/webhooks"):
-        # Agent polling/delivery surface — opt-in cap like the data plane (bulk
-        # orchestrators legitimately long-poll), never accidentally limited.
+        # Agent polling/delivery surface — opt-in cap, never accidentally limited.
         return "events"
     return "default"
 
@@ -140,22 +124,14 @@ def build_limiter_from_env(env: dict[str, str] | None = None) -> WindowRateLimit
 
 
 # ---------------------------------------------------------------------------
-# v1.3.2 (HA — E5): a Redis-backed counter, opt-in via AV_RATE_LIMIT_BACKEND=redis,
-# for exactly one reason: WindowRateLimiter's in-process dict (`_buckets` above) is
-# correct at N=1 replica and silently WRONG at N>1 — its own module docstring already
-# names the assumption that breaks ("atomic under asyncio's single-threaded
-# interleaving"), which is a per-PROCESS guarantee, not a per-deployment one. Under N
-# replicas behind a load balancer, each replica enforces its own independent window, so
-# a client round-robined across replicas effectively gets N times every configured
-# limit. This class fixes that FOR DEPLOYMENTS THAT OPT IN — the default stays the
-# in-process limiter above, byte-identical to pre-v1.3.2 behavior, unconfigured.
+# A Redis-backed counter, opt-in via AV_RATE_LIMIT_BACKEND=redis: WindowRateLimiter's
+# in-process dict is correct at N=1 replica but silently WRONG at N>1 (each replica
+# enforces its own independent window, so a round-robined client gets N times every
+# limit). Default stays the in-process limiter above, byte-identical when unconfigured.
 # ---------------------------------------------------------------------------
 
-# INCR then EXPIRE on first increment, as ONE atomic round trip — not two separate Redis
-# calls — specifically to avoid the window where a process dies between an INCR that
-# succeeds and an EXPIRE that never runs, which would leave a key with no TTL, silently
-# never resetting again. Lua scripts execute as one unit server-side in Redis, so there
-# is no gap between the two operations for a crash to land in.
+# INCR then EXPIRE on first increment, as ONE atomic Lua round trip -- avoids the window
+# where a process dies between a successful INCR and an EXPIRE that never runs.
 _INCR_AND_EXPIRE_LUA = """
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
@@ -165,12 +141,9 @@ return count
 
 class RedisWindowRateLimiter:
     """Same fixed-window semantics as `WindowRateLimiter`, same injectable-clock
-    testability contract (the clock decides which window BUCKET a key falls into; the
-    physical Redis key TTL is cleanup only, not part of the correctness path — a
-    fake/frozen clock in a test still produces deterministic bucket boundaries even
-    though the real Redis TTL keeps ticking in wall-clock time). `check()` is async
-    (a real Redis round trip) unlike its sync sibling — the one call site
-    (`server.py::limit_request_rate`) awaits it only when this backend is selected."""
+    testability contract -- the clock decides the window BUCKET, the Redis key TTL is
+    cleanup only, not part of the correctness path. `check()` is async, unlike its
+    sync sibling."""
 
     def __init__(self, redis_client, limits: dict[str, Limit | None], now_fn=time.time):
         self._redis = redis_client
@@ -186,9 +159,8 @@ class RedisWindowRateLimiter:
         try:
             count = await self._redis.eval(_INCR_AND_EXPIRE_LUA, 1, key, limit.window_seconds)
         except Exception:
-            # Fails OPEN, identical posture to redis_cache.py's check_hash_exists() —
-            # a degraded/unreachable Redis must never become an outage for every other
-            # request. A missed rate-limit enforcement window is far cheaper than that.
+            # Fails OPEN -- a degraded/unreachable Redis must never become an outage
+            # for every other request.
             return None
         if count > limit.max_requests:
             try:
@@ -206,8 +178,8 @@ class RedisWindowRateLimiter:
 
 
 def build_redis_limiter_from_env(redis_client, env: dict[str, str] | None = None) -> RedisWindowRateLimiter:
-    """Same env vars, same defaults as `build_limiter_from_env` — only the backend
-    (and therefore the cross-replica correctness property) differs."""
+    """Same env vars, same defaults as `build_limiter_from_env` -- only the backend
+    differs."""
     env = os.environ if env is None else env
     return RedisWindowRateLimiter(
         redis_client,

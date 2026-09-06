@@ -14,8 +14,7 @@ All additive, mirroring models.py:
 - audit_log: indexes on username and action — richer filters (actor, route family)
   land in the same release and need these to stay fast at scale.
 
-No existing row is touched; legacy healed volumes upgrade zero-touch exactly like fresh
-ones — see python/av_server/database.py::_LEGACY_COLUMNS.
+No existing row is touched; legacy volumes get these via the startup heal path.
 """
 from typing import Sequence, Union
 

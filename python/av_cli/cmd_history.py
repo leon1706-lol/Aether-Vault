@@ -41,16 +41,13 @@ def commit(
 
     staged = idx.get_staged_entries()
     if not staged:
-        # v1.2.5: exit 11 (nothing_to_commit) via fail(), matching the documented
-        # exit-code registry and av_sdk.Repo.commit()'s existing SDKError("nothing_to_commit")
-        # — previously this exited 0 in both text and JSON mode (Probleme.md).
+        # Exit 11 (nothing_to_commit) via fail(), matching the exit-code registry and
+        # av_sdk.Repo.commit()'s SDKError("nothing_to_commit").
         fail(click.get_current_context(silent=True), "nothing_to_commit", "Nothing to commit",
              data={"reason": "nothing_to_commit"})
 
-    # Run linkage (v1.2.0): an active run (av run start / AV_RUN_ID) rides the commit
-    # payload so the server can file it under the run without extra round trips.
-    # v1.2.5: resolve_run_id() is THE shared precedence (env > state) — see its
-    # docstring for why this used to disagree with commit_scoped_paths/av watch.
+    # Run linkage: an active run (av run start / AV_RUN_ID) rides the commit payload so
+    # the server can file it under the run without extra round trips.
     from .core import resolve_run_id
 
     run_id = resolve_run_id(repo_root)
@@ -82,9 +79,8 @@ def commit(
     # THE shared commit path (also used by `av watch` and the av_sdk SDK).
     from .core import commit_staged
 
-    # outcome_sink (v1.2.5) captures the FINAL queued state unconditionally, in both text
-    # and JSON mode, independent of json_sink (which only exists in JSON mode and also
-    # controls _finalize_commit's human-echo suppression) — see core.py's docstring on it.
+    # outcome_sink captures the final queued state unconditionally in both output modes,
+    # independent of json_sink (JSON-mode only, also suppresses the human echo).
     head_hash = commit_staged(
         repo_root, message, tags=tags, metrics=metrics,
         run_id=run_id, defer_upload=defer_upload,
@@ -102,16 +98,11 @@ def commit(
             "run_id": run_id,
             "queued": sink_data.get("queued", False),
             "queued_reason": sink_data.get("queued_reason"),
-            # v1.3.0: present only when queued_reason == "ref_race" — the colliding run
-            # (when known) + copy-paste remediation, matching pull/merge's own race data.
+            # Present only when queued_reason == "ref_race": the colliding run + remediation.
             "ref_race": sink_data.get("ref_race"),
         })
-    # Exit 0 even when queued (matches `av push`'s established behavior, cmd_history.py
-    # above: "reachable": False still returns/exits cleanly) — queued is a SAFE, complete
-    # local outcome by design (AGENTS.md non-negotiable #3), not a partial failure; the
-    # exit-code registry's `unreachable_queued`/13 is for commands where reachability IS
-    # the primary outcome (`av audit list`, `av webhooks list` when the registry can't be
-    # read at all — see cmd_audit.py/cmd_webhooks.py), not for commit's local-first design.
+    # Exit 0 even when queued -- queued is a SAFE, complete local outcome by design
+    # (AGENTS.md non-negotiable #3), not a partial failure.
 
 
 @click.command()
@@ -296,9 +287,8 @@ def log(limit: int, branch: str | None, show_all: bool) -> None:
         head_hash = start
 
     if json_mode:
-        # `tree` omitted (can be large — layers/chunks per file); every other field of the
-        # raw commit record rides through as-is. `short` is synthesized (matches the
-        # `commit`/`checkout` envelopes' own "short" field convention, and av_sdk.Repo.log()).
+        # `tree` omitted (can be large); every other field rides through as-is. `short`
+        # is synthesized to match the `commit`/`checkout` envelopes' own convention.
         emit_json(None, "log", data={"commits": [
             {**{k: v for k, v in commit.items() if k != "tree"},
              "short": commit["hash"][:7],
@@ -426,10 +416,8 @@ def _stash_push(message: str | None) -> None:
 
     stash_dir = _stash_dir(repo_root)
     stash_dir.mkdir(parents=True, exist_ok=True)
-    # Microsecond resolution, not just seconds — two stashes created in quick succession (e.g.
-    # back-to-back in a test, or a fast manual `av stash` / `av stash` retry) would otherwise
-    # share the same second-resolution prefix and sort arbitrarily (by the random shortid)
-    # instead of newest-first (found via the test suite, not just inferred).
+    # Microsecond resolution, not just seconds -- two stashes created in quick succession
+    # would otherwise share the same prefix and sort arbitrarily instead of newest-first.
     stash_id = f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex[:6]}"
 
     branch = "detached"
@@ -496,11 +484,9 @@ def _stash_apply_or_pop(stash_id: str | None, delete_after: bool) -> None:
                 "type": entry["type"], "staged": True, "pointer": entry.get("pointer"),
             }
         else:
-            # Was modified-but-unstaged before the stash: the working-tree file is restored
-            # to that dirty content above, but the index entry must go back to HEAD's
-            # baseline (with a deliberately non-matching mtime) so `status()`'s stat-mismatch
-            # check reports "modified" again instead of looking clean — mirroring exactly how
-            # `_stash_push` represents an unstaged modification in the first place.
+            # Was modified-but-unstaged: working tree is restored to the dirty content
+            # above, but the index entry goes back to HEAD's baseline with a deliberately
+            # non-matching mtime, so `status()` reports "modified" again instead of clean.
             head_data = head_tree.get(rel_path, {})
             new_entry = {
                 "hash": head_data.get("hash", entry["hash"]),

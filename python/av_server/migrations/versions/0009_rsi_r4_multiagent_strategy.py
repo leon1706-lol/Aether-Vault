@@ -4,15 +4,10 @@ Revision ID: 0009
 Revises: 0008
 Create Date: 2026-09-04
 
-Additive: one new nullable column on `runs` (`lessons_id`) plus six new tables. No
-existing row is touched. See development/architecture.md's Multi-Agent & Strategy Memory
-Contract section.
-
-`lessons` follows the same content-addressed + `/latest`-by-created_at pattern as
-`policy_packs` (migration 0006) — a versioned "what we believe now" document, without the
-hash-chain (lessons revise freely; they aren't a tamper-evident policy log). `reviews` and
-`critiques` both key on `change_sets.id` (migration 0006) — no FK, same shallow-write
-rationale as every prior RSI migration.
+Additive: one new nullable column on `runs` (`lessons_id`) plus six new tables. `lessons`
+follows the same content-addressed + `/latest`-by-created_at pattern as `policy_packs`,
+minus the hash-chain (lessons revise freely). `reviews`/`critiques` key on
+`change_sets.id` with no FK, same shallow-write rationale as prior RSI migrations.
 """
 from typing import Sequence, Union
 
@@ -68,11 +63,9 @@ def upgrade() -> None:
         "reviews",
         sa.Column("id", sa.String(), primary_key=True),
         sa.Column("project_id", sa.String(), nullable=False, index=True),
-        # target_type/target_id: a review can approve either a change SET (pre-apply) or
-        # an improver VERSION (pre-promote) — `av improver promote`'s require_review gate
-        # checks reviews against the CANDIDATE improver id directly, not a change set,
-        # since one improver version can be the eventual target of promotion regardless
-        # of which change set produced it.
+        # A review can approve either a change SET (pre-apply) or an improver VERSION
+        # (pre-promote) -- `av improver promote`'s require_review gate checks reviews
+        # against the CANDIDATE improver id directly, not a change set.
         sa.Column("target_type", sa.String(), nullable=False),  # "change_set" | "improver"
         sa.Column("target_id", sa.String(), nullable=False, index=True),
         sa.Column("reviewer", sa.String(), nullable=True),
@@ -85,10 +78,7 @@ def upgrade() -> None:
         "critiques",
         sa.Column("id", sa.String(), primary_key=True),
         sa.Column("project_id", sa.String(), nullable=False, index=True),
-        # Same target_type/target_id generalization as `reviews` above — a critique can
-        # be raised against a change set OR an improver version, and `av improver
-        # promote`'s gate checks unresolved/un-waived critiques against the CANDIDATE
-        # improver id directly.
+        # Same target_type/target_id generalization as `reviews` above.
         sa.Column("target_type", sa.String(), nullable=False),  # "change_set" | "improver"
         sa.Column("target_id", sa.String(), nullable=False, index=True),
         sa.Column("author", sa.String(), nullable=True),

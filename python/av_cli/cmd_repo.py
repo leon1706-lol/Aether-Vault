@@ -35,12 +35,9 @@ def _handle_init_protection_choice(
     repo_root: Path, yes: bool, protected_flag: bool, join_token: str | None
 ) -> dict | None:
     """The Anonymous/Protected prompt `av init` shows after choosing Local mode, plus its
-    "Generate a new token" vs "Enter an existing one" follow-up. Saves whatever was decided to
-    this repo's config (and, for "generate," writes/applies it via `av auth set-token`'s same
-    underlying helper) — never touched at all if the result is Anonymous, matching today's
-    behavior exactly. Returns a dict describing the outcome in JSON mode (folded into
-    `init`'s own envelope by the caller), None in text mode (behavior unchanged there).
-    """
+    token-source follow-up. Saves whatever was decided to this repo's config; returns a
+    dict describing the outcome in JSON mode (folded into `init`'s envelope), None in
+    text mode."""
     from . import ui
     from .client import AuthenticationError, VaultClient
 
@@ -136,10 +133,8 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
     from . import ui
 
     json_mode = current_output_mode() == "json"
-    # v1.3.0: init's whole shape is an interactive wizard by design (mode picker, protection
-    # prompt, REPL handoff) — none of that is meaningful for an agent parsing an envelope, so
-    # JSON mode requires the fully-scripted invocation shape instead of silently degrading:
-    # --mode explicit, --yes to skip every prompt, and no REPL to hand off into afterward.
+    # init's whole shape is an interactive wizard by design -- JSON mode requires the
+    # fully-scripted invocation shape (--mode, --yes, --no-repl) instead of degrading silently.
     if json_mode and (mode is None or not yes or not no_repl):
         fail(None, "validation",
              "av init --output json requires --mode, --yes, and --no-repl — it never "
@@ -165,12 +160,8 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
     if not json_mode:
         ui.print_banner("Aether-Vault", "version control for ML models & datasets")
 
-    # v1.3.3: enterprise.py's real SSO device-code login (WP-14) replaced the stub this
-    # comment used to describe as "unbuilt" -- --mode enterprise now genuinely logs in
-    # against the registry's configured OIDC provider. Still not offered by an
-    # interactive picker here (no such picker exists in this wizard today, local vs.
-    # enterprise was never actually prompted for, only ever reachable via this flag) --
-    # left that way rather than inventing a new prompt beyond what was asked.
+    # --mode enterprise logs in against the registry's configured OIDC provider
+    # (enterprise.py). Not offered by an interactive picker -- only reachable via this flag.
     if mode is not None:
         login_mode = mode
     else:
@@ -191,9 +182,8 @@ def init(mode: str | None, yes: bool, no_repl: bool, protected_flag: bool, join_
     cfg["login_mode"] = login_mode
     save_config(repo_root, cfg)
 
-    # Anonymous-vs-Protected only applies to Local mode — Enterprise has its own (separate,
-    # not-yet-built) account-based auth system; this shared-secret token is the free/OSS-tier
-    # mechanism, not something to layer underneath Enterprise login too.
+    # Anonymous-vs-Protected only applies to Local mode -- this shared-secret token is the
+    # free/OSS-tier mechanism, not layered underneath Enterprise login.
     protection_result = None
     if login_mode == "local":
         protection_result = _handle_init_protection_choice(repo_root, yes, protected_flag, join_token)
@@ -251,10 +241,8 @@ def update(check_only: bool, list_versions_flag: bool, enable_auto_update: bool,
     from . import update_check
 
     json_mode = current_output_mode() == "json"
-    # Every confirm() below defaults to True and only prompts when NOT already answered by
-    # --yes/--check — under CliRunner (and any real non-interactive invocation) that default
-    # applies silently anyway, so requiring --yes in JSON mode isn't a behavior change, just
-    # making the "no prompt in JSON mode" guarantee explicit rather than incidental.
+    # Every confirm() below defaults to True and only prompts when not already answered --
+    # requiring --yes in JSON mode makes the "no prompt in JSON mode" guarantee explicit.
     if json_mode and docker_flag and not yes:
         fail(None, "validation",
              "av update --docker --output json requires --yes (no interactive confirm in "

@@ -17,14 +17,10 @@ class CASStorage:
         self.refs_dir.mkdir(parents=True, exist_ok=True)
 
     def _object_path(self, sha256_hash: str, tenant_id: str | None = None) -> Path:
-        """v1.3.3 (WP-21, AV_CAS_ISOLATION): `tenant_id=None` (every pre-v1.3.3 call
-        site, and every call site under the default `shared` isolation mode) is the
-        EXACT flat layout this method has always used — byte-identical, zero migration
-        needed for existing deployments. A real tenant_id (only ever passed when
-        `AV_CAS_ISOLATION=isolated`) nests the object under its own tenant directory
-        instead, so two tenants' identical bytes are physically stored twice rather than
-        deduplicated across the tenant boundary — see server.py's own module docstring
-        on the storage-efficiency trade-off this switch makes explicit, not silent."""
+        """`tenant_id=None` (default `shared` isolation mode) is the exact flat layout
+        this method has always used. A real tenant_id (`AV_CAS_ISOLATION=isolated`)
+        nests the object under its own tenant directory instead, so two tenants'
+        identical bytes are physically stored twice rather than deduplicated."""
         if tenant_id is None:
             return self.objects_dir / sha256_hash[:2] / sha256_hash[2:]
         return self.objects_dir / tenant_id / sha256_hash[:2] / sha256_hash[2:]
@@ -75,10 +71,8 @@ class CASStorage:
 
     def get_object_path(self, sha256_hash: str, tenant_id: str | None = None) -> Path | None:
         """`tenant_id` given (isolated mode): checks the tenant-scoped path FIRST, then
-        falls back to the flat legacy path — an object stored before a deployment
-        switched to isolated mode (or one shared-mode upload that predates a tenant
-        going isolated) keeps being served with zero migration step and no downtime,
-        exactly as `AV_CAS_ISOLATION`'s own docstring in server.py promises."""
+        falls back to the flat legacy path, so an object stored before switching to
+        isolated mode keeps being served with zero migration step."""
         if tenant_id is not None:
             scoped = self._object_path(sha256_hash, tenant_id)
             if scoped.exists():

@@ -29,13 +29,9 @@ std::string hash_file_sequential(const std::string& path) {
     return sha.hexdigest();
 }
 
-// WARNING: This produces a *tree hash* (SHA-256 over the concatenation of per-chunk
-// hashes), NOT the canonical SHA-256 of the file. It is therefore NOT interchangeable
-// with hash_file_sequential and MUST NOT be used as the content-addressing object id:
-// the server verifies uploads against the plain whole-file SHA-256, so an object named
-// by this tree hash would always fail verification. Kept only for benchmarking / future
-// Merkle-chunk use. See `hash_file` binding below, which intentionally maps to the
-// sequential (canonical) digest.
+// WARNING: produces a *tree hash* (SHA-256 over concatenated per-chunk hashes), NOT the
+// canonical file SHA-256 -- MUST NOT be used as the content-addressing object id, since
+// the server verifies uploads against the plain whole-file hash. Kept for benchmarking only.
 std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 1024 * 1024, int num_threads = 0) {
     if (!fs::exists(path)) throw std::runtime_error("File not found: " + path);
     uintmax_t file_size = fs::file_size(path);
@@ -315,10 +311,8 @@ py::list chunk_and_hash_file(const std::string& path,
                 hash = (hash << 1) + GEAR[static_cast<uint8_t>(buffer[static_cast<size_t>(i)])];
                 pos++;
                 uint64_t size_so_far = pos - chunk_start;
-                // Any cut requires min bytes to remain AFTER it — otherwise the tail chunk
-                // would violate the minimum. This makes max_chunk a soft cap: a file just
-                // over k*max yields one chunk of up to max+min-1 rather than a tiny tail
-                // (both edge cases were observed before the guard existed).
+                // Any cut requires min bytes to remain AFTER it, else the tail chunk would
+                // violate the minimum -- this makes max_chunk a soft cap, not a hard one.
                 bool enough_left_after_cut = (file_size - pos >= min_chunk);
                 bool boundary = ((hash & mask) == 0) &&
                                 (size_so_far >= min_chunk) &&

@@ -1,10 +1,7 @@
-// branchGraph.ts — client-side helpers for partitioning the already-loaded commit window by
-// branch reachability. There is no server-side "commits on branch X" endpoint, so every panel
-// that needs per-branch filtering (Commits, Branches, Metrics) walks parent_hash locally from
-// each ref's tip. This only sees whatever commits are already loaded (e.g. the last N from
-// fetchCommits) — if a branch's history extends further back than the loaded window, the walk
-// silently stops at the edge of what's available. Callers must surface that as an
-// "ahead of loaded history" caveat rather than presenting it as an exact count.
+// branchGraph.ts — client-side helpers for partitioning the already-loaded commit window
+// by branch reachability, since there is no server-side "commits on branch X" endpoint.
+// The walk only sees commits already loaded, so callers must surface a truncated result
+// as an "ahead of loaded history" caveat rather than an exact count.
 import type { Commit } from "./api";
 
 export function indexByHash(commits: Commit[]): Map<string, Commit> {
@@ -34,9 +31,8 @@ export function reachableFromTip(
 }
 
 // Number of commits reachable from `tipHash` that are NOT reachable from `baseTipHash`
-// (e.g. "commits ahead of main"). `truncated` is true if the walk ran off the edge of the
-// loaded commit window before it could either find a common ancestor or exhaust the branch's
-// own history — callers should label the count as a lower bound in that case.
+// ("commits ahead of main"). `truncated` is true if the walk ran off the edge of the
+// loaded commit window -- callers should label the count as a lower bound in that case.
 export function commitsAhead(
   tipHash: string | undefined,
   baseTipHash: string | undefined,

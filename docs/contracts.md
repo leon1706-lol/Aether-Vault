@@ -15,13 +15,13 @@ checkout or an installed wheel — `importlib.resources` under the hood).
 | Event | `event-1.0.schema.json` | `GET /api/events` (each row of `data.events`) |
 | Run | `run-1.0.schema.json` | `GET /api/runs/{id}`, each row of `GET /api/runs` |
 | Webhook delivery body | `webhook-payload-1.0.schema.json` | The exact signed bytes POSTed to a webhook URL (verify against `X-AV-Signature`) |
-| Improver version (v1.3.1) | `improver-1.0.schema.json` | `GET /api/improvers/{id}`, each row of `GET /api/improvers` |
-| Change set (v1.3.1) | `change-set-1.0.schema.json` | `GET /api/change-sets/{id}`, each row of `GET /api/change-sets` |
-| Policy pack (v1.3.1) | `policy-pack-1.0.schema.json` | `GET /api/policy-packs/{id}`, `.../latest`, each row of `GET /api/policy-packs` |
-| Eval suite (v1.3.1) | `eval-suite-1.0.schema.json` | `GET /api/eval/suites/{id}`, each row of `GET /api/eval/suites` |
-| Tool manifest (v1.3.1) | `tool-manifest-1.0.schema.json` | `GET /api/tool-manifests/{id}`, `.../latest` — the index row; the manifest document itself is the referenced CAS object |
-| Action log (v1.3.1) | `action-log-1.0.schema.json` | `GET /api/action-logs/{id}`, each row of `GET /api/action-logs` — the index row; the action list itself is the referenced CAS object |
-| Backup manifest (v1.3.2) | `backup-manifest-1.0.schema.json` | `av admin backup create`'s `manifest.json`, read back by `av admin backup verify`/`restore` |
+| Improver version | `improver-1.0.schema.json` | `GET /api/improvers/{id}`, each row of `GET /api/improvers` |
+| Change set | `change-set-1.0.schema.json` | `GET /api/change-sets/{id}`, each row of `GET /api/change-sets` |
+| Policy pack | `policy-pack-1.0.schema.json` | `GET /api/policy-packs/{id}`, `.../latest`, each row of `GET /api/policy-packs` |
+| Eval suite | `eval-suite-1.0.schema.json` | `GET /api/eval/suites/{id}`, each row of `GET /api/eval/suites` |
+| Tool manifest | `tool-manifest-1.0.schema.json` | `GET /api/tool-manifests/{id}`, `.../latest` — the index row; the manifest document itself is the referenced CAS object |
+| Action log | `action-log-1.0.schema.json` | `GET /api/action-logs/{id}`, each row of `GET /api/action-logs` — the index row; the action list itself is the referenced CAS object |
+| Backup manifest | `backup-manifest-1.0.schema.json` | `av admin backup create`'s `manifest.json`, read back by `av admin backup verify`/`restore` |
 
 ## Loading a schema
 
@@ -41,10 +41,9 @@ there.
 - **Additive only within a MINOR.** A new optional field, a new enum value that only
   appears in new documents, a new schema file — all fine in a PATCH or MINOR release.
 - **Tightening a `required` list is additive too, IF every value the code has produced
-  since the schema's own introduction already satisfies it.** The v1.3.0 tightening of
-  `avh-2.0.schema.json`'s `semantic_summary`/`chunks` required-fields is an example: every
-  `.avh` document generated since v1.2.5 already has those fields, and older documents are
-  backfilled by `handoff.py::_upgrade_handoff()` before validation ever sees them.
+  since the schema's own introduction already satisfies it.** `avh-2.0.schema.json`'s
+  `semantic_summary`/`chunks` required-fields are an example: older documents missing
+  them are backfilled by `handoff.py::_upgrade_handoff()` before validation ever sees them.
 - **Removing a field, changing a field's type, or tightening in a way older real documents
   fail** requires a new schema file (bump the version in the filename, e.g. `run-2.0`) and
   a full MINOR-boundary deprecation cycle for the old one, exactly like any other contract

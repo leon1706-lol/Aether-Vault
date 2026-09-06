@@ -82,11 +82,8 @@ def test_at_least_one_workflow_file_exists():
     assert _all_workflow_files(), "no workflow files found under .github/workflows/"
 
 
-# v1.3.4 (W1a): every third-party `uses:` reference used to be a mutable tag or branch
-# ref (73 call sites, all 5 workflows) -- including `pypa/gh-action-pypi-publish@release/v1`
-# sitting on the PyPI-publishing path. All are now pinned to a full commit SHA with a
-# trailing `# vX.Y` comment naming the human-readable version that SHA resolves to. This
-# is the permanent guard against a new `uses:` line re-introducing a mutable ref.
+# Every third-party `uses:` reference must be pinned to a full commit SHA with a
+# trailing `# vX.Y` comment, not a mutable tag or branch ref.
 _ACTION_USES_RE = re.compile(r"^(\s*(?:-\s*)?uses:\s*)([^\s#]+)(.*)$", re.MULTILINE)
 # A local composite action (`uses: ./.github/actions/x`) or a Docker image reference
 # (`docker://...`) are exempt from the owner/repo@sha40 shape below.

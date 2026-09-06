@@ -10,13 +10,9 @@ import sys
 
 import click
 
-# Added to pyproject.toml's core dependencies alongside the rest of the "pretty av init" work —
-# an environment whose install predates that (or whose reinstall didn't pick up the new
-# dependency set) would otherwise hit a raw ModuleNotFoundError partway through this file's
-# imports. This module is only ever imported lazily (`from . import ui` inside
-# init/update/webui/the REPL entry point), so raising one clear, actionable error here — listing
-# every missing package at once rather than crashing on the first and rediscovering the rest one
-# `av init` retry at a time — doesn't affect commands that never touch this path.
+# An environment whose install predates these deps would otherwise hit a raw
+# ModuleNotFoundError partway through this file's imports -- lists every missing package
+# at once rather than crashing on the first and rediscovering the rest one retry at a time.
 _missing_deps: list[str] = []
 try:
     import questionary
@@ -55,12 +51,9 @@ _WORDMARK = "bold white"
 
 
 def _get_version() -> str:
-    """Banner version, resolved locally with zero network cost.
-
-    setuptools-scm regenerates `av_cli/_version.py` on every build/reinstall, so a fresh
-    tag automatically flows into the banner on the next installed run; metadata and a
-    literal fallback cover source-checkouts without that file.
-    """
+    """Banner version, resolved locally with zero network cost. setuptools-scm regenerates
+    `av_cli/_version.py` on every build; metadata and a literal fallback cover
+    source-checkouts without that file."""
     try:
         from ._version import __version__
 

@@ -64,13 +64,9 @@ def test_run_synthetic_probes_returns_one_entry_per_probe_with_sane_shape(tmp_pa
 
 
 def test_commit_and_log_probe_fixtures_are_real_not_stubs(tmp_path):
-    # One run_synthetic_probes() call, two assertions -- both new v1.2.5 fixture-building
-    # probes (commit_staged(), log()) must produce genuinely usable artifacts, not just a
-    # number: a commit object must land on disk under the synthetic repo commit_staged()
-    # builds (proving it never touched the network -- defer_upload=True + a deliberately
-    # closed remote_url -- and really exercises the commit path), and log()'s synthetic
-    # commits must form a genuine first-parent chain that walk_history() can traverse end
-    # to end, not just N unlinked files.
+    # commit_staged() and log()'s fixture-building probes must produce genuinely usable
+    # artifacts, not just a number: a real commit object on disk, and a first-parent
+    # chain walk_history() can actually traverse.
     from python.av_cli import history
 
     speedcheck.run_synthetic_probes(load_config, iter_working_files, tmp_path)

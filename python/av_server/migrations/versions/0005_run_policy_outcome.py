@@ -5,11 +5,8 @@ Revises: 0004
 Create Date: 2026-09-02
 
 Additive: `runs.policy_outcome` (JSON, nullable) records the most recent av promote/merge
-policy decision made for a run's active commit — {"decision": "allow"|"deny", "rule":
-str|None, "at": ISO-8601}. Reported via POST /api/runs/{id}/policy-outcome right after
-enforce_policy()/promote() decides. Null until the first decision for a given run — no
-existing row is touched, and legacy healed volumes upgrade zero-touch exactly like fresh
-ones (see python/av_server/database.py::_LEGACY_COLUMNS).
+policy decision for a run's active commit -- {"decision", "rule", "at"}. Null until the
+first decision for a given run.
 """
 from typing import Sequence, Union
 

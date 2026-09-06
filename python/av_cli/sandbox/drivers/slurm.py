@@ -1,23 +1,11 @@
-"""SlurmDriver — real `sbatch`/`squeue`/`sacct`/`scancel` isolation, asynchronous
-(v1.3.1, RSI R5: todo.md G.32).
+"""SlurmDriver — real `sbatch`/`squeue`/`sacct`/`scancel` isolation, asynchronous (v1.3.1).
+Addressed by JOB NAME (via `--job-name`), not Slurm's numeric job id, since `scancel -n`/
+`sacct --name=` both accept a name filter natively -- avoids a separate id-mapping file.
 
-Addressed by JOB NAME (`av-sandbox-<job_id>`, via `--job-name`), not Slurm's own numeric
-job id — `scancel -n <name>` and `sacct --name=<name>` both accept a name filter
-natively, so this avoids needing a separate id-mapping file to remember "which numeric
-Slurm job id did THIS job_id become" across CLI invocations, the same persistent-handle
-requirement `base.py`'s module docstring describes for `docker`/`kubernetes`.
-
-`submit()` writes a small batch script to `.av/sandbox/slurm/<job_id>.sh` (Slurm requires
-a real script file, not a bare command) and calls `sbatch`. Status is queried from
-`squeue` FIRST (currently pending/running jobs) and falls back to `sacct` (Slurm's
-accounting log, which is where a job's record lives once it's no longer queued) — this
-two-step lookup is required because `squeue` simply omits any job that has already
-finished. Output is captured via `--output=<path>` (Slurm merges stderr into the same
-file when `--error` is omitted), read directly from that file by `logs()` — Slurm has no
-`kubectl logs`/`docker logs` streaming equivalent.
-
-**Verified by contract tests against fixed command output, not a live Slurm cluster** —
-same rationale as `kubernetes.py`.
+`submit()` writes a batch script to `.av/sandbox/slurm/<job_id>.sh` and calls `sbatch`.
+Status is queried from `squeue` first (still-queued jobs), falling back to `sacct` (its
+accounting log) since `squeue` omits jobs that have already finished. Verified by
+contract tests against fixed command output, not a live Slurm cluster.
 """
 from __future__ import annotations
 

@@ -1,9 +1,6 @@
-""".avattributes — per-path staging directives, gitattributes-style.
-
-Lets a repo pin how specific files are stored at `av add` time without CLI flags:
-disable CDC chunking for opaque checkpoints, or disable safetensors layer-splitting,
-via glob patterns. Parsed once per CLI invocation and consulted inside stage_one_file,
-so the cost is one small file read per command regardless of file count.
+""".avattributes — per-path staging directives, gitattributes-style. Lets a repo pin how
+specific files are stored at `av add` time (e.g. disable CDC chunking or layer-splitting)
+via glob patterns, parsed once per CLI invocation.
 """
 
 from __future__ import annotations

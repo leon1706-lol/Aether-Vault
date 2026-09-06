@@ -109,13 +109,8 @@ def test_context_note_via_sdk_appears_in_cli_show(repo):
 
 
 # ---------------------------------------------------------------------------
-# v1.3.0 full-surface parity (todo.md item 5): the commit path's CLI≡SDK≡plugin-seam
-# parity is proven in tests/test_plugins.py's "seam migration" section; the SDK's OTHER
-# methods (status/log/push/diff_semantic/context_note/handoff_dict/publish_handoff) had
-# no such proof before this — each method's docstring says "mirrors the CLI's --output
-# json payload" but nothing ever checked that claim against the real CLI output on the
-# SAME repo state. These tests do exactly that: same repo, same operation via both
-# surfaces, same payload shape.
+# Full-surface parity: each SDK method's docstring claims it "mirrors the CLI's
+# --output json payload" -- these tests actually check that on the same repo state.
 # ---------------------------------------------------------------------------
 
 def test_status_parity_sdk_vs_cli(repo):
@@ -142,10 +137,8 @@ def test_log_parity_sdk_vs_cli(repo):
         sdk_log = r.log()
     cli_log = inv_cli_json(repo, "log")["data"]["commits"]
 
-    # SDK's log() is a narrower, purpose-built shape (hash/short/message/author/tags/
-    # metrics/parents) than the CLI's richer envelope (which also carries decorations/
-    # is_head/tree-adjacent fields) — parity is checked on the fields the SDK actually
-    # promises, not byte-for-byte across the two payloads.
+    # SDK's log() is a narrower shape than the CLI's richer envelope -- parity is checked
+    # on the fields the SDK actually promises, not byte-for-byte.
     assert len(sdk_log) == len(cli_log)
     for sdk_entry, cli_entry in zip(sdk_log, cli_log):
         for field in ("hash", "short", "message", "author", "tags", "metrics", "parents"):
@@ -200,10 +193,7 @@ def test_context_note_parity_sdk_vs_cli_shape(repo):
     # Both are {"appended": True, "entry": {...}} — the entry SHAPE (not content, which
     # differs by design) must match across surfaces.
     assert sdk_result["appended"] is True and cli_result.get("appended", True) is not False
-    # v1.3.1 fix (WP-37): this used to pin {"ts", "agent", "note"} — missing "run_id",
-    # which `av context note` (cmd_context.py) has always stamped via resolve_run_id().
-    # The SDK's own context_note() silently diverged from its own parity target; fixed to
-    # actually stamp _run_id(), and this test now pins the CORRECT shared shape.
+    # SDK's context_note() must stamp run_id too, matching `av context note`'s shape.
     assert set(sdk_result["entry"]) == {"ts", "agent", "note", "run_id"}
     assert set(cli_result["entry"]) == {"ts", "agent", "note", "run_id"}
 

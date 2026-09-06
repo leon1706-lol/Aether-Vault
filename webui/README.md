@@ -18,9 +18,9 @@ Served from the engine container's standalone bundle or plainly via `npm run dev
   tree-diff summary (chunk reuse + dedup efficiency), metrics-table flattening.
 - `src/hooks/useDashboard.ts` - polling orchestration with parallel first paint;
   surfaces a real `error` state (401/500/offline) distinct from "genuinely empty" -
-  every panel reads it and renders a distinct error state with retry (v1.3.0).
+  every panel reads it and renders a distinct error state with retry.
 - `src/hooks/useIncrementalReveal.ts` - progressive layer reveal for WeightHeatmap /
-  LayerDriftChart (v1.3.0), replacing the old hard `MAX_RENDERED_LAYERS` truncation.
+  LayerDriftChart, replacing a hard `MAX_RENDERED_LAYERS` truncation.
 - `__tests__/` - Vitest + React Testing Library suites (180 tests, 27 files). Run `npm test` for the current count — not auto-synced here the way `av test`'s own pytest count is (see `python/av_cli/cmd_devtools.py::_update_readme_test_badge`), since `av test --webui` streams Vitest's output live via `subprocess.run` rather than capturing it for parsing; a deliberate, stated scope limit, not an oversight.
 - `__benchmarks__/speed.bench.ts` - bench suite exercised by `av test --speed --webui`.
 - `e2e/` - Playwright specs + `seed_data.py` (pushes real commits via the real CLI).
@@ -41,13 +41,13 @@ npx playwright test      # E2E against a seeded live stack (docker compose up)
   TokenGate consumes it render-phase, strips it (render-phase + post-hydration safety
   net - Next patches history.replaceState and can undo a pre-hydration strip), and
   persists it to localStorage. Any other entry shows the manual prompt once.
-- Runs detail (v1.3.0: a full view swap when `?run=` is set, not just an expand-row)
+- Runs detail is a full view swap when `?run=` is set (not just an expand-row), and
   fetches its full metrics history from the dedicated `GET /api/runs/{id}/metrics`
   endpoint (only when `summary.total_commits > summary.commits.length` - the inline
   `/summary` copy stays capped) and shows a policy-outcome badge; lineage/semantic-diff
   summary composition is still client-side from existing endpoints.
 - Weight diff has shareable link state (`?tab=weight-diff&a=&b=&path=`) and an
-  arbitrary two-commit compare via a hash input in `CheckpointPicker` (v1.3.0) -
+  arbitrary two-commit compare via a hash input in `CheckpointPicker` -
   not just the 100 most recent commits. Cross-linked from `RunsPanel`'s
   "Compare weights" button.
 - Commit graph draws one edge per parent from the reconstructed `parents` array

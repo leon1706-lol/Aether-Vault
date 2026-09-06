@@ -72,9 +72,7 @@ def test_run_av_commit_with_no_changes_raises_nothing_to_commit(tmp_path):
     _run_av(repo_root, ["add", str(ckpt)])
     _run_av(repo_root, ["commit", "-m", "first"])
 
-    # v1.2.5: nothing staged the second time around now hits fail("nothing_to_commit")
-    # -> SystemExit(11) (see tests/test_exit_codes.py), matching the documented registry
-    # — pre-1.2.5 this exited 0/didn't raise, which is what this test used to assert.
+    # Nothing staged the second time hits fail("nothing_to_commit") -> SystemExit(11).
     # _run_av's cli.main(standalone_mode=False) doesn't catch SystemExit (unlike
     # CliRunner), so it propagates here exactly as it would to any real caller.
     with pytest.raises(SystemExit) as exc:
@@ -498,9 +496,8 @@ def test_lightning_real_training_loop_smoke(tmp_path):
         callbacks=[callback],
         limit_train_batches=2,
         # Lightning auto-adds its own ModelCheckpoint when none is supplied, writing to
-        # default_root_dir/checkpoints — which defaults to CWD (the checkout root, where
-        # there is no .av repo). Root the trainer INSIDE the av repo so the callback's
-        # resolve_repo_root finds it.
+        # default_root_dir/checkpoints, which defaults to CWD -- root it inside the av
+        # repo so the callback's resolve_repo_root finds it.
         default_root_dir=str(repo_root),
     )
     model = Tiny()
@@ -818,10 +815,8 @@ def test_seam_parity_error_codes_not_a_repo_and_nothing_staged(tmp_path):
     assert sdk_exc.value.code == "not_a_repo"
     assert sdk_exc.value.exit_code == EXIT_NOT_A_REPO
 
-    # nothing_to_commit: the seam returns None (its documented no-op contract) — it's
-    # intentionally scoped to only ever commit what was just staged, so "nothing to
-    # commit" is a normal, silent no-op there, not a failure — while the SDK raises with
-    # the dedicated code, matching what av commit now does (see test_exit_codes.py).
+    # nothing_to_commit: the seam returns None (a normal, silent no-op, since it only
+    # ever commits what was just staged), while the SDK raises with the dedicated code.
     seam_repo = _init_repo(_mkdir(tmp_path / "seam-empty"))
     result = commit_scoped_paths(seam_repo, [], "empty")
     assert result is None

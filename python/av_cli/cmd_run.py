@@ -1,9 +1,7 @@
-"""av run — first-class Experiment/Run lifecycle (v1.2.0).
-
-A run groups the commits of one training effort. `av run start` registers server-side
-when reachable and ALWAYS writes local state (.av/run.json) so offline agents keep
-grouping; the server lazily creates unknown runs at push time, so ordering never
-matters. AV_RUN_ID overrides/feeds the same state (agents set it per process).
+"""av run — first-class Experiment/Run lifecycle (v1.2.0). A run groups the commits of
+one training effort; `av run start` registers server-side when reachable and always
+writes local state (.av/run.json) so offline agents keep grouping. AV_RUN_ID overrides/
+feeds the same state.
 """
 
 import json
@@ -66,16 +64,13 @@ def start(name: str | None, parent_run_id: str | None, kind: str, improver_id: s
 
     code_pointer = capture_code_pointer(repo_root)
 
-    # v1.2.2 env snapshot/replay: an already-captured snapshot links to the run at
-    # registration AND in local state, so the registry can answer
-    # "what environment did this run use?" from day one.
+    # An already-captured snapshot links to the run at registration AND in local state.
     loaded_snapshot = load_env_snapshot(repo_root)
     env_snapshot_id = loaded_snapshot[0] if loaded_snapshot else None
 
-    # v1.3.1 (RSI R2, todo.md F.28): a scoring run's whole POINT is to be independently
-    # reproducible — one without a pinned environment AND a pinned code revision can
-    # never be re-run to check its own result, so it's rejected up front rather than
-    # silently accepted and only discovered irreproducible later, when it matters most.
+    # A scoring run's whole point is to be independently reproducible -- one without a
+    # pinned environment AND code revision is rejected up front rather than discovered
+    # irreproducible later.
     if kind == "scoring":
         missing = []
         if not env_snapshot_id:
@@ -88,12 +83,6 @@ def start(name: str | None, parent_run_id: str | None, kind: str, improver_id: s
                  "run must be independently reproducible.")
 
     registered, _ = _register_remote(repo_root, {
-        # v1.2.5 fix: project_id was missing here entirely — the server's POST /api/runs
-        # requires it (422 without one), so EVERY `av run start` registration has been
-        # silently failing (_register_remote swallows any non-200 status) and falling
-        # back to the server's lazy-create-at-push path, which has no way to learn the
-        # run's `name` (the commit payload never carries it) -- runs registered this way
-        # were created, but permanently nameless. See Probleme.md.
         "id": run_id, "project_id": cfg["project_id"], "name": name,
         "parent_run_id": parent_run_id, "code_pointer": code_pointer,
         "kind": kind, "improver_id": improver_id,
@@ -145,13 +134,9 @@ def finish(metrics_raw: tuple, as_failed: bool) -> None:
         except Exception:
             delivered = False
 
-    # v1.3.0 (todo.md item 8): guarantee lineage/metrics-tail/semantic-summary are
-    # present locally after every run finish — regenerated HERE, before the run state
-    # file is removed below, since build_handoff_dict() reads the active run_id from
-    # exactly that file. Best-effort and never fails the finish itself: the run
-    # completing (or failing) in the registry is the operation that matters here; a
-    # local write hiccup building the handoff is a bonus guarantee, not grounds to lose
-    # track of the run the way a network failure would be if it blocked queuing.
+    # Regenerate the handoff HERE, before run state is removed below, since
+    # build_handoff_dict() reads the active run_id from that file. Best-effort and never
+    # fails the finish itself.
     handoff_written = False
     try:
         from .handoff import generate_handoff
@@ -511,12 +496,9 @@ def run_auto_stop_check(run_id: str, metric_name: str, minimize: bool, patience:
 
 
 def current_run_id(repo_root) -> str | None:
-    """The active run id, if any (used by commit's auto-tagging).
-
-    v1.2.5: delegates to core.resolve_run_id() (explicit > AV_RUN_ID env > .av/run.json
-    state) — kept as a thin wrapper so `av_sdk.Repo` and any other existing import of
-    this name keep working unchanged; the actual precedence logic lives in one place now.
-    """
+    """The active run id, if any (used by commit's auto-tagging). Delegates to
+    core.resolve_run_id() -- kept as a thin wrapper so existing imports of this name
+    keep working."""
     from .core import resolve_run_id
 
     return resolve_run_id(repo_root)

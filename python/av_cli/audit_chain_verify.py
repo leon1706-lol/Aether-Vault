@@ -1,18 +1,16 @@
-"""Client-side, genuinely-independent audit-chain verification (v1.3.3, WP-32) — the
-logic behind `av audit verify --export`. Reuses the EXACT SAME hash formula the server
-uses (`av_server.audit_chain.compute_chain_hash`, imported directly — that module is
-dependency-free stdlib, so importing it here never pulls in FastAPI/SQLAlchemy/etc.)
-so a local recomputation is byte-for-byte comparable to what the server itself would
-compute, without asking the server to grade its own homework.
+"""Client-side, independent audit-chain verification (v1.3.3) — the logic behind
+`av audit verify --export`. Reuses the server's own hash formula
+(`av_server.audit_chain.compute_chain_hash`, dependency-free stdlib) so a local
+recomputation is byte-for-byte comparable without asking the server to grade its own
+homework.
 """
 from __future__ import annotations
 
 
 def verify_export(rows: list[dict], public_key_hex: str | None) -> dict:
     """`rows` is the parsed jsonl export (`av audit export --format jsonl`), already in
-    ascending id order (the server's export route emits oldest-first specifically so
-    this holds — see server.py's `export_audit_log`). Returns the same shape the live
-    `/api/admin/audit/verify` route does, so both CLI paths render identically."""
+    ascending id order. Returns the same shape the live `/api/admin/audit/verify` route
+    does, so both CLI paths render identically."""
     from av_server.audit_chain import compute_chain_hash
 
     prev_hash = None

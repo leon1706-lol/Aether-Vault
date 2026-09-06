@@ -4,8 +4,7 @@ Self-hosted numbers a deployment can hold ITSELF to and measure with the tooling
 repo ships — not a hosted-SaaS commitment (Aether-Vault is self-hosted; there is no
 Aether-Vault-operated multi-tenant cloud this doc could speak for).
 
-**Honest status (updated v1.3.4 — this section was stale since v1.3.3 shipped the
-endpoint it describes as missing):** `GET /api/metrics` is real — an `admin`-scoped
+`GET /api/metrics` is real — an `admin`-scoped
 Prometheus text-exposition endpoint (`python/av_server/metrics.py`, wired in `server.py`)
 exporting per-(method, path template, status class) request counts and duration
 histograms, plus point-in-time webhook queue depth and DB pool checkout snapshots.
@@ -42,7 +41,7 @@ Probleme.md as the error budget actually burning.
 
 ## What would close the remaining gap
 
-The endpoint and its request-rate/latency counters are built (v1.3.3, WP-35) — the
+The endpoint and its request-rate/latency counters are built — the
 remaining gap is genuinely operational, not code: this repo ships no example
 Prometheus scrape config / Grafana dashboard JSON, and there is still no cross-replica
 aggregation (each replica's counters are its own, by design — see the endpoint's own
