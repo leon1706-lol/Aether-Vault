@@ -80,3 +80,70 @@ def test_at_least_one_workflow_file_exists():
     # A guard against this whole test module silently asserting nothing (an empty
     # parametrize list passes trivially) if .github/workflows/ ever went missing.
     assert _all_workflow_files(), "no workflow files found under .github/workflows/"
+
+
+# v1.3.4 (W1a): every third-party `uses:` reference used to be a mutable tag or branch
+# ref (73 call sites, all 5 workflows) -- including `pypa/gh-action-pypi-publish@release/v1`
+# sitting on the PyPI-publishing path. All are now pinned to a full commit SHA with a
+# trailing `# vX.Y` comment naming the human-readable version that SHA resolves to. This
+# is the permanent guard against a new `uses:` line re-introducing a mutable ref.
+_ACTION_USES_RE = re.compile(r"^(\s*(?:-\s*)?uses:\s*)([^\s#]+)(.*)$", re.MULTILINE)
+# A local composite action (`uses: ./.github/actions/x`) or a Docker image reference
+# (`docker://...`) are exempt from the owner/repo@sha40 shape below.
+_LOCAL_OR_DOCKER_ACTION_RE = re.compile(r"^\./|^docker://")
+_SHA_PINNED_ACTION_RE = re.compile(r"^[\w.-]+/[\w.-]+(?:/[\w.-]+)*@[0-9a-f]{40}$")
+
+
+def _iter_uses_lines(text: str):
+    for match in _ACTION_USES_RE.finditer(text):
+        ref = match.group(2)
+        trailing_comment = match.group(3)
+        yield ref, trailing_comment
+
+
+class TestActionPinning:
+    @pytest.mark.parametrize("path", _all_workflow_files(), ids=lambda p: p.name)
+    def test_every_action_reference_is_sha_pinned(self, path):
+        text = path.read_text(encoding="utf-8")
+        offenders = []
+        for ref, _comment in _iter_uses_lines(text):
+            if _LOCAL_OR_DOCKER_ACTION_RE.match(ref):
+                continue
+            if not _SHA_PINNED_ACTION_RE.match(ref):
+                offenders.append(ref)
+        assert not offenders, (
+            f"{path.relative_to(REPO_ROOT)} has non-SHA-pinned action reference(s): "
+            f"{offenders} — every `uses:` must be `owner/repo@<40-hex-sha>`, never a "
+            f"mutable tag (@v5) or branch (@release/v1); see the pinned entries in this "
+            f"same file for the `# vX.Y` trailing-comment convention"
+        )
+
+    @pytest.mark.parametrize("path", _all_workflow_files(), ids=lambda p: p.name)
+    def test_every_sha_pinned_action_names_its_version_in_a_comment(self, path):
+        text = path.read_text(encoding="utf-8")
+        unlabeled = []
+        for ref, comment in _iter_uses_lines(text):
+            if _LOCAL_OR_DOCKER_ACTION_RE.match(ref) or not _SHA_PINNED_ACTION_RE.match(ref):
+                continue
+            if "# v" not in comment and "#v" not in comment:
+                unlabeled.append(ref)
+        assert not unlabeled, (
+            f"{path.relative_to(REPO_ROOT)} has SHA-pinned action(s) with no trailing "
+            f"`# vX.Y` comment naming the human-readable version: {unlabeled} — a bare "
+            f"40-hex SHA is unreadable in review; every pin must say which release it is"
+        )
+
+    @pytest.mark.parametrize("path", _all_workflow_files(), ids=lambda p: p.name)
+    def test_no_container_image_is_unpinned_latest(self, path):
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("image:"):
+                continue
+            image_ref = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+            assert "@sha256:" in image_ref or re.search(r":[0-9]", image_ref), (
+                f"{path.relative_to(REPO_ROOT)} has an unpinned `image:` reference "
+                f"({image_ref!r}) — container images (job containers, service containers) "
+                f"must be pinned by digest or a specific version tag, never a bare "
+                f"repository name (which resolves to `:latest`)"
+            )

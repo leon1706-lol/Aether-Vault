@@ -1,4 +1,4 @@
-# Enterprise operator guide: identity, tenancy, and DR (v1.3.2)
+# Enterprise operator guide: identity, tenancy, and DR (v1.3.2, SSO/SCIM added v1.3.3)
 
 A continuous path through the enterprise-readiness surfaces shipped in v1.3.2 — the same
 convention `docs/tutorial.md`/`docs/rsi-operator-guide.md` established, applied to the
@@ -11,10 +11,14 @@ the command and every flag it uses actually exist in the live CLI.
 **Read this first — what this pass shipped and what it didn't.** RBAC, hard
 multi-tenancy, and disaster recovery are real, live-verified code (see
 `development/architecture.md`'s Identity & Session / RBAC / Tenancy Isolation / Backup &
-DR contract sections). **SSO (OIDC/SAML) and SCIM provisioning are NOT built** — there is
-no `av login`, no IdP integration. Everything below authenticates with either the OSS
-`av auth` shared-secret/per-user-token path (unchanged) or the new DB-backed tokens this
-guide provisions with `av token create` — never an external identity provider.
+DR contract sections). **v1.3.4 correction:** this paragraph used to say SSO/SCIM were not
+built at all — that stopped being true in v1.3.3 (sections 10-11 below), which this intro
+was never updated to reflect. SSO (OIDC/SAML) and SCIM provisioning ARE implemented and
+locally tested — `av login`/`av idp add`/`av scim token create` exist — with the one
+remaining gap being a live run against a genuinely external IdP (see "What's next on the
+enterprise roadmap" below). Everything below still also works with the OSS `av auth`
+shared-secret/per-user-token path (unchanged) or the DB-backed tokens this guide
+provisions with `av token create`, entirely independent of an identity provider.
 
 ## 1. Provision a tenant
 

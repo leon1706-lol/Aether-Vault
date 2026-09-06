@@ -102,6 +102,44 @@ DOES NOT mean:
   it like an SSH private key. Registry compromise lets an attacker DELETE signatures but
   not forge new ones without the private key.
 
+## Supply-chain attestations (v1.3.4) — verifying a release, not just trusting it
+
+Every tagged release publishes an SBOM and a Sigstore-backed build-provenance
+attestation for every artifact — wheels, the sdist, and the `aether-vault-engine` GHCR
+image — via `release.yml`'s `github-release`/`build-and-push-docker` jobs
+(`anchore/sbom-action`, `actions/attest-build-provenance`, and buildx's own
+`provenance: mode=max`/`sbom: true`). None of this requires trusting the maintainer's
+own claim — every command below is independently verifiable by anyone with the `gh` CLI
+or `cosign`, against GitHub's/Sigstore's own transparency log, not this repo's say-so.
+
+**Verify a wheel or the sdist** (also downloadable from the GitHub Release page, alongside
+`aether-vault-<version>.sbom.spdx.json`):
+
+```bash
+gh attestation verify aether_vault-<version>-<tag>.whl --repo leon1706-lol/Aether-Vault
+```
+
+**Verify the published engine image**, by digest (from `docker buildx imagetools inspect`
+or the GitHub Release notes):
+
+```bash
+gh attestation verify oci://ghcr.io/leon1706-lol/aether-vault-engine@sha256:<digest> \
+  --repo leon1706-lol/Aether-Vault
+
+# Equivalent with cosign, and how to pull the buildx-embedded SBOM directly off the image:
+cosign verify-attestation --type slsaprovenance \
+  ghcr.io/leon1706-lol/aether-vault-engine@sha256:<digest>
+docker buildx imagetools inspect ghcr.io/leon1706-lol/aether-vault-engine:<tag> --format '{{ json .SBOM }}'
+```
+
+**What this does and does not mean** (same honesty standard as signed commits above):
+it proves the artifact was built by THIS repository's `release.yml` workflow, from the
+tagged commit, on GitHub's own runners — not that the code itself is free of bugs or
+vulnerabilities (that's what `security.yml`'s scans are for, run BEFORE any of this is
+generated). A verification failure means the artifact did NOT come from this repo's
+official pipeline — treat it as compromised or mis-sourced, not as a false alarm to
+work around.
+
 ### Key management and rotation (v1.2.5)
 
 `av registry keys list` shows every key this repo knows (active + archived) with its

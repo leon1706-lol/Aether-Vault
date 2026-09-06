@@ -11,6 +11,10 @@ on:
     - cron: "0 3 * * *"   # daily 03:00 UTC
   workflow_dispatch:
 
+# v1.3.4 (W1b): least-privilege default — both jobs only checkout + run pytest.
+permissions:
+  contents: read
+
 concurrency:
   group: nightly-${{ github.ref }}
   cancel-in-progress: true
@@ -25,9 +29,9 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -49,9 +53,9 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -73,3 +77,178 @@ jobs:
         env:
           AV_DATA_DIR: ${{ runner.temp }}/av-data
         run: pytest tests/test_env_snapshot.py tests/test_dataset_cdc.py tests/test_core.py -q -k "golden or cdc_boundary_stability or cdc_determinism"
+
+  # v1.3.4 (todo.md item 9): the wheel/sdist install path (package-build,
+  # smoke-wheel-linux, smoke-sdist-windows in tests.yml) never had a macOS leg — the
+  # `infrastructure.md` CI Job Map's own "Known residuals" line said so explicitly
+  # ("no macOS install smoke"). golden-fixtures-macos above proves the C++ core BUILDS on
+  # macOS; this proves a real wheel INSTALLS and the CLI actually runs, matching the
+  # Linux/Windows install-smoke jobs' own bar.
+  macos-install-smoke:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0   # setuptools-scm needs tag history to derive a real version
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Build a wheel (same MACOSX_DEPLOYMENT_TARGET as golden-fixtures-macos)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+        run: |
+          python -m pip install build
+          python -m build --wheel
+
+      - name: Install the built wheel into a clean venv
+        run: |
+          python -m venv "$GITHUB_WORKSPACE/clean"
+          "$GITHUB_WORKSPACE/clean/bin/python" -m pip install ./dist/*.whl
+
+      - name: Offline sanity roundtrip through the installed console script
+        # Mirrors tests.yml's smoke-wheel-linux job exactly — same repro, third OS.
+        run: |
+          AV="$GITHUB_WORKSPACE/clean/bin/av"
+          PYBIN="$GITHUB_WORKSPACE/clean/bin/python"
+          SCRATCH=$(mktemp -d)
+          cd "$SCRATCH"
+          "$AV" --version
+          "$PYBIN" -c "import av_cli, av_server, aether_core"
+          "$AV" init --mode local --yes --no-repl
+          echo "packaged" > f.txt
+          "$AV" add f.txt
+          "$AV" commit -m "macos-wheel-smoke"
+          "$AV" log | grep "macos-wheel-smoke"
+
+  # v1.3.4 (todo.md item 40, W3f): scripts/e2e_scenario.sh's Phase U (real backup ->
+  # destroy -> restore drill, `av admin backup create/verify/restore`) has existed since
+  # v1.3.2 but was wired to NOTHING in CI -- gated behind AV_E2E_DR=1, default off, it has
+  # never actually run here. Nightly (not every push): genuinely destructive against its
+  # own throwaway database/CAS dir, and slower than the push-gating jobs should be.
+  dr-drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
+        env:
+          POSTGRES_USER: av_user
+          POSTGRES_PASSWORD: av_password
+          POSTGRES_DB: aether_vault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis/redis-stack-server:latest@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      AV_TEST_DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test
+      AV_TEST_REDIS_URL: redis://localhost:6379/0
+      E2E_PSQL_URL: postgresql://av_user:av_password@localhost:5432/aether_vault_test
+      AV_E2E_DR: "1"
+      # No container named "aether-vault-db" exists in THIS job's topology (a service
+      # container, not docker-compose.yml's dev stack) -- unset so Phase U's own
+      # `docker inspect`-then-fallback logic takes the pg_dump/pg_restore-on-PATH path
+      # (installed below) instead of trying to `docker inspect` a container that isn't
+      # there.
+      E2E_DB_CONTAINER: ""
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Aether-Vault + postgresql-client (pg_dump/pg_restore)
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+          pip install -e .[dev]
+
+      - name: "DR drill (Phase U: backup -> destroy -> restore)"
+        shell: bash
+        run: bash scripts/e2e_scenario.sh
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dr-drill-server-log
+          path: /tmp/server-e2e.log
+          if-no-files-found: ignore
+
+  # v1.3.4 (todo.md item 39, W3g): old-binary-vs-new-schema rolling-upgrade drill (see
+  # scripts/compat_drill.sh's own header for exactly what this proves and its honest
+  # current limitation — it self-calibrates its expected outcome against whether the
+  # OLD tag it drills actually contains Probleme.md #136's fix, so it never produces a
+  # false failure regardless of tag history; it only becomes a REAL regression gate for
+  # that fix once a tag past it exists).
+  compat-drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
+        env:
+          POSTGRES_USER: av_user
+          POSTGRES_PASSWORD: av_password
+          POSTGRES_DB: aether_vault_compat_drill
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0   # tag history — the drill checks out a previous release tag
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Aether-Vault (current code)
+        run: pip install -e .[dev]
+
+      - name: Old-binary-vs-new-schema compatibility drill
+        env:
+          DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_compat_drill
+        run: bash scripts/compat_drill.sh
+
+  # v1.3.4 (todo.md item 18, W6b): the deprecation registry's own dry-run — prints every
+  # entry's status and, for "pending" ones, whether they'd be overdue at the NEXT MAJOR
+  # (this repo's removal-only-at-MAJOR policy, VERSIONING.md). Purely informational
+  # (`--dry-run`, always exits 0 per scripts/check_deprecations.py's own judgment call);
+  # tests/test_deprecations.py is what actually gates a real overdue entry, on every push.
+  deprecation-dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - run: pip install pyyaml
+
+      - name: Deprecation registry dry-run
+        run: python scripts/check_deprecations.py --dry-run

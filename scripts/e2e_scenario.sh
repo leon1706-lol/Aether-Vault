@@ -12,8 +12,9 @@
 #   D. protected mode with per-user tokens: join, attribution, revocation, 401 queueing
 #   E. GC drill with a zeroed grace period: orphan swept, live objects survive
 #   F-K. SDK run lifecycle, event stream, promotion policy, signed commits, audit trail
-#   L-N. chaos drills (v1.3.0) — gated behind AV_E2E_CHAOS=1, see their own section below:
-#        real redis outage, unwritable storage, server SIGKILLed mid-push
+#   L-N. chaos drills (v1.3.0, M2 added v1.3.4) — gated behind AV_E2E_CHAOS=1, see their
+#        own section below: real redis outage, unwritable storage, a genuinely FULL
+#        filesystem (real ENOSPC via a tmpfs mount), server SIGKILLed mid-push
 #
 # Every phase prints PASS/FAIL lines; any failure aborts with a nonzero exit.
 # The compose-restart plumbing of `av auth add-user` (writes .env, restarts a
@@ -218,7 +219,20 @@ start_server legacy-C     # boot must detect the pre-Alembic shape, heal, stamp
 
 [[ "$(psqlq "SELECT count(*) FROM information_schema.columns WHERE table_name='commits' AND column_name='extra_parents'")" == "1" ]] \
   || die "legacy boot did not restore commits.extra_parents"
-[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "0016" ]] || die "legacy boot did not stamp chain head (0016)"
+# v1.3.4 (W0.6): this used to be a hardcoded literal ("0016") -- the 6th "touch place" a
+# new migration has to remember (development/Probleme.md's own incident entry said so
+# explicitly: "the checklist itself should read '6 places' going forward"). Derived at
+# runtime from the SAME alembic ScriptDirectory the server itself resolves against, so
+# adding migration 0017 can never make this assertion silently stale again -- it now
+# checks "the server actually reached its own current head", not "the server reached the
+# head THIS SCRIPT was written against".
+EXPECTED_HEAD="$("$PY" -c "
+from av_server.database import _alembic_config
+from alembic.script import ScriptDirectory
+print(ScriptDirectory.from_config(_alembic_config()).get_current_head())
+")"
+[[ -n "$EXPECTED_HEAD" ]] || die "could not resolve the alembic chain's current head via ScriptDirectory"
+[[ "$(psqlq "SELECT version_num FROM alembic_version")" == "$EXPECTED_HEAD" ]] || die "legacy boot did not stamp chain head ($EXPECTED_HEAD)"
 [[ "$(psqlq "SELECT count(*) FROM commits")" == "$COMMITS_BEFORE" ]] || die "heal lost commit rows!"
 pass "Phase C: pre-Alembic volume healed + stamped zero-touch, data intact"
 
@@ -669,6 +683,54 @@ else
   log "Phase M SKIPPED — this environment does not honor chmod 555 as unwritable (root, or a filesystem that ignores POSIX perms)"
 fi
 chmod -R 755 "$READONLY_DATA" 2>/dev/null || true
+
+# ----------------------------------------------------------------------------
+# v1.3.4 (todo.md item 10, W3e): Phase M above proves an UNWRITABLE data dir fails
+# honestly and queues -- it does NOT prove a genuinely FULL one does, which is a
+# meaningfully different failure (ENOSPC on the write syscall itself, not EACCES/EPERM
+# rejected before the write is even attempted; a storage layer that only checks
+# writability up front, e.g. via os.access(), would pass Phase M while still corrupting
+# data on a real full-disk write). A real ENOSPC needs an actual filesystem with a real
+# size limit — a tiny tmpfs mount is the standard, safe way to get one in CI without
+# touching the runner's real disk at all.
+log "Phase M2 — genuine ENOSPC: a real full filesystem fails the write honestly, client queues, drains once space is freed"
+TMPFS_MOUNT="$WORK/data-enospc"
+mkdir -p "$TMPFS_MOUNT"
+if sudo mount -t tmpfs -o size=2m tmpfs "$TMPFS_MOUNT" 2>/dev/null; then
+  stop_server 2>/dev/null || true
+  # Pre-create CASStorage's own top-level dirs (same reasoning as Phase M above) and burn
+  # most of the 2 MiB budget with a filler file BEFORE the server ever touches it, so the
+  # very first real object write lands on an already-ENOSPC filesystem, not a race against
+  # exactly how much a fresh CASStorage.__init__ itself consumes.
+  mkdir -p "$TMPFS_MOUNT/objects" "$TMPFS_MOUNT/commits" "$TMPFS_MOUNT/refs"
+  if dd if=/dev/zero of="$TMPFS_MOUNT/filler" bs=1M count=1 status=none 2>/dev/null; then
+    start_server chaos-M2-full AV_DATA_DIR="$TMPFS_MOUNT"
+
+    mkdir -p "$WORK/repoM2" && cd "$WORK/repoM2"
+    av . init --mode local --yes --no-repl >/dev/null
+    # Bigger than the ~1 MiB of tmpfs headroom left after the filler file above --
+    # guaranteed to hit ENOSPC on write, not merely "might, depending on overhead".
+    dd if=/dev/urandom of=big-file.bin bs=1M count=2 status=none
+    av . add big-file.bin >/dev/null
+    set +e
+    M2_COMMIT_OUT="$(av . commit -m "commit against a genuinely full filesystem" 2>&1)"
+    set -e
+    [[ "$(pending_count "$WORK/repoM2")" -ge 1 ]] \
+      || die "Phase M2: commit against a full filesystem must queue locally, not silently succeed or crash the server. Output: $M2_COMMIT_OUT"
+
+    stop_server
+    sudo umount "$TMPFS_MOUNT" 2>/dev/null || true
+    start_server chaos-M2-recovered
+    av . push >/dev/null
+    [[ "$(pending_count "$WORK/repoM2")" -eq 0 ]] || die "Phase M2: queued commit did not drain once real disk space was available again"
+    pass "Phase M2: write failure against a genuinely full filesystem (real ENOSPC) queued honestly; recovered cleanly once space was freed"
+  else
+    log "Phase M2 SKIPPED — could not even write the filler file to the fresh tmpfs mount"
+    sudo umount "$TMPFS_MOUNT" 2>/dev/null || true
+  fi
+else
+  log "Phase M2 SKIPPED — this environment does not permit mounting tmpfs (no passwordless sudo, or mount is otherwise restricted)"
+fi
 
 # ----------------------------------------------------------------------------
 log "Phase N — server killed mid-push (SIGKILL, not graceful): pending_push survives intact, later push drains cleanly"

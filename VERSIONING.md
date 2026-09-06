@@ -320,6 +320,43 @@ SAML routes aren't mounted, not a startup failure).
   driven end-to-end against a real external IdP in this environment. Treat OIDC/SAML as
   implemented-and-locally-tested, not yet field-verified against Okta/Entra/Keycloak.
 
+## v1.3.4 additive surfaces
+
+Not a product-surface release (no new HTTP routes/DB schema/CLI commands) — this closes
+`todo.md`'s 40-item CI/CD backlog. Additive in the sense that matters for this table: no
+user-facing contract changed, only the pipeline that guards them and, incidentally, one
+real product-code fix (below) that closes a genuine schema-compatibility gap.
+
+- **New CI surfaces**: `codeql.yml` (SAST); `gitleaks`, `test-linux`, `contract-matrix`,
+  `migrations-drill`, `lint-workflows`, `slim-image-smoke`, `preview-env`, `ci-summary`
+  (`tests.yml`); `macos-install-smoke`, `dr-drill`, `compat-drill`, `deprecation-dry-run`
+  (`nightly.yml`); `verify-install`, `rollback-drill` (`release.yml`); `staging-smoke`
+  (`docker-edge.yml`). Full list: `development/infrastructure.md`'s CI Job Map.
+- **New scripts**: `release_smoke.sh`, `migrations_drill.py`, `compat_drill.sh`,
+  `rollback_drill.sh`, `check_deprecations.py`, `ci_summary.py`.
+- **New config files**: `.github/CODEOWNERS`, `.github/ci-budgets.yml`,
+  `.github/required-checks.txt`, `.gitleaks.toml`, `development/deprecations.yml`.
+- **Image changes**: the engine/server/webui images now carry a real
+  `org.opencontainers.image.version` (previously always `0.0.0.dev0`, Probleme.md #69),
+  a `HEALTHCHECK`, and (release path only) linux/arm64 alongside linux/amd64. SSO/SAML
+  extras (`authlib`, `pyjwt`, `pysaml2` + native `xmlsec1`/`libxml2`) are now actually
+  installed in every image — previously dead code in every shipped container despite
+  `pyproject.toml`'s own comment claiming otherwise.
+- **A real fix, not new surface**: `database.py::_ensure_schema_sync()` no longer
+  crashes when an older server binary boots against a database a newer replica has
+  already migrated past what the older binary's own alembic chain recognizes — see
+  Probleme.md #136. Additive/backward-compatible per this page's own schema-compatibility
+  rule above; no behavior change for the common case (a binary booting against a schema
+  it DOES recognize).
+- **Known, disclosed limitation**: this release's Docker/release-pipeline changes
+  (multi-arch build, the new drill scripts, the Dockerfile's SSO/SAML native-build
+  changes) were authored and reasoned through without a reachable Docker daemon in the
+  session that wrote them — real, but not yet locally end-to-end verified; their first
+  genuine proof is the next CI run against them, or a local run once Docker Desktop is
+  available. `scripts/compat_drill.sh` and `rollback_drill.sh` additionally cannot fully
+  prove themselves until a tag past this release's own fixes exists to drill against —
+  see each script's own header for exactly what that means.
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades
@@ -364,7 +401,7 @@ to 10/minute by default. Both pre-1.1.x behaviors remain available explicitly vi
    PRs** — it blocks a publish, it never merges, approves, or opens anything (see
    `tests/test_ci_policy.py`'s standing no-bots/no-auto-merge guard, which this job must
    never violate).
-6. Once the gate passes: builds sdist + wheels (cp310–cp312, three OSes) → publishes to
+6. Once the gate passes: builds sdist + wheels (cp310–cp314, three OSes) → publishes to
    PyPI via trusted publishing → creates a **GitHub Release for the tag** with
    auto-generated notes (commit highlights + full changelog link) and every wheel/sdist
    attached → pushes `:latest` + version-tagged images (plus the slim `server-*`/`webui-*`

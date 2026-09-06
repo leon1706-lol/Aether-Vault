@@ -6,6 +6,19 @@ on:
       - "v*.*.*"
   workflow_dispatch:
 
+# v1.3.4 (W1b): deny-all default -- every job below now grants itself exactly what it
+# needs explicitly (see each job's own `permissions:` block) rather than any job silently
+# inheriting whatever the REPO's default token permissions happen to be set to.
+permissions: {}
+
+# v1.3.4 (W1b): a real release is a rare, deliberate tag push -- but a re-tag or a
+# workflow_dispatch retry while the first run is still building must never race it for
+# the SAME tag (two concurrent publish-pypi runs against one version is exactly the kind
+# of thing OIDC trusted publishing can't undo).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # v1.3.0 (todo.md item 30): every publish job below depends on this passing — a red
   # commit (or a release whose bookkeeping is stale/incomplete) can no longer reach PyPI
@@ -17,12 +30,14 @@ jobs:
     name: Release gate
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0 # full history — release_gate.py needs `git merge-base --is-ancestor`
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -32,37 +47,86 @@ jobs:
       - name: Run the release gate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/release_gate.py --tag "${{ github.ref_name }}"
+        run: python scripts/release_gate.py --tag "${{ github.ref_name }}" --report release-gate-report.md
+
+      # v1.3.4 (todo.md item 23, W4d): the Essential-Tasks/gate outcome as an artifact a
+      # later reader can actually open — attached to the GitHub Release itself below
+      # (github-release job) — not just a claim in this job's own log. `if: always()`
+      # because the report is exactly what you want WHEN the gate failed, not only when
+      # it passed.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: release-gate-report
+          path: release-gate-report.md
+          if-no-files-found: warn
 
   build-wheels:
     name: Build wheels (${{ matrix.os }})
+    # v1.3.4 (W4e): this (and build-sdist below) used to have NO `needs:`, so both ran
+    # — and burned real runner-minutes across three OSes — even when `gate` had already
+    # failed; only the publish jobs were ever actually blocked by a red gate.
+    needs: gate
     runs-on: ${{ matrix.os }}
+    # v1.3.4 (W1b/W4e): was missing entirely — cibuildwheel compiling three CPython
+    # ABIs across every supported OS has no natural upper bound without one; a genuine
+    # hang here used to burn the full default 6-hour runner cap before this job's own
+    # failure was ever visible.
+    timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0 # full history so setuptools-scm can see tags
 
-      - uses: pypa/cibuildwheel@v2.16
+      # v1.3.4 (W0.1): v2.16 predates cp313/cp314 support entirely -- pyproject.toml's own
+      # [tool.cibuildwheel] build = "cp310-* … cp314-*" (and the classifiers list) has been
+      # asking this action to build wheels it structurally cannot produce; released wheels
+      # silently stopped at cp312 with no error anywhere in this pipeline. v4.x is current
+      # and covers the full cp310-cp314 range.
+      - uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
         env:
           CIBW_BUILD_VERBOSITY: 1
 
-      - uses: actions/upload-artifact@v7
+      # v1.3.4 (W0.1): asserts the fix above actually holds, not just "the step didn't
+      # error" -- cibuildwheel can silently skip a CPython tag it doesn't recognize rather
+      # than failing the build.
+      - name: Assert every supported CPython tag actually got built
+        shell: bash
+        run: |
+          missing=""
+          for tag in cp310 cp311 cp312 cp313 cp314; do
+            ls ./wheelhouse/*-"$tag"-*.whl >/dev/null 2>&1 || missing="$missing $tag"
+          done
+          if [[ -n "$missing" ]]; then
+            echo "wheelhouse is missing wheel(s) for:$missing" >&2
+            ls -la ./wheelhouse/ >&2
+            exit 1
+          fi
+          echo "all of cp310-cp314 present in ./wheelhouse/"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: wheels-${{ matrix.os }}
           path: ./wheelhouse/*.whl
 
   build-sdist:
     name: Build sdist
+    needs: gate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -71,52 +135,173 @@ jobs:
           python -m pip install build
           python -m build --sdist
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sdist
           path: dist/*.tar.gz
 
+  # v1.3.4 (todo.md item 24, W4e): `tests.yml` already proves a wheel/sdist from a plain
+  # `python -m build` installs cleanly (package-build/smoke-wheel-linux/smoke-sdist-
+  # windows) — but nothing had EVER installed the artifacts THIS pipeline actually
+  # publishes to PyPI before this. Real install verification on all three OSes, one
+  # representative CPython ABI (cp312) each, before anything reaches PyPI.
+  verify-install:
+    name: Verify install (${{ matrix.os }})
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the cp312 wheel into a clean venv (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          python -m venv "$GITHUB_WORKSPACE/clean"
+          WHEEL=$(ls ./dist/*-cp312-*.whl | head -1)
+          "$GITHUB_WORKSPACE/clean/bin/python" -m pip install "$WHEEL"
+
+      - name: Offline sanity roundtrip (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          AV="$GITHUB_WORKSPACE/clean/bin/av"
+          PYBIN="$GITHUB_WORKSPACE/clean/bin/python"
+          SCRATCH=$(mktemp -d)
+          cd "$SCRATCH"
+          "$AV" --version
+          "$PYBIN" -c "import av_cli, av_server, aether_core"
+          "$AV" diff --help > /dev/null
+          "$AV" registry --help > /dev/null
+          "$AV" init --mode local --yes --no-repl
+          echo "release-verify" > f.txt
+          "$AV" add f.txt
+          "$AV" commit -m "release-verify-install"
+          "$AV" log | grep "release-verify-install"
+          "$PYBIN" -c "
+          import importlib.resources as r
+          names = {'envelope-1.0','event-1.0','run-1.0','webhook-payload-1.0','semdiff-1.0','avh-2.0',
+                   'improver-1.0','change-set-1.0','policy-pack-1.0','eval-suite-1.0',
+                   'tool-manifest-1.0','action-log-1.0','backup-manifest-1.0'}
+          for name in names:
+              ref = r.files('av_cli').joinpath('schemas', f'{name}.schema.json')
+              assert ref.is_file(), f'{name}.schema.json missing from the RELEASE wheel'
+          print('all contract schemas present in the release wheel')
+          "
+
+      - name: Install the cp312 wheel into a clean venv (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m venv "$env:GITHUB_WORKSPACE\clean"
+          $wheel = (Get-Item ./dist/*-cp312-*.whl)[0].FullName
+          & "$env:GITHUB_WORKSPACE\clean\Scripts\python.exe" -m pip install $wheel
+
+      - name: Offline sanity roundtrip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $av = "$env:GITHUB_WORKSPACE\clean\Scripts\av.exe"
+          $py = "$env:GITHUB_WORKSPACE\clean\Scripts\python.exe"
+          $scratch = Join-Path $env:RUNNER_TEMP "av-release-verify"
+          New-Item -ItemType Directory -Force $scratch | Out-Null
+          Set-Location $scratch
+          & $av --version
+          & $py -c "import av_cli, av_server, aether_core"
+          & $av init --mode local --yes --no-repl
+          Set-Content -Path f.txt -Value release-verify
+          & $av add f.txt
+          & $av commit -m release-verify-install
+          (& $av log) | Select-String release-verify-install
+
   publish-pypi:
     name: Publish to PyPI
-    needs: [gate, build-wheels, build-sdist]
+    needs: [gate, build-wheels, build-sdist, verify-install]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: pypi
     permissions:
       id-token: write # required for PyPI trusted publishing (OIDC)
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: sdist
           path: dist
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
   github-release:
     name: Create GitHub Release with changelog
-    needs: [gate, build-wheels, build-sdist]
+    needs: [gate, build-wheels, build-sdist, verify-install]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write # create the Release and attach artifacts
+      # v1.3.4 (todo.md item 6, W4f): required for actions/attest-build-provenance's
+      # Sigstore-backed, keyless signing of the provenance attestation below.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: sdist
           path: dist
+
+      # v1.3.4 (todo.md item 23, W4d): the gate's own report, attached alongside the
+      # wheels/sdist — evidence the sign-off actually happened, not just a claim.
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-gate-report
+          path: dist
+
+      # v1.3.4 (todo.md item 4, W4f): SBOM for every wheel + the sdist, generated from
+      # the actual files about to ship (not a source-tree scan) and attached as a real
+      # Release asset — SPDX is the format `gh attestation verify`/most downstream
+      # tooling expects.
+      - name: Generate SBOM for the release artifacts
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: dist
+          format: spdx-json
+          output-file: dist/aether-vault-${{ github.ref_name }}.sbom.spdx.json
+
+      # v1.3.4 (todo.md item 6, W4f): a Sigstore-backed, keyless build-provenance
+      # attestation for every wheel + the sdist — verifiable by anyone via
+      # `gh attestation verify <file> --repo leon1706-lol/Aether-Vault` (see SECURITY.md).
+      # Separate mechanism from the Docker image's own `provenance: mode=max` (an in-toto
+      # attestation embedded in the image manifest) — this one covers the PyPI-bound
+      # file artifacts, which have no image manifest to embed anything in.
+      - name: Attest build provenance for the release artifacts
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/*.whl,dist/*.tar.gz"
 
       # Auto-generated notes (commit highlights, contributors, full-changelog link; GitHub
       # diffs against the previous tag automatically) plus every wheel/sdist attached.
@@ -135,18 +320,77 @@ jobs:
     name: Build and push Docker engine image (GHCR)
     needs: gate
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # v1.3.4 (W1f/W3b): bumped from 40 -- the engine image is built twice (scan, then
+    # push), and the push build now ALSO cross-compiles linux/arm64 under QEMU emulation
+    # (C++/native-extension compilation — the py-builder stage's pybind11 core AND
+    # pysaml2's xmlsec C extension — is the expensive part under emulation, commonly
+    # 3-5x slower than native). GHA layer caching (cache-from/to below) should bring
+    # this down over time; 90 is the safe ceiling for a cold cache's first run.
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
+      # v1.3.4 (todo.md item 6, W4f): required for the image-digest provenance
+      # attestation below (Sigstore-backed, keyless signing).
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: docker/login-action@v3
+      # v1.3.4 (W3c): a release tag's version is REAL (unlike docker-edge.yml's synthetic
+      # dev-version) — strip the leading "v" git tags carry but PEP 440/setuptools-scm
+      # versions never do ("v1.3.4" -> "1.3.4"), matching release_gate.py's own
+      # `version.lstrip("v")` convention for the exact same tag.
+      - name: Compute image metadata
+        id: meta
+        run: |
+          echo "av_version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "vcs_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # v1.3.4 (todo.md item 15, W3b): linux/arm64 needs QEMU emulation on an amd64
+      # GitHub-hosted runner; buildx is what actually drives a multi-platform build.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # v1.3.4 (todo.md item 3, W1f): same scan-before-push gate as docker-edge.yml —
+      # build once locally to scan, only push the SAME image once Trivy passes. A
+      # release tag is exactly the path where a shipped CVE would matter most.
+      # Deliberately NO `platforms:` here (defaults to the runner's own linux/amd64) --
+      # `load: true` only ever works for a single platform, and scanning the amd64 build
+      # is the accepted proxy for "this Dockerfile/base image is clean" across both
+      # architectures (todo.md item 15's own scope is multi-arch BUILDING, not a second
+      # emulated-arm64 scan pass).
+      - name: Build engine image (local only, for scanning)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: engine
+          push: false
+          load: true
+          tags: aether-vault-engine:release-scan
+          build-args: |
+            AV_VERSION=${{ steps.meta.outputs.av_version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha,scope=release-engine
+
+      - name: Trivy (fail on HIGH/CRITICAL before this release image is ever pushed)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: aether-vault-engine:release-scan
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
 
       # v1.2.2 consolidation: ONE multi-stage build produces the engine image
       # (registry + webui in one container). The historical aether-vault-server /
@@ -157,7 +401,8 @@ jobs:
       # already-pulled legacy images; see docs/migrate-engine-image.md for pinned-compose
       # migration and `av doctor --compose PATH` for an automated rewrite.
       - name: Build and push engine image
-        uses: docker/build-push-action@v6
+        id: push-engine
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           # v1.3.0 (Probleme.md): explicit — the Dockerfile's unnamed-default stage
@@ -166,14 +411,43 @@ jobs:
           # under the aether-vault-engine tag.
           target: engine
           push: true
+          # v1.3.4 (todo.md item 15, W3b): the engine image specifically — the one
+          # todo.md's own wording names — now ships both architectures.
+          platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/leon1706-lol/aether-vault-engine:latest
             ghcr.io/leon1706-lol/aether-vault-engine:${{ github.ref_name }}
+          build-args: |
+            AV_VERSION=${{ steps.meta.outputs.av_version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha,scope=release-engine
+          cache-to: type=gha,mode=max,scope=release-engine
+          # v1.3.4 (todo.md item 4/6, W4f): SBOM + build provenance attached as in-toto
+          # attestations on the published image — verifiable via `gh attestation verify`
+          # or `cosign`; see SECURITY.md for the exact commands.
+          sbom: true
+          provenance: mode=max
+
+      # v1.3.4 (todo.md item 6, W4f): a SECOND, independent provenance attestation —
+      # GitHub's own Sigstore-backed attestation API, keyed to the pushed image's real
+      # digest (not just the in-toto attestation buildx already embedded via
+      # `provenance: mode=max` above). Verifiable with
+      # `gh attestation verify oci://ghcr.io/leon1706-lol/aether-vault-engine@<digest> --repo leon1706-lol/Aether-Vault`
+      # — see SECURITY.md for the full command.
+      - name: Attest build provenance for the engine image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/leon1706-lol/aether-vault-engine
+          subject-digest: ${{ steps.push-engine.outputs.digest }}
+          push-to-registry: true
 
       # v1.3.0 (todo.md item 19): slim, single-role images alongside the "all" engine
       # image above — for operators who don't want both runtimes in one container.
+      # Stay single-arch (linux/amd64, buildx's default) -- todo.md item 15 scopes
+      # multi-arch to the engine image specifically; these can follow in a later pass.
       - name: Build and push slim server image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           target: server
@@ -181,9 +455,17 @@ jobs:
           tags: |
             ghcr.io/leon1706-lol/aether-vault-engine:server-latest
             ghcr.io/leon1706-lol/aether-vault-engine:server-${{ github.ref_name }}
+          build-args: |
+            AV_VERSION=${{ steps.meta.outputs.av_version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha,scope=release-server
+          cache-to: type=gha,mode=max,scope=release-server
+          sbom: true
+          provenance: mode=max
 
       - name: Build and push slim webui image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           target: webui
@@ -191,3 +473,57 @@ jobs:
           tags: |
             ghcr.io/leon1706-lol/aether-vault-engine:webui-latest
             ghcr.io/leon1706-lol/aether-vault-engine:webui-${{ github.ref_name }}
+          build-args: |
+            AV_VERSION=${{ steps.meta.outputs.av_version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha,scope=release-webui
+          cache-to: type=gha,mode=max,scope=release-webui
+          sbom: true
+          provenance: mode=max
+
+  # v1.3.4 (todo.md item 28, W5c): the actual rollback DRILL — see
+  # scripts/rollback_drill.sh's own header for exactly what it proves, and
+  # docs/runbooks/upgrade-rollback.md for the operator-facing procedure. Non-blocking to
+  # publish-pypi/github-release deliberately: PyPI has no rollback concept (an old wheel
+  # is simply still installable), and this drill is about the DOCKER/DB rollback path
+  # specifically — a finding here is real and worth seeing, but shouldn't hold up the
+  # Python package reaching users while it's investigated.
+  rollback-drill:
+    name: Rollback drill (previous image <-> this release)
+    needs: build-and-push-docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0   # tag history — need the tag immediately before this one
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the previous release tag
+        id: prev
+        run: |
+          prev="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [[ -z "$prev" ]]; then
+            echo "no previous tag reachable from ${GITHUB_REF_NAME} -- nothing to roll back TO, skipping this drill"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "previous tag: $prev"
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+            echo "tag=$prev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rollback drill
+        if: steps.prev.outputs.skip == '0'
+        run: |
+          bash scripts/rollback_drill.sh \
+            "ghcr.io/leon1706-lol/aether-vault-engine:${GITHUB_REF_NAME}" \
+            "ghcr.io/leon1706-lol/aether-vault-engine:${{ steps.prev.outputs.tag }}"

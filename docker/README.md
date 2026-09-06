@@ -5,12 +5,16 @@ image, ONE container running all subservices.
 
 - `engine-entrypoint.sh` - container entrypoint/supervisor. Dispatches on
   `AV_ENGINE_ROLE`: `all` (default) runs the uvicorn registry (:8000) AND the Next.js
-  standalone server (:3000); either child dying takes the container down so
-  `restart: unless-stopped` brings the whole engine back. `server` / `webui` run one
-  subservice each (legacy alias support). When the role is UNSET it auto-detects from
-  container env - `DATABASE_URL` set -> server-only, `NEXT_PUBLIC_API_URL` set without
-  it -> webui-only - which is exactly what pre-1.2.2 pinned compose files produce
-  against the aliased legacy image names.
+  standalone server (:3000). **v1.3.4 correction:** this used to say "either child dying
+  takes the container down" — that stopped being true in v1.2.5. A dead subservice is now
+  restarted INDEPENDENTLY (`record_restart`'s sliding-window budget,
+  `AV_ENGINE_MAX_RESTARTS`/`AV_ENGINE_RESTART_WINDOW_SECS`, default 5 restarts/300s); only
+  exceeding that budget (or `AV_ENGINE_RESTART_SUBSERVICE=0`) shuts the whole container
+  down, at which point `restart: unless-stopped` brings the whole engine back. `server` /
+  `webui` run one subservice each (legacy alias support). When the role is UNSET it
+  auto-detects from container env - `DATABASE_URL` set -> server-only,
+  `NEXT_PUBLIC_API_URL` set without it -> webui-only - which is exactly what pre-1.2.2
+  pinned compose files produce against the aliased legacy image names.
 
 The multi-stage Dockerfile lives at the repo root; compose files are
 `../docker-compose.yml` (dev, build-based) and

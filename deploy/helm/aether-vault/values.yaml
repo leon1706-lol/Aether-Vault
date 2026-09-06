@@ -7,7 +7,11 @@
 replicaCount: 2
 
 image:
-  repository: ghcr.io/leon1706/aether-vault-engine
+  # v1.3.4 (W0.3): this pointed at ghcr.io/leon1706/... -- no such image exists. Every
+  # publisher (Dockerfile:6, release.yml, docker-edge.yml, the release compose file) uses
+  # the leon1706-lol org. tests/test_helm_chart.py pins this against release.yml so it
+  # can't drift back.
+  repository: ghcr.io/leon1706-lol/aether-vault-engine
   tag: "1.3.2"
   pullPolicy: IfNotPresent
 

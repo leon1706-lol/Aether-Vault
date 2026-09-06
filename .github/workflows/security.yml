@@ -11,14 +11,29 @@ on:
   schedule:
     - cron: '0 6 * * 1'   # every Monday 06:00 UTC
   workflow_dispatch: {}
+  # v1.3.4 (W1c): security scans used to run on PR + weekly only -- a master push
+  # (the moment code actually lands) went entirely unscanned until the next Monday.
+  push:
+    branches: [master]
+
+# v1.3.4 (W1b): least-privilege default. `gitleaks`/`codeql-equivalent` SARIF-uploading
+# jobs below grant themselves `security-events: write` individually; every other job
+# here only ever reads the repo, scans, and uploads its own JSON report artifact.
+permissions:
+  contents: read
+
+# v1.3.4 (W1b): rapid-fire master pushes shouldn't run five overlapping scan sweeps.
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   python-deps:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: pip-audit (known-CVE scan of resolved dependencies)
@@ -39,7 +54,7 @@ jobs:
               for v in d.get('vulns', []):
                   print(f\"  {d[\'name\']}=={d[\'version\']}: {v[\'id\']} - {v.get(\'description\', \'\')[:120]}\")
           "
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: pip-audit-report
@@ -49,8 +64,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
       - name: bandit (Python security linter)
@@ -71,7 +86,7 @@ jobs:
           if high:
               raise SystemExit(f'{len(high)} HIGH-severity bandit finding(s) -- see above')
           "
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: bandit-report
@@ -81,9 +96,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     container:
-      image: semgrep/semgrep
+      # v1.3.4 (W0.8): was `image: semgrep/semgrep` -- unqualified, so this resolved to
+      # whatever `:latest` happened to be on the day the job ran, an unpinned execution
+      # surface sitting inside the SECURITY workflow itself. Pinned to the digest
+      # `:latest` pointed at on 2026-09-06 (a multi-arch index digest, so both amd64/arm64
+      # runners resolve correctly); bump deliberately, the same policy as every other pin
+      # in this repo (infrastructure.md's "do not downgrade pins" note).
+      image: semgrep/semgrep@sha256:51c9f53a4fce0d55e9abd08d7b96968654248a4b1122e77f20e0a49c0072446c
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: semgrep (Python security + secrets rulesets)
         run: |
           semgrep scan --config p/python --config p/secrets \
@@ -99,7 +120,7 @@ jobs:
           if errors:
               raise SystemExit(f'{len(errors)} ERROR-severity semgrep finding(s) -- see above')
           "
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: semgrep-report
@@ -109,11 +130,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Build the engine image
         run: docker build --target engine -t aether-vault-engine:security-scan .
       - name: Trivy (OS + Python package CVE scan of the built image)
-        uses: aquasecurity/trivy-action@0.28.0
+        # v1.3.4 (W1a / Probleme.md #135): was `@0.28.0` -- that ref does not exist in
+        # aquasecurity/trivy-action (tags are `v`-prefixed; no bare "0.28.0" tag/branch
+        # ever existed). Since this whole workflow had never actually run (see #135:
+        # trigger was PR+weekly-only, and this repo has had zero PRs), this broken
+        # reference was never caught. Pinned to the real, current v0.36.0 by SHA.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: aether-vault-engine:security-scan
           format: json
@@ -121,7 +147,7 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: '1'
           ignore-unfixed: true   # a CVE with no available fix yet isn't actionable this run
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: trivy-report
@@ -131,8 +157,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # v1.3.4 (W0.7): was @v5 -- every other workflow in this repo (and
+      # infrastructure.md's own "do not downgrade pins" note) standardizes on the
+      # Node-24 v6 major.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
       - name: npm audit (production dependencies only)
@@ -142,3 +171,42 @@ jobs:
           # --audit-level=high: dev-dependency-only advisories (build tooling never
           # shipped to a user) are noise for a PRODUCTION-image security gate.
           npm audit --omit=dev --audit-level=high
+
+  # v1.3.4 (W1c, todo.md item 1): secret scanning that actually fails the build. GitHub's
+  # native secret scanning + push protection are already enabled at the repo level (see
+  # infrastructure.md) — this is the complementary layer that scans the FULL git history
+  # on every run (push protection only ever sees NEW pushes going forward) and reports
+  # into the Security tab like the CodeQL workflow below, rather than only a push-time
+  # block.
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write   # required to upload the SARIF report below
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0   # full history — gitleaks scans commits, not just the working tree
+
+      - name: Install gitleaks (checksum-verified)
+        run: |
+          curl -sLO https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          rm gitleaks_8.30.1_linux_x64.tar.gz
+
+      - name: gitleaks (full history, SARIF output)
+        # `.gitleaks.toml` (repo root) allowlists a handful of known dev-only literals
+        # (local-compose-only DB passwords, scripts/e2e_scenario.sh's Phase D fixture
+        # tokens) — see that file's own comments for exactly which and why. Everything
+        # else is a hard, exit-1 gate; no `|| true` here, unlike the advisory-only scans
+        # above.
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --report-format sarif --report-path gitleaks.sarif --exit-code 1
+
+      - name: Upload SARIF to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v3
+        with:
+          sarif_file: gitleaks.sarif

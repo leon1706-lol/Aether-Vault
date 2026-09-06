@@ -2206,3 +2206,150 @@ architectural fix those two features exposed as a hard blocker
 (No "Essential-Tasks: signed off" line — the owner is rebuilding the Docker image and
 running post-rebuild verification manually for this phase, per this session's own
 instruction; nothing here is committed by the agent.)
+
+## Phase 63 — V1.3.4 "CI/CD to 10/10": supply-chain lockdown, OS-parity test coverage,
+release-gate depth, and the operational drills the pipeline never actually ran
+
+Full execution of `todo.md`'s 40-item v1.3.4 CI/CD backlog (groups A–H), plus every bug
+found while doing it, fixed rather than deferred. Six waves; the full plan (and the
+verification-status caveats below) lives in this session's own record, summarized here.
+
+- **Supply chain (todo A):** all 73 third-party `uses:` references across 6 workflow
+  files (a new `codeql.yml` added) SHA-pinned with a trailing `# vX.Y` comment — including
+  `pypa/gh-action-pypi-publish`, previously on the mutable `@release/v1` branch on the
+  PyPI-publishing path itself. Service/job-container images (`postgres`, `redis-stack-
+  server`, `semgrep`) pinned by digest. New `tests/test_ci_policy.py::TestActionPinning`
+  makes this permanent — a new unpinned `uses:` or unpinned `image:` fails CI by name,
+  the same standing-guard pattern the existing no-bots policy already established. New
+  `gitleaks` job (full-history secret scan, SARIF to the Security tab, `.gitleaks.toml`
+  allowlisting the handful of known dev-only literals) and a new `codeql.yml` workflow
+  (Python + TypeScript + the workflow files themselves via CodeQL's `actions` language).
+  `security.yml` gained a `push: master` trigger. Every workflow now declares a
+  least-privilege top-level `permissions:` block; the repo's own default workflow token
+  permission was flipped `write` → `read`. Trivy image scanning moved from a
+  disconnected throwaway build to an actual scan-before-push gate on the REAL image
+  about to reach GHCR, in both `docker-edge.yml` and `release.yml`.
+- **Test completeness (todo B):** `test-linux` — the Linux twin of the Windows-only
+  `test` matrix this repo had run stack-free tests on exclusively until now — carries a
+  real, MEASURED coverage gate (`[tool.coverage]` in pyproject.toml; see VERSIONING.md's
+  own note on where the `fail_under` floor came from) and a slowest-25 report. A new
+  `contract-matrix` job promotes the exit-code/envelope/anti-leakage sweep to its own
+  ~2-minute named check. `migrations-drill` proves every INDIVIDUAL revision's
+  upgrade/downgrade/re-upgrade against a real Postgres, not just one full round trip.
+  `lint-workflows` runs `actionlint`+`shellcheck` on every push. A flake-quarantine policy
+  (`tests/FLAKES.md`, `@pytest.mark.flaky`, `tests/test_flake_registry.py`) exists and is
+  deliberately EMPTY — no test earned quarantine rather than an honest fix this pass.
+  `nightly.yml` gained a real macOS wheel-install smoke (closing a residual
+  `infrastructure.md` had documented since v1.3.0).
+- **Engine/Docker depth (todo C):** the Dockerfile now bakes a REAL version into every
+  image (`ARG AV_VERSION`/`SETUPTOOLS_SCM_PRETEND_VERSION`, closing Probleme.md #69 for
+  good — every prior image reported the `0.0.0.dev0` fallback), carries OCI `LABEL`s, and
+  has a real `HEALTHCHECK` on every target for the first time. The release path's engine
+  image is now genuinely multi-arch (linux/amd64+arm64 via buildx/QEMU). SSO/SAML were
+  dead in every shipped image (pyproject.toml's own comment claimed otherwise, verified
+  false) — `py-builder` now resolves `.[sso,saml,sign]` as one dependency graph and both
+  final stages install the native `xmlsec1`/`libxml2` runtime libs. `slim-image-smoke`
+  is the first job that ever builds and boots the actual slim `server`/`webui` Dockerfile
+  targets (published since v1.3.0, never exercised). `scripts/release_smoke.sh` — new,
+  boots the REAL release compose file (`python/av_cli/docker/docker-compose.release.yml`,
+  which was missing `AV_APP_DATABASE_URL` this whole time — every pip-install user has
+  been on the RLS-bypassing superuser topology migration 0015 exists to close — now
+  fixed) and asserts health/ready/push/pull/protected-mode. Three new drill scripts —
+  `migrations_drill.py`, `compat_drill.sh`, `rollback_drill.sh` — plus the chaos suite's
+  new genuine-ENOSPC drill (Phase M2, a real tmpfs, not a read-only-directory proxy for
+  it) and Phase U (backup/restore, written since v1.3.2, never wired to CI) finally
+  running nightly as `dr-drill`.
+- **Real bug, found and fixed:** `database.py::_ensure_schema_sync()` called
+  `command.upgrade(cfg, "head")` unconditionally — but alembic MUST resolve the
+  database's current revision within its OWN script directory to compute an upgrade
+  path, so any OLDER replica's restart during a rolling upgrade, once a newer replica had
+  already advanced the schema, crashed outright (`CommandError: Can't locate revision`).
+  Directly contradicted VERSIONING.md's additive-schema promise. Fixed:
+  `_schema_is_ahead_of_this_binary()` detects this and skips the upgrade attempt with a
+  clear log warning instead of crashing. Three new stack-free SQLite unit tests; NOT yet
+  live-verified against a real two-binary rolling upgrade (see `scripts/compat_drill.sh`
+  and Probleme.md #136 for the honest status).
+- **Real bug, found and fixed:** `security.yml` had ZERO runs, ever, since it was
+  authored — its trigger was PR+weekly-only and this repo has had zero PRs — AND its
+  Trivy step referenced `aquasecurity/trivy-action@0.28.0`, a version string that has
+  never existed in that repository (tags are `v`-prefixed). The entire pip-audit/bandit/
+  semgrep/Trivy/npm-audit surface was providing zero actual coverage, silently. Fixed on
+  both counts (Probleme.md #135); this is also why security.yml's SHA pins are this
+  session's, not inherited from a previously-green run.
+- **Release gates (todo D):** `scripts/release_gate.py`'s GitHub check
+  (`check_required_checks_green`, replacing `check_tagged_commit_tests_green`) now
+  requires EVERY context in the live (or `.github/required-checks.txt`-fallback)
+  required-status-checks list — the old version filtered by `"test" in name.lower()`,
+  silently ignoring `ha-drill`, every `security.yml` job, `helm-lint`, and more. New
+  checks: `check_changelog_versioning_sync` (refuses a tag whose CHANGELOG entry doesn't
+  name it, or — on a MINOR-or-above release — whose VERSIONING.md has no matching
+  section) and `check_benchmarks_fresh_on_minor` (a MINOR-or-above release's captured
+  benchmark sha must postdate the PREVIOUS tag, or carry an explicit `Benchmarks:
+  unchanged` attestation). `--report PATH` renders every check's outcome as a Markdown
+  table, uploaded as a `release-gate-report` artifact and attached to the GitHub Release
+  itself. `build-wheels`/`build-sdist` now actually `needs: gate` (they used to run
+  regardless). cibuildwheel bumped v2.16→v4.2.2 — v2.16 could never have built the
+  cp313/cp314 wheels `pyproject.toml`'s own config already asked for; a new CI step
+  asserts every CPython tag actually landed in the wheelhouse. A new `verify-install`
+  job installs the ACTUAL release artifacts (not a separate `python -m build` output) on
+  all three OSes before anything reaches PyPI. Every wheel/sdist and the engine image now
+  carry an SBOM (SPDX, `anchore/sbom-action` / buildx `sbom: true`) and a Sigstore-backed
+  build-provenance attestation (`actions/attest-build-provenance` / buildx
+  `provenance: mode=max`) — verification commands documented in SECURITY.md's new
+  "Supply-chain attestations" section.
+- **Deploy/observability (todo E/F):** "staging" realized as the just-pushed `:edge`
+  image smoked by digest immediately after publish (`docker-edge.yml`'s new
+  `staging-smoke` job) — no external host, no new secrets. `preview-env` gives every PR a
+  locally-built-image smoke rendered into that run's own summary. `rollback-drill`
+  (release.yml) deploys the previous release image → this release → back to the
+  previous, asserting no data loss across the round trip — self-calibrating against
+  whether the OLD tag actually contains a given fix, so it never produces a false
+  failure regardless of tag history (see its own header for what that means for
+  Probleme.md #136 specifically). `ci-summary` (new, `scripts/ci_summary.py`) renders a
+  per-job duration-vs-budget table into every `tests.yml` run's summary and, on a
+  same-repo PR, as a comment — budgets tracked in `.github/ci-budgets.yml`, kept
+  impossible to drift from the real jobs by `tests/test_ci_map.py`.
+- **Policy/process (todo G):** `development/infrastructure.md`'s CI Job Map rewritten to
+  list every job in all 6 workflow files individually (previously just filenames for
+  three of them) — `tests/test_ci_map.py` parses both the table and the real YAML and
+  fails on any mismatch, in either direction, permanently. The migration "5-places"
+  checklist (previously only ever written up as a `Probleme.md` audit entry, never in the
+  one doc an author would actually consult) now lives in `infrastructure.md` itself. The
+  parallel exit-code "six places" checklist gained mechanical enforcement for its
+  previously-unchecked three places (`av_sdk/exceptions.py`, `docs/for-agents.md`,
+  `AGENTS.md` — `tests/test_contract_matrix.py`'s new `TestExitCodeRegistryMatches*`
+  classes). `development/deprecations.yml` + `scripts/check_deprecations.py` +
+  `tests/test_deprecations.py` give the deprecation policy a real, schema-checked,
+  overdue-detecting registry (seeded with the v1.3.0 GHCR-alias removal as the one
+  historical entry). `.github/CODEOWNERS` added for the server, the two single-path
+  modules, Docker/deploy, and CI itself — deliberately WITHOUT enabling required code-
+  owner reviews, which would force every PR through a review gate this repo's actual
+  direct-to-master flow doesn't use.
+- **Doc drift fixed along the way, found while touching adjacent files (not the
+  objective, but real):** `pyproject.toml`/`CONTRIBUTING.md`'s project URLs pointed at
+  `github.com/leon1706/aether-vault` (no such org); the Helm chart's default image
+  pointed at the same wrong org (`values.yaml`); `docs/enterprise-operator-guide.md`'s own
+  intro still said SSO/SCIM were "NOT built" a full phase after they shipped; `docs/
+  slo.md` still said `/api/metrics` didn't exist a full phase after it shipped (with real
+  request-rate/latency histograms, per-path, already built); `docker/README.md` still
+  described pre-v1.2.5 all-or-nothing subservice restart semantics; the Dockerfile's own
+  header comment described the v1.3.0-removed legacy GHCR aliases as still being
+  published.
+- **Deferred, stated plainly:** this session had no reachable Docker daemon — every
+  Docker-dependent script (`ha_drill.sh`'s W0 fixes, `release_smoke.sh`,
+  `rollback_drill.sh`, `compat_drill.sh`, the Dockerfile's SSO/SAML native-build changes,
+  the multi-arch/SBOM/provenance build-push changes) is text-verified and reasoned
+  through, NOT locally run end-to-end — their real proof is the next CI run, or a local
+  run once Docker Desktop is available. The branch-protection required-status-checks
+  update (to match `.github/required-checks.txt`'s complete 30-context list) and
+  `sha_pinning_required` at the repo level need to be applied directly by the owner —
+  the former was attempted via `gh api` and blocked by this session's own permission
+  classifier as an outward-facing/hard-to-reverse change, the latter needs an admin
+  scope this session's token doesn't have. Requiring signed commits was deliberately NOT
+  enabled without asking first (this session's own stated checkpoint). Reference
+  customers, third-party audit, and a live external-IdP run remain deferred from Phase
+  61/62, unchanged.
+
+(No "Essential-Tasks: signed off" line — Docker-dependent verification and the branch-
+protection/repo-settings changes above are the owner's to complete; nothing here is
+committed by the agent.)

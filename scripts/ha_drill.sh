@@ -47,6 +47,11 @@ cleanup() {
   else
     log "KEEP_HA_STACK=1 — leaving the stack up for inspection (docker compose -f docker-compose.ha.yml -p aether-vault-ha down -v to clean up later)"
   fi
+  # v1.3.4 (W0.5): $WORK (the mktemp -d dir holding every phase's error/code logs) was
+  # never removed — every drill run, local or CI, leaked one /tmp/av-ha-drill-XXXXXX
+  # directory forever. Harmless on a CI runner that's destroyed after the job, but a real
+  # leak on a long-lived machine running this locally.
+  rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -171,13 +176,27 @@ export API PY
 # actually checked -- a materially easier bar to clear than genuine concurrency. Fixed
 # to match phase 2's own already-correct pattern just below: redirect the concurrent
 # batch's output to a log file and check it's empty before declaring success.
+# v1.3.4 (W0.4): this was still a bare, unscoped `wait` — the exact same class of bug
+# root-caused in phase 4 below (v1.3.3.13). It happened to never hang HERE because at
+# this point in the script nothing long-lived has been backgrounded yet (webhook_probe.py
+# only starts in phase 3) -- but that's incidental, not a guarantee, and it discarded
+# every job's own exit status on top (a push killed by a signal rather than printing to
+# stderr would pass silently). Scoped to exactly the PIDs this loop launched, matching
+# phase 4's own fix and phase 2's pattern below.
 BASELINE_ERRORS="$WORK/baseline_errors.log"
 : > "$BASELINE_ERRORS"
-for i in $(seq 1 20); do push_object_and_commit "baseline-$i" >>"$BASELINE_ERRORS" 2>&1 & done
-wait || true
-if [[ -s "$BASELINE_ERRORS" ]]; then
+declare -a _baseline_pids=()
+for i in $(seq 1 20); do
+  push_object_and_commit "baseline-$i" >>"$BASELINE_ERRORS" 2>&1 &
+  _baseline_pids+=("$!")
+done
+BASELINE_FAILS=0
+for pid in "${_baseline_pids[@]}"; do
+  wait "$pid" || BASELINE_FAILS=$((BASELINE_FAILS + 1))
+done
+if [[ "$BASELINE_FAILS" -ne 0 || -s "$BASELINE_ERRORS" ]]; then
   cat "$BASELINE_ERRORS" >&2
-  die "one or more concurrent baseline pushes failed with no fault injected"
+  die "one or more concurrent baseline pushes failed with no fault injected ($BASELINE_FAILS non-zero exit(s))"
 fi
 
 FAILS=0
@@ -200,7 +219,12 @@ sleep 1
 log "docker kill aether-vault-ha-engine-2 (mid-batch)"
 docker kill aether-vault-ha-engine-2 >/dev/null
 
-wait "$PUSH_BATCH_PID" || true
+# v1.3.4 (W0.5): `wait "$PUSH_BATCH_PID" || true` discarded the subshell's own exit
+# status (itself just the LAST job in its internal bare `wait`, not an aggregate anyway)
+# -- the log-emptiness check below was already the real assertion; this just stops
+# silently swallowing a genuine subshell-level failure (e.g. it never reaching its own
+# `wait` at all) on top of it.
+wait "$PUSH_BATCH_PID" || log "push batch subshell exited non-zero (checking its error log next)"
 if [[ -s "$WORK/failover_errors.log" ]]; then
   cat "$WORK/failover_errors.log" >&2
   die "one or more pushes failed while engine-2 was down — LB failover did not cover them"
@@ -304,6 +328,18 @@ log "of 20 rapid /api/refs requests through the LB: $OK_COUNT succeeded, $LIMITE
 [[ "$LIMITED_COUNT" -gt 0 ]] || die "expected at least one 429 out of 20 requests against a 6/minute global limit — Redis-backed limiting did not engage (or each replica is enforcing its own independent 6/minute, allowing up to 12 through)"
 [[ "$OK_COUNT" -le 6 ]] || die "expected at most 6 successes against a 6/minute GLOBAL limit, got $OK_COUNT — replicas are enforcing independent limits (the exact N-replica bug WP-24 exists to fix), not a shared one"
 pass "rate limit enforced globally across both replicas ($OK_COUNT allowed, capped at the configured 6/minute — not 2x)"
+
+# v1.3.4 (W0.5): phase 4 is the last phase to mutate the stack, and it deliberately
+# applies a restrictive AV_RATE_LIMIT_DEFAULT=6/minute. Under KEEP_HA_STACK=1 (this job's
+# own default) the drill used to just exit here, leaving anyone who then pokes at the kept
+# stack silently rate-limited to 6/minute with no indication why. Recreate the engines one
+# more time with the env var unset so "kept for inspection" means the stack's NORMAL
+# (unlimited-by-default) state, not phase 4's fault-injected one.
+unset AV_RATE_LIMIT_DEFAULT
+log "resetting engines to their normal (non-rate-limited) config before finishing"
+$COMPOSE up -d
+$COMPOSE restart lb
+wait_ready "$API/api/ready" || die "engines never became ready again after resetting AV_RATE_LIMIT_DEFAULT"
 
 # ---------------------------------------------------------------------------
 log "ALL HA DRILL PHASES PASSED"

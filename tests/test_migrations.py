@@ -18,6 +18,7 @@ from python.av_server.database import (
     _alembic_config,
     _heal_legacy_columns,
     _heal_legacy_indexes,
+    _schema_is_ahead_of_this_binary,
 )
 
 _MIGRATIONS = Path(MIGRATIONS_DIR)
@@ -169,6 +170,55 @@ def test_heal_is_idempotent(tmp_path):
         cols = {c["name"] for c in sa.inspect(conn).get_columns("commits")}
     engine.dispose()
     assert "extra_parents" in cols
+
+
+# v1.3.4 (todo.md item 39, W3g): the rolling-upgrade compatibility check —
+# `_ensure_schema_sync` skips `alembic upgrade head` entirely (instead of crashing)
+# when the database's recorded current revision isn't one this binary's own
+# ScriptDirectory recognizes. `_schema_is_ahead_of_this_binary` is the pure detection
+# logic; SQLite proves it identically to the heal-logic tests above (it only ever reads
+# `alembic_version` + walks the REAL script directory, no dialect-specific DDL involved).
+def test_schema_is_ahead_returns_false_when_no_version_table(tmp_path):
+    from alembic.script import ScriptDirectory
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'fresh.db'}")
+    script = ScriptDirectory.from_config(_alembic_config())
+    with engine.connect() as conn:
+        assert _schema_is_ahead_of_this_binary(conn, script) is False
+    engine.dispose()
+
+
+def test_schema_is_ahead_returns_false_for_a_real_known_revision(tmp_path):
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'current.db'}")
+    script = ScriptDirectory.from_config(_alembic_config())
+    known_revision = sorted(rev.revision for rev in script.walk_revisions())[0]
+    with engine.begin() as conn:
+        MigrationContext.configure(conn).stamp(script, known_revision)
+    with engine.connect() as conn:
+        assert _schema_is_ahead_of_this_binary(conn, script) is False
+    engine.dispose()
+
+
+def test_schema_is_ahead_returns_true_for_an_unknown_future_revision(tmp_path):
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'future.db'}")
+    script = ScriptDirectory.from_config(_alembic_config())
+    with engine.begin() as conn:
+        # A real, applied alembic_version table row this binary's chain has never heard
+        # of -- exactly the state a rolling upgrade leaves an older replica facing.
+        conn.exec_driver_sql(
+            "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL, "
+            "PRIMARY KEY (version_num))"
+        )
+        conn.exec_driver_sql("INSERT INTO alembic_version VALUES ('9999_from_the_future')")
+    with engine.connect() as conn:
+        assert _schema_is_ahead_of_this_binary(conn, script) is True
+    engine.dispose()
 
 
 def test_heal_legacy_indexes_creates_only_whats_missing_on_sqlite(tmp_path):

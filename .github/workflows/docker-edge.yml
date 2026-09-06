@@ -25,45 +25,160 @@ on:
       - 'requirements.txt'
       - '.github/workflows/docker-edge.yml'
 
+# v1.3.4 (W1b): deny-all default at the workflow level — the one job below already
+# grants itself exactly contents:read + packages:write, so this only closes the gap for
+# any future job added here without its own explicit block.
+permissions: {}
+
+# v1.3.4 (W1b): two master pushes to Dockerfile/docker/webui/python/src in quick
+# succession shouldn't run two overlapping 40-minute triple-image builds.
+concurrency:
+  group: docker-edge-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-push-edge:
     name: Build and push :edge engine image (GHCR)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # v1.3.4 (W1f): bumped from 40 -- the engine image is now built twice (once to scan
+    # locally, once to actually push) with no build cache between them yet (Wave 3 adds
+    # cache-from/to). Revisit downward once that caching lands.
+    timeout-minutes: 55
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.push-engine.outputs.digest }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: docker/login-action@v3
+      # v1.3.4 (W3c): every image this job builds gets the SAME real version/revision/
+      # date baked in via the Dockerfile's AV_VERSION/VCS_REF/BUILD_DATE ARGs, instead of
+      # every published image silently reporting "0.0.0.dev0" (Probleme.md #69).
+      # PEP 440's local-version-segment syntax (`+<segment>`) is what makes
+      # "0.0.0.dev0+<sha>" a valid version setuptools-scm/pip will actually accept.
+      - name: Compute image metadata
+        id: meta
+        run: |
+          echo "av_version=0.0.0.dev0+${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "vcs_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # v1.3.4 (todo.md item 3, W1f): the engine image used to build straight to `push:
+      # true` with no scan gate at all -- security.yml's own Trivy job (container-image)
+      # only ever scanned a SEPARATE, throwaway `:security-scan` build, never the actual
+      # image reaching GHCR's `:edge` tag. Build once locally (load: true, no push),
+      # scan it, and only then push the SAME image so a HIGH/CRITICAL finding blocks the
+      # publish, not just a different tag nobody pulls. `cache-from/to: type=gha` (W3b)
+      # means the second (push) build below mostly reuses this one's layers instead of
+      # recompiling from scratch, offsetting the cost of building twice.
+      - name: Build engine image (local only, for scanning)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: engine
+          push: false
+          load: true
+          tags: aether-vault-engine:edge-scan
+          build-args: |
+            AV_VERSION=${{ steps.meta.outputs.av_version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha,scope=edge-engine
+          cache-to: type=gha,mode=max,scope=edge-engine
+
+      - name: Trivy (fail on HIGH/CRITICAL before this image is ever pushed)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: aether-vault-engine:edge-scan
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
       - name: Build and push engine image
-        uses: docker/build-push-action@v6
+        id: push-engine
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           # v1.3.0 (Probleme.md): explicit — see release.yml's identical comment.
           target: engine
           push: true
           tags: ghcr.io/leon1706-lol/aether-vault-engine:edge
+          build-args: |
+            AV_VERSION=${{ steps.meta.outputs.av_version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha,scope=edge-engine
+          cache-to: type=gha,mode=max,scope=edge-engine
+          # v1.3.4 (todo.md item 4/6, W4f): SBOM + build provenance attached as
+          # in-toto attestations on the published image, verifiable via
+          # `gh attestation verify`/`cosign` (see SECURITY.md).
+          sbom: true
+          provenance: mode=max
 
       # v1.3.0 (todo.md item 19): slim, single-role images alongside :edge.
       - name: Build and push slim server image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           target: server
           push: true
           tags: ghcr.io/leon1706-lol/aether-vault-engine:server-edge
+          build-args: |
+            AV_VERSION=${{ steps.meta.outputs.av_version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha,scope=edge-server
+          cache-to: type=gha,mode=max,scope=edge-server
+          sbom: true
+          provenance: mode=max
 
       - name: Build and push slim webui image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           target: webui
           push: true
           tags: ghcr.io/leon1706-lol/aether-vault-engine:webui-edge
+          build-args: |
+            AV_VERSION=${{ steps.meta.outputs.av_version }}
+            VCS_REF=${{ steps.meta.outputs.vcs_ref }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha,scope=edge-webui
+          cache-to: type=gha,mode=max,scope=edge-webui
+          sbom: true
+          provenance: mode=max
+
+  # v1.3.4 (todo.md items 25/26, W5a): "staging" realized as the just-pushed :edge image
+  # smoked immediately after publish — no external host, no new secrets, fully
+  # reproducible. Pulls by DIGEST (not the mutable :edge tag, which could already point
+  # at a LATER push by the time this job starts) so this is provably testing the exact
+  # image build-and-push-edge just built.
+  staging-smoke:
+    name: Staging smoke (:edge, by digest)
+    needs: build-and-push-edge
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read   # only needs to PULL the image this job smokes, never push
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release smoke against the just-pushed image
+        run: bash scripts/release_smoke.sh "ghcr.io/leon1706-lol/aether-vault-engine@${{ needs.build-and-push-edge.outputs.digest }}"

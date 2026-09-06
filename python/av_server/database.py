@@ -479,9 +479,53 @@ def _ensure_schema_sync(sync_conn, cfg) -> None:
         # must run AFTER _heal_legacy_columns put the (nullable) column in place.
         _heal_audit_chain_hash(sync_conn, healed_tables)
         MigrationContext.configure(sync_conn).stamp(script, script.get_current_head())
+    elif _schema_is_ahead_of_this_binary(sync_conn, script):
+        # v1.3.4 (todo.md item 39, W3g): a rolling upgrade puts an OLDER server binary
+        # against a database an ALREADY-upgraded replica has migrated past this binary's
+        # own head — a real, expected state during any rolling deploy (docs/runbooks/
+        # upgrade-rollback.md), not a corruption. Before this fix, `command.upgrade(cfg,
+        # "head")` below crashed startup outright: alembic must resolve the database's
+        # CURRENT revision within ITS OWN script directory to compute an upgrade path,
+        # and a revision this binary has never heard of raises
+        # `alembic.util.exc.CommandError: Can't locate revision identified by '<rev>'`
+        # unconditionally -- there is no code path where an unrecognized current revision
+        # upgrades cleanly. Skipping the upgrade call entirely (rather than attempting
+        # anything against a schema state this binary doesn't understand) is safe under
+        # VERSIONING.md's own schema-compatibility contract: new columns/tables are
+        # always additive and nullable/default-safe, so an older binary's unchanged ORM
+        # models simply never reference whatever's new and keep working against
+        # everything they DO know about.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Database schema is at a revision this server binary's migration chain "
+            "does not recognize (own head: %s) -- assuming a newer binary already "
+            "migrated it during a rolling upgrade. Skipping `alembic upgrade head` "
+            "rather than crashing startup; this instance will keep serving against the "
+            "additive, backward-compatible schema its own code already knows. Upgrade "
+            "this instance's image when convenient.",
+            script.get_current_head(),
+        )
+        return
 
     cfg.attributes["connection"] = sync_conn
     command.upgrade(cfg, "head")
+
+
+def _schema_is_ahead_of_this_binary(sync_conn, script) -> bool:
+    """True when the database's recorded current revision is a real, non-null value
+    that this binary's OWN alembic script directory does not contain — i.e. some OTHER,
+    newer binary has already migrated this database past what this process knows about.
+    Distinct from `_unrecorded_chain()` (no revision recorded at all, the true-legacy
+    case, handled by the `needs_adoption` branch above) — this is "a revision IS
+    recorded, it's simply unknown here"."""
+    from alembic.runtime.migration import MigrationContext
+
+    current_rev = MigrationContext.configure(sync_conn).get_current_revision()
+    if current_rev is None:
+        return False
+    known_revisions = {rev.revision for rev in script.walk_revisions()}
+    return current_rev not in known_revisions
 
 
 def _unrecorded_chain(sync_conn, tables: set) -> bool:

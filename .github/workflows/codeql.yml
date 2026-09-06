@@ -1,0 +1,50 @@
+# v1.3.4 (todo.md item 2, W1d): SAST for Python + TypeScript, plus the workflow files
+# themselves (the `actions` language — reinforces W1a/W1b's SHA-pinning/least-privilege
+# work by statically checking the SAME workflows for injection-prone patterns). This repo
+# has never run CodeQL before this — `gh api repos/:owner/:repo/code-scanning/analyses`
+# returned "no analysis found" prior to this workflow's first run. Public repo: CodeQL and
+# every runner OS here are free (no GitHub Advanced Security purchase needed).
+name: CodeQL
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: '30 6 * * 1'   # every Monday 06:30 UTC, offset from security.yml's 06:00
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write   # required to upload results to the Security tab
+      actions: read            # required for the `actions` language's own analysis
+    strategy:
+      fail-fast: false
+      matrix:
+        # `build-mode: none` for all three: python/javascript-typescript are interpreted
+        # (no compilation needed for CodeQL's extraction) and `actions` analyzes YAML
+        # directly — none of these need this repo's C++ extension built first.
+        language: [python, javascript-typescript, actions]
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: github/codeql-action/init@6f5948dfacef28e207b48d0905cf90c03365536d # v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@6f5948dfacef28e207b48d0905cf90c03365536d # v3
+        with:
+          category: "/language:${{ matrix.language }}"

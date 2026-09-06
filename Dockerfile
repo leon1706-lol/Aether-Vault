@@ -11,26 +11,56 @@
 # (=all); a container with it unset falls through to the entrypoint's own
 # runtime auto-detect/default logic instead.
 #
-# Legacy aliasing (earliest removal v1.3.0, not yet scheduled — see
-# VERSIONING.md): the release and edge workflows ALSO push this exact image
-# under the historical aether-vault-server / aether-vault-webui repository
-# names, so existing installs whose pinned compose files pull those tags keep
-# working unchanged — the entrypoint auto-detects which role a legacy
-# per-service container wants from its environment (DATABASE_URL set →
-# server-only; NEXT_PUBLIC_API_URL set without it → webui-only).
+# Legacy aliasing: REMOVED as of v1.3.0 (see VERSIONING.md's "Removed in v1.3.0" entry) —
+# the release/edge workflows no longer publish the historical aether-vault-server /
+# aether-vault-webui repository-name aliases. This comment used to describe that
+# publishing as still active (v1.3.4 correction). The entrypoint's legacy auto-detect
+# (DATABASE_URL set → server-only; NEXT_PUBLIC_API_URL set without it → webui-only) is
+# UNCHANGED and still works for any already-pulled legacy-shaped container — only the
+# alias TAGS themselves stopped being published going forward.
 #
 # Stage invariant (Probleme.md #69): the runtime Python minor MUST match the
 # py-builder's (a cp312 wheel is rejected by a 3.11 interpreter). Keep them in sync.
 # ============================================================================
 
+# v1.3.4 (W3c): build-time metadata, threaded through to every final stage's OCI LABELs
+# below AND into the wheel's own version (via SETUPTOOLS_SCM_PRETEND_VERSION in
+# py-builder) — without this, `.dockerignore` excluding `.git/` means setuptools-scm
+# always falls back to "0.0.0.dev0" and EVERY published image reports that same fake
+# version from `/api/health` regardless of what tag or commit it was actually built from
+# (Probleme.md #69 already found the symptom; this is the actual fix, not just a
+# description of it). All three default to a clearly-fake value so a build that forgets
+# to pass them fails obviously rather than silently looking like a real release.
+ARG AV_VERSION=0.0.0.dev0+unknown
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
 # ── Stage 1: py-builder — C++17 core + wheel (unchanged logic) ──────────────
 FROM python:3.12-slim-bookworm AS py-builder
+ARG AV_VERSION
+# setuptools-scm reads this in preference to trying (and, with no .git/ in the build
+# context, always failing) to derive a version from VCS state -- see the top-of-file
+# comment for why this matters. `pyproject.toml`'s `fallback_version = "0.0.0.dev0"`
+# stays as the safety net for a genuinely tag-less local `pip install -e .`.
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=$AV_VERSION
 RUN apt-get update && apt-get install -y build-essential cmake g++
 COPY requirements.txt setup.py pyproject.toml /build/
 COPY src /build/src
 COPY python /build/python
 WORKDIR /build
-RUN pip install pybind11 && pip wheel . -w /wheels --no-deps
+# v1.3.4 (W0.10): was `pip wheel . -w /wheels --no-deps` — ONLY the local package's own
+# wheel, with fastapi/uvicorn/requests/click fetched separately (and unpinned to this
+# build) by each final stage below. pyproject.toml's `saml` extra comment also claimed
+# "the native xmlsec1/libxml2 libraries (installed in the Dockerfile's engine/server
+# targets)" — verified false, neither ever appeared here, so SSO/SAML were dead in every
+# shipped image. Resolving `.[sso,saml,sign]` (base deps + SSO/SAML/signing) as ONE
+# dependency graph here — where build-essential + the xmlsec build headers already exist
+# — avoids two independently-resolved wheel sets ever disagreeing on a shared transitive
+# version, and lets both final stages install everything from local wheels with zero
+# network access.
+RUN apt-get install -y --no-install-recommends libxml2-dev libxmlsec1-dev pkg-config \
+    && pip install pybind11 \
+    && pip wheel ".[sso,saml,sign]" -w /wheels
 
 # ── Stage 2: web-builder — Next.js standalone output ────────────────────────
 FROM node:20-bookworm-slim AS web-builder
@@ -51,12 +81,24 @@ RUN npm run build
 # default; every one of them now pins `target: engine` explicitly instead, but naming the
 # stage itself is the belt-and-suspenders fix that survives a future reordering too).
 FROM python:3.12-slim-bookworm AS engine
+# ARGs declared before the first FROM (top of file) do NOT automatically carry into any
+# stage -- each stage that wants one must re-declare it (Docker's own scoping rule).
+ARG AV_VERSION
+ARG VCS_REF
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="aether-vault-engine" \
+      org.opencontainers.image.description="Aether-Vault registry (FastAPI) + webui (Next.js) in one container" \
+      org.opencontainers.image.version="$AV_VERSION" \
+      org.opencontainers.image.revision="$VCS_REF" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.source="https://github.com/leon1706-lol/Aether-Vault" \
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 # NodeSource Node 20 on top of the python base — node-fetch-style healthchecks
 # and the standalone Next server share this interpreter-free runtime layer.
 # procps (pkill/ps/etc.) is NOT in python:3.12-slim by default — needed both for
 # `docker exec <container> pkill ...` in e2e-engine-smoke's independent-restart CI
 # check and for real operational debugging (`docker exec -it ... ps aux`).
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg procps \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg procps libxml2 libxmlsec1-openssl \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get purge -y gnupg \
@@ -64,8 +106,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=py-builder /wheels /wheels
+# v1.3.4 (W0.10): the separate `pip install fastapi uvicorn requests click` line is gone —
+# py-builder's `.[sso,saml,sign]` wheel build above already resolved and built wheels for
+# every base dependency, so this now installs the ENTIRE closure from local wheels with no
+# network access, instead of re-resolving a subset of it fresh against PyPI every build.
 RUN pip install --no-cache-dir /wheels/*.whl \
-    && pip install --no-cache-dir fastapi uvicorn requests click \
     && mkdir -p /data && chmod 777 /data
 
 # Next standalone bundle: server.js at /webui/server.js, static assets beside it.
@@ -92,6 +137,16 @@ ENV AV_DATA_DIR=/data \
     HOSTNAME=0.0.0.0 \
     NODE_ENV=production
 EXPOSE 8000 3000
+# v1.3.4 (W3c): this image had NO healthcheck of its own before this -- the dual
+# python-urllib(/api/ready) + node-fetch(:3000/) probe here is the SAME one
+# docker-compose.yml's own `healthcheck:` stanza already runs; baking it into the image
+# means a bare `docker run` (no compose file supplying its own healthcheck) still gets a
+# real health signal instead of none at all. `/api/ready` (not `/api/health`) deliberately
+# — a container whose DB/Redis/data-dir isn't actually usable yet should show unhealthy,
+# not just "the process is alive".
+HEALTHCHECK --interval=10s --timeout=10s --start-period=40s --retries=5 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/ready').read()" \
+      && node -e "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 ENTRYPOINT ["/engine-entrypoint.sh"]
 
 # ============================================================================
@@ -108,11 +163,22 @@ ENTRYPOINT ["/engine-entrypoint.sh"]
 
 # ── Target: server — Python/FastAPI registry only, no Node ──────────────────
 FROM python:3.12-slim-bookworm AS server
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates procps \
+ARG AV_VERSION
+ARG VCS_REF
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="aether-vault-engine-server" \
+      org.opencontainers.image.description="Aether-Vault registry (FastAPI) only, no webui" \
+      org.opencontainers.image.version="$AV_VERSION" \
+      org.opencontainers.image.revision="$VCS_REF" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.source="https://github.com/leon1706-lol/Aether-Vault" \
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates procps libxml2 libxmlsec1-openssl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=py-builder /wheels /wheels
+# v1.3.4 (W0.10): see the engine stage's identical comment above — installs the full
+# `.[sso,saml,sign]` closure from local wheels, no separate network-fetched line needed.
 RUN pip install --no-cache-dir /wheels/*.whl \
-    && pip install --no-cache-dir fastapi uvicorn requests click \
     && mkdir -p /data && chmod 777 /data
 COPY docker/engine-entrypoint.sh /engine-entrypoint.sh
 RUN chmod +x /engine-entrypoint.sh
@@ -123,10 +189,23 @@ RUN chmod +x /engine-entrypoint.sh
 ENV AV_DATA_DIR=/data \
     AV_ENGINE_ROLE=server
 EXPOSE 8000
+# v1.3.4 (W3c): same reasoning as the engine stage's HEALTHCHECK above, python-only leg.
+HEALTHCHECK --interval=10s --timeout=10s --start-period=40s --retries=5 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/ready').read()"
 ENTRYPOINT ["/engine-entrypoint.sh"]
 
 # ── Target: webui — Next.js standalone dashboard only, no Python ────────────
 FROM node:20-bookworm-slim AS webui
+ARG AV_VERSION
+ARG VCS_REF
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="aether-vault-engine-webui" \
+      org.opencontainers.image.description="Aether-Vault Next.js dashboard only, no registry" \
+      org.opencontainers.image.version="$AV_VERSION" \
+      org.opencontainers.image.revision="$VCS_REF" \
+      org.opencontainers.image.created="$BUILD_DATE" \
+      org.opencontainers.image.source="https://github.com/leon1706-lol/Aether-Vault" \
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 RUN apt-get update && apt-get install -y --no-install-recommends curl procps \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=web-builder /build/webui/.next/standalone /webui
@@ -139,4 +218,7 @@ ENV WEBUI_PORT=3000 \
     NODE_ENV=production \
     AV_ENGINE_ROLE=webui
 EXPOSE 3000
+# v1.3.4 (W3c): same reasoning as the engine stage's HEALTHCHECK above, node-only leg.
+HEALTHCHECK --interval=10s --timeout=10s --start-period=40s --retries=5 \
+  CMD node -e "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 ENTRYPOINT ["/engine-entrypoint.sh"]

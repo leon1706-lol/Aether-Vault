@@ -333,30 +333,91 @@ below for the automated proof of this.
 
 ## CI Job Map
 
-Every product surface and the workflow that guards it (Tests workflow unless noted):
+Every job across all 5 workflow files, grouped by which file defines it. `tests/test_ci_map.py`
+(v1.3.4) parses every workflow's real job ids AND this table's "Job(s)" column and fails if
+they ever disagree in either direction — a job added here with no doc row, or a doc row
+naming a job that no longer exists, both fail CI. Keep this table's job-id backticks exact.
+
+**`tests.yml`** — runs on every push/PR unless noted:
 
 | Surface | Job(s) |
 |---|---|
 | Full stack-free suite, py3.10 + 3.14 (Windows build) | `test` matrix |
-| In-between Pythons 3.11–3.13 | `nightly.yml` (`compat`) |
+| Same, Linux (v1.3.4 OS-parity twin of `test`), + coverage gate + slowest-25 report | `test-linux` matrix |
+| Registered-flaky tests only (`tests/FLAKES.md`), non-gating | `flaky-quarantine` |
+| Contract matrix + exit codes + CI policy, as their own named check | `contract-matrix` |
+| Per-revision migration upgrade/downgrade/re-upgrade drill (live Postgres) | `migrations-drill` |
+| `actionlint` + `shellcheck` over every workflow/script | `lint-workflows` |
+| Plugins incl. real Lightning training loop + signed-commit gate (`[sign]` extra) | `plugin-tests` |
+| WebUI lint/typecheck/Vitest | `webui-tests` |
 | Server live stack (Postgres+Redis): TestClient + real-wire | `server-tests` |
 | Same, native Windows services | `server-tests-windows` |
 | Product flows via real CLI: merge collaboration, offline drain, legacy upgrade, per-user auth, GC | `e2e-suite` (`scripts/e2e_scenario.sh`) |
-| Chaos drills: real Redis outage, unwritable storage, server killed mid-push | `chaos-drills` (`scripts/e2e_scenario.sh`, `AV_E2E_CHAOS=1`) |
+| Chaos drills: real Redis outage, unwritable storage, genuinely full filesystem (v1.3.4), server killed mid-push | `chaos-drills` (`scripts/e2e_scenario.sh`, `AV_E2E_CHAOS=1`) |
 | Engine image smoke (Phase I): role dispatch + dual healthchecks from ONE container; v1.2.5: `/api/ready` degrading independently of `/api/health`, killing one subservice restarts only it; v1.3.0: a real SIGTERM drain under concurrent load (20 in-flight uploads) all complete cleanly | `e2e-engine-smoke` |
-| Plugins incl. real Lightning training loop + signed-commit gate (`[sign]` extra) | `plugin-tests` |
-| WebUI lint/typecheck/Vitest | `webui-tests` |
-| WebUI browser E2E: dashboard, weight-diff, token gate | `webui-e2e` |
+| Slim `server`/`webui` Dockerfile targets, actually built and booted (v1.3.4) | `slim-image-smoke` |
+| PR preview environment: local image build + `scripts/release_smoke.sh`, results in the run summary | `preview-env` |
 | sdist+wheel build & twine check | `package-build` |
 | Wheel install smoke (Linux venv) | `smoke-wheel-linux` |
 | Sdist compile-install smoke (Windows venv, MSVC path) | `smoke-sdist-windows` |
-| `:edge` images on master pushes | `docker-edge.yml` |
-| Wheels cp310–314 ×3 OS, PyPI, GitHub Release, GHCR | `release.yml` (tags) |
-| HA drill (v1.3.2): real 2-replica compose topology, killed replica mid-load, webhook double-delivery + rate-limit proofs | `ha-drill` (`scripts/ha_drill.sh`) |
+| WebUI browser E2E: dashboard, weight-diff, token gate | `webui-e2e` |
 | Helm chart schema verification (v1.3.2): `helm template \| kubeconform -strict` across 4 value permutations — NOT a real cluster deploy | `helm-lint` |
-| Security scanning (v1.3.2): `pip-audit`, `bandit`, `semgrep`, `trivy` (built image), `npm audit` — PR + weekly cron | `security.yml` |
+| HA drill (v1.3.2): real 2-replica compose topology, killed replica mid-load, webhook double-delivery + rate-limit proofs | `ha-drill` (`scripts/ha_drill.sh`) |
+| CI duration/budget dashboard (v1.3.4), `.github/ci-budgets.yml`-driven, posts a PR comment | `ci-summary` |
 
-Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` flow test, no macOS install smoke. Dependabot was removed (Phase 55, owner decision — config deleted, all open PRs closed); dependency freshness review is manual now.
+**`security.yml`** — PR + `push: master` + weekly cron (v1.3.4 added the master-push trigger):
+
+| Surface | Job(s) |
+|---|---|
+| `pip-audit` (advisory-only) | `python-deps` |
+| `bandit` (fails on HIGH severity) | `python-static` |
+| `semgrep` `p/python` + `p/secrets` (fails on ERROR severity) | `semgrep` |
+| Trivy image scan of the built engine image (fails on HIGH/CRITICAL) | `container-image` |
+| `npm audit --omit=dev` (fails on high) | `webui-deps` |
+| Full-history secret scan, SARIF to the Security tab (v1.3.4) | `gitleaks` |
+
+**`codeql.yml`** (v1.3.4, new) — push:master + PR + weekly cron:
+
+| Surface | Job(s) |
+|---|---|
+| SAST for Python, TypeScript, and the workflow files themselves | `analyze` matrix (`language: python\|javascript-typescript\|actions`) |
+
+**`nightly.yml`** — schedule + `workflow_dispatch` only (never produces a check-run for a
+specific commit — see `.github/required-checks.txt`'s own note on why these are excluded
+from the release gate):
+
+| Surface | Job(s) |
+|---|---|
+| In-between Pythons 3.11–3.13 | `compat` |
+| C++ core builds on macOS (golden-hash cross-OS fixtures) | `golden-fixtures-macos` |
+| macOS wheel install smoke (v1.3.4 — closes the residual noted below) | `macos-install-smoke` |
+| Backup → destroy → restore drill, `av admin backup` (v1.3.4 — Phase U finally wired to CI) | `dr-drill` |
+| Old-binary-vs-new-schema rolling-upgrade drill (v1.3.4, self-calibrating — see `scripts/compat_drill.sh`) | `compat-drill` |
+| Deprecation registry dry-run: prints every entry, what the next MAJOR would remove (v1.3.4) | `deprecation-dry-run` |
+
+**`release.yml`** — tag push (`v*.*.*`) + `workflow_dispatch`:
+
+| Surface | Job(s) |
+|---|---|
+| Release gate: stack-free suite, perf-history/BENCHMARKS freshness, CHANGELOG/VERSIONING sync, every required check green (v1.3.4: not just "test" in the name) | `gate` |
+| Wheels, cp310–cp314 × 3 OS via cibuildwheel v4 (v1.3.4 bump — v2.16 predated cp313/314) | `build-wheels` matrix |
+| sdist | `build-sdist` |
+| Real install verification of the artifacts about to publish, 3 OS (v1.3.4) | `verify-install` matrix |
+| PyPI publish (OIDC trusted publishing) | `publish-pypi` |
+| GitHub Release + release-gate report + SBOM + provenance attestation (v1.3.4) attached | `github-release` |
+| Engine image: scan-before-push gate, multi-arch (linux/amd64+arm64, v1.3.4), SBOM+provenance | `build-and-push-docker` |
+| Rollback drill: previous image ↔ this release, data-survival proof (v1.3.4) | `rollback-drill` |
+
+**`docker-edge.yml`** — push:master, path-filtered:
+
+| Surface | Job(s) |
+|---|---|
+| `:edge`/`:server-edge`/`:webui-edge` images: scan-before-push gate, SBOM+provenance (v1.3.4) | `build-and-push-edge` |
+| Staging smoke: just-pushed `:edge` image, by digest, via `scripts/release_smoke.sh` (v1.3.4) | `staging-smoke` |
+
+Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` flow test.
+Dependabot was removed (Phase 55, owner decision — config deleted, all open PRs closed);
+dependency freshness review is manual now.
 
 ## Database Migrations
 
@@ -377,6 +438,34 @@ Authoring a new migration:
 **Caution:** never edit an already-applied migration in place; append a new revision instead. Volumes that predate the v1.1.x FK removals may still carry `trees_object_hash_fkey`-style constraints — drop those manually once if inserts fail on such a volume (documented per-phase in [CHANGELOG.md](CHANGELOG.md)).
 
 **Invariant:** `_apply_schema` MUST run the chain inside `engine.begin()` (committing), never `engine.connect()`. Postgres DDL is transactional — a plain connect() rolls the entire freshly-built schema back at context exit while startup logs stay green (Probleme.md #70, four CI cycles undetected). SQLite can't catch regressions here: its driver auto-commits DDL.
+
+**The 5-places checklist (v1.3.4):** every new migration that adds a column to an EXISTING
+table touches five files, not just the migration itself — found the hard way
+(`development/Probleme.md`'s migration-chain incidents) when a subset was missed and only
+surfaced on a legacy-volume-adoption path months later:
+
+1. `python/av_server/models.py` — the ORM model, the real source of truth.
+2. `python/av_server/database.py::_LEGACY_COLUMNS` — the same column, so a pre-Alembic or
+   adoption-healed volume gets it too (`_heal_legacy_columns`).
+3. `tests/test_migrations.py::test_migration_chain_resolves_to_single_head` — the
+   `heads == [...]` and `walked == [...]` literal lists (new revision id appended).
+4. `tests/test_migrations.py::test_chain_renders_downgrade_ddl_offline_for_every_revision`
+   — the head-to-base order list.
+5. `tests/test_migrations.py`'s per-revision downgrade-DDL expectations dict (search for
+   the previous revision's own entry for the exact shape).
+
+(v1.3.4 also removed a FORMER 6th place — `scripts/e2e_scenario.sh` Phase C's
+legacy-volume-heal assertion used to hardcode the expected post-heal head as a literal
+string, silently going stale every time this checklist's items 3-4 were followed but this
+one wasn't. It now resolves the expected head from `ScriptDirectory` at runtime instead of
+naming a revision id at all — nothing to add here going forward.)
+
+A NEW TABLE (rather than a new column on an existing one) needs none of items 2/5 — a
+legacy volume simply lacks the whole table, which `_create_missing_tables()` already
+handles from `Base.metadata` directly; only items 1/3/4 apply. See also the parallel
+"exit code — six places" checklist in `development/CHANGELOG.md`'s v1.3.3 entry
+(`login_required`/21 activation) for a different but structurally identical class of
+cross-file drift, now also mechanically checked (`tests/test_contract_matrix.py`).
 
 ## Inspecting PostgreSQL
 
@@ -428,7 +517,8 @@ Mark-and-sweep deletes objects no commit's Merkle tree references, respecting th
 
 Cutting a release is a tag push; everything else is pipeline:
 
-1. Land work on `master` with green CI (five test jobs).
+1. Land work on `master` with green CI — see the CI Job Map above for the current, complete
+   list of required jobs (14 in `tests.yml` alone as of v1.3.4, not five).
 2. Curate highlights from [CHANGELOG.md](CHANGELOG.md) since the previous tag into release notes.
 3. Tag and push:
 
@@ -439,7 +529,12 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 4. `release.yml` then builds wheels (cp310–cp314 × Windows/Linux/macOS via cibuildwheel) plus sdist.
 5. PyPI publishes via trusted publishing (OIDC, environment `pypi`) — no stored tokens.
 6. A GitHub Release appears with auto-generated notes and all artifacts attached.
-7. GHCR receives `:latest` + version-tagged **engine images** (`aether-vault-engine`), plus the legacy `aether-vault-server`/`-webui` names as aliases of the SAME image for the one transition cycle (deprecated — removed next release).
+7. GHCR receives `:latest` + version-tagged **engine images** (`aether-vault-engine`), plus
+   slim single-role variants (`:server-*`, `:webui-*`) as TAGS on that same repository — not
+   separate images. (v1.3.4 correction: the legacy `aether-vault-server`/`aether-vault-webui`
+   repository-name ALIASES this used to describe were removed in v1.3.0 — see
+   `VERSIONING.md`'s "Removed in v1.3.0" entry — `release.yml`/`docker-edge.yml` have not
+   published them since.)
 
 Users pick releases up themselves:
 

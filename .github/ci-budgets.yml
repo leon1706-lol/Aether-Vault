@@ -1,0 +1,73 @@
+# v1.3.4 (todo.md item 31, W5d): soft runner-minute budgets, one per job, read by the
+# `ci-summary` job (tests.yml) to annotate (`::warning::`) any job that overran its
+# budget — NEVER a hard gate (that's what each job's own `timeout-minutes` is for). A
+# budget here is deliberately BELOW that job's real `timeout-minutes` (the hard ceiling),
+# so a slow-creeping job gets flagged well before it's at risk of actually timing out.
+#
+# `tests/test_ci_map.py` asserts every job across all 5 workflow files has an entry here
+# (and that every entry here still names a real job) — this file cannot silently drift
+# out of sync with the workflows the way a hand-maintained doc easily could.
+#
+# Budgets for jobs that have run for real (tests.yml's original 14) are set from an
+# ACTUAL observed run (`gh run view`, 2026-09-06) plus headroom, not guessed. Budgets for
+# every job this v1.3.4 pass ADDED are marked `# estimated` — genuinely unobserved yet;
+# `ci-summary`'s own warning for these should be read as "first real signal", not treated
+# as an already-tuned threshold, until they've actually run a few times.
+
+workflows:
+  tests.yml:
+    test: 22                      # observed 19min (both matrix legs) + margin
+    test-linux: 12                # estimated
+    flaky-quarantine: 6           # estimated (empty registry today — should be seconds)
+    contract-matrix: 5            # estimated
+    migrations-drill: 6           # estimated
+    lint-workflows: 5             # estimated
+    plugin-tests: 5               # observed 2min + margin
+    webui-tests: 4                # observed 1min + margin
+    server-tests: 4               # observed 1min + margin
+    server-tests-windows: 18      # observed 15min + margin
+    e2e-suite: 5                  # observed 2min + margin
+    chaos-drills: 5               # observed 2min + margin
+    e2e-engine-smoke: 6           # observed 2min + margin
+    slim-image-smoke: 10          # estimated
+    preview-env: 12               # estimated
+    package-build: 3              # observed <1min + margin
+    smoke-wheel-linux: 3          # observed <1min + margin
+    smoke-sdist-windows: 4        # observed 1min + margin
+    webui-e2e: 6                  # observed 3min + margin
+    helm-lint: 3                  # observed <1min + margin
+    ha-drill: 10                  # observed 5min + margin (post v1.3.3.14 fix)
+    ci-summary: 3                 # estimated (a single gh api call + a render)
+
+  security.yml:
+    python-deps: 6                # estimated
+    python-static: 6              # estimated
+    semgrep: 7                    # estimated
+    container-image: 12           # estimated
+    webui-deps: 6                 # estimated
+    gitleaks: 6                   # estimated (full-history scan, first run may differ)
+
+  codeql.yml:
+    analyze: 15                   # estimated, per matrix leg
+
+  nightly.yml:
+    compat: 15                    # estimated
+    golden-fixtures-macos: 10     # estimated
+    macos-install-smoke: 10       # estimated
+    dr-drill: 10                  # estimated
+    compat-drill: 10              # estimated
+    deprecation-dry-run: 4        # estimated
+
+  release.yml:
+    gate: 10                      # estimated
+    build-wheels: 35              # estimated (cp310-cp314 x 3 OS via cibuildwheel v4)
+    build-sdist: 6                # estimated
+    verify-install: 6             # estimated
+    publish-pypi: 5               # estimated
+    github-release: 6             # estimated
+    build-and-push-docker: 60     # estimated (multi-arch arm64 under QEMU is the wildcard)
+    rollback-drill: 12            # estimated
+
+  docker-edge.yml:
+    build-and-push-edge: 35       # estimated
+    staging-smoke: 8              # estimated

@@ -9,9 +9,9 @@
 | [`avattributes.md`](avattributes.md) | `.avattributes` staging directives — forcing or suppressing chunking/layer-splitting for a specific path. |
 | [`migrate-engine-image.md`](migrate-engine-image.md) | Moving a pinned two-container (`aether-vault-server`/`aether-vault-webui`) compose file onto the consolidated `aether-vault-engine` image, or onto the new slim single-role images. |
 | [`dr.md`](dr.md) | Disaster recovery: `av admin backup create/verify/restore`, the real destroy-and-restore drill (Phase U), and the measured-RTO/stated-RPO distinction. |
-| [`enterprise-operator-guide.md`](enterprise-operator-guide.md) | Identity/RBAC/tenancy/DR continuous path: provision a tenant → create users → grant roles → mint a remote token → turn on tenant enforcement → back up and restore. States plainly what's NOT built (SSO/SCIM). |
+| [`enterprise-operator-guide.md`](enterprise-operator-guide.md) | Identity/RBAC/tenancy/DR continuous path: provision a tenant → create users → grant roles → mint a remote token → turn on tenant enforcement → back up and restore, plus SSO (OIDC/SAML) and SCIM provisioning (v1.3.3). States plainly what's still NOT done (a live run against a real external IdP). |
 | [`support.md`](support.md) | Where to get help, `av support-bundle`, and links to `sla.md`/`slo.md`/`runbooks/`. |
-| [`slo.md`](slo.md) | Service level indicators/objectives and how each is actually measured today (honestly noting no live `/api/metrics` endpoint exists yet). |
+| [`slo.md`](slo.md) | Service level indicators/objectives and how each is actually measured today, including the live `GET /api/metrics` Prometheus endpoint (v1.3.3). |
 | [`sla.md`](sla.md) | A support/SLA policy TEMPLATE — fill in real tiers/contacts before using it as a live commitment. |
 
 For everything else — install, CLI reference, architecture, CI, benchmarks, the full

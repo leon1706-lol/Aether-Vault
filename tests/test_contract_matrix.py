@@ -10,11 +10,15 @@ echoes because it never passed a result_sink (cmd_history.py's `commit` always h
 are fixed at the source (core.py, cmd_watch.py) — see development/Probleme.md.
 """
 import json
+import re
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from python.av_cli.main import cli
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Commands genuinely exempt from "single clean JSON envelope, zero leakage" — each has a
 # specific, documented reason, not a shortcut:
@@ -188,4 +192,91 @@ class TestExitCodeRegistryIsSelfConsistent:
         assert has_marker, (
             f"exit code {exit_status} ({code}) has no test_..._exits_{exit_status}_... "
             "function in tests/test_exit_codes.py"
+        )
+
+
+# v1.3.4 (W6a′): the exit-code "six places" checklist (development/CHANGELOG.md's
+# v1.3.3 entry, `login_required`/21 activation) was only ever mechanically checked for
+# THREE of its six places (core.py's _EXIT_CODES, this file's own EXIT_CODE_REGISTRY, and
+# test_exit_codes.py's naming convention, all three via the tests above). The other
+# three — av_sdk/exceptions.py, docs/for-agents.md, AGENTS.md — could drift silently.
+# These three classes close that gap, one per remaining place.
+class TestExitCodeRegistryMatchesSdkExceptions:
+    def test_sdk_exit_codes_dict_matches_the_registry(self):
+        from python.av_sdk.exceptions import EXIT_CODES as sdk_exit_codes
+
+        assert sdk_exit_codes == EXIT_CODE_REGISTRY, (
+            "av_sdk/exceptions.py's own EXIT_CODES dict drifted from EXIT_CODE_REGISTRY "
+            "above — update both together when adding a code."
+        )
+
+    @pytest.mark.parametrize("code", sorted(EXIT_CODE_REGISTRY))
+    def test_every_code_has_a_typed_sdk_exception_class(self, code):
+        from python.av_sdk.exceptions import _CODE_TO_CLASS, SDKError
+
+        cls = _CODE_TO_CLASS.get(code)
+        assert cls is not None, f"av_sdk/exceptions.py's _CODE_TO_CLASS has no entry for {code!r}"
+        assert issubclass(cls, SDKError)
+        assert cls.code == code, f"{cls.__name__}.code is {cls.code!r}, expected {code!r}"
+
+
+class TestExitCodeRegistryMatchesForAgentsDocs:
+    _TABLE_ROW_RE = re.compile(
+        r"^\|\s*`(\w+)`\s*\|\s*(\d+)\s*\|\s*`(\w+)`\s*\|", re.MULTILINE
+    )
+
+    def _rows(self) -> dict:
+        text = (REPO_ROOT / "docs" / "for-agents.md").read_text(encoding="utf-8")
+        return {m.group(1): (int(m.group(2)), m.group(3)) for m in self._TABLE_ROW_RE.finditer(text)}
+
+    def test_every_registry_code_has_a_matching_table_row(self):
+        rows = self._rows()
+        from python.av_sdk.exceptions import _CODE_TO_CLASS
+
+        for code, exit_status in EXIT_CODE_REGISTRY.items():
+            assert code in rows, f"docs/for-agents.md's exit-code table has no row for {code!r}"
+            doc_exit_status, doc_class_name = rows[code]
+            assert doc_exit_status == exit_status, (
+                f"docs/for-agents.md says {code!r} is exit {doc_exit_status}, registry says {exit_status}"
+            )
+            assert doc_class_name == _CODE_TO_CLASS[code].__name__, (
+                f"docs/for-agents.md says {code!r}'s SDK exception is `{doc_class_name}`, "
+                f"actual class is `{_CODE_TO_CLASS[code].__name__}`"
+            )
+
+
+class TestExitCodeRegistryMatchesAgentsMd:
+    def _text(self) -> str:
+        return (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("code", sorted(EXIT_CODE_REGISTRY))
+    def test_every_code_name_is_mentioned(self, code):
+        # AGENTS.md documents this registry as prose, not a table (unlike
+        # docs/for-agents.md) — codes 10-16 are named once as a set with "exit codes
+        # 10-16 respectively" (positional, not individually numbered); codes 17+ are each
+        # individually annotated as `` `code` (NUMBER, ...) `` inline. This only checks
+        # the name is mentioned at all — see the class below for the individually
+        # numbered ones' actual number.
+        assert f"`{code}`" in self._text() or code in self._text(), (
+            f"AGENTS.md's exit-code summary no longer mentions {code!r} at all"
+        )
+
+    @pytest.mark.parametrize("code,exit_status", sorted(
+        (c, n) for c, n in EXIT_CODE_REGISTRY.items() if n >= 17
+    ))
+    def test_individually_numbered_codes_match_their_stated_number(self, code, exit_status):
+        # Codes 17+ are each written as `` `name` (NUMBER, ...) `` inline in AGENTS.md's
+        # own prose — unlike 10-16, which are only ever named as a set against a stated
+        # RANGE ("10-16 respectively"), not individually numbered.
+        match = re.search(rf"`{re.escape(code)}`\s*\((\d+)", self._text())
+        assert match, f"AGENTS.md does not individually number {code!r} as `` `{code}` (N, ...) ``"
+        assert int(match.group(1)) == exit_status, (
+            f"AGENTS.md says {code!r} is exit {match.group(1)}, registry says {exit_status}"
+        )
+
+    def test_codes_10_to_16_range_is_still_stated(self):
+        assert re.search(r"10.{1,3}16", self._text()), (
+            "AGENTS.md no longer states the '10-16' range for the positionally-listed "
+            "codes (not_a_repo..policy_denied) — if any of those seven codes' numbers "
+            "ever change, or the range is written differently, update this check too"
         )

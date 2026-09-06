@@ -17,11 +17,13 @@ Prerequisites: **Python ≥ 3.10**, **C++ build tools + CMake** (the C++ core co
 source in a dev install), and optionally **Docker Desktop** for the registry/webui stack.
 
 ```bash
-git clone https://github.com/leon1706/aether-vault
-cd aether-vault
+git clone https://github.com/leon1706-lol/Aether-Vault
+cd Aether-Vault
 pip install -e .[dev]          # compiles the C++ core, installs `av` + pytest
 
-pytest tests/ -q               # full suite (~330 tests; Docker-dependent ones skip)
+pytest tests/ -q               # full suite (Docker-dependent tests skip cleanly without a
+                                # stack; current count tracked by README's own test badge,
+                                # not restated here — see scripts/check_readme_test_freshness.py)
 av doctor                      # repo/environment health check
 ```
 

@@ -1,6 +1,6 @@
 # tests
 
-Owns Aether-Vault's pytest suite: 1,139 tests across 64 files covering the CLI, the
+Owns Aether-Vault's pytest suite: 1,139 tests across 69 files covering the CLI, the
 C++ bindings, the live registry server, the plugins, and the webui logic. Run with
 `pytest tests/ -q` (or `av test`); the skip-summary hook prints WHY anything skipped.
 
@@ -38,8 +38,14 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
   (tool detection, verdict rating, table/markdown rendering) and
   `scripts/append_perf_history.py`'s pure merge/render logic.
 - `test_release_gate.py`, `test_ci_policy.py` - `scripts/release_gate.py`'s checks
-  (perf-history tag, CHANGELOG sign-off, benchmarks-sha ancestry) and the permanent
-  no-dependency-bots/no-auto-merge guard over `.github/`.
+  (perf-history tag, CHANGELOG/VERSIONING sync, benchmarks-sha ancestry + MINOR-release
+  freshness, every required check green) and the permanent no-dependency-bots/no-
+  auto-merge/every-action-SHA-pinned guard over `.github/`.
+- `test_ci_map.py`, `test_ci_summary.py`, `test_deprecations.py`, `test_flake_registry.py`,
+  `test_helm_chart.py` (v1.3.4) - CI-map/budget doc-vs-YAML consistency,
+  `scripts/ci_summary.py`'s pure logic, `development/deprecations.yml`'s schema + overdue
+  guard, the flake-quarantine policy, and the Helm chart's default image matching its
+  real publisher.
 - `test_docs_commands.py` - parses every fenced `av ...` command out of `docs/*.md` and
   resolves it against the live Click tree, so documentation rot is a test failure.
 - `test_benchmark_docs_freshness.py` - guards README.md's/benchmarks/README.md's

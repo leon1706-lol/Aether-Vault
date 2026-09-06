@@ -1,0 +1,34 @@
+# v1.3.4 (todo.md item 18): machine-checkable deprecation registry. Every surface this
+# project has ever deprecated (or plans to) gets one entry here — `scripts/
+# check_deprecations.py` reads it, `tests/test_deprecations.py` validates its shape and
+# flags anything overdue, and the nightly `deprecation-dry-run` job prints what the NEXT
+# MAJOR release would remove, before that release is ever cut.
+#
+# Schema per entry:
+#   surface        - human-readable name of the deprecated thing
+#   announced_in   - the version this was first announced as deprecated
+#   remove_in      - the version it is (or was) scheduled for removal in
+#   status         - "pending" (still present, scheduled) | "removed" (gone already)
+#   probe          - for "pending" entries only: a real, executable check (python -c
+#                    snippet, or a file/string to grep for) that returns true while the
+#                    surface STILL exists -- read by check_deprecations.py to confirm a
+#                    "removed" entry is genuinely gone and a "pending" one hasn't been
+#                    silently removed without updating its status. null for "removed"
+#                    entries (nothing left to probe).
+#   notes          - context: why, what the migration path is/was, where documented.
+
+deprecations:
+  - surface: "GHCR image repository-name aliases: aether-vault-server / aether-vault-webui"
+    announced_in: "v1.2.2"
+    remove_in: "v1.3.0"
+    status: "removed"
+    probe: null
+    notes: >
+      Seeded as the one historical, closed example this registry existed to generalize
+      from — see VERSIONING.md's "Removed in v1.3.0: legacy GHCR alias tags" section for
+      the full story (including the v1.2.3/v1.2.4/v1.2.5 reaffirmed-floor detour before
+      the actual removal). Migration path: `av doctor --compose PATH --write`, or manual
+      (docs/migrate-engine-image.md). The entrypoint's own legacy auto-detect
+      (DATABASE_URL/NEXT_PUBLIC_API_URL-based role inference) is UNCHANGED and still
+      works for any already-pulled legacy-shaped container -- only the alias TAGS
+      themselves stopped being published.

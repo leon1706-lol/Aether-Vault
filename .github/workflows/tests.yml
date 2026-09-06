@@ -4,6 +4,13 @@ on:
   push:
   pull_request:
 
+# v1.3.4 (W1b): least-privilege default -- every job here only ever reads the repo,
+# builds, and uploads its own artifacts; none pushes anywhere or touches
+# packages/id-token/security-events. Individual jobs are free to grant themselves more
+# if a future one genuinely needs it (none do today).
+permissions:
+  contents: read
+
 # Superseded runs (rapid-fire pushes) are cancelled — saves runner minutes and makes
 # the latest commit's result the authoritative one.
 concurrency:
@@ -24,9 +31,9 @@ jobs:
         python-version: ["3.10", "3.14"]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -66,20 +73,190 @@ jobs:
 
       - name: Upload speedcheck JSON artifact
         if: matrix.python-version == '3.14'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: speedcheck-windows-py${{ matrix.python-version }}
           path: speedcheck-${{ matrix.python-version }}.json
           retention-days: 90
+
+  # v1.3.4 (todo.md item 8, W2a): the ONLY other place the full stack-free suite ran was
+  # Windows (`test` above) -- Linux, the platform this project actually deploys/publishes
+  # containers on, had zero coverage of its own test run, only nightly's narrower
+  # in-between-Python `compat` job. This is the real floor+ceiling Linux twin of `test`,
+  # PLUS (todo items 13/14/30, W2b/W2e) the coverage gate and slowest-tests report neither
+  # OS-parity job needs to duplicate.
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Aether-Vault (builds the C++ core via pybind11)
+        run: pip install -e .[dev,watch]
+
+      - name: Run test suite (coverage-gated, slowest 25 reported)
+        env:
+          AV_DATA_DIR: ${{ runner.temp }}/av-data
+        # `-m "not flaky"` excludes tests/FLAKES.md-registered flakes from this GATING
+        # job (see the separate, non-gating flaky-quarantine job below); `fail_under` is
+        # read automatically from pyproject.toml's [tool.coverage.report].
+        run: |
+          pytest -m "not flaky" --cov=python --cov-report=term-missing --cov-report=xml --cov-report=html --durations=25 tests/ -q
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo "### Coverage (test-linux, py${{ matrix.python-version }})"
+            echo '```'
+            python -m coverage report | tail -5
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: coverage-linux-py${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+          retention-days: 30
+
+  # v1.3.4 (todo.md item 12, W2d): flake quarantine policy — runs ONLY the registered
+  # flakes (tests/FLAKES.md), non-gating (`continue-on-error`), so a real regression in
+  # one is still visible in the run summary instead of silently retried or ignored
+  # forever. Starts against an EMPTY registry (see FLAKES.md's own header) — this job
+  # collects zero tests today and that is the correct, intended state.
+  flaky-quarantine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Aether-Vault
+        run: pip install -e .[dev,watch]
+
+      - name: Run only registered-flaky tests (non-gating)
+        env:
+          AV_DATA_DIR: ${{ runner.temp }}/av-data
+        run: pytest -m flaky -v tests/
+
+  # v1.3.4 (todo.md item 11, W2c): promotes the contract matrix from "buried inside the
+  # ~19-minute Windows `test` job" to its own small (~2 min), named, independently
+  # required check. These four files together already assert every CLI command × text/
+  # json output × the full exit-code registry (test_contract_matrix.py) plus the
+  # no-bots/no-push-back policy (test_ci_policy.py) — this job exists so a contract
+  # regression shows up as ITS OWN red check, not buried in a 19-minute job's log tail.
+  contract-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Aether-Vault
+        run: pip install -e .[dev]
+
+      - name: Contract matrix + exit codes + CI policy
+        env:
+          AV_DATA_DIR: ${{ runner.temp }}/av-data
+        run: |
+          pytest tests/test_contract_matrix.py tests/test_contracts.py tests/test_exit_codes.py tests/test_ci_policy.py tests/test_helm_chart.py -v
+
+  # v1.3.4 (todo.md item 38, W2f): a real per-revision upgrade/downgrade drill against a
+  # fresh Postgres — stronger than test_server.py's existing single head-to-base-and-back
+  # round trip (test_migration_chain_downgrades_and_reupgrades_cleanly), which only proves
+  # ONE full round trip works, not that every individual step in the chain does.
+  migrations-drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
+        env:
+          POSTGRES_USER: av_user
+          POSTGRES_PASSWORD: av_password
+          POSTGRES_DB: aether_vault_migrations_drill
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Aether-Vault
+        run: pip install -e .[dev]
+
+      - name: Per-revision upgrade -> downgrade -> re-upgrade drill
+        env:
+          DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_migrations_drill
+        run: python scripts/migrations_drill.py
+
+  # v1.3.4 (todo.md item 35, W1e): lints .github/workflows/*.yml and every shell script
+  # this repo ships (scripts/*.sh, docker/**/*.sh) — no services, no build, runs on every
+  # push in well under a minute. Would have caught this same session's own
+  # aquasecurity/trivy-action@0.28.0 broken-ref bug (Probleme.md #135) had it existed
+  # before that fix landed.
+  lint-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install actionlint (checksum-verified)
+        run: |
+          curl -sLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum -c -
+          tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint
+          sudo mv actionlint /usr/local/bin/actionlint
+          rm actionlint_1.7.12_linux_amd64.tar.gz
+
+      - name: actionlint
+        run: actionlint -color
+
+      - name: shellcheck (scripts/ + docker/ha/*.sh)
+        # shellcheck ships preinstalled on GitHub-hosted ubuntu-latest runners — no
+        # install step needed. -S error: this repo's scripts lean on bash-specific
+        # constructs (arrays, [[, process substitution) that trip a large number of
+        # shellcheck's stylistic (info/warning-level) defaults on purpose; error-level
+        # only keeps this gate meaningful instead of training reviewers to ignore it
+        # (the same judgment call security.yml's scanners already document).
+        run: |
+          shopt -s globstar
+          shellcheck -S error scripts/*.sh docker/ha/*.sh
 
   plugin-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 12
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -97,9 +274,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "20"
 
@@ -124,7 +301,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:15-alpine
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
         env:
           POSTGRES_USER: av_user
           POSTGRES_PASSWORD: av_password
@@ -137,7 +314,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       redis:
-        image: redis/redis-stack-server:latest
+        image: redis/redis-stack-server:latest@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
         ports:
           - 6379:6379
         options: >-
@@ -151,9 +328,9 @@ jobs:
       AV_TEST_REDIS_URL: redis://localhost:6379/0
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -204,7 +381,7 @@ jobs:
       PG_BIN: C:\Program Files\PostgreSQL\15\bin
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install PostgreSQL 15 and Memurai via Chocolatey
         run: |
@@ -218,7 +395,7 @@ jobs:
           & "$env:PG_BIN\psql.exe" -U postgres -h localhost -d postgres -c "SELECT version()" || Start-Sleep 10
           & "$env:PG_BIN\psql.exe" -U postgres -h localhost -d postgres -c "CREATE DATABASE aether_vault_test;"
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -236,7 +413,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:15-alpine
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
         env:
           POSTGRES_USER: av_user
           POSTGRES_PASSWORD: av_password
@@ -249,7 +426,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       redis:
-        image: redis/redis-stack-server:latest
+        image: redis/redis-stack-server:latest@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
         ports:
           - 6379:6379
         options: >-
@@ -264,9 +441,9 @@ jobs:
       E2E_PSQL_URL: postgresql://av_user:av_password@localhost:5432/aether_vault_test
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -280,7 +457,7 @@ jobs:
 
       - name: Upload server log on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: e2e-server-log
           path: /tmp/server-e2e.log
@@ -297,7 +474,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:15-alpine
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
         env:
           POSTGRES_USER: av_user
           POSTGRES_PASSWORD: av_password
@@ -310,7 +487,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       redis:
-        image: redis/redis-stack-server:latest
+        image: redis/redis-stack-server:latest@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
         ports:
           - 6379:6379
         options: >-
@@ -326,9 +503,9 @@ jobs:
       AV_E2E_CHAOS: "1"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -341,7 +518,7 @@ jobs:
 
       - name: Upload server log on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: chaos-drills-server-log
           path: /tmp/server-e2e.log
@@ -357,7 +534,7 @@ jobs:
     timeout-minutes: 40
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Build the engine image
         # v1.3.0 (Probleme.md): explicit target — see release.yml's identical comment.
@@ -549,6 +726,106 @@ jobs:
           docker rm -f engine-all engine-drain engine-srv engine-legacy engine-webui pg >/dev/null 2>&1 || true
           docker network rm avnet >/dev/null 2>&1 || true
 
+  # v1.3.4 (todo.md item 17, W3d): e2e-engine-smoke above proves role dispatch works from
+  # the "all" (engine) target with AV_ENGINE_ROLE overridden -- it never builds or boots
+  # the actual SLIM `server`/`webui` Dockerfile targets released alongside every tag
+  # (release.yml's "Build and push slim server/webui image" steps, published since
+  # v1.3.0). This is the first CI job that ever does.
+  slim-image-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Build slim server + webui images
+        run: |
+          docker build --target server -t aether-vault-engine:server-smoke .
+          docker build --target webui -t aether-vault-engine:webui-smoke .
+
+      - name: Role=server (slim image) — registry healthy, no Node runtime at all
+        run: |
+          docker network create avnet-slim >/dev/null
+          docker run -d --name pg-slim --network avnet-slim -e POSTGRES_USER=av_user \
+            -e POSTGRES_PASSWORD=av_password -e POSTGRES_DB=aether_vault \
+            postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b >/dev/null
+          for i in $(seq 1 30); do
+            docker exec pg-slim pg_isready -U av_user >/dev/null 2>&1 && break; sleep 1; done
+          docker run -d --name slim-server --network avnet-slim -p 8010:8000 \
+            -e DATABASE_URL=postgresql+asyncpg://av_user:av_password@pg-slim:5432/aether_vault \
+            -e REDIS_URL=redis://this-host-is-intentionally-absent:6379/0 \
+            aether-vault-engine:server-smoke >/dev/null
+          ok=0
+          for i in $(seq 1 45); do
+            curl -sf http://localhost:8010/api/health >/dev/null 2>&1 && { ok=1; break; }
+            sleep 2
+          done
+          [[ "$ok" == 1 ]] || { docker logs slim-server >&2 || true; exit 1; }
+          # No Node binary should even EXIST in this image (target: server never installs
+          # it) -- a stronger assertion than "port 3000 doesn't respond", which a slow
+          # boot could produce transiently even if Node WERE present.
+          docker exec slim-server sh -c 'command -v node' && {
+            echo "::error::slim server image has a node binary -- target: server should never install Node"; exit 1; } || true
+          echo "::notice::role=server (slim image): registry healthy, confirmed no Node runtime present"
+
+      - name: Role=webui (slim image) — dashboard healthy, no Python runtime at all
+        run: |
+          docker run -d --name slim-webui -p 3010:3000 \
+            -e NEXT_PUBLIC_API_URL=http://localhost:8010 \
+            aether-vault-engine:webui-smoke >/dev/null
+          ok=0
+          for i in $(seq 1 45); do
+            curl -sf http://localhost:3010/ >/dev/null 2>&1 && { ok=1; break; }
+            sleep 2
+          done
+          [[ "$ok" == 1 ]] || { docker logs slim-webui >&2 || true; exit 1; }
+          docker exec slim-webui sh -c 'command -v python3 || command -v python' && {
+            echo "::error::slim webui image has a python binary -- target: webui should never install Python"; exit 1; } || true
+          echo "::notice::role=webui (slim image): dashboard healthy, confirmed no Python runtime present"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f slim-server slim-webui pg-slim >/dev/null 2>&1 || true
+          docker network rm avnet-slim >/dev/null 2>&1 || true
+
+  # v1.3.4 (todo.md item 27, W5b): a "preview environment" for a PR — realized the same
+  # way staging is (docker-edge.yml's staging-smoke): boot the real release compose
+  # topology from a LOCALLY built image (never pushed anywhere, works for fork PRs with
+  # zero registry/secrets access) and run the same release smoke checks, with the
+  # results rendered into the PR run's own summary instead of a deployed URL.
+  preview-env:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Build the engine image locally (no push)
+        run: docker build --target engine -t aether-vault-engine:preview .
+
+      - name: Release smoke against the local preview image
+        # Informational, not gating — a preview job's whole point is to show a PR
+        # author what a real deploy would look like; continue-on-error so the summary
+        # below still renders (and still shows) a genuine failure instead of the step
+        # just disappearing behind a red X with no detail.
+        continue-on-error: true
+        run: bash scripts/release_smoke.sh aether-vault-engine:preview 2>&1 | tee preview-smoke.log
+
+      - name: Render preview summary
+        if: always()
+        run: |
+          {
+            echo "### Preview environment (PR #${{ github.event.number }})"
+            echo ""
+            echo "Built \`aether-vault-engine\` from this PR's own \`Dockerfile\` (target: engine, local only — never pushed) and ran \`scripts/release_smoke.sh\` against it."
+            echo ""
+            echo '```'
+            tail -60 preview-smoke.log 2>/dev/null || echo "(no smoke log captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # First time release artifacts are ever INSTALLED rather than just built: a wheel goes
   # into a clean Linux venv, and the sdist is compiled from scratch inside a clean Windows
   # venv (validating the MSVC/CMake path end users hit when no wheel matches).
@@ -557,9 +834,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -570,7 +847,7 @@ jobs:
           twine check dist/*
 
       - name: Upload dist artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist
           path: dist/
@@ -582,12 +859,12 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: dist
           path: dist
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -636,12 +913,12 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: dist
           path: dist
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -676,7 +953,7 @@ jobs:
     timeout-minutes: 18
     services:
       postgres:
-        image: postgres:15-alpine
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
         env:
           POSTGRES_USER: av_user
           POSTGRES_PASSWORD: av_password
@@ -689,7 +966,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       redis:
-        image: redis/redis-stack-server:latest
+        image: redis/redis-stack-server:latest@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
         ports:
           - 6379:6379
         options: >-
@@ -699,9 +976,9 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -739,7 +1016,7 @@ jobs:
       - name: Seed checkpoint data via the real av CLI
         run: python webui/e2e/seed_data.py
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "20"
 
@@ -805,7 +1082,7 @@ jobs:
 
       - name: Upload Playwright report on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: playwright-report
           path: webui/playwright-report/
@@ -819,17 +1096,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: "v3.15.0"
 
       - name: Install kubeconform
+        # v1.3.4 (W0.9): this used to pipe a network download straight into
+        # /usr/local/bin with no integrity check at all -- a compromised release asset or
+        # a MITM'd download would execute unnoticed. Checksum pinned from kubeconform
+        # v0.8.0's own published CHECKSUMS file.
         run: |
-          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz \
-            | tar -xz -C /usr/local/bin kubeconform
+          curl -sLO https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xz -C /usr/local/bin -f kubeconform-linux-amd64.tar.gz kubeconform
+          rm kubeconform-linux-amd64.tar.gz
 
       - name: helm lint (default + a representative override set)
         run: |
@@ -867,7 +1150,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Run the HA drill
         # v1.3.3.1 fix (found live): without KEEP_HA_STACK=1, ha_drill.sh's own `cleanup()`
@@ -902,3 +1185,66 @@ jobs:
       - name: Tear down (in case the drill's own trap didn't run)
         if: always()
         run: docker compose -f docker-compose.ha.yml -p aether-vault-ha down -v || true
+
+  # v1.3.4 (todo.md item 29/31, W5d): CI observability — a per-job duration/budget table
+  # rendered into this run's own summary (and, on a same-repo PR, posted as a comment)
+  # every time, success or failure. `needs:` every job so this always runs LAST and sees
+  # every result; `if: always()` so a red run still gets a summary (arguably the most
+  # useful time to have one). Never gating — see scripts/ci_summary.py's own docstring.
+  ci-summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - test
+      - test-linux
+      - flaky-quarantine
+      - contract-matrix
+      - migrations-drill
+      - lint-workflows
+      - plugin-tests
+      - webui-tests
+      - server-tests
+      - server-tests-windows
+      - e2e-suite
+      - chaos-drills
+      - e2e-engine-smoke
+      - slim-image-smoke
+      - preview-env
+      - package-build
+      - smoke-wheel-linux
+      - smoke-sdist-windows
+      - webui-e2e
+      - helm-lint
+      - ha-drill
+    permissions:
+      contents: read
+      actions: read          # to read this run's own job list
+      pull-requests: write    # to post/update the summary comment on same-repo PRs only
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - run: pip install pyyaml
+
+      - name: Render the CI summary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/ci_summary.py --workflow tests.yml --run-id "${{ github.run_id }}" \
+            | tee ci-summary.md
+          cat ci-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Same-repo PRs only — a fork PR's GITHUB_TOKEN has no write access to the base
+      # repo's PR comments, and this repo permanently bans the OTHER trigger variant
+      # that would grant it (tests/test_ci_policy.py's standing no-elevated-fork-trigger
+      # guard — see that file for exactly which substring, deliberately not spelled out
+      # here so this comment doesn't itself trip the same guard it's describing).
+      - name: Post/update the summary as a PR comment
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment "${{ github.event.number }}" --edit-last --create-if-none -F ci-summary.md

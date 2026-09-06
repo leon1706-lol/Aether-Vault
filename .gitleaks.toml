@@ -1,0 +1,34 @@
+# v1.3.4 (W1c): gitleaks config for the new `gitleaks` job in .github/workflows/security.yml.
+# Extends gitleaks' own default ruleset (https://github.com/gitleaks/gitleaks#configuration) —
+# this file does NOT replace it, only allowlists specific, known, intentional literals.
+#
+# Every entry below is a fixed, published, dev-only credential that only ever talks to a
+# local Docker Compose stack this same repo spins up — never a real external service, never
+# unique to a person or environment. Real secrets in this repo (API tokens, signing keys) are
+# either runtime-generated (`av registry keygen`) or read from `.env`/environment variables,
+# never committed as literals — that is exactly what `test_ci_policy.py` and this scan exist
+# to keep true. Add a new entry here ONLY for a literal you have personally verified is one of
+# these same categories; never widen a regex to match more than the one literal it documents.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known dev-only literals, not real secrets"
+regexTarget = "match"
+regexes = [
+  # Postgres password for the LOCAL `db`/`db-primary`/`db-replica` containers only —
+  # docker-compose.yml, docker-compose.ha.yml, python/av_cli/docker/docker-compose.release.yml,
+  # and the matching `AV_APP_DATABASE_URL`/`DATABASE_URL` connection strings that embed it
+  # (database.py's own docstring, migration 0015, tests/test_server.py's local fixtures).
+  '''av_password''',
+  '''av_app_password''',
+  # docker/ha/postgres-primary-init.sh's own comment already calls this out as a hardcoded
+  # dev-only value for the streaming-replication `replicator` role, local-compose-only.
+  '''replicator_password''',
+  # scripts/e2e_scenario.sh Phase D's Protected-mode fixture literals — AV_API_TOKEN /
+  # AV_AUTH_USERS values fed straight into a throwaway local server process for that one
+  # phase, torn down at the end of the same script run.
+  '''owner-secret-xyz''',
+  '''alice-token-123''',
+]

@@ -1,0 +1,28 @@
+# v1.3.4 (todo.md item 34): CODEOWNERS for the highest-risk paths in this repo — the
+# single commit/restore paths, signing, the container build, deploy manifests, CI itself,
+# and the release-adjacent scripts. Auto-requests review on any PR touching these; does
+# NOT enable "require code owner reviews" in branch protection (that would force every
+# PR through a review gate, which would break this repo's actual direct-to-master flow —
+# a deliberate choice, not an oversight, see development/infrastructure.md).
+
+# Default owner for everything not more specifically matched below.
+*                                       @leon1706-lol
+
+# Server: schema, migrations, auth/identity, tenancy — the highest-blast-radius surface.
+/python/av_server/                     @leon1706-lol
+
+# CLI: the single commit/restore paths (AGENTS.md non-negotiables #1/#2) and the
+# registry/signing commands.
+/python/av_cli/core.py                 @leon1706-lol
+/python/av_cli/cmd_registry.py         @leon1706-lol
+/python/av_cli/cmd_auth.py             @leon1706-lol
+
+# Container build, compose topologies, k8s chart.
+/Dockerfile                            @leon1706-lol
+/docker/                               @leon1706-lol
+/docker-compose*.yml                   @leon1706-lol
+/deploy/                               @leon1706-lol
+
+# CI/CD itself — workflows, release/CI-adjacent scripts, and this file.
+/.github/                              @leon1706-lol
+/scripts/                              @leon1706-lol

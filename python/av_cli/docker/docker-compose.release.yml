@@ -30,6 +30,13 @@ services:
       - NODE_ENV=production
       - WEBUI_PORT=3000
       - DATABASE_URL=postgresql+asyncpg://av_user:av_password@db:5432/aether_vault
+      # v1.3.4 (W3a): this line was MISSING from the release compose (present in the dev
+      # docker-compose.yml since v1.3.2) — every real `pip install aether-vault` user was
+      # silently getting the RLS-bypassing superuser-only topology migration 0015 exists
+      # specifically to close. See docker-compose.yml's identical variable for the full
+      # av_user/av_app rationale; migration 0015 creates the `av_app` role itself (no
+      # extra Postgres init step needed here) the first time the server boots.
+      - AV_APP_DATABASE_URL=postgresql+asyncpg://av_app:av_app_password@db:5432/aether_vault
       - REDIS_URL=redis://redis:6379/0
       # Optional shared-secret gate ("Protected" mode) — empty/unset means every route behaves
       # exactly as before ("Anonymous"). Set via `av auth set-token`, which writes this to a
