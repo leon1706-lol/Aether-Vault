@@ -63,52 +63,21 @@ wait_ready() {
   # v1.3.3.7 fix (found live): no timeout on this curl meant a single request that
   # connects but never responds (a real hang, not a clean refuse-fast failure -- e.g.
   # the LB proxying to a container whose IP it has stale-cached) could block this WHOLE
-  # loop indefinitely on ONE of its 60 tries, well past this job's own CI timeout,
-  # rather than cycling through retries and failing cleanly via the `return 1` below.
-  # `--connect-timeout 5 --max-time 10` bounds every single attempt.
+  # loop indefinitely on ONE of its 60 tries, rather than cycling through retries and
+  # failing cleanly via the `return 1` below. `--connect-timeout 5 --max-time 10` bounds
+  # every single attempt; `timeout -k 5 12` is a second, OS-level backstop outside
+  # curl's own process. Progress is logged every 10 tries (~24s) so a genuine hang here
+  # leaves a visible trail instead of silence.
   #
-  # v1.3.3.8 fix (found live): the flags above did NOT actually bound the CI hang --
-  # phase 4's identical call still hung for 24 STRAIGHT minutes of total zero output
-  # (job's own 30-minute timeout killed it, `curl`'s own 10s max-time never visibly
-  # fired). Whether that's a curl/libcurl edge case this box's version has (a stalled
-  # phase --max-time's event loop doesn't poll, a resolver call that blocks outside
-  # curl's own cancellable I/O) or something else entirely is still unknown -- so this
-  # wraps the whole attempt in coreutils `timeout`, an OS-level deadline enforced by
-  # SIGTERM/SIGKILL from OUTSIDE curl's own process, independent of whatever curl-
-  # internal mechanism did not fire. Belt-and-suspenders over belt alone.
-  # Also logs progress every 10 tries (~24s) so a genuine future hang leaves a visible
-  # timestamped trail in the live job log instead of total silence until cancellation --
-  # every prior investigation of this exact hang had NOTHING to go on between the last
-  # "waiting for..." line and the timeout kill.
-  #
-  # v1.3.3.9 fix (found live): the `timeout 12` wrapper above STILL didn't bound it --
-  # the next CI run hung again with ZERO progress log lines printed at all, meaning the
-  # very FIRST curl call never returned control even to `timeout` itself. Plain
-  # `timeout N CMD` only *sends* SIGTERM to CMD when N elapses; if CMD is wedged deep
-  # enough (blocked in a syscall that defers signal delivery) it can decline to die
-  # promptly, and `timeout` then waits for it to actually exit before returning --
-  # which means `timeout` inherits the exact same "no return" symptom it was added to
-  # prevent. `-k 5` (`--kill-after`) closes that gap: 5s after the SIGTERM, if the
-  # process is still alive, `timeout` escalates to an unmaskable SIGKILL instead of
-  # waiting on it indefinitely.
-  #
-  # v1.3.3.10 (found live): `-k 5` made ZERO observable difference -- the very next CI
-  # run hung in this exact spot for the same ~9.5 minutes with the same total absence of
-  # even ONE progress line, which a genuinely SIGKILL-bounded loop cannot produce (10
-  # iterations at a hard 17s worst case each is ~3 minutes, well inside that window).
-  # Two targeted fixes in a row producing byte-identical symptoms means the curl/timeout
-  # layer was very likely never the actual bottleneck -- so instead of a third guess,
-  # this turns on `set -x` with a per-line UTC timestamp in PS4, scoped tightly to just
-  # this loop, so the NEXT hang's raw trace shows conclusively which exact command bash
-  # is stuck on (inside `timeout`/`curl`, or somewhere entirely different this function
-  # doesn't otherwise print anything for, e.g. the arithmetic or the `if` itself).
+  # v1.3.3.7-3.3.10 investigated a suspected hang in THIS function via `set -x` tracing
+  # (since removed) -- the trace proved wait_ready was never actually the problem; it
+  # always returned within one or two tries. The real bug, found via the SAME kind of
+  # tracing applied further down the script, was an unrelated unscoped `wait` in phase
+  # 4's rate-limit probe block (see v1.3.3.13 there). Left here as a pointer in case this
+  # function is ever blamed again: it wasn't, twice, with hard evidence both times.
   local url="$1" tries=60 start_tries=60
-  local _old_ps4="$PS4"
-  PS4='+ [wait_ready $(date -u +%H:%M:%S)] '
-  set -x
   while (( tries-- > 0 )); do
     if timeout -k 5 12 curl -sf --connect-timeout 5 --max-time 10 -o /dev/null "$url"; then
-      set +x; PS4="$_old_ps4"
       return 0
     fi
     if (( tries % 10 == 0 )); then
@@ -116,7 +85,6 @@ wait_ready() {
     fi
     sleep 2
   done
-  set +x; PS4="$_old_ps4"
   return 1
 }
 
@@ -177,12 +145,16 @@ push_object_and_commit() {
   # uploaded, specifically to prove a retry of already-landed work is harmless -- with
   # `-f`, that retry pass turned "already landed, harmless" into 20 hard failures on
   # every single run, every time, unconditionally (not a race, not a flake).
+  # v1.3.3.13 (found live, code review): unlike wait_ready and phase 4's rate-limit
+  # probes, these two calls -- by far the most-invoked curl site in the whole drill (70+
+  # calls across phases 1-3) -- had never been given any timeout protection at all.
+  # `--connect-timeout 5 --max-time 10` matches every other curl call site now.
   local obj_code
-  obj_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/objects/$hash" \
+  obj_code="$(curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' -X POST "$API/api/objects/$hash" \
     -H "Content-Type: application/octet-stream" --data-binary "$body")"
   [[ "$obj_code" == "201" || "$obj_code" == "409" ]] || { echo "push $n object upload got HTTP $obj_code" >&2; return 1; }
   local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/commits" \
+  code="$(curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' -X POST "$API/api/commits" \
     -H "Content-Type: application/json" \
     -d "{\"hash\": \"$hash\", \"message\": \"ha-drill-$n\", \"root_tree_hash\": \"$hash\", \"project_id\": \"ha-drill\", \"project_name\": \"ha-drill\"}")"
   [[ "$code" == "201" || "$code" == "409" ]] || { echo "push $n commit got HTTP $code" >&2; return 1; }
@@ -190,11 +162,27 @@ push_object_and_commit() {
 export -f push_object_and_commit
 export API PY
 
-FAILS=0
-for i in $(seq 1 20); do push_object_and_commit "baseline-$i" & done
+# v1.3.3.13 (found live, code review): the CONCURRENT pass below is the thing this
+# phase's own name and pass-message actually claim to test -- but its results used to
+# be thrown away entirely (`wait || true` discards every job's exit status), so a real
+# failure in the concurrent run would print to stderr and nothing else: no `FAILS`
+# increment, no `die`, `pass` still fires unconditionally. Only the SECOND, sequential
+# pass below (re-pushing the same 20 objects, expected to get harmless 409s) was ever
+# actually checked -- a materially easier bar to clear than genuine concurrency. Fixed
+# to match phase 2's own already-correct pattern just below: redirect the concurrent
+# batch's output to a log file and check it's empty before declaring success.
+BASELINE_ERRORS="$WORK/baseline_errors.log"
+: > "$BASELINE_ERRORS"
+for i in $(seq 1 20); do push_object_and_commit "baseline-$i" >>"$BASELINE_ERRORS" 2>&1 & done
 wait || true
+if [[ -s "$BASELINE_ERRORS" ]]; then
+  cat "$BASELINE_ERRORS" >&2
+  die "one or more concurrent baseline pushes failed with no fault injected"
+fi
+
+FAILS=0
 for i in $(seq 1 20); do push_object_and_commit "baseline-$i" >/dev/null 2>&1 || FAILS=$((FAILS+1)); done
-[[ "$FAILS" -eq 0 ]] || die "baseline pushes: $FAILS unexpected failures with no fault injected"
+[[ "$FAILS" -eq 0 ]] || die "baseline pushes: $FAILS unexpected failures on the idempotent-retry pass"
 pass "20 concurrent pushes through the LB with 2 healthy replicas: zero failures"
 
 # ---------------------------------------------------------------------------
@@ -288,66 +276,27 @@ $COMPOSE restart lb
 log "waiting for both engine replicas to report ready again after the rate-limit env change"
 wait_ready "$API/api/ready" || die "engines never became ready again after applying AV_RATE_LIMIT_DEFAULT"
 
-# v1.3.3.12 (found live): the v1.3.3.11 bounded-poll diagnostic below NEVER printed
-# either -- meaning execution froze before even reaching it, most likely inside the
-# for-loop's own burst of 20 near-simultaneous forks right after three straight rounds
-# of container churn (phase 2's kill+restart, phase 4's own recreate+restart). That
-# points at runner-level resource exhaustion (memory/process-table pressure making
-# fork() itself block), not curl/timeout at all -- a class of hang no shell-level
-# timeout could ever catch, since the INTERPRETER itself would be what's stuck, before
-# any of its own later code (including the v1.3.3.11 kill -9 diagnostics) gets a chance
-# to run. These are cheap, single-process, unconditional prints -- if the runner really
-# is under pressure at this exact point, this is what will finally show it directly.
-free -h 2>&1 || true
-echo "process count: $(ps aux 2>/dev/null | wc -l)"
-docker stats --no-stream 2>&1 || true
-
 CODES="$WORK/ratelimit_codes.txt"
 : > "$CODES"
 declare -a _rl_pids=()
 for i in $(seq 1 20); do
   timeout -k 5 12 curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}\n' "$API/api/refs" >> "$CODES" &
   _rl_pids+=("$!")
-  echo "launched probe $i/20 (pid $!)"
 done
-echo "all 20 probes launched, pids: ${_rl_pids[*]}"
-# v1.3.3.11 fix (found live): this exact `timeout -k 5 12 curl ...` guard -- the SAME
-# one that supposedly bounds wait_ready's own call -- hung here just as totally and
-# unkillably in the very next CI run after wait_ready itself hung (v1.3.3.10 traced
-# wait_ready succeeding on its first try; the hang had simply moved to this block). Two
-# independent call sites failing identically means curl/`timeout` itself is very
-# unlikely to be the real problem -- so a blind `wait` (zero visibility, and itself
-# exposed to the same "never returns" class of bug if even one job never exits) is
-# replaced with an explicit, bounded poll: a hard 30s deadline, then `kill -9` issued
-# directly from THIS shell on any PID still alive (bypassing `timeout` entirely, in case
-# `timeout` is somehow the thing not returning) -- and, the actual point of this change,
-# `ps -o stat` printed for that PID first. `stat` code `D` means uninterruptible kernel
-# I/O, immune to every signal including SIGKILL, which no shell-level timeout can ever
-# fix; anything else means a signal really should have reached it and didn't for some
-# other reason.
-echo "$(date -u +%H:%M:%S) entering the 30s poll loop over ${#_rl_pids[@]} pids"
-_rl_deadline=$(( $(date +%s) + 30 ))
-_rl_iter=0
-while (( $(date +%s) < _rl_deadline )); do
-  _rl_iter=$((_rl_iter + 1))
-  _rl_alive=0
-  for pid in "${_rl_pids[@]}"; do
-    kill -0 "$pid" 2>/dev/null && _rl_alive=$((_rl_alive + 1))
-  done
-  echo "$(date -u +%H:%M:%S) poll iter $_rl_iter: $_rl_alive/${#_rl_pids[@]} still alive"
-  (( _rl_alive == 0 )) && break
-  sleep 2
-done
-echo "$(date -u +%H:%M:%S) poll loop exited after $_rl_iter iterations, checking final states"
-for pid in "${_rl_pids[@]}"; do
-  if kill -0 "$pid" 2>/dev/null; then
-    log "  PID $pid still alive after a 30s deadline -- state: $(ps -o pid,stat,etime,cmd -p "$pid" 2>&1 | tail -1)"
-    kill -9 "$pid" 2>/dev/null || true
-  fi
-done
-echo "$(date -u +%H:%M:%S) about to call the final bare wait"
-wait 2>/dev/null || true
-echo "$(date -u +%H:%M:%S) final wait returned"
+# v1.3.3.13 fix (found live, ROOT CAUSE): every prior fix here (v1.3.3.7-12: curl
+# timeouts, `timeout -k`, `set -x` tracing, a bounded poll with `kill -9`) was chasing
+# an innocent target -- a heartbeat trace finally proved all 20 of these curls exit
+# correctly within 2 SECONDS, every single time. The real bug was a bare `wait` (no
+# arguments) right here, present since before this investigation started: bash's
+# argument-less `wait` blocks for EVERY background job the shell has ever started, not
+# just the ones this block cares about -- and phase 3 started `webhook_probe.py` as a
+# deliberately long-lived listener (`PROBE_PID`), only meant to be killed later in
+# `cleanup()`'s EXIT trap. That job is still running at this point BY DESIGN, so the
+# bare `wait` was blocking on a process that was never supposed to exit yet, for as
+# long as the surrounding job/step timeout allowed. Scoping `wait` to exactly the PIDs
+# this block launched fixes it outright, with no diagnostic machinery needed -- each
+# already has its own `timeout -k 5 12` bound, so this cannot reintroduce the hang.
+wait "${_rl_pids[@]}" 2>/dev/null || true
 
 OK_COUNT="$(grep -c '^200$' "$CODES" || true)"
 LIMITED_COUNT="$(grep -c '^429$' "$CODES" || true)"
