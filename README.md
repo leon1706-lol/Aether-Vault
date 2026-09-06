@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC-0097E8?style=flat-square&labelColor=1A1A1A" alt="PolyForm Noncommercial">
-  <img src="https://img.shields.io/badge/tests-1139%2F1139%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="1139 of 1139 tests passing">
+  <img src="https://img.shields.io/badge/tests-1276%2F1276%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="1276 of 1276 tests passing">
   <img src="https://img.shields.io/pypi/v/aether-vault?style=flat-square&labelColor=1A1A1A&label=pypi&logo=pypi&logoColor=white" alt="PyPI">
   <img src="https://img.shields.io/badge/docker-aether--vault--engine-2496ED?style=flat-square&labelColor=1A1A1A&logo=docker&logoColor=white" alt="Docker">
 </p>
@@ -202,7 +202,7 @@ and how it's wired in, this table is the index.
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
 | `python/av_plugins/` | Lightning / Transformers / MLflow auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
-| `tests/` | 1,139-test suite across 69 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
+| `tests/` | 1,276-test suite across 69 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
@@ -290,7 +290,7 @@ For full methodology, every raw number, and the rating legend, see [`development
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs 1,139 tests across 69 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the v1.3.1 RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
+The full suite (`av test` or `pytest tests/ -q`) runs 1,276 tests across 69 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the v1.3.1 RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
 
 ```bash
 av test                  # full suite

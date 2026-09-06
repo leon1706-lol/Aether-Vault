@@ -1,0 +1,15 @@
+# v1.3.4 (Probleme.md #137): Trivy ignore list for the engine image scan
+# (security.yml's container-image job / release.yml's / docker-edge.yml's scan-before-
+# push gates). Every entry here is a genuine accepted-risk decision with a written
+# reason, not a blanket suppression -- re-evaluate whenever the upstream package that
+# forces this changes.
+
+# pyOpenSSL 22.0.0 (CVE-2026-27459, fixed 26.0.0). pysaml2 7.5.4 -- the ONLY consumer of
+# pyOpenSSL in this image, via the `saml` extra -- pins `pyopenssl<24.3.0` itself
+# (verified in a real build log, not assumed). Any version satisfying that ceiling is
+# necessarily vulnerable to this CVE; there is no pyOpenSSL version this repo could pin
+# that is both >=26.0.0 AND <24.3.0. Fixing this for real requires pysaml2 itself to
+# raise its own ceiling upstream, or this project dropping SAML support -- neither is
+# something a downstream pin can force. Revisit when pysaml2 ships a release compatible
+# with a patched pyOpenSSL.
+CVE-2026-27459

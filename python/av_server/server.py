@@ -5294,6 +5294,21 @@ except ImportError:
     # this server, matching every other optional-dependency pattern in this codebase
     # (av watch/av doctor --compose/etc.): a 404 for an unmounted route, not a crash.
     logger.info("pysaml2 not installed -- SAML SSO routes are not mounted")
+except Exception as exc:
+    # v1.3.4 (found live -- Probleme.md #137): pysaml2 IS installed, but importing it
+    # transitively imports pyOpenSSL's own `OpenSSL.crypto`, which raises `AttributeError:
+    # module 'lib' has no attribute 'GEN_EMAIL'` at IMPORT TIME under a real pyOpenSSL/
+    # cryptography version combination this environment resolved (see Probleme.md for the
+    # full investigation) -- an installed-but-broken optional dependency, not an ABSENT
+    # one, which the bare `except ImportError` above was never written to catch. Before
+    # this fix, that AttributeError propagated all the way up and crashed the ENTIRE
+    # server at startup -- SSO/OIDC, the base registry, everything -- over a SAML-only
+    # compatibility problem. Degrades exactly like the ImportError case above: SAML
+    # routes don't mount, everything else keeps working.
+    logger.warning(
+        "pysaml2 is installed but failed to import cleanly (%s: %s) -- SAML SSO routes "
+        "are not mounted; OIDC and every other server route are unaffected", type(exc).__name__, exc,
+    )
 
 try:
     from . import scim as scim_module

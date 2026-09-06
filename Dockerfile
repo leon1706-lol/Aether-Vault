@@ -103,7 +103,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get purge -y gnupg \
     && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # v1.3.4 (found live via Trivy, once security.yml's container-image job ran for the
+    # first time -- Probleme.md #137): npm ships bundled with the nodejs package but is
+    # NEVER invoked at runtime here (engine-entrypoint.sh only ever execs `node
+    # server.js` and `uvicorn` -- grepped, confirmed) -- it was along for the ride purely
+    # as an artifact of installing Node, and its OWN vendored dependencies (tar, pacote,
+    # sigstore, ip-address, minimatch, ...) carried real HIGH/CRITICAL CVEs that had
+    # nothing to do with this project's own code. Removed rather than upgraded: it's
+    # unused dead weight, not a dependency this image needs to keep working. Best-effort
+    # (`|| true`) since the exact path is a NodeSource/Debian packaging detail, not a
+    # documented contract -- worst case this is a no-op, never a build break.
+    && rm -rf /usr/lib/node_modules/npm /usr/lib/node_modules/corepack \
+              /usr/bin/npm /usr/bin/npx /usr/bin/corepack 2>/dev/null || true
 
 COPY --from=py-builder /wheels /wheels
 # v1.3.4 (W0.10): the separate `pip install fastapi uvicorn requests click` line is gone —
@@ -207,7 +219,13 @@ LABEL org.opencontainers.image.title="aether-vault-engine-webui" \
       org.opencontainers.image.source="https://github.com/leon1706-lol/Aether-Vault" \
       org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 RUN apt-get update && apt-get install -y --no-install-recommends curl procps \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    # v1.3.4 (found live via Trivy — same reasoning as the engine stage's identical
+    # removal above): this base image ships npm at the official Node image's own
+    # /usr/local path convention, never invoked at runtime (only `node server.js` runs
+    # here). Best-effort, never a build break.
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+              /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack 2>/dev/null || true
 COPY --from=web-builder /build/webui/.next/standalone /webui
 COPY --from=web-builder /build/webui/.next/static /webui/.next/static
 COPY --from=web-builder /build/webui/public /webui/public

@@ -151,9 +151,21 @@ jobs:
         run: pip install -e .[dev,watch]
 
       - name: Run only registered-flaky tests (non-gating)
+        # v1.3.4 (found live — this job's own first-ever run): pytest exits 5 ("no tests
+        # collected") whenever the -m filter matches nothing, which is the deliberate,
+        # correct starting state here (tests/FLAKES.md's registry is empty by design —
+        # see that file's own header). `continue-on-error: true` on the job already makes
+        # this non-blocking, but the STEP itself still shows red, which is misleading for
+        # the expected/normal case; exit 5 specifically is treated as success, any OTHER
+        # nonzero exit (a real flaky test genuinely failing) still surfaces as one.
         env:
           AV_DATA_DIR: ${{ runner.temp }}/av-data
-        run: pytest -m flaky -v tests/
+        run: |
+          set +e
+          pytest -m flaky -v tests/
+          code=$?
+          set -e
+          [[ "$code" == 0 || "$code" == 5 ]] || exit "$code"
 
   # v1.3.4 (todo.md item 11, W2c): promotes the contract matrix from "buried inside the
   # ~19-minute Windows `test` job" to its own small (~2 min), named, independently
@@ -236,7 +248,26 @@ jobs:
           rm actionlint_1.7.12_linux_amd64.tar.gz
 
       - name: actionlint
-        run: actionlint -color
+        # v1.3.4 (found live — this job's own first-ever run): actionlint runs shellcheck
+        # over every embedded `run:` block too, at EVERY severity, with no flag to raise
+        # its floor (verified: actionlint's `-ignore` filters by MESSAGE regex, not
+        # severity; the only severity-adjacent flag, `-shellcheck`, only enables/disables
+        # the integration wholesale). It found five real non-error-severity shellcheck
+        # notes across pre-existing `run:` blocks this job had simply never been run
+        # against before: SC2034 (warning — "loop variable unused" on `for i in $(seq 1
+        # N); do ... & done` background-fan-out loops, where `i` is deliberately unused),
+        # SC2015 (info — "A && B || C is not if-then-else" on deliberate best-effort
+        # `cmd && ok || true` idioms), SC2129 (style — "use a {} redirect block"),
+        # SC2012/SC2102 (info — `ls`-over-`find` and a character-class note, neither a
+        # real bug in this controlled CI context). Same error-level-only judgment call as
+        # the standalone shellcheck step below. Named explicitly rather than silencing
+        # shellcheck wholesale (`-shellcheck=`) so a REAL shellcheck error-level finding
+        # in a future `run:` block still fails this job — if a new non-error code shows
+        # up here later, add it the same way, don't reach for the wholesale disable.
+        run: >-
+          actionlint -color
+          -ignore 'SC2034:' -ignore 'SC2015:' -ignore 'SC2129:'
+          -ignore 'SC2012:' -ignore 'SC2102:'
 
       - name: shellcheck (scripts/ + docker/ha/*.sh)
         # shellcheck ships preinstalled on GitHub-hosted ubuntu-latest runners — no

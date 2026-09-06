@@ -52,7 +52,13 @@ jobs:
           print(f'::notice::pip-audit found {len(vulns)} advisories across {len(deps)} packages')
           for d in deps:
               for v in d.get('vulns', []):
-                  print(f\"  {d[\'name\']}=={d[\'version\']}: {v[\'id\']} - {v.get(\'description\', \'\')[:120]}\")
+                  # v1.3.4 fix (Probleme.md, found live -- security.yml had never run
+                  # before this pass, so this was never caught): the outer f-string is
+                  # already single-quoted-delimiter-free (it uses double quotes), so the
+                  # backslash-escaped single quotes below were never needed and are
+                  # invalid inside an f-string expression -- 'SyntaxError: unexpected
+                  # character after line continuation character'.
+                  print(f\"  {d['name']}=={d['version']}: {v['id']} - {v.get('description', '')[:120]}\")
           "
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
@@ -107,7 +113,19 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: semgrep (Python security + secrets rulesets)
         run: |
+          # v1.3.4 (found live -- this whole workflow had never run before this pass,
+          # Probleme.md #135): `python.sqlalchemy.security.audit.avoid-sqlalchemy-text`
+          # fired 12 times, all inside python/av_server/migrations/versions/ -- Alembic
+          # migrations legitimately use sa.text()/op.execute() for DDL/DML the ORM can't
+          # express (verified each one: hardcoded table/column names from this repo's own
+          # fixed migration-internal lists, values passed as real bind params, never
+          # string-concatenated external input -- the actual injection pattern this rule
+          # exists to catch). Excluded by path, not by rewriting 12 already-applied
+          # migrations (AGENTS.md: never edit an applied migration in place) or silencing
+          # the rule repo-wide (application code's own use of text(), if any is ever
+          # added, should still be caught).
           semgrep scan --config p/python --config p/secrets \
+            --exclude 'python/av_server/migrations/versions/*' \
             --severity ERROR --error --json --output semgrep-report.json python/ || true
           python3 -c "
           import json

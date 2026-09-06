@@ -82,6 +82,16 @@ sso = ["authlib>=1.3", "pyjwt[crypto]>=2.8"]
 # stages install the runtime shared libs (libxml2, libxmlsec1-openssl). Kept as its OWN
 # extra, separate from `sso` above, so a pip-only CLI install (no SAML IdP in play) never
 # needs the native dependency at all.
+# v1.3.4 (found live via Trivy, Probleme.md #137): Trivy flagged pyOpenSSL 22.0.0
+# (CVE-2026-27459, fixed 26.0.0) in the built image. A first attempt to fix this by
+# adding an explicit "pyopenssl>=26.0.0" HERE broke pysaml2 outright at import time
+# (AttributeError: module 'lib' has no attribute 'GEN_EMAIL', found live in
+# e2e-engine-smoke once this whole extra was ever actually installed for the first
+# time) -- because pysaml2 7.5.4 itself pins `pyopenssl<24.3.0` (verified in the real
+# build log: "Collecting pyopenssl<24.3.0 (from pysaml2>=7.5->...)"), a constraint this
+# repo doesn't control and can't override without genuinely breaking SAML. Reverted;
+# see .trivyignore for the accepted-risk entry this leaves, and Probleme.md #137 for
+# the full account.
 saml = ["pysaml2>=7.5"]
 
 [project.scripts]

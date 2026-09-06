@@ -1,6 +1,6 @@
 # tests
 
-Owns Aether-Vault's pytest suite: 1,139 tests across 69 files covering the CLI, the
+Owns Aether-Vault's pytest suite: 1,276 tests across 69 files covering the CLI, the
 C++ bindings, the live registry server, the plugins, and the webui logic. Run with
 `pytest tests/ -q` (or `av test`); the skip-summary hook prints WHY anything skipped.
 

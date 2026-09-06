@@ -384,7 +384,24 @@ def backup_restore(backup_dir, database_url, data_dir, db_container, engine_cont
             if hasattr(tarfile, "data_filter"):
                 tf.extractall(data_path, filter="data")
             else:
-                tf.extractall(data_path)
+                # v1.3.4 (bandit B202, found live once security.yml's python-static job
+                # ran for the first time -- Probleme.md #135/#137): an interpreter old
+                # enough to lack `data_filter` entirely gets no automatic path-traversal
+                # protection from tarfile itself (CVE-2007-4559's own class of bug) --
+                # this manually rejects any member whose resolved path would land
+                # outside `data_path` (absolute paths, `../` traversal, symlink/hardlink
+                # targets that escape it) before extracting, rather than trusting the
+                # archive blindly. `data_path.resolve()` once, outside the loop -- the
+                # directory itself doesn't move mid-extraction.
+                base = data_path.resolve()
+                for member in tf.getmembers():
+                    target = (base / member.name).resolve()
+                    if target != base and base not in target.parents:
+                        raise ValueError(
+                            f"refusing to extract {member.name!r} — resolves outside {base} "
+                            "(path traversal in the backup archive)"
+                        )
+                tf.extractall(data_path)  # nosec B202 -- every member validated above
 
     # --- Part 3: bring the schema to THIS build's head (heals a backup taken on an
     # older migration chain — the same adoption path a legacy volume goes through).
