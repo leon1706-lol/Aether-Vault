@@ -68,7 +68,6 @@ export function RunsPanel({
       openedFromDeepLink.current = true;
       selectRun(initialRunId);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialRunId]);
 
   const load = useCallback(async () => {

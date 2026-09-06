@@ -9,16 +9,16 @@
     "test": "vitest run",
     "test:e2e": "playwright test",
     "bench": "vitest bench --run",
-    "lint": "next lint --max-warnings 0",
+    "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "date-fns": "3.6.0",
     "lucide-react": "^0.400.0",
-    "next": "14.2.35",
-    "react": "^18",
-    "react-dom": "^18",
-    "recharts": "^2.12.7"
+    "next": "16.3.4",
+    "react": "^19",
+    "react-dom": "^19",
+    "recharts": "^3.10.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
@@ -26,11 +26,11 @@
     "@testing-library/react": "^16.0.0",
     "@testing-library/user-event": "^14.5.0",
     "@types/node": "^20",
-    "@types/react": "^18",
-    "@types/react-dom": "^18",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^4.3.0",
-    "eslint": "8.57.1",
-    "eslint-config-next": "14.2.5",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.4",
     "jsdom": "^25.0.0",
     "typescript": "^5",
     "vitest": "^2.0.0"

@@ -93,10 +93,10 @@ export function LayerDriftChart({ layers }: Props) {
               }}
               labelStyle={{ color: "#718096" }}
               itemStyle={{ color: "#e2e8f0" }}
-              formatter={(_value: number, _name: string, ctx: { payload?: { name: string; status: string } }) => [
-                ctx.payload?.status ?? "",
-                ctx.payload?.name ?? "",
-              ]}
+              formatter={(_value, _name, item) => {
+                const payload = (item as { payload?: { name: string; status: string } })?.payload;
+                return [payload?.status ?? "", payload?.name ?? ""];
+              }}
             />
             <Bar dataKey="value" isAnimationActive={false}>
               {data.map((d) => (

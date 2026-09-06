@@ -32,8 +32,14 @@ describe("LayerDriftChart", () => {
     }));
     render(<LayerDriftChart layers={layers} />);
     expect(screen.getByText(/Rendering \d+ of 4001 layers…/)).toBeInTheDocument();
+    // v1.3.4 (Next.js 16 / React 19 upgrade): the default 1000ms waitFor timeout was
+    // comfortably enough for jsdom to fire the 5 rAF-driven reveal ticks (500 -> 1500 ->
+    // 2500 -> 3500 -> 4001) under React 18 + the old testing-library major -- under
+    // React 19's, it now reliably lands on "3500 of 4001" (one tick short) right at the
+    // default timeout. Same assertion, same real ticks required, just a longer real-
+    // wall-clock allowance for the newer stack's per-tick overhead.
     await waitFor(() => {
       expect(screen.queryByText(/Rendering \d+ of 4001 layers…/)).not.toBeInTheDocument();
-    });
+    }, { timeout: 5000 });
   });
 });
