@@ -600,6 +600,7 @@ log "Phase M — storage write failure: upload fails honestly, nothing partial l
 # CASStorage's own top-level dirs before locking the tree down read-only, so the server
 # can still boot (its own mkdir(exist_ok=True) only needs to stat them) while a NEW
 # per-object shard dir created during upload fails honestly instead of succeeding.
+stop_server
 READONLY_DATA="$WORK/data-readonly"
 mkdir -p "$READONLY_DATA/objects" "$READONLY_DATA/commits" "$READONLY_DATA/refs"
 chmod -R 555 "$READONLY_DATA"

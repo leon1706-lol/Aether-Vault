@@ -50,6 +50,11 @@ defers to — part of the contract, not optional.
 - DB changes: append an Alembic revision (`0003…`), update `test_migrations.py` heads.
 - Docs move with code: README CLI reference, architecture.md contracts,
   infrastructure.md env vars, CHANGELOG.md phase entry, Probleme.md only for real bugs.
+- **Probleme.md entries: condensed, not narrated.** Every entry is title + severity/status
+  line + **Problem**/**Fix**/**Verification**, each section **~1-3 sentences** — the
+  finding, the change, the proof, nothing else. No blow-by-blow of hypotheses tried,
+  investigation narrative, or restated code. This is a MUST going forward, not a style
+  preference: condense at write time, don't write long and condense later.
 - **Comments: short and precise.** A comment earns its place by telling a
   reader something the code can't — a non-obvious *why*, an invariant, a real gotcha.
   Useless (restates the code, or narrates process — "found live", "see Probleme.md #N")

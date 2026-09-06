@@ -12,6 +12,11 @@ are for — see `AGENTS.md`).
 ### Main Objektive:
 
 
+main objektive v1.3.7
+- general condensing of changelog file to make it more cleaner and human readable
+- add an vanila pytorch plugin fully end to end implemented
+- add tests with ci, and normal test suit for it
+- do verification tasks afterwards and agent md
 
 
 ### FUture testing not in scope for current plans:
