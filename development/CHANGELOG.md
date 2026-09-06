@@ -2353,3 +2353,47 @@ verification-status caveats below) lives in this session's own record, summarize
 (No "Essential-Tasks: signed off" line — Docker-dependent verification and the branch-
 protection/repo-settings changes above are the owner's to complete; nothing here is
 committed by the agent.)
+
+## Phase 64 — V1.3.5: closing v1.3.4's own CI gaps, a docs index link, and a repo-wide
+comment-condensing pass (plus the two regressions it caused, found and fixed)
+
+- **Real bug, found and fixed:** three of `scripts/release_smoke.sh`'s call sites
+  (`staging-smoke` in `docker-edge.yml`, `rollback-drill` in `release.yml`, `preview-env`
+  in `tests.yml`) never installed the `av` CLI on the RUNNER before the script's own
+  real `av push`/`av pull` round trip — every other job that uses `av` does
+  `setup-python` + `pip install -e .` first, these three skipped straight from checkout
+  to Docker. `staging-smoke` (a brand-new v1.3.4 job) failed on its very first real run:
+  `av: command not found`, right after `/api/health`/`/api/ready`/the version check had
+  all genuinely passed. `preview-env` had the identical gap masked by its own
+  `continue-on-error: true`. Fixed in all three (Probleme.md #138); confirmed live —
+  `staging-smoke` went green on the next push.
+- **CI reliability:** the Windows `test` matrix job's `timeout-minutes: 25` left too
+  little margin over its own ~20-minute typical runtime — one run's `(3.10)` leg got
+  cancelled at the 25-minute mark with 95% of the suite already done (not a hang, just
+  runner variance). Bumped to 40.
+- **Docs:** added a `docs/` row to the main README's Module Documentation table, pointing
+  at `docs/README.md`'s own topic index (tutorial, RSI guide, contracts, DR, SLA/SLO,
+  runbooks) — previously only reachable via an inline mention buried in the "For Agents"
+  section.
+- **Repo-wide comment-condensing pass** (202 files): trimmed verbose/historical
+  commentary (old bug-number call-outs, superseded version-bump notes, restated-in-prose
+  rationale already covered by a test or a doc) down to what a reader actually needs
+  going forward, across every workflow, script, Python module, and webui file touched
+  this session.
+- **Real regression, found and fixed:** the condensing pass deleted two pieces of actual
+  content that happened to sit right next to the comment paragraphs it was trimming —
+  not comments themselves. (1) `scripts/e2e_scenario.sh` lost the line
+  `READONLY_DATA="$WORK/data-readonly"`, turning chaos drill Phase M into an instant
+  `set -u` unbound-variable failure. (2) `python/av_cli/cmd_registry.py` lost the "not a
+  PKI / not identity-binding" disclaimer sentence from five signing-command docstrings
+  (`registry keys list/fingerprint/rotate`, `verify`, `export-signature`) — a real
+  `--help`-text regression `tests/test_signing.py` specifically guards per-command,
+  since Click doesn't roll a parent group's docstring into its subcommands' own
+  `--help`. Both restored; caught by `chaos-drills`/`plugin-tests` going red on this
+  pass's own first CI run, not by re-reading the diff (Probleme.md #139, which also
+  records the systematic whole-diff re-scan run afterward — one confirmed instance of
+  each regression class, nothing further found).
+- **Audit:** every entry in `Probleme.md` (139 at last count) verified to carry both a
+  `Severity: N/10` rating and a colored status marker; #94 (Docker Desktop's WSL2 backend
+  failing to start) updated from 🟡 `partial` to 🟢 `fixed` now that it starts and boots
+  the stack correctly again.

@@ -341,7 +341,8 @@ def keys_group() -> None:
 
 @keys_group.command("list")
 def keys_list() -> None:
-    """List every signing key this repo knows about (active + archived from past rotations)."""
+    """List every signing key this repo knows about (active + archived from past
+    rotations). Tamper evidence, not PKI/identity binding — see `av registry keys --help`."""
     from .signing import list_keys
 
     repo_root = ensure_repo()
@@ -359,7 +360,8 @@ def keys_list() -> None:
 
 @keys_group.command("fingerprint")
 def keys_fingerprint() -> None:
-    """Print just this repo's active-key fingerprint (scriptable)."""
+    """Print just this repo's active-key fingerprint (scriptable). Tamper evidence, not
+    PKI/identity binding — see `av registry keys --help`."""
     from .signing import fingerprint, public_key_path
 
     repo_root = ensure_repo()
@@ -376,9 +378,9 @@ def keys_fingerprint() -> None:
 @keys_group.command("rotate")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip the confirmation prompt.")
 def keys_rotate(yes: bool) -> None:
-    """Archive the current signing key and generate a fresh one. Old commits keep
-    verifying (their signature embeds the old public key); the archived private key is
-    never deleted."""
+    """Archive the current signing key and generate a fresh one. Tamper evidence, not
+    PKI/identity binding: old commits keep verifying (their signature embeds the old
+    public key); the archived private key is never deleted."""
     from .signing import fingerprint, public_key_path, rotate_keypair
 
     repo_root = ensure_repo()
@@ -413,7 +415,9 @@ def keys_rotate(yes: bool) -> None:
               help="Write to this file instead of stdout.")
 def export_signature(commit_hash: str, out_path: str | None) -> None:
     """Export COMMIT_HASH's signature as a standalone record for external audit, verified
-    elsewhere with `av registry verify <hash> --signature FILE` with no repo access needed."""
+    elsewhere with `av registry verify <hash> --signature FILE` with no repo access needed.
+    Tamper evidence, not PKI/identity binding: proves the record matches what was signed,
+    not who signed it."""
     from .handoff import load_commit
     from .signing import export_signature_blob
 
@@ -489,8 +493,9 @@ def invoke_mergeless_attest_tag(repo_root, tags):
                    "signature — for auditing a commit without this repo's config.")
 def verify(commit_hash: str, signature_file: str | None) -> None:
     """Verify COMMIT_HASH: an ed25519 commit signature when present, else a legacy HMAC
-    attestation tag, else UNSIGNED (exit 0 -- unsigned commits are valid; this is tamper
-    evidence, not a trust gate). See SECURITY.md."""
+    attestation tag, else UNSIGNED (exit 0 -- unsigned commits are valid). Tamper evidence,
+    not PKI/identity binding — proves the payload wasn't modified, not who signed it. See
+    SECURITY.md."""
     from .handoff import load_commit
     from .signing import SigningUnavailable, load_public_key_hex, verify_detached, verify_signature
 

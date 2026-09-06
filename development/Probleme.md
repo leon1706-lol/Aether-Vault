@@ -1137,7 +1137,7 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 94. Docker Desktop's WSL2 backend would not start on the primary dev machine
 
-**Severity:** 6/10 (blocks local verification; not a codebase defect) · **Status:** 🟡 `partial` — open, owner will resolve manually (2026-09-01)
+**Severity:** 6/10 (blocks local verification; not a codebase defect) · **Status:** 🟢 `fixed` (2026-09-06) — Docker Desktop's WSL2 backend starts and boots the stack correctly again on the owner's machine
 
 **Problem:** After a routine `docker compose up -d --build` (rebuilding the engine image with the V1.2.5 changes), Docker Desktop's `docker-desktop` WSL2 distro stopped coming up: `docker ps` returned "Docker Desktop is unable to start", `docker buildx ls` reported `DeadlineExceeded` for every builder, and the backend log (`com.docker.backend.exe.log`) showed 7+ minutes of `still waiting for the engine to respond to _ping`. This is a host/environment failure, not something in this repo's Docker config — `docker-compose.yml`, the `Dockerfile`, and `engine-entrypoint.sh` were all unaffected and unchanged by this.
 
@@ -1146,9 +1146,9 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 2. `wsl --shutdown` (full WSL2 teardown) followed by a clean Docker Desktop relaunch — same result.
 3. Attempted to start the `com.docker.service` Windows service directly (`Start-Service`) — failed with "cannot be opened" (needs admin elevation this session doesn't have).
 
-**Fix:** none applied — this needs either an admin-elevated Docker Desktop restart or a full machine reboot, which the owner will do (owner: "I will do the docker stuff tomorrow"). Concrete next steps for whoever picks this up: reboot (or elevate + `Restart-Service com.docker.service`), then `docker compose up -d --build` and re-run WP-10's manual verification (kill one subservice → confirm only it restarts via `docker inspect --format '{{.RestartCount}}'`; `docker stop` with an in-flight request → confirm the `AV_ENGINE_STOP_GRACE_SECS` drain window is honored; break `AV_DATA_DIR` → confirm `/api/health` stays 200 while `/api/ready` goes 503).
+**Fix:** resolved on the owner's side (reboot/Docker Desktop restart, per the "Concrete next steps" below) — no codebase change was ever needed, matching this entry's own original diagnosis that the config was unaffected.
 
-**Verification:** N/A (not yet re-attempted). This is the reason the V1.2.5 "Depth Pass" report could not confirm the rebuilt image was actually running, nor exercise WP-10's live-Docker checks — see the CHANGELOG Phase 57 "Deferred" note.
+**Verification:** the owner confirms Docker Desktop's WSL2 backend now starts and the stack boots correctly. WP-10's specific manual checks (kill one subservice → confirm only it restarts; `docker stop` mid-request → confirm the `AV_ENGINE_STOP_GRACE_SECS` drain window is honored; break `AV_DATA_DIR` → confirm `/api/health` stays 200 while `/api/ready` goes 503) were the concrete next steps this entry called for and have not been specifically re-confirmed here — worth a quick pass whenever Docker is next open, but this entry itself (Docker Desktop failing to start) is closed.
 
 ---
 
@@ -1757,3 +1757,17 @@ Separately, four tests (`TestImproverVersions::test_create_is_idempotent_by_id`,
 **Fix:** added `actions/setup-python@…#v6` (Python 3.12) + `pip install -e .` immediately after checkout (before the docker login step, since the two are independent) in all three jobs: `staging-smoke`, `rollback-drill`, and `preview-env` — matching the exact pattern every other `av`-CLI-using job in this repo already follows.
 
 **Verified:** YAML re-parses cleanly (`yaml.safe_load` on all three edited workflow files) and `pip install -e .` is byte-for-byte the same install line already proven working on `ubuntu-latest` by `contract-matrix`/`migrations-drill`/`webui-e2e` (same runner OS, same pybind11 C++ build path, already green in this same CI run). **Not yet re-confirmed live** — the next push carrying this fix is the actual proof the `staging-smoke` job goes green; recorded here per this project's "nothing is done until it's verified" standard, pending that push.
+
+### 139. A repo-wide "condense the comments" pass (`5651198`, 202 files) deleted two pieces of REAL code/content hiding inside the comment blocks it was trimming
+
+**Severity:** 6/10 (both broke a real, previously-green CI job on this exact pass's own first run — not latent, not pre-existing) · **Status:** 🟢 `fixed` (2026-09-06), found via `gh run view --log-failed` on run `34061260573`, root-caused via `git show 5651198 -- <file>` diffs, not guessed at.
+
+**Problem 1 — `scripts/e2e_scenario.sh`'s Phase M lost its own setup line.** The multi-line comment above Phase M ("a genuinely full disk isn't reliably producible...") sat directly above `READONLY_DATA="$WORK/data-readonly"` — condensing the comment into 4 shorter lines dropped that assignment along with it (no line of the new comment resembles it; it's plain code, not a comment). Every later reference to `$READONLY_DATA` (6 of them) is a `set -u` unbound-variable error, so `chaos-drills` died at `scripts/e2e_scenario.sh: line 603: READONLY_DATA: unbound variable` the instant Phase M started (Phases A–L all ran fine first).
+
+**Problem 2 — five signing-command docstrings lost their own "not PKI / not identity binding" disclaimer.** `tests/test_signing.py::test_every_signing_command_help_states_not_pki` deliberately checks this phrase appears on EACH signing-adjacent command's OWN `--help` (`av registry keys list/fingerprint/rotate`, `verify`, `export-signature`), not just the parent `av registry keys --help` — Click doesn't roll a group's docstring into its subcommands'. The condensing pass merged the repeated disclaimer down to just the `keys` group's docstring, dropping it from the five subcommands' own docstrings (a real user-facing `--help` content regression, not a comment). `plugin-tests` failed all 5 parametrized cases with the exact assertion the test file's own header predicts.
+
+**Fix:** restored `READONLY_DATA="$WORK/data-readonly"` in `e2e_scenario.sh`; restored a short one-line "Tamper evidence, not PKI/identity binding — see `av registry keys --help`" (or the command-specific equivalent) to each of the five docstrings, condensed but present, rather than reverting the whole comment trim.
+
+**Caution for future passes of this kind:** a real assignment or a compliance-relevant sentence can sit inside what LOOKS like a comment paragraph (a variable declared right after its rationale comment; a docstring line embedded in prose). A "condense/shorten comments" pass across many files needs a rule of only ever deleting lines that already start with a comment marker (`#`) or sit fully inside a docstring's own margins — never a diff hunk that spans from comment into the very next code line without checking each retained/dropped line individually.
+
+**Verified:** `bash -n scripts/e2e_scenario.sh` and `python -c "import ast; ast.parse(...)"` on `cmd_registry.py` both clean; `pytest tests/test_signing.py::test_every_signing_command_help_states_not_pki -q` — 7/7 passing locally (all 5 previously-failing + the 2 that never broke). **Only these two regressions are confirmed** — this commit touched 202 files with 7,008 deletions; the rest is being verified by CI itself (`tests.yml`'s full 1,276-test suite) as it completes, not by manual re-reading of a diff this size.
