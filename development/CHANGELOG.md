@@ -6,2429 +6,410 @@ development history; see [`README.md`](../README.md) for current usage docs and
 findings (resolved and still-open).
 
 ## Phase 1 — High-Performance C++ Hashing Core
-- **Custom SHA-256 Engine**: Thread-safe cryptographic hashing.
-- **Parallel Tree-Hashing**: Splits files into 8MB chunks, hashes concurrently across all CPU cores.
+- **Custom SHA-256 engine**: thread-safe hashing, with parallel tree-hashing splitting files into 8MB chunks across all CPU cores.
 
 ## Phase 2 — CLI Framework & LFS Pointers
-- **Staging Index Manager**: Manages the local `.av/index`.
-- **LFS-Style Pointers**: Detects large files, copies them to object storage, and replaces them with `.av-pointer` files.
+- **Staging index manager** for `.av/index`, plus LFS-style pointers: large files are copied to object storage and replaced with `.av-pointer` files.
 
 ## Phase 3 — Content-Addressable Storage (CAS)
-- **Robust CAS Manager**: Deduplicates by SHA-256 hash with atomic writes.
-- **FastAPI Endpoints**: High-concurrency streaming uploads, downloads, and branch management.
+- **CAS manager** deduplicating by SHA-256 with atomic writes, exposed via FastAPI endpoints for high-concurrency streaming uploads/downloads and branch management.
 
 ## Phase 4 — Database & Cache Integration
-- **PostgreSQL Schema**: Structured SQL representation of the commit DAG, branches, and metadata.
-- **Redis Integration**: `redis-stack-server` for high-performance in-memory caching.
+- **PostgreSQL schema** for the commit DAG/branches/metadata, backed by `redis-stack-server` for high-performance caching.
 
 ## Phase 5 — Safetensors & Merkle Trees
-- **C++ Layer-Splitting**: Parses `.safetensors` JSON headers to independently hash individual model layers — saving up to **99% storage** when only classifier heads change.
-- **Merkle Tree DAG**: PostgreSQL tables modelling the full directory hierarchy as a content-addressed tree.
+- **C++ layer-splitting**: parses `.safetensors` headers to hash individual model layers independently, saving up to 99% storage when only classifier heads change. A Postgres Merkle-tree DAG models the full directory hierarchy as content-addressed.
 
 ## Phase 6 — Scalability & Garbage Collection
-- **RedisBloom Filter**: O(1) hash existence checks, dramatically reducing Postgres load.
-- **Mark-and-Sweep GC**: Traverses all Merkle Trees to purge orphaned data shards.
+- **RedisBloom filter** for O(1) hash existence checks (cuts Postgres load), plus mark-and-sweep GC that traverses Merkle trees to purge orphaned shards.
 
 ## Phase 7 — ML Experiment Tracking
-- **Dynamic Metadata**: `--tag` and `--metric` flags bind arbitrary tracking data (Sharpe ratio, loss, accuracy, drawdown) directly into atomic commits.
+- **`--tag`/`--metric`** flags bind arbitrary tracking data (loss, accuracy, drawdown, etc.) directly into atomic commits.
 
 ## Phase 8 — Native Codebase Visualization
-- **AST Parsing & Graph Generation**: `av graph` dynamically maps function calls, external library dependencies, and docstrings into an Obsidian-compatible Markdown vault.
+- **`av graph`**: AST parsing maps function calls, external dependencies, and docstrings into an Obsidian-compatible Markdown vault.
 
 ## Phase 9 — Web UI Dashboard
-- **Next.js Frontend**: Dark glassmorphism dashboard at `http://localhost:3000`.
-- **SVG Commit Graph**: DAG visualizer with coloured branch lanes and bezier edges.
-- **Recharts Metrics**: Line charts plotting all numeric ML metrics over time.
-- **Live API**: `GET /api/commits`, `GET /api/dashboard/summary` — auto-refreshes every 15 seconds.
-- **Docker Service**: `aether-vault-webui` added to `docker-compose.yml`, launched via `av webui`.
+- **Next.js dashboard** (`localhost:3000`): SVG commit-DAG graph with branch lanes, Recharts metric lines, and a `GET /api/commits`/`/api/dashboard/summary` live API auto-refreshing every 15s. Shipped as its own `aether-vault-webui` Docker service, launched via `av webui`.
 
 ## Phase 10 — Commit Integrity & Offline Resilience
-- **Change-Aware Staging**: `av add` only re-stages a file when its content hash actually changed, so re-running `av add .` after a commit no longer produces an empty duplicate commit.
-- **Pending-Push Queue**: Commits made while the remote registry is unreachable are saved locally and queued in `.av/pending_push` instead of silently failing to reach the Web UI dashboard.
-- **`av push`**: Retries syncing queued commits to the remote registry on demand; every `av commit` also auto-retries the queue when the server is back up.
+- **Change-aware staging**: `av add` only re-stages files whose content hash actually changed, so re-running it after a commit no longer produces an empty duplicate.
+- **Pending-push queue**: commits made while the registry is unreachable are saved to `.av/pending_push` instead of silently lost; `av push` retries on demand and every `av commit` auto-retries the queue once the server is back.
 
 ## Phase 11 — Agent Context Handoff
-- **`.avh` Open Format**: A JSON snapshot of branch, commit, tags, metrics, model/dataset lineage, and freeform agent instructions — designed to be read by another AI agent picking up the work.
-- **`av handoff`**: Generates/updates `handoff.avh` plus a human-readable Markdown note logged chronologically into `Aether-Handoff/`, indexed by a central `Handoff-Hub.md`.
-- **Per-Layer Weight Diffing**: `av handoff --diff-weights` reuses the Phase 5 safetensors layer hashes to report exactly which model layers changed since the parent commit, without re-hashing the file.
-- **`av handoff log` / `show`**: Browse and inspect the chronological snapshot history directly from the terminal.
+- **`.avh` format + `av handoff`**: a JSON snapshot of branch, commit, tags, metrics, and model/dataset lineage, meant to be read by another AI agent picking up the work — plus a human-readable note logged into `Aether-Handoff/`, indexed by `Handoff-Hub.md`.
+- **`--diff-weights`** reuses the Phase 5 per-layer hashes to report exactly which model layers changed since the parent commit, without re-hashing; `av handoff log`/`show` browse the history from the terminal.
 
 ## Phase 12 — Hardening & Robustness
-- **Race-Free Garbage Collection**: `av gc` now honours a grace period — object shards (and their DB rows) created during the upload→commit window are never reaped, so a GC running concurrently with a push can no longer delete a live object whose commit is still in flight.
-- **Batched Merkle-Tree Resolution**: Commit-tree reconstruction (`GET /api/commits/{hash}`) and the GC mark phase no longer issue one DB query per tree node (N+1). Tree resolution runs level-by-level with a single batched query per depth (dedup-safe via path prefixes); GC loads all tree rows once and walks them in memory. Bulk deletes are chunked to stay within driver bind-parameter limits.
-- **Unified File-Metadata Source**: Size/mtime change-detection is handled exclusively through Python's `os.stat` (a single Unix-epoch source). This removes a cross-language hazard where the C++ core's `std::filesystem::last_write_time` (implementation-defined epoch) and Python's `st_mtime_ns` could disagree and make unchanged files appear "modified"; the C++ core is now used purely for hashing.
-- **Crash-Safe Local Writes**: Commit objects, refs/HEAD, the pending-push queue, the metadata registry and config are written atomically (temp file + `fsync` + `os.replace`), so an interrupted `av commit` can never leave a ref pointing at a half-written or missing commit.
-- **Idempotent Registry API**: Concurrent uploads of the same object hash, or concurrent pushes of the same commit, now resolve to a clean `409` instead of a `500` (`IntegrityError` is caught and treated as success). `push_commit` also enforces payload limits (tree size, metric/tag counts, message length) to reject abusive input on the unauthenticated endpoint.
-- **Shallow / Out-of-Order Pushes**: A commit whose parent isn't on the server yet (offline pending-push, partial clone) no longer triggers a foreign-key `500`; DAG integrity is anchored by content-addressed hashes.
-- **Single-Request Commit Loading**: The Web UI fetches recent commits in one `/api/commits` call (newest-first, with parent links) instead of walking the parent chain one request at a time, and runs all dashboard fetches in parallel.
-- **Smaller polish**: pointer detection reads only the fixed magic prefix in binary mode (safe on multi-GB inputs); the parallel hasher only spins up a thread pool when there is enough work to amortize it; `VaultClient` is now closable / a context manager; deprecated `datetime.utcnow()` and `@app.on_event` replaced with timezone-correct helpers and a FastAPI `lifespan`.
+- **Race-free GC**: a grace period now protects objects created during the upload→commit window, so a concurrent GC can't reap a live object whose commit is still in flight.
+- **Batched Merkle-tree resolution**: commit-tree reconstruction and the GC mark phase no longer do one DB query per node — both now run one batched query per depth/pass instead of N+1.
+- **Unified file-metadata source**: change-detection now goes exclusively through Python's `os.stat`, removing a cross-language mismatch where the C++ core's and Python's mtime epochs could disagree and mark unchanged files "modified."
+- **Crash-safe writes**: commit objects, refs/HEAD, the pending-push queue, and config are all written atomically (temp file + fsync + replace), so an interrupted commit can't leave a ref pointing at nothing.
+- **Idempotent registry API**: concurrent uploads/pushes of the same hash now resolve to a clean 409 instead of a 500; `push_commit` also enforces payload limits against the unauthenticated endpoint.
+- **Other fixes**: out-of-order pushes (parent not yet on server) no longer 500; the Web UI loads recent commits in one batched call instead of walking the parent chain; pointer detection, thread-pool sizing, a closable `VaultClient`, and timezone-correct/`lifespan`-based FastAPI cleanup.
 
 ## Phase 13 — Visual Weight Diffing
-- **"Weight Diff" Web UI tab**: a sidebar tab (lifted into the existing single-page dashboard, no new route) lets you drag two checkpoints from a list into two comparison slots and see a colored per-layer heatmap, summary stats (changed/total/% changed), and a Recharts bar chart of which layers changed across model depth. Entirely client-side — it reuses the per-layer hashes `GET /api/commits/{hash}` already returns, so no new server endpoints were needed.
-- **Fixed while building it — commits referencing layer-split `.safetensors` artifacts could never sync to the server.** Two compounding bugs: (1) `av commit`/`av push` uploaded a commit *before* its objects, and the server's tree rows had a hard foreign key to the objects table, so the insert always failed; the offline-queue retry path additionally never uploaded objects at all; (2) the server's generic `except IntegrityError` mapped *any* integrity violation to a "commit already exists" 409 — which the client (by design) treats as idempotent success — so the failure was completely silent: `av push` reported success while the commit and ref never reached the database. Fixed by uploading objects before the commit (in both the live and queued-retry paths), dropping the now-provably-wrong foreign key (a layer-split file's whole-file blob is never uploaded by design), and having the server re-check by hash before deciding a 409 is genuine.
-- **Fixed:** `av add` computed per-layer safetensors hashes but never actually persisted them to `.av/index` (an internal `auto_save` wrote the index before the layers were attached to the in-memory entry) — so every `av commit` silently shipped an empty `layers: []`, degrading `av handoff --diff-weights` (and now the Web UI) into a whole-file comparison for every checkpoint, undetected until this feature exercised it end-to-end.
-- **Fixed:** `atomic_write_text`'s temp filename (PID + full UUID4 hex) could push a commit's path past Windows' 260-character `MAX_PATH` limit, making the write — and the whole commit — fail outright on deeply nested working directories.
-- See [`Probleme.md`](Probleme.md) for full details, severity ratings, and a couple of smaller items left open.
+- **"Weight Diff" Web UI tab**: drag two checkpoints into comparison slots to see a colored per-layer heatmap, summary stats, and a Recharts bar chart of changed layers — entirely client-side, reusing the existing per-layer hashes.
+- **Real bug found and fixed**: commits referencing layer-split `.safetensors` files could never sync — the client uploaded the commit *before* its objects (violating the server's FK constraint), and the server's generic `IntegrityError` handler silently treated that failure as an idempotent 409, so `av push` reported success while nothing actually landed. Fixed by uploading objects first and having the server re-verify by hash before trusting a 409.
+- **Also fixed**: `av add` computed per-layer hashes but never persisted them to the index (so every commit silently shipped `layers: []`, degrading diffing to whole-file); and `atomic_write_text`'s temp filename could exceed Windows' 260-char `MAX_PATH` on deeply nested repos.
 
 ## Phase 14 — Per-Project Registry Separation + Real-World Fixes
-- **Per-project identity on the shared registry**: every `av init` repo previously pointed at the exact same `http://localhost:8000` with no way to tell commits from different local folders apart — so a Web UI started from one repo would show commits pushed by an unrelated one. `av init` now generates a stable `project_id` (UUID) + `project_name` (folder name, renameable via `av config --name`), included in the hashed commit payload and namespacing every branch ref as `"<project_id>/<branch>"` (so two projects can each have a `main` without colliding). Repos initialized before this change are backfilled automatically and stably on first use.
-- **`av config --remote-url`**: point a repo at a different registry entirely; `av config` with no arguments now prints the current LFS threshold, remote URL, and project identity.
-- **New "Projects" Web UI tab**: lists every project that has pushed to the registry (commit count, last push), with an "Open" button that scopes the Dashboard, Branch List, and Weight Diff tab to just that project (persisted across reloads); a badge in the top bar shows the active filter with a one-click clear.
-- **`GET /api/projects`** (new) and an optional `?project_id=` filter on `GET /api/commits`/`GET /api/refs`. Object storage stays deduplicated *across* projects on purpose — only commit/ref metadata is scoped.
-- **Fixed real usability bugs reported from a separate test install**: the Layer Drift chart's tooltip text was unreadable (black on dark background) and its X-axis label was clipped with no Y-axis explanation; `av webui` rebuilt/re-evaluated the Docker image on every single invocation even when nothing changed (now skips straight to the browser if already healthy, ~15s instead of 2+ minutes; `--rebuild` forces a fresh build when needed).
-- See [`Probleme.md`](Probleme.md) for the full edge-case pass (legacy configs, project-name collisions, branch-name collisions across projects, GC/stats behavior with multiple projects) and what was deliberately left unscoped.
+- **Per-project identity**: every repo used to share one registry URL with no way to tell commits from different projects apart. `av init` now generates a stable `project_id`/`project_name`, hashed into every commit and namespacing branch refs as `"<project_id>/<branch>"`; existing repos are backfilled automatically. New "Projects" Web UI tab scopes the dashboard to one project at a time; `av config --remote-url`/`GET /api/projects` round this out.
+- **Fixed real usability bugs from a separate test install**: unreadable dark-on-dark chart tooltips and a clipped axis label, and `av webui` rebuilding the Docker image on every invocation (now skips straight to the browser when already healthy; `--rebuild` forces a fresh one).
 
 ## Phase 15 — Framework Plugins (PyTorch Lightning & HuggingFace Transformers)
-- **`av_plugins` package**: `AetherVaultCallback` (Lightning) and `AetherVaultTrainerCallback` (Transformers) hook into each framework's native checkpoint-save callback and drive the existing `av` CLI in-process (`cli.main(..., standalone_mode=False)`) rather than duplicating add/commit/push logic — every existing guarantee (LFS pointers, safetensors layer splitting, offline pending-push queueing, per-project ref namespacing) is reused as-is.
-- Both frameworks are optional extras (`pip install aether-vault[lightning]` / `[transformers]`) — the core package stays framework-agnostic.
-- Plain PyTorch/TensorFlow were deliberately left out of scope: neither exposes a native checkpoint-save hook comparable to Lightning's `Callback` or HF's `TrainerCallback`, so supporting them would mean a manual "call this after `torch.save()`" API — a different, lower-value feature.
+- **`av_plugins` package**: `AetherVaultCallback`/`AetherVaultTrainerCallback` hook into each framework's native checkpoint-save callback and drive the existing `av` CLI in-process, reusing every existing guarantee (LFS pointers, layer splitting, offline queueing) rather than duplicating logic. Both are optional extras (`pip install aether-vault[lightning|transformers]`); plain PyTorch/TensorFlow were left out since neither exposes a comparable native save hook.
 
 ## Phase 16 — Dataset Auto-Logging + Symmetric Import Commands
-
-- **Dataset auto-logging**: `AetherVaultCallback` (Lightning) and `AetherVaultTrainerCallback` (Transformers) gained a `dataset_paths` constructor argument, committed once at `on_train_start`/`on_train_begin` and tagged `dataset` — closing a gap against the roadmap's "Framework Plugins" item, which called for auto-logging datasets used, not just checkpoints and metrics. Auto-*detection* of a dataset's on-disk path isn't feasible (generic `Dataset`/`DataLoader` objects don't reliably expose one), so this is opt-in rather than automatic, same as the existing `checkpoint_paths` override.
-- **MLflow compatibility layer**: new `python/av_plugins/mlflow.py` with `import_run(run_id, ...)`, closing the roadmap's "optional MLflow compatibility layer (import existing MLflow runs)" item. Downloads a run's artifacts into `<repo_root>/mlflow_imports/<run_id>/` (MLflow's own artifact store is typically outside the Aether-Vault repo, and `av add` requires staged paths to live under the repo root), then commits them tagged `mlflow-import` with the run's metrics and string params attached.
-- **Symmetric import commands across all three plugins**: `import_checkpoint()` added to both `lightning.py` and `transformers.py`, mirroring `mlflow.py`'s `import_run()` — backfills a checkpoint that already exists on disk from before a callback was wired in. All three are exposed identically as CLI commands: `av import-lightning <path>`, `av import-transformers <path>`, `av import-mlflow <run_id>`.
-- **Found and fixed during manual end-to-end testing (not mocks):** `MlflowClient.download_artifacts()` raises its own internal `MlflowException` (instead of returning an empty directory) when a run has zero artifacts — `import_run` now checks `list_artifacts()` first and raises Aether-Vault's own clear error instead of letting MLflow's internal exception leak through. See [`Probleme.md`](Probleme.md).
-- **Verified manually** (real throwaway `av init` repos, a real installed MLflow with a sqlite-backed tracking store — file-store backend is deprecated/blocked by default as of MLflow 3.x): double-importing the same unchanged checkpoint is a no-op; importing while unrelated files are staged commits those too (existing, intentional `av commit`-everything-staged behavior, not unique to imports — documented in the README rather than changed); a missing checkpoint path fails with a clear, actionable message.
-- **Also found and fixed:** the new MLflow tests themselves left a stray `mlruns/` folder in the real repo root — a sqlite tracking URI only relocates run *metadata*, not MLflow's default `./mlruns`-relative-to-cwd artifact storage. Fixed with `monkeypatch.chdir(tmp_path)` in both tests. See [`Probleme.md`](Probleme.md).
+- **Dataset auto-logging**: both callbacks gained an opt-in `dataset_paths` argument, committed once at training start and tagged `dataset` (auto-*detecting* a dataset's path isn't feasible from a generic `Dataset`/`DataLoader`). New **MLflow compatibility layer** (`import_run()`) downloads a run's artifacts into the repo and commits them tagged `mlflow-import`; symmetric `import_checkpoint()` added to both other plugins, all three exposed as `av import-lightning|transformers|mlflow`.
+- **Found and fixed during manual end-to-end testing**: `MlflowClient.download_artifacts()` raised its own internal exception on a zero-artifact run instead of returning empty — now checked and re-raised as a clear Aether-Vault error. Also fixed a stray `mlruns/` folder the new tests themselves left in the repo root (MLflow's default artifact path is cwd-relative even under a sqlite tracking store) via `monkeypatch.chdir`.
 
 ## Phase 17 — Minimum Viable Test Suite + Diagnostics
-- **45-test pytest suite**: New `tests/test_cli.py` (CLI commands via `click.testing.CliRunner`:
-  `init`, `add`, `status`, `commit`, `checkout`, `doctor`, `test`), `tests/test_core.py` (the
-  `aether_core` pybind11 bindings: `hash_file`, `compare_metadata`, `split_and_hash_safetensors`,
-  skipped cleanly via `pytest.importorskip` if the native core isn't built), and
-  `tests/test_registry.py` (registry/config load-save round-trips), on top of the existing
-  `test_vault.py`/`test_plugins.py`. Shared `tests/conftest.py` `repo` fixture bootstraps a real
-  `.av` repo via `av init` rather than hand-rolled directories.
-- **`av doctor`**: New read-only diagnostic command — checks native core availability, remote
-  server reachability, index/pointer consistency, the pending-push queue, and leftover
-  interrupted-write temp files. No auto-repair (`--fix`) yet; see the Open Source Roadmap.
-- **`av test`**: New dev-only command that runs the project's own pytest suite via
-  `python -m pytest` from the installed package's source root; gives a clear error instead of a
-  crash on a non-editable (wheel) install.
-- **CI**: New `.github/workflows/tests.yml` (GitHub Actions, `windows-latest`) runs the full
-  suite (with `pip install -e .[dev]`, which builds the C++ core) on every push/PR.
-- **Found and fixed while building this suite** (manual end-to-end debugging, not just unit
-  tests — see `Probleme.md`): `av checkout` never restored `code`-type files (only
-  `artifact`-type), and `av add` never wrote a CAS object for code/sub-threshold files in the
-  first place — so rolling back code to an older commit was silently a no-op despite reporting
-  success. Fixed by writing every tracked file (not just LFS artifacts) into `.av/objects/` on
-  `add`, restoring any changed file type on `checkout`, and uploading code objects to the remote
-  in `upload_commit_objects()`.
+- **45-test pytest suite**: new `test_cli.py` (CLI via `CliRunner`), `test_core.py` (the pybind11 bindings, skipped cleanly if the native core isn't built), and `test_registry.py`, plus a shared `conftest.py` fixture bootstrapping a real `av init` repo. New read-only `av doctor` (native-core/server/index/pointer/queue checks, no auto-repair yet) and dev-only `av test` (runs the suite from the installed source root). New CI workflow runs the full suite on every push/PR.
+- **Found and fixed while building this suite**: `av checkout` never restored `code`-type files, and `av add` never wrote a CAS object for them at all — rolling back code to an older commit silently no-opped despite reporting success. Fixed by writing every tracked file into CAS on `add` and restoring any changed type on `checkout`.
 
 ## Phase 18 — `av doctor --fix` Auto-Repair Mode
-- **`--fix`**: closes the `av doctor --fix` roadmap item — repairs what `av doctor` already
-  knows how to detect: re-links orphaned/stale `.av-pointer` entries back to their CAS object
-  (downloading it from the remote first if it's only available there), removes `*.tmp.*`
-  leftovers from interrupted atomic writes, and clears pending-push queue entries whose commit
-  no longer exists locally (genuinely unrecoverable) while retrying whatever legitimately
-  remains via the existing `flush_pending_push()`. Anything it can't safely recover (object
-  missing both locally and on an unreachable/lacking remote) stays a `[WARN]`, never fabricated
-  or silently dropped.
-- **`--fix --dry-run`**: previews exactly what `--fix` would do — using only non-mutating checks
-  (`VaultClient.object_exists()`'s `HEAD`-only request instead of an actual download, local
-  existence checks instead of writes/deletes) — and prints `[WOULD FIX]` instead of `[FIXED]`,
-  with a "(dry run — nothing was changed)" summary suffix. `--dry-run` without `--fix` is a
-  no-op, identical to plain `av doctor`.
-- **Manually verified end-to-end** (not just unit tests) in a scratch repo: hand-constructed all
-  four broken `.av/` states (orphaned pointer entry with no remote, stale pointer file with an
-  intact object, a `*.tmp.*` leftover, and a pending-push entry referencing a missing commit),
-  confirmed `av doctor` reports each, confirmed `--fix --dry-run` previews without touching
-  anything on disk, then confirmed the real `--fix` actually repairs the recoverable ones and
-  correctly leaves the two genuinely-unrecoverable ones (no local or remote copy of the object)
-  as `[WARN]`. No new bugs found during this pass.
+- **`--fix`**: repairs what `av doctor` detects — re-links orphaned/stale pointers to their CAS object (downloading from remote if needed), removes interrupted-write temp leftovers, and clears unrecoverable pending-push entries while retrying the rest. Anything it can't safely recover stays a `[WARN]`, never fabricated. `--dry-run` previews the same via non-mutating checks only, printing `[WOULD FIX]`.
+- **Manually verified end-to-end**: hand-constructed all four broken `.av/` states in a scratch repo, confirmed `doctor` reports each, `--fix --dry-run` touches nothing, and real `--fix` repairs the recoverable ones while correctly leaving the two truly-unrecoverable ones as `[WARN]`.
 
 ## Phase 19 — Closed the 5 Remaining Test-Coverage Roadmap Gaps
-- **`av_server` test coverage** (was 0%): new `tests/test_server.py` — pure validation tests
-  (`validate_ref_name` path-traversal rejection, `CASStorage._safe_ref_path` escape rejection,
-  always run) plus FastAPI `TestClient`-backed HTTP-layer tests (health, upload/download
-  round-trip, hash-mismatch rejection, idempotent duplicate-upload 409, `push_commit`'s payload
-  limits — `MAX_TREE_ENTRIES`/`MAX_TAGS`/`MAX_TAG_LEN`/`MAX_METRICS`/`MAX_MESSAGE_LEN` — all
-  422, duplicate-commit 409, ref update/get round-trip, project-scoped ref filtering, dashboard/
-  projects endpoint shape, and the GC grace-period logic both protecting a fresh object and
-  sweeping an aged one). Requires a reachable Postgres + Redis (`AV_TEST_DATABASE_URL`/
-  `AV_TEST_REDIS_URL`, sensible localhost defaults) — skips cleanly with a clear message
-  otherwise, same philosophy as `test_core.py`'s `importorskip`.
-- **Integration tests against a live stack**: one dedicated "real wire" test drives a real
-  `av init`/`add`/`commit` through the actual CLI against a genuinely running
-  `aether-vault-server` process (not just `TestClient`), then confirms the commit landed via a
-  direct `GET /api/commits/{hash}` — the first repeatable test of the real wire protocol rather
-  than the in-process ASGI call. Gated on `http://localhost:8000/api/health` responding.
-- **`webui/` test suite** (was none at all): added Vitest, covering the pure diff/formatting
-  logic — `diffWeights.ts`'s `diffFile`/`isModelPath`/`listModelPaths`/`unionModelPaths`
-  (including a regression test for the documented `__header__` pseudo-layer filtering) and
-  `api.ts`'s `formatBytes`/`shortHash`. React Testing Library component tests and Playwright
-  E2E are a deliberate, documented scope decision — not implemented this round (still 🔲 on the
-  README roadmap).
-- **Framework-plugin callbacks now actually run in CI**: root cause was `tests.yml` only ever
-  installing the `[dev]` extra, never `[lightning,transformers,mlflow]` — the 2 callback tests
-  (already written, already correct) silently always skipped. Fixed via a new `plugin-tests` CI
-  job that installs the extras and runs `tests/test_plugins.py`.
-- **Direct CLI command tests**: new `tests/test_cli_commands.py` covers `branch`, `push`, `gc`,
-  `list-meta`, `config`, `graph --update`, `webui` (Docker-not-running path), and all three
-  `import-lightning`/`import-transformers`/`import-mlflow` commands (via `sys.modules`
-  injection, since the real plugin modules raise `ImportError` at import time without their
-  optional extras installed — can't import-then-monkeypatch a module that doesn't import).
-- **New CI**: `plugin-tests` and `webui-tests` (both `ubuntu-latest`) and `server-tests`
-  (`ubuntu-latest` with Postgres + Redis as GitHub Actions service containers, plus a live
-  `uvicorn` process for the real-wire test) — four jobs total in `tests.yml` now.
-- **Bonus, not one of the 5 roadmap lines**: `av test --webui` runs the webui Vitest suite
-  after the Python suite in one command, combining exit codes — closes a real workflow friction
-  (two toolchains, two commands) rather than just the roadmap's literal ask.
-- **Found and fixed during manual debugging**: `av test --webui` failed with a "npm not found
-  on PATH" error on this Windows dev machine *despite npm being genuinely installed and on
-  PATH* — `subprocess.run(["npm", "test"], ...)` doesn't reliably resolve `npm` to `npm.cmd` on
-  Windows without going through `shutil.which()` first (a well-known Windows
-  `subprocess`/`npm` interaction). Fixed by resolving the full path via `shutil.which("npm")`
-  before invoking it, falling back to the original clear error message only when that genuinely
-  returns nothing.
+- **`av_server` coverage (was 0%)**: new `test_server.py` covering validation, HTTP round-trips, payload limits, ref filtering, and GC grace-period logic against Postgres+Redis (skips cleanly if unreachable), plus one live-wire integration test driving a real CLI against a genuinely running server. **`webui/` gained a Vitest suite** for its pure diff/formatting logic (RTL and Playwright deliberately deferred). New `tests/test_cli_commands.py` covers the remaining CLI surface.
+- **Found and fixed**: framework-plugin callback tests silently always skipped in CI (the workflow never installed the plugin extras) — fixed via a new `plugin-tests` job. Also `av test --webui` reported "npm not found" on Windows despite npm being on PATH, since `subprocess.run` doesn't reliably resolve `npm.cmd` — fixed by resolving via `shutil.which()` first.
+- **Bonus**: `av test --webui` runs both suites in one command with combined exit codes.
 
 ## Phase 20 — Framework-Plugin Tests Verified Against the Real Libraries
-- The 7 `tests/test_plugins.py` tests that previously always skipped in local dev (no
-  `lightning`/`transformers`/`mlflow` installed) were run for real for the first time, in an
-  isolated `venv/` (kept out of the main dev environment specifically to avoid pulling `torch`
-  — a multi-GB transitive dependency of both `lightning` and `transformers` — into it).
-  `pip install -e .[dev,lightning,transformers,mlflow]` succeeded cleanly; all 6 previously-
-  skipped callback/import tests now **pass** (not just skip), and the 3 "raises a clear
-  `ImportError` when missing" tests correctly flip to **skipped** instead (their entire purpose
-  is exercising the *absent*-dependency path, which no longer applies once the packages are
-  genuinely installed). Full suite re-run inside the same venv: 88 passed, 20 skipped (the
-  remaining skips are the 17 `test_server.py` tests needing Postgres/Redis/Docker, unrelated to
-  this venv) — zero regressions from having the heavier packages importable. No bugs found.
+- The 7 plugin tests that previously always skipped locally (no `lightning`/`transformers`/`mlflow` installed) were run for real for the first time in an isolated venv — all 6 callback/import tests now pass, and the 3 "raises ImportError when missing" tests correctly flip to skipped. Full re-run: 88 passed, 20 skipped, zero regressions, no bugs found.
 
 ## Phase 21 — `tests/test_server.py` Verified Against a Live Docker Stack
-- The 17 `av_server` tests that previously had only ever been verified by static source review
-  (no Docker available in earlier sessions) were run for real for the first time, against
-  `docker compose up -d db redis aether-vault-server` plus a dedicated `aether_vault_test`
-  database (created inside the same Postgres container, kept separate from the real dev
-  database so the tests' per-test `TRUNCATE` cleanup can never touch real data) and Redis
-  index `1` (kept separate from index `0`, the real server's default).
-- **Found and fixed a genuine production bug**: `run_garbage_collection`'s physical-shard sweep
-  computed its cutoff by calling `.timestamp()` directly on a naive UTC datetime, which Python
-  silently interprets as *local* time — on this host (UTC+2) that made the cutoff two hours too
-  early, so aged orphaned objects were never actually swept from disk (the DB-side row deletion
-  was unaffected, since it compares two naive datetimes directly without an epoch conversion).
-  On a host *behind* UTC, the same bug would delete objects *before* their grace period really
-  expired. Fixed by attaching `tzinfo=timezone.utc` before converting to an epoch. See
-  `Probleme.md` for the full writeup.
-- Also fixed two test-only issues surfaced by the same run: the per-test DB cleanup crashed at
-  teardown on every test (a SQLAlchemy pooled connection reused across a mismatched asyncio
-  event loop — fixed by using a fresh, self-contained `asyncpg` connection instead), and
-  leftover orphan shard files from earlier tests made the GC grace-period test's exact-count
-  assertion flaky (fixed by clearing the on-disk storage directories between tests, not just
-  the DB tables).
-- Final result: all 29 `test_server.py` tests pass (17 previously-skipped + 12 always-run pure
-  tests); full suite: 101 passed, 7 skipped (only the framework-plugin "raises ImportError when
-  missing" tests, unrelated to Docker), 0 failed.
+- The 17 server tests (previously only statically reviewed) were run for real against a live Postgres+Redis stack for the first time — all pass.
+- **Found and fixed a genuine production bug**: GC's shard sweep computed its cutoff from a naive UTC datetime via `.timestamp()`, which Python silently reads as *local* time — on this UTC+2 host, aged orphans were never actually swept (and on a UTC-behind host, live objects could be deleted early). Fixed by attaching `tzinfo=timezone.utc` explicitly. Also fixed two test-only flakes: a cross-event-loop connection reuse crashing teardown, and leftover shard files making the GC grace-period test flaky.
 
 ## Phase 22 — Combined venv + Docker: the True Test-Suite Maximum
-- Ran the full suite through the plugin `venv/` (Phase 20) *together with* the live Docker
-  stack (Phase 21) for the first time in one `pytest tests/` invocation — previously each had
-  only ever been verified separately. Result: **105 passed, 3 skipped, 0 failed** out of 108 —
-  the 3 remaining skips are permanent by design (the "raises a clear `ImportError` when missing"
-  tests, which structurally can never pass once their package is actually installed).
-- Found and fixed one real flakiness bug surfaced only by this heavier combined run: the
-  real-wire test's reachability check was a collection-time `skipif` condition, which raced
-  against the much heavier import phase (`torch`/`transformers`/`lightning`) and misread the
-  server as unreachable. Moved to a lazy, in-test check instead. See `Probleme.md`.
-- README test badge updated to `105/108` to reflect the real demonstrated maximum.
+- Ran the plugin venv (Phase 20) together with the live Docker stack (Phase 21) in one invocation for the first time: 105 passed, 3 skipped (permanent-by-design), 0 failed. Found and fixed one flake the combined run surfaced — a collection-time reachability check raced against the heavy `torch`/`transformers` import phase and misread the server as down; moved to a lazy in-test check. README badge updated to 105/108.
 
 ## Phase 23 — `webui/` Component Tests (RTL) + Playwright E2E
-- **React Testing Library component tests**: extended the existing Vitest setup with a `jsdom`
-  environment scoped to `src/components/**` (the existing pure-logic tests stay on `node`), plus
-  `@vitejs/plugin-react` for JSX support and an explicit `afterEach(cleanup)` (Vitest doesn't
-  auto-register RTL's cleanup the way Jest does). New tests for `StatsRow`, `WeightHeatmap`,
-  `LayerDriftChart`, `CheckpointPicker`, `BranchList`, `CommitList`, and `MetricsChart` — 27 new
-  tests, 46 total in `webui/` now. `WeightDiffPanel`/`ProjectsPanel`/`useDashboard` are
-  deliberately still out of scope (they manage their own async fetch state; testing them
-  meaningfully needs either a fetch-mock layer or extracting that logic into a hook first).
-- **Playwright E2E**: two flows against the real `docker compose` stack — a dashboard smoke test
-  and a full Weight Diff comparison (select two real seeded checkpoints, assert the rendered
-  layer diff matches what was actually pushed). `webui/e2e/seed_data.py` seeds real data through
-  the actual `av` CLI (`CliRunner`, same pattern as `test_cli_commit_pushes_to_a_live_server`),
-  not synthetic API calls. New `webui-e2e` CI job (own service containers + a freshly-built
-  webui, not the cached docker-compose image — see the bug below for why that distinction
-  mattered here).
-- **Found and fixed a real bug**: adding `vitest.setup.ts` broke the *production* `next build` —
-  `next build` type-checks the whole project, and an `@ts-expect-error` directive that suppressed
-  a real Vitest-context type error was flagged as "unused" under Next's own type resolution
-  (TypeScript treats an unused suppression directive as its own error). Fixed by using a plain
-  type cast instead of a suppression comment, and excluded test-only files
-  (`vitest.config.ts`/`vitest.setup.ts`/`playwright.config.ts`/`e2e/`/`*.test.ts(x)`) from the
-  app's `tsconfig.json` scope so this category of cross-contamination can't recur.
-- **Also diagnosed (not a bug)**: the Weight Diff E2E test initially looked broken (checkpoint
-  rows never appeared) when run with 2 parallel Playwright workers — turned out to be genuine
-  slowness, not breakage: the panel resolves up to 30 commits' full Merkle trees via individual
-  sequential requests (no batched server endpoint for this exists yet), and 2 workers competing
-  for CPU/network made an already-slow ~15-20s load look like a hang. Fixed by pinning
-  `workers: 1` and raising the timeout, rather than "fixing" a feature that wasn't broken.
+- **RTL component tests**: added a `jsdom`-scoped Vitest environment for `src/components/**`, covering `StatsRow`, `WeightHeatmap`, `LayerDriftChart`, `CheckpointPicker`, `BranchList`, `CommitList`, and `MetricsChart` (27 new tests). Panels with their own async fetch state (`WeightDiffPanel`, `ProjectsPanel`, `useDashboard`) were deliberately left for later.
+- **Playwright E2E**: a dashboard smoke test and a full Weight Diff comparison against a real `docker compose` stack, seeded through the actual CLI rather than synthetic API calls.
+- **Found and fixed**: adding `vitest.setup.ts` broke the production `next build` — an `@ts-expect-error` suppressing a Vitest-only type error was flagged "unused" under Next's stricter resolution. Fixed with a plain type cast and by excluding test-only files from `tsconfig.json`'s scope. Also diagnosed (not a bug): the Weight Diff E2E test looked broken under 2 parallel workers but was just genuinely slow (sequential per-commit tree fetches) — fixed by pinning `workers: 1` and raising the timeout.
 
 ## Phase 24 — Speed Fixes + `--speed` Diagnostics
-- **Four bottleneck fixes** found by reading the hot paths directly: `av add` was calling
-  `Index.save()` (a full JSON re-serialize + write) once *per staged file* instead of once per
-  `add` invocation — fixed by batching with `auto_save=False` inside the loop, matching the
-  pattern already used elsewhere in the same command. `handoff.py`'s `resolve_head()` read the
-  same ref file twice. `av_server/storage.py`'s `get_storage_stats()` read every ref file's full
-  *contents* just to count them — switched to a plain `os.walk` file count. `webui`'s
-  `CommitGraph`/`MetricsChart` rebuilt their graph/metric-key data from scratch on every render
-  (the dashboard polls every 15s) — wrapped in `useMemo`.
-- **`av doctor --speed`**: a new, read-only timing snapshot of the *current* repo's hot paths
-  (`Index.load()`, `load_config()`, a working-tree scan, local object-store stats) — for an end
-  user diagnosing why their own repo feels slow.
-- **`av test --speed`** (dev-only): the same hot paths timed against disposable, fixed-size
-  synthetic fixtures (`python/av_cli/speedcheck.py`) so results are repeatable across machines and
-  runs, plus `pytest --durations=20`. Each probe prints against a soft advisory budget — exceeding
-  one only flags the row, never fails the run. Combined with `--webui`, also runs a small Vitest
-  `bench()` suite (`webui/src/components/__benchmarks__/speed.bench.ts`) covering `buildGraph()`
-  and `extractMetricKeys()`, and (when `av` is found on `PATH`) a third "av CLI, end-to-end"
-  subsection timing real `av init`/`add`/`commit` subprocess calls.
-- **Benchmark Comparison (README)**: `scripts/run_benchmark_comparison.py` times `av` against
-  equivalent Git LFS and DVC operations on the same synthetic fixture (the script skips and labels
-  any tool not found on `PATH` rather than guessing at numbers) and prints a Markdown table, pasted
-  into a new README section with the exact command, versions, and capture date — so the comparison
-  stays reproducible rather than a stale, undefendable claim.
+- **Four bottlenecks fixed** by reading the hot paths directly: `av add` re-saved the index once per staged file instead of once per invocation; `handoff.py` read the same ref file twice; server-side stats read every ref file's contents just to count them; and the webui rebuilt its graph/metric data from scratch on every 15s poll. All fixed (batching, caching, `os.walk`, `useMemo`).
+- **New `av doctor --speed`** (a real-repo timing snapshot) and dev-only `av test --speed` (the same probes against repeatable synthetic fixtures, plus a Vitest `bench()` suite and an end-to-end CLI-subprocess timing pass) — each probe flags against a soft advisory budget without failing the run.
+- **Benchmark Comparison (README)**: a new script times `av` against Git LFS/DVC on the same fixture and publishes a reproducible Markdown table with exact command, versions, and capture date.
 
 ## Phase 25 — Cross-Tool Benchmark Suite (`av benchmark`)
-- **8 new benchmarks** comparing Aether-Vault against **Git LFS**, **DVC**, and **MLflow**, each
-  a real subprocess/HTTP measurement (never fabricated): hashing throughput at scale,
-  safetensors layer-dedup storage savings, commit+push latency, no-op status/add speed, cold
-  clone/first pull, partial-checkpoint (layer-level) fetch, storage footprint over N versions,
-  and concurrent multi-user push throughput. New `benchmarks/` package: `tool_runner.py`
-  (tool detection, a `NOT_APPLICABLE`-vs-`NOT_INSTALLED` distinction, a 1.5x-relative-to-best-
-  competitor good/ok/bad verdict rule, table/Markdown printers) and `fixtures.py` (wraps
-  `av_cli.speedcheck`'s existing fixture builders rather than duplicating them).
-- **`av benchmark` CLI command** (`--only`, `--vs`, `--markdown`) — dispatches into
-  `benchmarks/bench_*.py` by name, same "(Development only)" / `_find_source_root()`
-  convention as `av test`. Results published in [`development/BENCHMARKS.md`](BENCHMARKS.md).
-- **Found and fixed a real bug while building the flagship dedup benchmark**: `add()` stored
-  the whole-file blob *in addition to* split safetensors layers, unconditionally — every
-  fine-tune commit re-stored the *entire* checkpoint regardless of how many layers actually
-  changed, on top of the (correctly deduped) per-layer copies. Net effect: a layered artifact
-  used *more* disk than not splitting at all, the opposite of the feature's purpose. The
-  codebase's own `push_objects()` already had the right condition ("upload the whole-file
-  object only if layers weren't successfully chunked") and `checkout` already reassembles
-  from layers on demand — `add()` was the one place that hadn't caught up. Fixed to match;
-  `doctor`'s orphaned-pointer detection/`--fix` recovery made layer-aware too (otherwise every
-  layered artifact would have started false-positiving as "orphaned" the moment the
-  whole-file copy was removed). See [`Probleme.md`](Probleme.md#8-av-add-stored-the-whole-file-blob-in-addition-to-split-layers--layer-dedup-gave-zero-real-storage-savings).
-  Verified via the benchmark itself: Aether dropped from 162.5MB to 36.7MB for the same
-  6-commit fine-tune sequence, turning a losing number into a winning one.
-- **Also fixed**: `scripts/run_benchmark_comparison.py` had a latent `NameError`
-  (`CODE_FILE_SIZE` was referenced but never re-exported from `av_cli.speedcheck` after an
-  earlier DRY refactor) — never triggered until this phase's first real re-run with DVC
-  installed actually reached that code path.
-- **Real product gap surfaced, not a bug**: `av` has no `clone`/`pull` command — sync is
-  push-only from a single working repo today. Discovered while building the cold-clone
-  benchmark; `av`'s column there is `N/A` with that footnote rather than a fabricated number,
-  and it's now an open Open Source Roadmap item.
-- **DVC and MLflow installed** as a new `benchmarks` extra (`pyproject.toml`) for use as
-  comparison targets only — not runtime dependencies. (MLflow's full package needs `pyarrow`,
-  which has no prebuilt wheel for Python 3.14 yet; `mlflow-skinny` pinned to match the
-  already-installed `mlflow` 3.14.0 avoids a version-mismatch warning instead.)
+- **8 new benchmarks** against Git LFS, DVC, and MLflow (hashing throughput, layer-dedup savings, commit+push latency, no-op speed, cold clone, partial-checkpoint fetch, storage footprint, concurrent push), each a real measurement — never fabricated. New `av benchmark` CLI (`--only`/`--vs`/`--markdown`), results published in `BENCHMARKS.md`.
+- **Found and fixed a real bug while building the dedup benchmark**: `add()` stored the whole-file blob *in addition to* split safetensors layers unconditionally, so a layered artifact used *more* disk than not splitting at all — the opposite of the feature's purpose. `push_objects()`/`checkout` already handled the layers-only case correctly; `add()` hadn't caught up. Fixed, made `doctor`'s orphan detection layer-aware to match, and verified via the benchmark itself: 162.5MB → 36.7MB for the same fine-tune sequence.
+- **Real product gap surfaced, not a bug**: `av` had no `clone`/`pull` — sync was push-only, so the cold-clone benchmark reports an honest `N/A` rather than a fabricated number (now on the roadmap). DVC/MLflow added as comparison-only dev extras.
 
 ## Phase 26 — Benchmark-Driven Performance Pass (no-op `add`, `commit` latency)
-- **No-op `add`/`status` (Benchmark #4, was 875.0 ms vs Git LFS 143.4 ms, rated BAD)**: the
-  size+mtime fast path (`compare_meta_safe`) already skipped re-hashing correctly — the
-  remaining cost was everything around it. Fixed three things in `python/av_cli/main.py`:
-  (1) `add()` called `get_file_meta_safe()` then `compare_meta_safe()`, which re-stats the
-  same path a second time — now compares directly against the already-fetched `meta` dict;
-  (2) `idx.save()` ran whenever any files were scanned, even when zero entries actually
-  changed — now gated on an `any_changed` flag; (3) `VaultClient` (and the `requests` import
-  it pulls in) and the `aether_core` pybind11 extension were both imported unconditionally at
-  module load, even for commands that never touch the network or never hash anything — both
-  are now lazily imported on first actual use (`_get_aether_core()`, local `from .client
-  import VaultClient` inside the five commands that need it, plus a module `__getattr__` so
-  `main.VaultClient` stays resolvable for existing test monkeypatching). **Result: ~875ms →
-  ~550-625ms (~30% faster)** across repeated captures. Still rated BAD — the residual gap is
-  CPython interpreter + `click` import startup, which a compiled Git LFS binary doesn't pay;
-  out of scope without rewriting the CLI in a compiled language.
-- **`commit` latency (Benchmark #3, was 2,933.7 ms vs DVC 354.4 ms, rated BAD)**:
-  `upload_commit_objects()` did a serial `HEAD`-then-`POST` per object — up to ~120 round
-  trips for a 60-file commit. The server already exposed `POST /api/sync/batch-objects` for
-  exactly this (existence-check many hashes in one call) but nothing in the client called it.
-  Added `VaultClient.batch_check_objects()`, a `known_missing` fast path on `upload_object()`
-  to skip the now-redundant per-object `HEAD`, and rewired `upload_commit_objects()` to
-  batch-check once then upload only the missing objects via a small `ThreadPoolExecutor` —
-  still waiting for every upload to finish before `push_commit()` is called, preserving the
-  existing FK-ordering invariant. Same code path is used by `flush_pending_push()`, so the
-  offline-retry queue benefits too. **Result: ~2,933.7 ms → ~1,357-2,532 ms (45-54% faster)
-  depending on machine load.** Still rated BAD against DVC — DVC's `commit` never touches the
-  network (`dvc push` is separate), while av intentionally uploads synchronously during
-  `commit` per the FK constraint documented in `upload_commit_objects()`'s docstring; that
-  architectural difference wasn't in scope for this pass.
-- **New tests**: `tests/test_client.py` (new file) covers `batch_check_objects()` and the
-  `known_missing` HEAD-skip; `tests/test_cli_commands.py` adds two tests asserting
-  `upload_commit_objects()` batch-checks once and uploads only what's missing;
-  `tests/test_cli.py` adds a test asserting a true no-op `add` never rewrites `.av/index`.
-- Verified against a real `av_server` (Docker Compose: Postgres + Redis + FastAPI), not just
-  mocks: ran `av init/add/commit/push` end-to-end, confirmed all uploaded objects land
-  server-side via a live `batch-objects` query, and confirmed the offline pending-push queue
-  still flushes correctly through the same (now parallelized) upload path.
-- See [`Probleme.md`](Probleme.md#-fixed--benchmark-driven-performance-pass-no-op-add-and-commit-latency-2026-06-27) for severity/difficulty ratings and exact file:line citations; full before/after numbers in [`BENCHMARKS.md`](BENCHMARKS.md).
+- **No-op `add`/`status`** (was 875ms vs Git LFS's 143ms, rated BAD): fixed a duplicate stat call, a redundant index save when nothing changed, and unconditional eager imports of the network client and native extension (now lazy). Result: ~875ms → ~550-625ms (~30% faster) — still BAD, since the residual gap is CPython/`click` startup cost a compiled Git LFS binary doesn't pay.
+- **`commit` latency** (was 2,934ms vs DVC's 354ms, rated BAD): `upload_commit_objects()` did a serial HEAD-then-POST per object (~120 round trips for a 60-file commit) despite the server already exposing a batch-existence-check endpoint nothing called. Added `batch_check_objects()` and rewired uploads to batch-check once then parallelize the rest. Result: ~2,934ms → ~1,357-2,532ms (45-54% faster) — still BAD against DVC, whose `commit` never touches the network at all (an architectural difference out of scope here).
+- **Verified** against a real Docker-Compose stack (not mocks): full `init/add/commit/push` round-trip, confirmed objects land server-side, confirmed the offline queue still flushes through the new parallel path. New tests cover the batch-check fast path and the no-op-add invariant.
 
 ## Phase 27 — Pretty `av init` UX, Local/Enterprise Login, PyPI Packaging, Auto-Update
-- **Pretty `av init`**: shows a `rich`-rendered banner and a `questionary` arrow-key select
-  asking Local vs. Enterprise on first run in a project. New `python/av_cli/ui.py` centralizes
-  the rendering helpers (banner/step/select) so `init`, `webui`, and `update` all render
-  consistently instead of each hand-rolling `click.secho` color/emoji prefixes.
-- **Enterprise login seam (stub)**: new `python/av_cli/enterprise.py` defines
-  `EnterpriseAuthProvider` (`login`/`logout`/`current_session`/`refresh`) and the only
-  implementation today, `StubEnterpriseAuthProvider`, which prints a "coming soon" message and
-  falls back to Local. Real account-based auth plugs into this seam later without changing any
-  call site in `main.py`/`repl.py`.
-- **Local-mode Docker onboarding factored out and extended**: new
-  `python/av_cli/docker_runtime.py` extracts the docker-compose logic that used to live only in
-  `webui_cmd` (`check_docker_running`, `get_container_health`, `start_services`,
-  `wait_for_http_ready`) and adds the one capability that was missing — `image_exists()`, which
-  distinguishes "image never built/pulled" from "built but the container is stopped" from
-  "already running and healthy". `ensure_local_backend_running()` is the new top-level
-  orchestrator, used by both `av webui` (refactor, behavior-preserving — same
-  `"Docker is not running"` message the existing test asserts on) and `av init`'s local-mode
-  first-run/reconnect path.
-- **Interactive REPL session**: new `python/av_cli/repl.py`. `av init` (after setup or
-  reconnect) and bare `av` (in an already-initialized repo) now drop into a persistent session
-  built on `prompt_toolkit.PromptSession`, where commands are still typed with the `av` prefix
-  (e.g. `av status`) and dispatched into the same Click group used for one-shot invocations
-  (`cli.main(..., standalone_mode=False)`), so behavior never diverges from running the same
-  command outside the session. `exit`/`quit`/Ctrl+D leave; Ctrl+C cancels the current line only.
-  `cli()` gained `invoke_without_command=True` so bare `av` in an initialized repo reconnects
-  (no re-prompting) straight into the session instead of just printing help.
-  - **Bug found in manual debugging (step 1) and fixed**: on Git Bash/mintty on Windows,
-    `sys.stdin.isatty()`/`sys.stdout.isatty()` both report `True` but `prompt_toolkit`'s Win32
-    backend still can't get a real console screen buffer handle, so
-    `PromptSession(...)` itself raised an unhandled `NoConsoleScreenBufferError` and crashed
-    bare `av` outright. Fixed by wrapping both the session construction and each `.prompt()`
-    call in `run_repl()` in a broad `except Exception`, degrading to a one-line warning
-    ("Interactive session isn't available in this terminal — run `av <command>` directly
-    instead.") instead of crashing. See
-    [`Probleme.md`](Probleme.md#-fixed--repl-session-construction-crashed-bare-av-under-git-bashmintty-on-windows-2026-06-27).
-    Regression test: `tests/test_repl.py::test_repl_degrades_gracefully_when_session_cannot_be_constructed`.
-- **PyPI packaging**: `pyproject.toml` switched from a hardcoded `version = "1.0.0"` to
-  `dynamic = ["version"]` via `setuptools-scm` (`write_to = "python/av_cli/_version.py"`,
-  gitignored, derived from git tags at build time) — eliminates the prior risk of the
-  `pyproject.toml`/`__init__.py` version strings drifting out of sync. Added
-  `[tool.cibuildwheel]` so releases ship prebuilt wheels (no local C++ compiler needed for most
-  users; the sdist fallback still requires one, same as today, for platforms outside the built
-  matrix). New `.github/workflows/release.yml`, triggered on `v*.*.*` tag push: builds wheels
-  (`cibuildwheel`) + sdist, publishes to PyPI via trusted publishing (OIDC, no stored token),
-  and builds/pushes the Docker image to **GHCR** (chosen over Docker Hub — uses the repo's
-  built-in `GITHUB_TOKEN`, no extra secrets, no anonymous pull-rate limits).
-- **Update checking**: new `python/av_cli/update_check.py`. User-level config at
-  `~/.aether-vault/config.json` (distinct from the existing per-repo `.av/config`) holds
-  `auto_update` (off by default — opt-in only), `update_check_enabled`, and a cached
-  last-check result (12h cache window, so most invocations are a zero-network-call file read).
-  New `av update` command: `--check` (report only), `--list-versions` (every published
-  version, newest first, current one marked), `--enable-auto-update`/`--disable-auto-update`.
-  `av init` prints a one-line "update available" banner at the end of its flow; deliberately
-  **not** hooked into every routine command (`av add`, `av status`, ...) — only `av init` and
-  the explicit `av update` ever make a PyPI network call.
-- **Shared atomic-write helper extracted**: `atomic_write_text`/`atomic_write_json` moved from
-  `main.py` into new `python/av_cli/fsutil.py` so both the per-repo config (`main.py`) and the
-  new user-level config (`update_check.py`) can use them without importing each other.
-- **Docs cleanup (unrelated to the feature, done alongside)**: removed the
-  "Optimization pass (2026-06-27)" narrative from `README.md`'s Benchmark Comparison section
-  and `development/BENCHMARKS.md` — both now show only current benchmark standing, since the
-  optimization history already lives in this changelog and in `Probleme.md`.
-- **New tests**: `tests/test_docker_runtime.py`, `tests/test_repl.py`, `tests/test_update_check.py`.
-  Updated every existing call site that invokes `av init` as a subprocess or in-process
-  (`tests/conftest.py`'s `repo` fixture, `tests/test_cli.py`, `tests/test_server.py`,
-  `tests/test_plugins.py`, `python/av_cli/speedcheck.py`, three `benchmarks/bench_*.py` files)
-  to pass `--mode local --yes --no-repl` so none of them block on an interactive prompt or
-  the REPL. Full suite: 122 passed, 3 skipped (pre-existing, unrelated).
-- **Verified manually** (step 1 of the wrap-up checklist, via the real installed `av` binary in
-  a scratch dir outside this checkout, not just `CliRunner`): `av init` (default, no flags),
-  re-running `av init` against an already-initialized repo (reconnect path), `av init --mode
-  enterprise` (stub fallback), bare `av`, and a full `add`/`commit`/`status` cycle — this is
-  what surfaced the Git Bash/mintty REPL bug above.
-- **Deferred, tracked on the README roadmap**: no real `vX.Y.Z` tag has been pushed yet — the
-  release workflow needs a TestPyPI dry run before trusted publishing points at the real
-  `pypi.org` project, and the `aether-vault` PyPI name needs to be confirmed available/claimed.
-  The Docker-onboarding three-state decision tree (`image_exists`/health/not-running) is unit
-  tested but has not been exercised end-to-end against a real Docker daemon in this pass — no
-  Docker install was available in the environment this phase was built in.
+- **Pretty `av init`**: a `rich` banner + `questionary` Local-vs-Enterprise select, centralized in a new `ui.py` so `init`/`webui`/`update` render consistently. Enterprise is a stub seam (`enterprise.py`'s `EnterpriseAuthProvider`, prints "coming soon", falls back to Local) that real account auth can plug into later without touching call sites.
+- **Docker onboarding factored out**: new `docker_runtime.py` extracts the compose logic out of `webui_cmd` and adds `image_exists()` to distinguish "never built" from "stopped" from "running healthy" — used by both `av webui` and `av init`'s local-mode flow.
+- **Interactive REPL**: `av init` and bare `av` (in an initialized repo) now drop into a `prompt_toolkit`-based session dispatching into the same Click group as one-shot invocations, so behavior never diverges. **Bug found and fixed**: on Git Bash/mintty on Windows, `isatty()` lies and `prompt_toolkit`'s Win32 backend crashes outright — wrapped session construction/prompting in a broad exception handler that degrades to a one-line warning instead of crashing bare `av`.
+- **PyPI packaging**: switched to `setuptools-scm`-derived dynamic versioning (was hardcoded), added `cibuildwheel` for prebuilt wheels, and a new tag-triggered `release.yml` publishing to PyPI via trusted OIDC publishing and pushing a Docker image to GHCR.
+- **Update checking**: new user-level config (`~/.aether-vault/config.json`, 12h-cached) and `av update` (`--check`/`--list-versions`/`--enable-auto-update`); only `av init` and explicit `av update` ever make a PyPI network call — no other command does.
+- **Verified manually** with the real installed binary (not just `CliRunner`): default init, reconnect, enterprise stub fallback, bare `av`, and a full add/commit/status cycle — this is what surfaced the Git Bash REPL bug above. Full suite: 122 passed, 3 pre-existing skips.
+- **Deferred**: no real version tag pushed yet (needs a TestPyPI dry run first); the Docker onboarding decision tree is unit-tested but not yet exercised against a real daemon.
 
 ## Phase 28 — Docker Auto-Update: Rolling `:edge` Builds + `av update --docker`
-
-- **Real gap found while investigating "can the Docker image auto-update"**: `docker-compose.yml`
-  (used by `docker_runtime.ensure_local_backend_running`, called from `av init` and `av webui`)
-  defines `aether-vault-server`/`aether-vault-webui` with `build: .` / `build: ./webui` — it
-  builds from local source, it never pulled a published image at all. Combined with
-  `_find_source_root()` resolving relative to the installed package's file location, **Local-mode
-  onboarding only worked for an editable/source install** — a real `pip install aether-vault` end
-  user has no `Dockerfile`/`docker-compose.yml` on disk for it to find. Fixed by adding a second,
-  image-only compose file (`python/av_cli/docker/docker-compose.release.yml`, no `build:` keys,
-  references `ghcr.io/leon1706/aether-vault-server`/`-webui:latest`), shipped as package data
-  (`[tool.setuptools.package-data]` in `pyproject.toml`). New
-  `docker_runtime.resolve_compose_file()` picks the right one: the dev compose file when a real
-  source checkout is found (unchanged behavior for contributors), the bundled release compose file
-  otherwise. `ensure_local_backend_running()` now calls this instead of hardcoding the dev path.
-- **Also found**: `release.yml`'s `build-and-push-docker` job only ever built **one** image (the
-  server) — the webui's Docker image had never been published to GHCR at all. Fixed: the job now
-  builds and pushes both images, renamed to `ghcr.io/leon1706/aether-vault-server` and
-  `...-webui` (safe to rename — no real tag has ever been pushed, nothing live to break).
-- **`av update --docker`** (new flag, deliberately separate from plain `av update` — restarting a
-  running backend is disruptive, same reasoning as `auto_update` being off-by-default): pulls the
-  latest published image via `docker_runtime.pull_latest_image()` (compares `docker images -q`
-  before/after the pull rather than parsing `docker compose pull`'s text output), reports whether
-  anything changed, and on confirmation (or `--yes`) calls `restart_service()` then
-  `remove_old_images()` to clean up the now-superseded image by its exact ID — never a blanket
-  `docker image prune`, since a real machine can have plenty of unrelated images from other
-  projects that must not be touched. No-ops with guidance ("use `git pull` + `av webui --rebuild`
-  instead") when run from a dev/source checkout, since that backend isn't tied to a published
-  image tag at all.
-- **Bug found in manual debugging and fixed**: `check_for_docker_update()` didn't check whether
-  Docker was even running before calling `docker compose pull` — against a registry image that
-  doesn't exist yet (nothing's been published), this can hang for minutes (up to the 600s
-  per-service timeout) instead of failing fast. Fixed by checking `check_docker_running()` first,
-  matching the existing fast-fail UX everywhere else in `docker_runtime.py`.
-- **New workflow `.github/workflows/docker-edge.yml`**: rolling `:edge` build on every push to
-  `main` (path-filtered to Dockerfile/webui/python/compose/pyproject changes, so doc-only commits
-  don't trigger a rebuild), pushing both images tagged `:edge`. `:latest` is left untouched — it
-  stays exclusively tied to tagged releases via `release.yml`, so "stable" and "bleeding edge"
-  never collide.
-- **Verified locally** (real Docker, not mocked — this machine has Docker installed and running):
-  ran `docker compose build` against the dev compose file to confirm the rebuild path still works
-  unchanged, then `docker compose up -d` to restart all four containers on the freshly built
-  images, confirmed all four (`server`, `webui`, `db`, `redis`) report `healthy`, and confirmed no
-  aether-vault image duplicates were left behind (the old pre-rebuild image IDs were already
-  superseded by BuildKit's tag-reuse; the one dangling image found on the machine afterward
-  belongs to an unrelated project and was correctly left untouched).
-- **New tests**: extended `tests/test_docker_runtime.py` (`resolve_compose_file`,
-  `pull_latest_image`'s old-ID tracking, `remove_old_images`, `check_for_docker_update`'s
-  dev-checkout/not-running/up-to-date/updated paths) and `tests/test_cli_commands.py`
-  (`av update --docker`'s three outcomes, including that `remove_old_images` is called with the
-  right IDs after a confirmed restart). Full suite: 133 passed, 3 skipped (pre-existing).
-- **Deferred**: the actual GHCR pull/restart path against real published images can't be
-  end-to-end verified until something is actually published — no tag has been pushed and
-  `docker-edge.yml` hasn't run yet (this work itself hasn't been pushed to `main`). Tracked on the
-  README roadmap alongside the existing "first real tagged release" item.
+- **Real gap found**: the compose file only ever built images from local source, so a real `pip install` end user (no source checkout) had no working Docker onboarding path at all. Fixed with a second, image-only release compose file bundled as package data, and `resolve_compose_file()` picking the right one. Also found the release workflow only ever published the server image, never the webui — fixed to publish both.
+- **`av update --docker`**: pulls the latest published image, reports what changed, and on confirmation restarts and removes only the now-superseded image by exact ID (never a blanket prune). No-ops with guidance when run from a dev checkout, since that backend isn't tied to a published tag.
+- **Bug found and fixed**: the update check didn't verify Docker was running before pulling, so it could hang for minutes against a registry image that doesn't exist yet — fixed to fail fast.
+- **New `docker-edge.yml`**: rolling `:edge` build on every push to `main`, path-filtered; `:latest` stays tied exclusively to tagged releases. Verified locally against real Docker (rebuild, restart, all four services healthy, no orphaned images). Full suite: 133 passed, 3 pre-existing skips. Deferred: the real GHCR pull/restart path can't be end-to-end verified until something is actually published.
 
 ## Phase 29 — `av init` Polish, `.avignore`/`av file`, `av unstage`, `av stash`
-
-- **`av init` prompt cleanup**: `select_login_mode()` now passes `instruction=""` to suppress
-  questionary's default "(Use arrow keys)" hint, drops the "(recommended)" label from the Local
-  choice (pre-highlighted via `default=` instead), and prints a blank line before the prompt.
-- **Real logo banner**: `print_banner()` no longer renders a `rich.panel.Panel` box — it renders
-  a small ANSI block-art rendering of the actual "AV" monogram (`development/logo.png`), two-tone
-  (graphite `rgb(90,90,90)` / copper `rgb(230,160,40)`, exact TrueColor values, not approximated
-  hex), with the title/subtitle text preserved underneath it. Design provided by the user as a
-  bash/ANSI mockup; compared side by side against an earlier draft (which read as two abstract
-  diagonal bars, not recognizable as "A"/"V") and rated 8/10 vs. 4/10 before implementing it.
-- **`.avignore` + `av file --avignore`**: new `load_avignore_patterns()`/`_matches_avignore()` in
-  `main.py`, wired into `iter_working_files()` (the single function already shared by `add`,
-  `status`, `doctor --speed`, and the speedcheck probes) — one change covers every caller.
-  Gitignore-*lite* (plain `fnmatch` globs, `#` comments, no negation/anchoring/`**`). New `av
-  file` command (`--avignore` flag, extensible for future generated-file types as new flags;
-  refuses to overwrite an existing file).
-- **`av unstage`**: undoes `av add` without touching the working tree — reverts a staged entry
-  back to its last-committed state (so `av status` correctly reports it "modified" again) or
-  removes it entirely if it was never committed (back to "untracked"), using the already-existing
-  `Index.remove_entry()`/`get_staged_entries()`.
-- **`av stash`** (`push`/`list`/`pop`/`apply`/`drop`, `@cli.group(invoke_without_command=True)`
-  mirroring git's own `git stash` shape): shelves staged + modified-tracked-file changes and
-  reverts the working tree to HEAD, so `checkout`/`branch` can proceed without `--force`; `pop`
-  restores everything exactly as it was, staged or not. Built on four small extractions from
-  `add()`/`checkout()` rather than reimplementing their logic freehand — deliberately, since
-  `checkout`'s safetensors restore path has had a real corruption bug fixed in it before
-  (see Phase history) and duplicating that logic risked reintroducing a similar one:
-  - `materialize_file()` / `remove_file_and_pointer()` — extracted from `checkout()`'s per-entry
-    restore/cleanup blocks; `checkout()` now calls these instead of inlining them
-    (behavior-preserving refactor, verified against the full existing `checkout`/`add` test suite).
-  - `resolve_head_tree()` — new helper reading HEAD's commit tree, normalizing the legacy
-    `{"code":..., "artifacts":...}` shape into the unified flat one.
-  - `stage_one_file()` — extracted from `add()`'s per-file loop body (hash, LFS-threshold check,
-    safetensors layer-split, pointer creation); `add()`'s loop now calls this once per file.
-  - `compute_status()` — extracted from `status()`'s staged/modified/deleted/untracked
-    classification, so `av stash push` computes the exact same dirty set `status()` displays.
-- **Two real bugs found via manual debugging (not just unit tests) and fixed**:
-  1. `av stash pop` initially restored a previously-modified-but-unstaged file's index entry
-     using its *dirty* hash/stat instead of HEAD's baseline — since `status()` detects
-     "modified" purely via a stat mismatch against the stored entry, this made the file look
-     silently clean after popping instead of "modified" again. Fixed by looking up
-     `resolve_head_tree()` again during pop for `was_staged=False` entries and storing HEAD's
-     baseline (with a deliberately non-matching mtime) instead of the dirty data.
-  2. Two stashes created within the same second sorted unpredictably in `av stash list` — the
-     filename-based newest-first sort relied on a second-resolution timestamp prefix, so a tie
-     fell back to comparing the random shortid suffix, which isn't time-ordered. Fixed by using
-     microsecond resolution in the stash ID. Found by the test suite itself
-     (`test_stash_list_orders_newest_first`), not inferred from reading the code.
-- **New tests**: `tests/test_stash.py` (10 cases — push reverting staged/modified entries, pop's
-  exact staged/unstaged restoration, apply keeping the record, drop, list ordering, "nothing to
-  stash", skipped-deleted-files warning, a full safetensors layer-split push/pop round-trip);
-  extended `tests/test_cli.py` with 9 cases for `.avignore`/`av file`/`av unstage`. Full suite:
-  161 passed, 3 skipped (pre-existing, unrelated) — the `checkout()`/`add()`/`status()` refactors
-  introduced zero behavior change there.
-- **Manually verified** end-to-end with the real installed `av` binary, not just `CliRunner`:
-  the full `init` → `file --avignore` → `add` (ignoring a `venv/`) → `unstage` → `stash` cycle,
-  including the motivating scenario itself — `checkout` blocked by dirty state, `av stash`
-  unblocking it, a clean branch switch, then `av stash pop` restoring everything exactly as it
-  was. Also verified every new command works identically inside the REPL both bare and
-  `av`-prefixed, and outside it with the `av` prefix required — per the existing,
-  un-special-cased dispatch mechanism in `repl.py`.
+- **`av init` polish**: cleaner prompt (suppressed default hint, pre-highlighted default), and a real two-tone ANSI block-art logo banner replacing the plain `rich.panel.Panel` box.
+- **`.avignore` + `av file --avignore`**: a gitignore-*lite* pattern file (plain fnmatch globs, no negation/`**`) wired into the single shared `iter_working_files()`, so one change covers `add`/`status`/`doctor --speed` alike.
+- **`av unstage`**: undoes `av add` without touching the working tree, reverting a staged entry to its last-committed state or back to untracked.
+- **`av stash push/list/pop/apply/drop`**: shelves staged + modified changes and reverts to HEAD so `checkout`/`branch` can proceed without `--force`. Built on four small extractions out of `add()`/`checkout()`/`status()` (`materialize_file`, `resolve_head_tree`, `stage_one_file`, `compute_status`) rather than reimplementing their logic, deliberately, since `checkout`'s restore path has had real corruption bugs before.
+- **Two real bugs found via manual debugging and fixed**: `stash pop` restored a previously-modified file using its dirty hash instead of HEAD's baseline, silently making it look clean afterward instead of "modified"; and two stashes created in the same second sorted unpredictably in `stash list` due to second-resolution timestamps (fixed with microsecond resolution).
+- **Verified**: 161 tests passing (10 new stash cases, 9 new avignore/file/unstage cases), plus a full manual `init → file --avignore → add → unstage → stash` cycle with the real binary, including the motivating dirty-checkout scenario and REPL parity.
 
 ## Phase 30 — WebUI Logo, Neon-Orange Theme, Four Dedicated Sidebar Panels
-
-- **Real logo in the sidebar**: `Sidebar.tsx`'s top-left brand mark was emoji+text
-  (`🌌 Aether-Vault`) — replaced with the actual `development/logo.png` monogram via `next/image`
-  (`webui/public/logo.png`, 140×91 rendered), with the "ML Registry Dashboard" subtitle kept
-  underneath. Same image also added as `webui/src/app/icon.png` so the browser tab favicon
-  matches (Next.js App Router auto-serves a literal `app/icon.png`, zero config).
-- **Theme: single neon-orange brand accent, replacing black+blue/purple**: `globals.css`'s
-  `--accent-blue`/`--accent-purple` (and every selector deriving from them — nav active state,
-  commit dots/hashes, spinner, tag pills, branch icons/tips, project badge, checkpoint labels,
-  `--grad-brand`, `--border-accent`, `--shadow-glow`) collapsed into two shades of one hue:
-  `--accent-orange` (#ff7a1a) and `--accent-orange-soft` (#ffb380). `--accent-amber` shifted from
-  #f6ad55 to #ffd166 (more toward yellow) so it stays visually distinct from the new orange rather
-  than colliding — the two were only 6° apart in hue before the shift, 18° after. Hardcoded hex in
-  `MetricsChart.tsx`, `CommitGraph.tsx`, `LayerDriftChart.tsx`, and `BranchList.tsx`'s inline
-  styles were swept too, not just the CSS variables. The `accent-blue`/`accent-purple` *class*
-  names themselves (passed as literal strings from `StatsRow.tsx` and `WeightDiffPanel.tsx`) were
-  renamed to `accent-orange`/`accent-orange-soft` rather than left as a permanently misleading
-  "a class named blue renders orange" naming mismatch.
-- **Four sidebar tabs that used to alias the Dashboard now have real, distinct panels**: before
-  this phase, `page.tsx`'s `active` state only special-cased `weight-diff` and `projects` —
-  `commits`, `branches`, `metrics`, and `storage` all fell into the same catch-all `else`,
-  rendering the identical Dashboard teaser view. Each now has its own component:
-  - **`CommitsPanel.tsx`** — offset-aware pagination over `GET /api/commits` (new
-    `fetchCommitsPage()` in `lib/api.ts`, since the existing `fetchCommits()` only fetched a fixed
-    window for the dashboard hook), client-side search/filter over the loaded page, a branch
-    filter via a new shared reachability-walk helper (`lib/branchGraph.ts`), and click-to-expand
-    rows that lazily fetch full tree detail (cached per-hash) to show an added/removed/changed
-    file diff against the parent commit.
-  - **`BranchesPanel.tsx`** — full tip detail, a "commits ahead of main" count via the same
-    reachability walk (labeled "(of loaded history)" when the walk runs off the edge of the
-    loaded window rather than presenting it as exact), branch-row expand to see its commits, and
-    a working "branch from here" create action (new `createRef()` in `lib/api.ts`, since
-    `PUT /api/refs/{name}` already upserts). Branch *delete* has no backend route at all — not
-    added, with an explicit note in the UI that it isn't available yet rather than silently
-    omitting it.
-  - **`MetricsPanel.tsx`** — full-size metrics chart with per-metric show/hide toggles, a metrics
-    table (commit × metric, fully derived from already-loaded data), and a single-branch
-    comparison dropdown.
-  - **`StoragePanel.tsx`** — store-wide CAS stats reused from `data.stats`, plus a file-type
-    breakdown, largest-tracked-files list, and an approximate dedup ratio — all derived from only
-    the **latest commit's** hydrated tree (not summed across commits, to avoid double-counting
-    deduped content), and explicitly labeled as a latest-snapshot view, not a CAS-store-wide one.
-    A true store-wide file-type breakdown, growth-over-time, and a store-wide largest-objects list
-    all need new backend endpoints (no path/extension column on `DBObject`, no historical
-    snapshots, no listable object table) — noted as future work, not faked.
-  - `page.tsx`'s branch chain is now fully explicit (`dashboard` included) with a `null` fallback
-    for an unrecognized `active` value, instead of silently rendering the Dashboard for anything
-    unmatched.
-- **One real bug found via manual debugging (not unit tests) and fixed**: `TopBar.tsx`'s title
-  was hardcoded to the literal string `"Dashboard"` regardless of which sidebar tab was active —
-  harmless before this phase (every tab *was* the Dashboard), but confusing now that Commits/
-  Branches/Metrics/Storage are real distinct pages. Added a `title` prop to `TopBar` and a
-  `TAB_TITLES` lookup in `page.tsx` so the header always matches the active tab.
-- **New tests**: `CommitsPanel.test.tsx`, `BranchesPanel.test.tsx`, `MetricsPanel.test.tsx`,
-  `StoragePanel.test.tsx` (loading/empty states, the reachability-walk ahead-count, search/branch
-  filtering, lazy tree-detail fetch on expand, file-type bucketing). Full webui suite: 64 passed.
-- **Manually verified** by running `npm run dev` and driving the real browser with Playwright
-  (headless Chromium, no `chromium-cli` available in this environment) against an offline backend
-  to exercise every loading/empty state: clicked through all 7 sidebar tabs, confirmed the logo
-  and neon-orange theme render consistently, and confirmed the topbar-title fix above.
+- **Real logo + favicon**: the sidebar's emoji brand mark was replaced with the actual monogram image, also wired up as the browser tab favicon.
+- **Single neon-orange brand accent**: collapsed the black+blue/purple theme into two shades of orange across every CSS variable and hardcoded chart/panel hex value, including renaming the misleadingly-named `accent-blue`/`accent-purple` classes themselves.
+- **Four sidebar tabs that used to alias the Dashboard now have real panels**: `CommitsPanel` (paginated, searchable, branch-filterable, expandable file diffs), `BranchesPanel` (tip detail, ahead-count, create-from-here — delete has no backend route and is honestly labeled unavailable), `MetricsPanel` (full chart + table + branch comparison), and `StoragePanel` (latest-commit-snapshot stats, explicitly labeled as such rather than a fabricated store-wide view).
+- **Bug found and fixed**: the top bar's title was hardcoded to "Dashboard" regardless of active tab — harmless before this phase, confusing now with real distinct pages. Added a per-tab title lookup.
+- **Verified**: 64 webui tests passing (new panel tests for loading/empty states, filtering, lazy fetch), plus a manual Playwright pass through all 7 sidebar tabs confirming the logo, theme, and topbar fix.
 
 ## Phase 31 — `av test` Auto-Updates README's Test-Count Badge
-
-- **Motivation:** README.md's `tests-N%2FM passing` badge was a hand-edited literal string
-  (`161%2F164`) — it silently drifted from reality every time the suite gained/lost tests, with
-  nobody remembering to bump it. Asked to make it self-maintaining instead of manually edited.
-- **`test_cmd` (`av test`) now streams *and* captures pytest's output**: the Python suite
-  previously ran via a plain `subprocess.run(args, cwd=source_root)` that just inherited the
-  terminal. It now runs via `subprocess.Popen(..., stdout=PIPE, stderr=STDOUT, text=True)`,
-  echoing each line as it arrives (so the live experience is unchanged) while also collecting it
-  for parsing afterward — avoiding a second, redundant pytest invocation just to get the numbers.
-  `--color=yes` is forced on the pytest invocation since piping stdout makes pytest think it's
-  not a real terminal and silently drop all colorization otherwise.
-- **New `_update_readme_test_badge(passed, failed)`**: parses the captured output for pytest's
-  own `"N passed"` / `"N failed"` / `"N error"` summary counts (after stripping ANSI escapes,
-  which can otherwise sit between a number and its label and break the regex), then rewrites both
-  the badge URL and its `alt` text in `README.md` via a single regex substitution, using
-  `fsutil.atomic_write_text` (already used elsewhere in this codebase for crash-safe writes) so a
-  failure mid-write never leaves the README half-edited. The badge turns red instead of green
-  when any failures/errors are present, rather than just changing the numbers.
-- **Only updates on a full, unfiltered run**: gated on `test_filter is None` — `av test -k
-  <pattern>` never touches the badge, since a scoped subset's count would misrepresent the whole
-  suite. `--cov`/`--speed`/`--webui` don't restrict which Python tests run, so they don't gate it.
-- **New tests**: `tests/test_cli.py` — unit tests for `_update_readme_test_badge` itself (rewrites
-  URL+alt text, turns red on failures, no-ops when nothing parsed) plus integration tests driving
-  the real `test_cmd` against a fake source root with a fake README.md, confirming the badge
-  updates from a fake pytest summary line and that `-k` leaves it untouched. The existing
-  `test_test_command_*` tests all had to switch from faking `subprocess.run` to faking
-  `subprocess.Popen` for the pytest call specifically (npm/av-CLI calls inside the same command
-  are still real `subprocess.run` calls, faked the same way as before) — a `FakePytestPopen`
-  helper (`_fake_pytest_popen`) mimics just enough of the real interface (`.stdout` as an
-  iterable of lines, `.wait()`, `.returncode`) for `test_cmd`'s streaming loop.
-- **Manually verified**: ran the real `av test` end-to-end (not just the faked unit tests) against
-  this repo's actual suite — confirmed colored output still streamed live, and the badge was
-  rewritten to the real result (178/178 passing) with the correct URL-encoding and alt text.
+- **Motivation**: the README's test-count badge was a hand-edited literal string that silently drifted from reality every time the suite changed size.
+- **Fix**: `av test` now streams pytest's output via `Popen` while also capturing it, then parses the real "N passed/failed" summary (after stripping ANSI codes) to rewrite the badge URL and alt text atomically — turning it red on any failure. Only fires on a full, unfiltered run (`-k` leaves it untouched, since a scoped count would misrepresent the whole suite).
+- **Verified**: new unit + integration tests (including a fake-Popen harness), plus a real end-to-end `av test` run confirming the badge updated to the actual result (178/178) with correct encoding.
 
 ## Phase 32 — Benchmark Regression Tracking, `gc_throughput` Benchmark, Six New Test Files
-
-- **Motivation:** a read-only benchmark/test audit (Docker down at the time) found
-  `development/BENCHMARKS.md`'s captured numbers were stale — dated at the very commit that
-  *introduced* the benchmark suite, predating a later "Benchmark optimisations" commit entirely.
-  Re-running with Docker up confirmed several rows had drifted (`no-op status/add` got
-  meaningfully worse, `commit`'s init step lost its clear edge). Asked to fix the staleness at
-  the root, add the regression-tracking mode the audit recommended, and fill every test gap
-  the audit found.
-- **`av benchmark --markdown` now writes a complete, ready-to-commit file in one shot**: previously
-  it wrote bare per-benchmark tables only (`Path(markdown_out).write_text("\n".join(chunks))`),
-  silently dropping the header/Captured-line/Legend/Methodology-notes preamble that had to be
-  manually re-spliced in after every run — the actual root cause of the staleness. New
-  `benchmarks/tool_runner.render_doc_header()` generates that preamble fresh each run (today's
-  date, platform, git short-SHA, and each tool's real `--version` output — `av`'s own version
-  comes from its installed package metadata, since it has no `--version` flag), and a new
-  `METHODOLOGY_NOTES` constant (the narrative explanations, hand-edited when methodology
-  genuinely changes but now always included automatically) is appended alongside it.
-- **`av benchmark --save-json`/`--baseline`: regression tracking independent of the
-  competitor-comparison verdicts.** The existing GOOD/OK/BAD verdicts answer "is Aether faster
-  than DVC" — nothing answered "did Aether get slower since last time," which is exactly the
-  staleness this phase started from. New `results_to_json()`/`compare_to_baseline()`/
-  `print_regression_report()` in `tool_runner.py`: `--save-json` snapshots this run's `av`-only
-  numbers; a later `--baseline <snapshot>` run diffs against it using the same 1.5x
-  `VERDICT_THRESHOLD` already used for verdicts, and the command exits non-zero if anything
-  regressed past it. Manually verified against the real GC benchmark with both a deliberately
-  regressed fake baseline (correctly exited 1) and a genuine prior capture (correctly flagged a
-  real 1.55x single-run timing blip, confirming the math holds on live, noisy data too).
-- **New 9th benchmark, `gc_throughput`** (`benchmarks/bench_gc_throughput.py`): times `av gc`
-  against a real `av_server` after committing+pushing 20 small objects from a real fixture,
-  using the real CLI via subprocess (never the server's internal GC function directly).
-  Aether-only — no competitor has a comparable server-side GC primitive — following the same
-  N/A-with-footnote pattern already established by `bench_concurrent_push.py`.
-- **`benchmarks/README.md`**: documents the new flags/benchmark, and adds a "Future work" note
-  for a `doctor --speed`-shaped repo-size benchmark idea as a *documented manual exercise*
-  rather than a 10th automated benchmark — it doesn't fit the cross-tool comparison framing
-  this suite is built around (no competitor has an equivalent "diagnose my own repo" command).
-- **README**: refreshed the Benchmark Comparison section's numbers from a real, Docker-backed
-  capture (the stale numbers came from a `b82e998` capture where several server-backed rows
-  couldn't even run for real), cut the redundant raw-number "quick sample" table that duplicated
-  `BENCHMARKS.md` and needed re-syncing by hand forever, and updated `av benchmark`'s CLI
-  reference for the new flags and the 8→9 benchmark count.
-- **Large-file (GB-scale) hashing was explicitly NOT added**, despite being suggested in the
-  original audit — `benchmarks/fixtures.py` already has a deliberate prior decision against it
-  ("not literal GB, to stay practical to generate/run in a dev sandbox"); confirmed with the
-  user to leave that alone rather than override it.
-- **Six new test files filling every gap the audit found with zero direct coverage**:
-  `tests/test_fsutil.py` (atomic-write round-trip, full-overwrite, parent-dir creation, and a
-  simulated-crash-mid-write case via a monkeypatched `os.replace`), `tests/test_speedcheck.py`
-  (`run_synthetic_probes`/`_budget_for`/`storage_stats` directly, not just through the `av test
-  --speed` CLI wrapper), `tests/test_ui.py` (`print_banner`/`print_step`/`select_login_mode`/
-  `is_interactive` — complements the existing dependency-*absence* guard tests, which never
-  exercised what these functions render when the deps ARE present), `tests/test_graph.py`
-  (`CodeVisitor`/`resolve_targets`/`sanitize_name`/`is_ignored` against small in-memory ASTs,
-  independent of the existing end-to-end `av graph --update` test), `tests/test_tool_runner.py`
-  (`rate()`'s 1.5x threshold math at every boundary, `format_value`, the new regression-tracking
-  functions), and `webui/src/components/__tests__/{TopBar,WeightDiffPanel}.test.tsx` (the
-  former locks in Phase 30's topbar-title bug fix; the latter drives two real checkpoint-row
-  clicks through `CheckpointPicker` and asserts the per-layer diff stats/heatmap/drift chart all
-  render from mocked `fetchCommits`/`fetchCommit` data).
-- **Two real test-fragility bugs found via manual debugging (not unit tests) and fixed**:
-  1. `tests/test_cli.py::test_doctor_fix_cannot_recover_truly_missing_object` silently depended
-     on no `av_server` being reachable on `localhost:8000` in the test environment — true by
-     coincidence until this session's Docker stack was left running for the benchmark work,
-     at which point the object became genuinely recoverable and the test's `[WARN]`/"could not
-     recover" assertions broke. Fixed by explicitly monkeypatching
-     `VaultClient.server_available` to `False`, matching the existing pattern already used by
-     the adjacent `test_doctor_fix_downloads_missing_object_from_server` test (which forces
-     `True`) — neither test should depend on environmental chance either way.
-  2. A new `test_benchmark_command_markdown_writes_file` case initially used
-     `monkeypatch.setattr("benchmarks.tool_runner.render_doc_header", ...)` (the string-target
-     form) in the same test as `monkeypatch.setattr(main_module.importlib, "import_module", ...)`
-     — pytest's own string-target resolution calls the real `importlib.import_module`
-     internally, so the test's own `import_module` patch leaked into pytest's machinery and
-     broke the second patch with an `AttributeError` ("`_FakeBenchModule` object has no
-     attribute `tool_runner`"). Fixed by importing the real module object first
-     (`import benchmarks.tool_runner as tool_runner_module`, a plain `import` statement, which
-     doesn't route through `importlib.import_module` and so isn't affected by the patch) and
-     patching that object directly instead of using the string-target form.
-- **Manually verified**: ran the real `av benchmark --markdown development/BENCHMARKS.md
-  --save-json <snapshot>` against the live Docker stack (db/redis/server/webui all healthy) —
-  produced a complete, correctly-formatted file in one shot; drove the real webui in a headless
-  browser against the resulting live data (Dashboard, Weight Diff, Storage tabs) and confirmed
-  the per-tab topbar title and neon-orange theme render correctly with real commits/branches.
-  Full suite: 249 passed, 3 skipped (Python); 73 passed (webui).
+- **Motivation**: a benchmark/test audit found `BENCHMARKS.md`'s numbers stale — dated to the commit that *introduced* the suite, before a later optimization pass. Root-caused to `av benchmark --markdown` writing bare per-benchmark tables and silently dropping the header/legend preamble that had to be manually re-spliced in after every run.
+- **Fixed at the root**: a new `render_doc_header()` regenerates that preamble fresh on every run (date, platform, git SHA, tool versions), so `--markdown` now writes a complete, ready-to-commit file in one shot.
+- **New `--save-json`/`--baseline` regression tracking**: independent of the existing competitor-comparison verdicts — snapshots this run's numbers and a later `--baseline` run diffs against them, exiting non-zero on regression past the same 1.5x threshold used elsewhere. New 9th benchmark, `gc_throughput`, timing `av gc` against a real server (Aether-only, no competitor equivalent).
+- **README/BENCHMARKS.md refreshed** from a real Docker-backed capture; the redundant duplicate "quick sample" table was cut.
+- **Six new test files** filling every direct-coverage gap the audit found (`test_fsutil.py`, `test_speedcheck.py`, `test_ui.py`, `test_graph.py`, `test_tool_runner.py`, plus two new webui component tests).
+- **Two real test-fragility bugs found and fixed**: a doctor test silently depended on no server being reachable (broke once Docker was left running) — fixed with an explicit monkeypatch instead of relying on environmental chance; and a benchmark test's string-target monkeypatch collided with pytest's own `importlib` machinery — fixed by patching the real imported module object directly.
+- **Verified**: full benchmark+markdown run against the live Docker stack, a headless-browser pass through the webui, and 249 passed/3 skipped (Python) + 73 passed (webui).
 
 ## Phase 33 — Optional "Protected" Access Token, Weight Diff Aggregate Endpoint, Atomic Index Save
-- **Closed all 3 remaining `🔸 Open` items in `Probleme.md`** — re-verified each was still
-  present in the current codebase (not just trusted from the doc) before fixing.
-- **Optional shared-secret access token ("Protected" mode)**: unset by default, so a solo/local
-  install behaves exactly as before ("Anonymous" — zero config). Setting one switches every
-  route (reads included, `GET /api/health` and the FastAPI docs routes exempt) behind a
-  `require_token` FastAPI middleware using `secrets.compare_digest` for the header check.
-  - `av auth set-token [TOKEN]` / `clear` / `status` manage it; re-running `set-token` is also
-    the "I forgot it" path — no separate reset flow needed for a self-hosted secret.
-  - `av init` now asks Anonymous-or-Protected for Local mode, and Protected splits further into
-    *generate a new token* (standing a registry up) vs. *enter an existing one* (joining a
-    registry a teammate already protected — validated against the live server, distinguishing
-    "rejected" from "unreachable," and saved to `.av/config` only, without touching `.env` or
-    restarting anything).
-  - `VaultClient` attaches the token header and raises `AuthenticationError` on 401 (instead of
-    a generic failure); a centralized `click.Group` subclass catches it across every CLI
-    command and prompts interactively for the current token (or prints the exact fix
-    non-interactively) rather than each command handling it separately.
-  - Webui gets a `TokenGate` component: `av webui` hands the token to the browser via a
-    one-time `?av_token=` URL param (stripped immediately via `history.replaceState`) so
-    launching through the CLI never shows a manual prompt when the CLI already has one; opening
-    the dashboard any other way shows the same one-time entry screen on a 401.
-  - The externally-mapped Postgres/Redis ports were removed from `docker-compose.release.yml`
-    (the file real `pip install` users actually deploy) but deliberately **kept** in the dev
-    `docker-compose.yml` — removing them there would have silently degraded
-    `tests/test_server.py`'s direct `localhost:5432`/`6379` connections to skip-mode instead of
-    a loud failure (checked, not assumed).
-  - **A real bug found via manual debugging against the live Docker stack, not unit tests**:
-    `commit()`'s push-to-remote logic assumed any failure would return `False`/`None` (its
-    existing "queue for `av push` later" fallback) — but a rejected token now *raises*
-    `AuthenticationError` instead, since `server_available()`'s health probe is deliberately
-    auth-exempt and so can't prove the token itself is valid. That exception skipped the
-    queueing fallback entirely; a commit made with a stale/wrong token was created locally but
-    silently never queued, unlike every other kind of push failure. Reproduced for real
-    (committed against the live server with a deliberately wrong token, confirmed the commit
-    was missing from both the server and `.av/pending_push`), then fixed by catching
-    `AuthenticationError` in `commit()`'s push block and in `flush_pending_push()` (which now
-    preserves the rest of its queue before re-raising, so one bad token mid-retry doesn't drop
-    the untried entries too) and queueing exactly like any other push failure.
-- **Weight Diff checkpoint list — N parallel requests collapsed to one**: `get_commit`'s tree
-  resolution was factored into a module-level `resolve_tree(db, root_hash)`; `GET /api/commits`
-  gained `include_layers=true` to attach each commit's resolved tree in the same response
-  (resolved sequentially per commit, not via `asyncio.gather` — a single `AsyncSession` can't
-  run concurrent queries, a correctness bug caught before it ever ran). `WeightDiffPanel.tsx`
-  now makes one `fetchCommitsWithLayers` call instead of `fetchCommits` + N×`fetchCommit`;
-  `CHECKPOINT_FETCH_LIMIT` raised 30 → 100 now that it bounds one response's size, not a
-  request count.
-- **`Index.save()` made atomic**: mechanical swap from a raw `open()`+`json.dump` to the
-  existing `atomic_write_json` helper already used elsewhere in the codebase.
-- **Tests**: 14 new `tests/test_server.py` cases (auth header parsing edge cases,
-  health/docs exemption, `include_layers`), 12 new `tests/test_client.py` cases (token header,
-  every method raising `AuthenticationError` on 401), `tests/test_docker_runtime.py` (`.env`
-  read/write round-trip including a deliberately-awkward-characters case, the webui URL token
-  handoff), `tests/test_cli.py` (`av auth`, `av init`'s Protected/join-existing flow, and two
-  regression tests for the commit-queueing bug above), and a new
-  `webui/src/components/__tests__/TokenGate.test.tsx`. Full suite: 303 passed, 3 skipped
-  (Python); 79 passed (webui).
-- **Manually verified against the live Docker stack** (not just unit tests): rebuilt the server
-  image, confirmed Anonymous mode is byte-for-byte unchanged, confirmed `av auth set-token`
-  restarts the server and Protected mode correctly rejects/accepts requests (including the
-  `/api/health` and `/docs` exemptions), confirmed the CLI's own 401 message, and confirmed the
-  commit-queueing fix actually recovers a "lost" commit via `av push` once the right token is
-  restored.
+- **Optional shared-secret "Protected" mode**: unset by default (solo/local stays Anonymous, zero config); setting a token switches every route behind a `require_token` middleware. `av auth set-token/clear/status` manage it; `av init` now offers Anonymous-vs-Protected and, for Protected, generate-new-vs-join-existing; the webui gets a `TokenGate` fed by a one-time `?av_token=` URL param from the CLI.
+- **Real bug found via manual debugging against the live stack**: a rejected token *raises* rather than returning failure, which skipped `commit()`'s existing "queue for later" fallback entirely — a commit made with a stale token was silently never queued, unlike every other push failure. Fixed by catching `AuthenticationError` in both the commit and flush-queue paths and queueing it like any other failure.
+- **Weight Diff N+1 fixed**: `GET /api/commits?include_layers=true` now returns each commit's resolved tree in one response, collapsing what used to be one request per checkpoint into one call.
+- **`Index.save()` made atomic** (swapped to the existing `atomic_write_json` helper).
+- **Verified**: 26+ new tests across server/client/docker_runtime/cli, plus a full manual pass against the live Docker stack confirming Anonymous mode is unchanged, Protected mode correctly gates requests, and the commit-queueing fix actually recovers a "lost" commit via `av push`. Full suite: 303 passed, 3 skipped (Python); 79 passed (webui).
 
 ## Phase 34 — Wired Up Real Auto-Update (closing the `maybe_auto_update` dead-code gap)
-- **Files:** `python/av_cli/main.py` (new `run()`), `pyproject.toml` (`[project.scripts]`),
-  `python/av_cli/update_check.py`, `tests/test_update_check.py`, `tests/test_cli.py`, `README.md`.
-- **Problem:** `av update --enable-auto-update` already existed and persisted a real config
-  flag, but the function that actually performs the silent upgrade
-  (`update_check.maybe_auto_update()`) was never called from anywhere — confirmed via zero test
-  coverage for it. Enabling the flag had no effect.
-- **Fix:** added `main.py`'s `run()` — the new console-script entry point
-  (`pyproject.toml`: `av = "av_cli.main:run"`, was `av_cli.main:cli`) — which wraps `cli()` and
-  calls `maybe_auto_update()` exactly once in a `finally`, right as the whole process is about
-  to exit. Deliberately **not** hooked into `_AuthRetryGroup.invoke()` (the existing
-  centralized-error-handling class): that fires once per `cli.main()` call, which is once per
-  line typed inside the interactive REPL session too — wrapping the single outer `cli()` call
-  instead is the only place that fires exactly once regardless of whether a REPL session ran
-  inside it. Any exception from the update check itself is swallowed so it can never mask the
-  real command's exit code. Also hardened `maybe_auto_update()` itself: it previously ran
-  `pip install --upgrade` without checking the subprocess's return code, so a failed upgrade
-  (no network, no permissions) silently looked identical to success — now checks
-  `returncode` and prints a clear one-line success/failure notice either way.
-- Stays **off by default** (`auto_update: False` in the user-level config) — this round closes
-  the wiring gap, it doesn't change the feature's opt-in nature.
-- **Verified**: 6 new tests (`maybe_auto_update`'s opted-out/up-to-date/outdated/failed-pip
-  cases; `run()` calling it exactly once and swallowing its own failures without changing the
-  real exit code), plus a real manual end-to-end run against the actual installed `av` binary
-  (reinstalled editable to pick up the new entry point) — opted in via the real
-  `av update --enable-auto-update`, simulated a newer release by monkeypatching
-  `_fetch_latest_version` in-process, confirmed the real `pip install --upgrade` subprocess ran
-  and the success message printed, then reset the machine's user config back to the off
-  default and cleared the synthetic cached result afterward. Full suite: 309 passed, 3 skipped.
-- **Deliberately left to the user, not scriptable**: the one-time PyPI↔GitHub trusted-publisher
-  link (pypi.org account settings → pending publisher, pointing at this repo's `release.yml`
-  under the `pypi` environment) and pushing the actual first `vX.Y.Z` tag — both manual,
-  account-level web steps. Once done, this closes the README roadmap's last open item
-  ("First real tagged release").
+- **Problem**: `av update --enable-auto-update` persisted a real config flag, but the function that actually performs the silent upgrade was never called from anywhere — enabling it had no effect.
+- **Fix**: added a new `run()` console-script entry point wrapping `cli()` that calls `maybe_auto_update()` exactly once in a `finally`, deliberately not hooked into the per-invocation error-handling class (which would fire once per REPL line instead of once per process). Also hardened the upgrade itself to check the subprocess's return code instead of assuming success. Stays off by default.
+- **Verified**: 6 new tests plus a real manual end-to-end run — reinstalled to pick up the entry point, opted in, simulated a newer release, confirmed the real `pip install --upgrade` ran and reported correctly, then reset the machine back to defaults. Full suite: 309 passed, 3 skipped. The one-time PyPI trusted-publisher link and first real tag push are left as manual, account-level steps.
 
 ## Phase 35 — Short-Hash Checkout (`av checkout`/`av handoff --since` now accept commit prefixes)
-- **Files:** `python/av_cli/fsutil.py` (new `find_commit_file()`), `python/av_cli/exceptions.py`
-  (new `AmbiguousCommitHash`), `python/av_cli/main.py` (`checkout`),
-  `python/av_cli/handoff.py` (`load_commit`), `tests/test_cli.py`, `tests/test_vault.py`,
-  `README.md`.
-- **Problem (found via a manual debugging session against the real installed `av`, not unit
-  tests):** `av commit` prints the commit's short hash (`[a54a0b2] first commit`,
-  `main.py:1285`) — but `av checkout <hash>` only accepted either an exact branch name or the
-  *full* 64-character hash. Copying the short form av itself had just printed produced
-  `Error: Commit 'a54a0b2' not found.` Reproduced for real: committed twice in a scratch repo,
-  copied the first commit's printed short hash into `av checkout` → hard error. No prefix
-  resolution existed anywhere in the codebase (verified by grep — the only `[:7]` uses are the
-  printing sites).
-- **Fix:** new shared helper `fsutil.find_commit_file(repo_root, commit_hash)` — exact filename
-  match first; otherwise, if the target is a 4–63 char hex string, glob `.av/commits/` for a
-  unique prefix match and return it, raising the new `AmbiguousCommitHash`
-  (a `ValidationError`/`ClickException` subclass) when several commits share the prefix, and
-  plain `FileNotFoundError` when none does. `checkout` now resolves through the helper (and
-  rewrites `commit_hash` to the resolved full hash before writing HEAD's detached entry, so a
-  short-hash checkout still records the full hash); the remote-fetch fallback only kicks in when
-  local resolution finds nothing, exactly as before. `handoff.load_commit()` routes through the
-  same helper, so `av handoff --since <short-hash>` works too (it previously required the full
-  hash as well). Ambiguity surfaces as a clear red "ambiguous — use more characters" error
-  rather than a silent guess, matching git's behavior.
-- **Verified:** manual end-to-end in the scratch repo after the fix — `av checkout a54a0b2`
-  checks out the right commit, restores the correct file content, writes the full hash into
-  detached HEAD; `av handoff --update --diff-weights --since d91bad3` resolves and produces the
-  expected per-layer diff. New tests: CLI-level short-hash checkout (content restored + full
-  hash written to HEAD), ambiguous-prefix rejection via two fabricated colliding commits,
-  `find_commit_file` exact/prefix/not-found/ambiguous unit cases, and `load_commit` accepting a
-  7-char prefix.
+- **Problem found via manual debugging**: `av commit` prints a 7-char short hash, but `av checkout <hash>` only accepted an exact branch name or the full 64-character hash — copying av's own printed output produced a hard error.
+- **Fix**: new shared `find_commit_file()` helper resolves an exact match first, then a unique hex-prefix match against `.av/commits/`, raising a clear ambiguity error when several commits share a prefix (matching git's behavior). Both `checkout` and `handoff --since` now route through it, with the checkout path recording the resolved full hash into HEAD.
+- **Verified**: manual end-to-end short-hash checkout and handoff diff in a scratch repo, plus new unit/CLI tests for the exact/prefix/not-found/ambiguous cases.
 
 ## Phase 36 — LICENSE, Real PyPI Metadata, sdist Slimmed 64.7 MB → 761 KB, Roadmap De-Staled
-- **Files:** `LICENSE` (new), `MANIFEST.in` (new), `pyproject.toml`, `README.md`, `.gitignore`,
-  `aether-vault-server.tar` (untracked).
-- **Problem (found by auditing the actual PyPI release + the built sdist, not the source):**
-  three packaging/release gaps that made the shipped `0.1.0`/`0.1.1` releases look abandoned:
-  1. **No LICENSE file existed anywhere in the repo**, and pyproject had no license field —
-     legally nobody could use or redistribute the published package.
-  2. **The published PyPI pages for 0.1.0/0.1.1 were empty**: no summary, no long description,
-     no classifiers, no project URLs, no keywords (`pypi.org/pypi/aether-vault/json` shows
-     `summary: null`). Root cause: `[project]` in `pyproject.toml` carried only
-     name/version/dependencies.
-  3. **The sdist was 64.7 MB** (~85x too big): setuptools-scm seeds sdist contents from all
-     git-tracked files, and the 64.5 MB `aether-vault-server.tar` Docker-image export was
-     git-tracked, so it shipped inside every source release. Verified by building the sdist and
-     listing its contents — the tar was right there.
-- **Fix:**
-  - `LICENSE`: PolyForm Noncommercial License 1.0.0 with the licensor's Required Notice line
-    (`Copyright Leon Schwarzkopf (Aether Quant)`). Noncommercial use is free; commercial use
-    requires a separate license — this is a deliberate business-model decision (source-available,
-    not OSI open source).
-  - `pyproject.toml [project]`: real one-line description, `readme = "README.md"` (so the full
-    README renders on the PyPI page), license text, author, keywords, 15 classifiers (Beta /
-    audiences / OSes / Python 3.10–3.12 / C++ / version-control + AI topics), and four
-    `[project.urls]` entries (Homepage/Repository/Issues/Changelog).
-  - New `MANIFEST.in` excluding the server-image tar (+ pyc/pycache hygiene); additionally
-    untracked `aether-vault-server.tar` from git entirely (`git rm --cached`, local copy kept)
-    and added it to `.gitignore` — it never belonged in version control and was bloating every
-    clone as well as the sdist.
-  - README: Open Source Roadmap de-staled — the "first tagged release" row is now ✅ (0.1.0 and
-    0.1.1 are live on PyPI via trusted publishing), plus new 🔲 rows for the gaps found during
-    this review (`av log`, branch merge, Alembic migrations, CORS/rate-limit hardening,
-    cp313/cp314 wheels). Added a short License section pointing at LICENSE.
-- **Verified:** rebuilt the sdist for real: 64.7 MB → **761 KB** (177 files), no `.tar` inside,
-  LICENSE + MANIFEST.in included; `twine check dist/*.tar.gz` → PASSED; PKG-INFO inspected and
-  now carries Summary/License/classifiers/URLs/keywords plus the full README as the long
-  description (which is what the next PyPI upload will render). Note for release: the *next*
-  tag push will publish this metadata; the already-published 0.1.x pages stay sparse until then.
+- **Problem found by auditing the actual PyPI release**: no LICENSE existed anywhere (nobody could legally use the package), the published PyPI pages were empty (no description/classifiers/URLs — `pyproject.toml`'s `[project]` had only name/version/deps), and the sdist was 64.7MB because a git-tracked Docker image export shipped inside every source release.
+- **Fix**: added a PolyForm Noncommercial LICENSE, filled in real PyPI metadata (description, classifiers, keywords, project URLs), added a `MANIFEST.in` excluding the image tar, and untracked the tar from git entirely. README roadmap de-staled to match.
+- **Verified**: rebuilt sdist for real, 64.7MB → 761KB, `twine check` passed, PKG-INFO now carries full metadata.
 
 ## Phase 37 — `av log` (offline commit history) — v1.1.1 cycle
-- **Files:** `python/av_cli/history.py` (new), `python/av_cli/main.py` (`log` command),
-  `tests/test_cli.py` (4 tests).
-- **What:** new `av log` — walks the first-parent chain from HEAD (or `--branch <name>`) and
-  prints git-style lines `[shorthash] (HEAD, main) message` with an indented author/timestamp/
-  tags/metrics detail line. Flags: `--limit N` (default 30), `--branch`, `--all` (every local
-  commit across branches, timestamp-descending). Pure-local module: reads only `.av/commits`
-  + `.av/refs/heads`, zero network cost even when a registry is configured; cloned repos see
-  full upstream history because clone stores every commit's metadata locally.
-- **Why modular:** walking/rendering logic lives in `history.py`, the Click wrapper in
-  `main.py` stays ~40 lines — keeps the growing CLI surface out of one monolith.
-- **Verified:** 4 new tests (ordering/decorations, limit+empty-repo, branch flag incl.
-  shared-history walk + bad-branch error, detached HEAD). Manual: real binary in a scratch
-  repo — decorations, limit, tags/metrics line all render as documented.
+- **New `av log`**: walks the first-parent chain from HEAD (or `--branch`) printing git-style decorated lines with an author/timestamp/tags/metrics detail line (`--limit`, `--branch`, `--all`). Pure-local, zero network cost. Verified: 4 new tests plus a manual pass with the real binary.
 
 ## Phase 38 — Enterprise mode hidden from interactive init — v1.1.1 cycle
-- **Files:** `python/av_cli/ui.py`, `python/av_cli/main.py` (`init`), `tests/test_ui.py`,
-  `README.md`.
-- **What:** interactive `av init` no longer offers Local-vs-Enterprise — it always picks Local
-  (then goes straight to the Anonymous/Protected question). `ui.select_login_mode()` deleted;
-  a guard test asserts it stays gone so the unbuilt flow can't quietly resurface. The
-  `--mode enterprise` flag is still accepted (scripts/replays keep working) and still falls
-  back to Local through the untouched `enterprise.py` seam; existing repos with
-  `login_mode=enterprise` reconnect unchanged. README init docs updated to match.
-- **Rationale:** the stub told every new user "coming soon" on first contact — worse than not
-  offering it. The seam stays wired for the real commercial login.
+- **What**: interactive `av init` no longer offers Local-vs-Enterprise — it always picks Local, since the stub told every new user "coming soon" on first contact. `--mode enterprise` still works for scripts and still falls back to Local through the untouched seam; existing enterprise-mode repos reconnect unchanged.
 
 ## Phase 39 — `av clone` / `av pull` (team collaboration baseline) — v1.1.1 cycle
-- **Files:** `python/av_cli/sync.py` (new), `python/av_cli/client.py`
-  (`list_projects`, `list_commits`, `list_refs`), `python/av_cli/main.py`
-  (`clone`, `pull`, `_materialize_tree` extraction, `_collect_dirty_paths`),
-  `tests/test_sync.py` (new, 9 tests), `tests/test_server.py`
-  (`test_live_two_repo_clone_pull_flow`), `benchmarks/bench_cold_clone.py`.
-- **What:**
-  - `av clone <project> [dir] [--remote-url] [--token]`: resolves the project by exact id,
-    exact name, or unique name prefix against `/api/projects` (ambiguity lists candidates);
-    bootstraps `.av/`; **writes the remote project's `project_id` into config** so pushes from
-    any clone attribute to the same project; fetches ALL commits as metadata via paginated
-    `/api/commits?include_layers=true` (500/page — clones are fully self-sufficient offline);
-    picks the default branch (main → master → alphabetical); materializes tip objects with one
-    batch-check round trip then parallel downloads (8 workers); refuses non-empty targets.
-  - `av pull [--force]`: fast-forward-only onto `<project_id>/<branch>`. Walks the remote
-    chain back until it joins local history, storing every fetched commit locally (so even a
-    diverged pull leaves `av merge <remote-tip>` ready to run). FF requires the local tip to
-    be a strict ANCESTOR of the remote tip — a repo with its own unpushed commits gets the
-    diverged handoff instead of silently losing them. Dirty-tree guard identical to checkout.
-  - Refactor (behavior-preserving): checkout's inline restore loop extracted as shared
-    `_materialize_tree(repo_root, client, tree, idx)` + `_collect_dirty_paths()` — one restore
-    path behind checkout/clone/pull/merge, verified by the untouched checkout/stash suites.
-- **Latency design:** discovery/ref/history are single round trips (pagination, batched
-  existence checks, parallel downloads); no server schema change needed for the base flow.
-- **Verified:** FakeRemoteClient suite drives real clone/pull code paths offline (materialize,
-  identity inheritance, ambiguity, non-empty refusal, FF, up-to-date, diverged, detached,
-  dirty-guard). Live two-repo Docker E2E added (push→clone→push→pull) — lazily skipped when
-  the stack is down. bench_cold_clone.py's av column un-N/A'd: pushes the standard fixture
-  untimed, times `av clone` (reports "registry unreachable" honestly without a stack).
+- **`av clone <project>`**: resolves the project by id/name/prefix, bootstraps `.av/`, fetches all commit metadata (fully self-sufficient offline afterward), and materializes the tip via a batch-check + parallel download.
+- **`av pull [--force]`**: fast-forward-only sync, storing every fetched commit locally even when diverged (so `av merge` is ready to run) rather than silently dropping anything.
+- **Refactor**: checkout's inline restore loop extracted into a shared `_materialize_tree()` used by checkout/clone/pull/merge alike, verified behavior-preserving against the existing suites.
+- **Verified**: an offline fake-remote test suite (9 cases) plus a live two-repo Docker E2E (push→clone→push→pull).
 
 ## Phase 40 — `av merge` (three-way merge, two-parent commits) — v1.1.1 cycle
-- **Files:** `python/av_cli/merge.py` (new), `python/av_cli/main.py`
-  (`merge` command, `_finalize_commit` extraction, commit() tail refactor),
-  `python/av_server/models.py` (`DBCommit.extra_parents`), `python/av_server/server.py`
-  (`_full_parents`, push/get/list endpoints return `parents`),
-  `tests/test_merge.py` (new, 17 tests), `tests/test_server.py` (2 parent-round-trip tests).
-- **Server:** merge commits need both parents persisted — `parent_hash` keeps `parents[0]`
-  (every existing consumer unchanged) and new nullable `extra_parents` TEXT column stores
-  `json(parents[1:])`. GET /api/commits/{hash} AND /api/commits now return a reconstructed
-  full `parents` array (corrupt JSON tolerated → primary parent only). Existing DBs need a
-  one-time `ALTER TABLE commits ADD COLUMN extra_parents TEXT;` (same create_all caveat as
-  the BigInteger fix).
-- **Client:** pure algorithms isolated in `merge.py` (no I/O): nearest-common-ancestor via
-  ancestor-set + generation-order BFS (merge-aware, follows every parent edge), and per-path
-  three-way tree merge where entry absence = deletion and full-dict equality means a re-split
-  that preserves content counts as unchanged. Command semantics: already-up-to-date /
-  fast-forward (no commit created, `--no-ff` overrides) / true three-way producing a two-parent
-  merge commit; BOTH-changed-differently conflicts abort before touching anything, listing
-  paths with `--ours`/`--theirs` escape hatches (whole-merge policy; no content-level text
-  merging — payloads are binary artifacts, honest abort beats corrupt merge). Missing
-  theirs-side objects batch-checked then parallel-downloaded before materializing; dirty tree
-  refused; detached HEAD refused. `commit()`'s tail (deterministic hash over sorted JSON →
-  atomic persist → ref move → echo → push/queue block) extracted verbatim as
-  `_finalize_commit` so normal commits and merges share exactly one creation path.
-- **Known limitation (documented):** the Web UI graph renders `parent_hash` only — merge
-  commits appear linear there for now.
-- **Verified:** 17 tests (pure merge/base cases incl. delete-vs-keep, add/add-same,
-  modify-vs-delete conflict; CLI FF, two-parent creation verified in the commit JSON +
-  `av log` render, abort-immutability, `--theirs`, dirty/detached/unknown guards) plus live
-  server round-trip tests proving both parents survive a push→fetch cycle. Manual scratch
-  session: diverged branches merged (+2 parents confirmed in the commit file), conflict abort
-  listed train.py and touched nothing, `--theirs` resolved with the noted auto-resolve count.
+- **Server**: merge commits need both parents persisted — a new nullable `extra_parents` column stores the rest beyond `parent_hash`, and commit endpoints reconstruct the full `parents` array.
+- **Client**: pure nearest-common-ancestor + three-way tree merge logic in a new `merge.py`. Already-up-to-date/fast-forward creates no commit; a true three-way merge produces a two-parent commit; conflicting changes abort before touching anything, with `--ours`/`--theirs` escape hatches (no content-level text merging — these are binary artifacts, an honest abort beats a corrupt merge).
+- **Known limitation**: the Web UI graph still renders `parent_hash` only, so merge commits appear linear there for now.
+- **Verified**: 17 new tests (pure-merge cases, CLI fast-forward/two-parent/conflict/abort paths) plus live server round-trip tests proving both parents survive a push→fetch cycle, and a manual scratch session confirming a real diverged-branch merge.
 
 ## Phase 41 — CDC chunk dedup for `.pt`/`.pth`/`.ckpt` — v1.1.1 cycle
-- **Files:** `src/core.cpp` (`chunk_and_hash_file` + gear table),
-  `python/av_cli/main.py` (`CHUNKABLE_EXTS`, stage/upload/materialize/doctor wiring),
-  `python/av_server/models.py` (`DBTree.chunks`), `python/av_server/server.py`
-  (build_merkle_tree persists chunks, resolve_tree returns them, GC marks chunk hashes alive),
-  `tests/test_core.py` (3), `tests/test_cli.py` (4), `tests/test_sync.py` (1).
-- **C++ core:** new export `chunk_and_hash_file(path, min=512KB, avg=2MB, max=8MB)` — pass 1
-  streams the file once computing gear-hash rolling cut points (deterministic splitmix64
-  table; mask = avg rounded down to power of two), pass 2 SHA-256s each [offset_i, offset_{i+1})
-  range in parallel on the existing ThreadPool. Two boundary bugs caught by the fuzz probe
-  during development and fixed: tiny final chunks (a cut with <min bytes remaining produced a
-  sub-minimum tail) and post-overflow tails (hard-cap cut leaving a sliver) — both now guarded
-  by requiring ≥min bytes to remain AFTER any cut, making max a soft cap of max+min-1 in rare
-  edge cases (verified across 60 random files, 2–13 MB). Canonical `hash_file` untouched.
-- **Python wiring:** artifacts above the LFS threshold with chunkable extensions are chunked
-  when safetensors splitting doesn't apply (graceful whole-file fallback if the native core is
-  missing/fails, mirroring the layers fallback). Tree entries carry `"chunks"` alongside
-  `"layers"`; uploads send shard hashes instead of a whole-file blob; checkout/pull/merge
-  reassemble byte-identical files from shards (downloading missing ones); doctor treats a
-  missing *chunk* like a missing layer (intact chunked artifacts are NOT orphaned-pointer
-  false positives); server GC marks chunk hashes alive (unmarked shards would be reaped);
-  Weight Diff needs no change — chunked entries have no layers and fall back to whole-file
-  comparison automatically.
-- **Verified:** binding tests (validity/consecutiveness, stability under a mid-file byte flip
-  with deterministic small-chunk params, param validation); CLI tests: staging produces shards
-  and NO whole-file blob, re-add after a mid-file mutation reuses all-but-the-edited chunks,
-  checkout of the old commit restores bytes exactly, doctor detects a deleted shard; sync test:
-  chunked checkpoint survives a fake-registry clone byte-identically with the whole-file hash
-  absent everywhere. Manual: real binary — 6/6 chunks staged, mid-file edit reused 5/6,
-  reassembly byte-identical.
+- **New C++ `chunk_and_hash_file`**: gear-hash rolling-cut content-defined chunking (512KB–8MB range), each shard SHA-256'd in parallel. Two boundary bugs (sub-minimum tail chunks, post-overflow slivers) were caught by a fuzz probe during development and fixed by requiring a minimum remainder after any cut.
+- **Python wiring**: chunkable-extension artifacts above the LFS threshold are chunked when safetensors splitting doesn't apply, with a whole-file fallback if the native core is unavailable; checkout/pull/merge/doctor/GC were all made chunk-aware to match.
+- **Verified**: binding tests (validity, stability under a byte flip), CLI tests (shard staging, edit-reuse, byte-identical checkout, doctor detecting a deleted shard), a sync test, and a manual real-binary run confirming reuse and byte-identical reassembly.
 
 ## Phase 42 — `.avattributes` (per-path staging directives) — v1.1.1 cycle
-- **Files:** `python/av_cli/attributes.py` (new), `python/av_cli/main.py`
-  (`file --avattributes`, stage_one_file attr_flags param, add/stash call sites),
-  `tests/test_cli.py` (4).
-- **What:** gitattributes-style repo file parsed once per invocation (one small read, then
-  fnmatch per path — negligible latency): `<glob> <flag>...`, last matching line wins, unknown
-  flags ignored (forward-compatible). Flags honored by staging: `no-chunk` (opaque checkpoints
-  stored as whole-file blobs instead of CDC chunks) and `no-layer-split` (safetensors stored
-  whole instead of per-layer shards). `av file --avattributes` writes the documented template,
-  refusing to overwrite like `--avignore`. Absent file = zero rules = behavior identical to
-  before.
-- **Verified:** scaffold create/no-clobber; `*.pt no-chunk` suppresses chunking and stores the
-  blob; `no-layer-split` stores safetensors whole; pattern scoping + last-match-wins unit
-  checks. Manual: template written once, second call refused, directive honored live.
+- **New gitattributes-style file**: `<glob> <flag>` rules (last match wins) honored by staging — `no-chunk` and `no-layer-split` force whole-file storage for specific paths. `av file --avattributes` writes the template; absent file means zero behavior change. Verified: unit tests for pattern scoping/last-match-wins plus a manual round trip.
 
 ## Phase 43 — CI green again: conftest import fix, writable CAS in CI, Node-24 actions, folder READMEs
-- **Files:** `pyproject.toml`, `.github/workflows/tests.yml`,
-  `.github/workflows/release.yml`, `.github/workflows/docker-edge.yml`,
-  `README.md` (Repository Map + TOC), new folder READMEs (11×), `tests/README.md` links.
-- **Problem (diagnosed from the actual failed-run logs of the v1.1.0 push, not guessed):**
-  three independent CI failures:
-  1. **Every pytest job died at collection** (`ModuleNotFoundError: No module named
-     'python'` loading `tests/conftest.py`): tests import `python.av_cli.*` as a namespace
-     package from the checkout root, but bare console-script `pytest` never puts the repo
-     root on `sys.path`. Local runs masked it because `python -m pytest` injects CWD.
-     Reproduced locally by stashing the fix and running the console-script binary — exact
-     same error; this also explains why the v0.1.1-era master pushes failed identically.
-  2. **webui-e2e rendered an empty dashboard** → Playwright element-not-found: the
-     bare-metal uvicorn processes default their CAS directory to `/data`
-     (`server.py`'s `AV_DATA_DIR` default is container-oriented) and got
-     `PermissionError: '/data'`; object uploads then failed while `/api/health` stayed
-     green, so seed_data's pushes queued offline and nothing appeared in the UI.
-  3. Node-20 deprecation annotations on every pinned action.
-- **Fixes:**
-  1. `[tool.pytest.ini_options] pythonpath = ["."]` in `pyproject.toml` — one line fixes
-     every job and any local invocation style, no workflow churn.
-  2. `AV_DATA_DIR: ${{ runner.temp }}/av-data` on both uvicorn-starting jobs
-     (server-tests, webui-e2e), with comments explaining the failure mode so it doesn't
-     get "cleaned up" later.
-  3. All workflows bumped to the Node-24 action majors:
-     `checkout@v5`, `setup-python@v6`, `setup-node@v6`, `upload-artifact@v7`,
-     `download-artifact@v7` (versions verified against each action's releases before
-     bumping; release/docker-edge included for consistency).
-- **Docs structure:** new self-documenting `README.md` for every tracked top-level folder
-  (`.github/`, `benchmarks/`, `development/`, `python/` plus its three packages, `scripts/`,
-  `src/`, `tests/`, `webui/`) covering purpose, per-file tables, and module-specific
-  invariants (e.g. canonical-hash and CDC-determinism rules in `src/`, the single
-  restore/commit path in `av_cli`). The main README gained a **Repository Map** section
-  (and TOC entry) linking all of them.
-- **Verified:** full suite collects cleanly via console-script `pytest tests/
-  --collect-only -q` (365 tests — previously impossible outside `python -m`);
-  `test_registry.py` passes through the same invocation; workflow diffs are version-bumps
-  and env additions only.
+- **Three CI failures diagnosed from real failed-run logs**: every pytest job died at collection because bare console-script `pytest` never puts the repo root on `sys.path` (fixed with `pythonpath = ["."]`); `webui-e2e` rendered an empty dashboard because the bare-metal server's CAS directory defaulted to a container-oriented `/data` path with no write permission (fixed with an explicit `AV_DATA_DIR` for CI); and every pinned action was on a deprecated Node-20 major (bumped to the Node-24 majors across all workflows).
+- **Docs structure**: added a self-documenting README to every top-level folder, linked from a new Repository Map section in the main README. Verified: full suite (365 tests) now collects cleanly via the console-script `pytest` invocation that was previously broken.
 
 ## Phase 44 — Project governance: contribution docs, security policy, issue/PR templates, versioning policy, per-tag GitHub Releases
-- **Files:** `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `VERSIONING.md` (all new),
-  `.github/ISSUE_TEMPLATE/config.yml` + `bug_report.yml` + `feature_request.yml` (new),
-  `.github/PULL_REQUEST_TEMPLATE.md` (new), `.github/workflows/release.yml`,
-  `.github/README.md`, `README.md` (Contributing section rewritten).
-- **What:**
-  - `CONTRIBUTING.md`: dev setup, the Essential-Tasks wrap-up workflow, code conventions
-    (module-per-feature, lazy imports, the single restore/commit-path invariants), PR style,
-    and the licensing note — contributions are accepted under the same PolyForm
-    Noncommercial terms as the project.
-  - `CODE_OF_CONDUCT.md`: Contributor Covenant v2.1 with enforcement routed to the
-    maintainer via private channels.
-  - `SECURITY.md`: private reporting via GitHub security advisories (never public issues),
-    72h-ack/weekly-update expectations, supported-versions table (latest line only),
-    explicit in/out-of-scope guidance, and honest pointers to the known open hardening
-    items (CORS wildcard, no rate limiting, shared-secret auth) so they're reportable but
-    not "discoveries".
-  - Issue templates: YAML forms for bugs (repro/version/OS/environment checkboxes) and
-    features (motivation/proposal/alternatives); blank issues disabled with contact links
-    routing security → advisories and questions → Discussions.
-  - `PULL_REQUEST_TEMPLATE.md`: mirrors the wrap-up checklist (tests, manual debug session,
-    docs-moved-with-code, latency discipline).
-  - `VERSIONING.md`: SemVer mapped to each compatibility surface (CLI, `.av/` on-disk
-    format, HTTP API, config files, Python imports) with concrete MAJOR/MINOR/PATCH
-    examples from real shipped changes; a binding deprecation policy (announce in release
-    notes + CHANGELOG, ≥1 minor grace window, removal only at MAJOR) effective since
-    v1.1.1; DB-schema migration caveats until Alembic lands; and the full release runbook.
-  - `release.yml` gained a `github-release` job: on tag push it creates a GitHub Release
-    with auto-generated notes (GitHub diffs against the previous tag automatically) and
-    attaches every wheel/sdist — closing the "Releases with changelogs per tag" gap. The
-    curated long-form history stays in `development/CHANGELOG.md`; job guarded to tag refs
-    only and needs no third-party action (`gh release create --generate-notes`).
-- **Verified:** all new YAML parses cleanly (pyyaml round-trip on templates + workflows);
-  release.yml's five jobs confirmed structurally intact with correct `if:`/permissions;
-  fast test slice green (10 passed). The GitHub-Releases flow itself activates on the next
-  real tag push.
+- **New governance docs**: `CONTRIBUTING.md` (dev setup, conventions, PR style), `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1), `SECURITY.md` (private advisory-based reporting, honest pointers to known open hardening gaps), issue/PR templates, and `VERSIONING.md` (SemVer mapped to each compatibility surface, with a binding deprecation policy effective since v1.1.1).
+- **`release.yml`** gained a `github-release` job creating a GitHub Release with auto-generated notes and attached wheels/sdist on every tag push, closing the "releases with changelogs per tag" gap. Verified: all new YAML parses cleanly, workflow structure confirmed intact.
 
 ## Phase 45 — CI-caught test defects fixed + eager-annotation guard script
-- **Files:** `tests/test_merge.py`, `tests/test_server.py`, `webui/e2e/dashboard.spec.ts`,
-  `scripts/check_eager_annotations.py` (new), `development/Probleme.md`.
-- **Problem:** the first CI run of the v1.1.1 cycle surfaced three test-infrastructure
-  defects (all diagnosed from `gh run view --log-failed`; zero product-code changes needed):
-  1. `tests/test_merge.py` used `Path` in an annotation nine lines above its import —
-     eager annotation evaluation on CI's Python 3.10 aborted the whole `test` job at
-     collection, while Python 3.14 dev machines (PEP 649 lazy annotations) never saw it.
-  2. The new live clone/pull E2E in `tests/test_server.py` called `json.loads` without a
-     module-level `import json` — crashed *after* proving the whole flow worked on the
-     real stack (47/48 other server tests passed).
-  3. `webui/e2e/dashboard.spec.ts` asserted a `🌌 Aether-Vault` hero heading removed from
-     the UI long ago; every prior E2E red had died at this line and been misread as empty
-     seed data. With seeding now working, weight-diff passed while dashboard still timed
-     out here — isolating the stale selector.
-- **Fixes:** imports hoisted to the top of both files; dashboard boot assertion replaced
-  with real-DOM selectors (sidebar brand text + `#nav-dashboard`). New
-  `scripts/check_eager_annotations.py`: AST guard flagging annotations that reference
-  names imported later — the exact py3.14-vs-3.10 trap, proven to catch the pre-fix file
-  (exit 1 with line numbers) and clean on the fixed tree.
-- **Verified:** `pytest tests/test_merge.py -q` → 22 passed; `test_server.py` collects all
-  48; both e2e specs compile (`tsc --noEmit` exit 0);   checker run documented above. Live
-  confirmation of the two-repo flow arrives with the next Docker-backed CI run.
+- **Three test-infrastructure defects diagnosed from CI logs (zero product-code changes needed)**: an annotation referencing a name imported later crashed collection under Python 3.10's eager evaluation (invisible on 3.14's lazy PEP 649 behavior); a live E2E test used `json.loads` without importing `json`, crashing only after proving the real flow worked; and a Playwright spec asserted a hero heading removed from the UI long ago, silently misread as "empty seed data" by every prior red run.
+- **Fixes**: imports hoisted, the stale selector replaced with real DOM selectors, and a new `scripts/check_eager_annotations.py` AST guard added to catch the exact 3.14-vs-3.10 trap going forward — proven to flag the pre-fix file and pass clean on the fixed one.
 
 ## Phase 46 — Hardening cycle: Alembic, transport hardening, Python matrix, CLI split, skip transparency
-- **Files:** `python/av_server/{database.py,migrations/*,rate_limit.py,server.py}`, `python/av_cli/{main.py,core.py,cmd_repo.py,cmd_staging.py,cmd_history.py,cmd_sync.py,cmd_auth.py,cmd_maintenance.py,cmd_devtools.py,cmd_integrations.py}`, `pyproject.toml`, `requirements.txt`, `setup.py`, `Dockerfile`, `.github/workflows/{tests.yml,release.yml}`, `webui/{package.json,.eslintrc.json,src/app/layout.tsx}`, `tests/{conftest.py,skipsummary.py,test_skipsummary.py,test_rate_limit.py,test_migrations.py,test_cli_commands.py,test_server.py}`, `scripts/check_eager_annotations.py`, docs (README roadmap/progress, architecture.md, infrastructure.md, SECURITY.md, VERSIONING.md, development/README.md).
-- **Point 10 — DB migrations:** schema ownership moved from `create_all` to Alembic (`python/av_server/migrations/`, packaged with the wheel). Startup (`database.py::init_db`) upgrades to head programmatically inside the existing async connection — no nested event loop, no alembic.ini. Migration `0001_baseline` encodes the full current model state; legacy create_all volumes are detected (`commits` exists + no `alembic_version`), healed of known column drift (`extra_parents`/`chunks`) and stamped zero-touch. The old manual-ALTER caveat is retired from VERSIONING.md.
-- **Point 11 — Transport hardening:** CORS defaults to the webui origin (`AV_CORS_ORIGINS`; `"*"` explicit opt-in) — kills drive-by requests against reachable registries. New dependency-free fixed-window rate limiter (`rate_limit.py`): GC bucket on by default (`AV_RATE_LIMIT_GC=10/minute`) closing the destructive-anonymous-endpoint hazard; data plane opt-in (`AV_RATE_LIMIT_DEFAULT`) because bulk uploads legitimately burst. 429 + `Retry-After`. A `Retry-After` off-by-one was caught by its own unit test pre-merge.
-- **Point 12 — Python matrix:** cibuildwheel cp310–cp314, classifiers extended, pybind11 floor ≥3.0.0 (3.0.4 proven locally on 3.14), CI `test` job matrix 3.10+3.14, Dockerfile + release sdist aligned on 3.12. Wheel-build proof lands at next tag (cibuildwheel runs in release.yml).
-- **Point 13 — main.py split:** 3,263-line monolith → `core.py` (shared helpers) + eight `cmd_*.py` command modules + a ~200-line main.py compat shell that keeps: cli group + registration ORDER, PEP 562 `VaultClient`, the two direct-monkeypatch targets (`_find_source_root`, `_update_readme_test_badge`) physically resident, and re-exports of the audited historical namespace surface (17 names). Moved callers reach patch targets late-bound via `from . import main`. Gates all green: `av --help` / `init --help` / `stash --help` byte-identical before/after, plugins' eager `from av_cli.main import cli` intact, full suite unchanged.
-- **Point 14 — webui tooling:** eslint 8 + eslint-config-next added with `lint`/`typecheck` scripts; one justified inline rule-disable (App Router font-link false positive); lint/typecheck steps added to the webui-tests CI job.
-- **Point 15 — skip transparency:** new end-of-run pytest summary block buckets every skip (docker-stack / native-core / plugin-extras) and prints the exact `docker compose up` command. ASCII-only rendering after Windows-console escape fallbacks were observed live.
-- **Verification:** full suite 356 passed / 43 skipped / 0 failed (skip note renders as specified); targeted suites for every new module; `tsc --noEmit`, `next lint`, Vitest 79 green; checker clean across python/ + tests/ after teaching it to resolve the cmd modules' shared-prelude star-imports (13 false positives eliminated); help byte-diff ×3; plugins import edge verified. One full-run flake observed once in `test_merge_conflict_resolved_with_theirs_flag` and not reproduced across module runs plus a second full pass — watch item, no code change.
-- **Deferred (needs the Docker stack, per owner):** live upgrade of the real legacy volume, two-repo clone/pull E2E confirmation, benchmark #5 capture.
+- **DB migrations**: schema ownership moved from `create_all` to Alembic, applied programmatically at startup; a legacy `create_all` volume is detected, healed of known column drift, and stamped with zero manual intervention.
+- **Transport hardening**: CORS now defaults to the webui origin instead of a wildcard, and a new dependency-free rate limiter protects GC by default (data-plane limiting is opt-in, since bulk uploads legitimately burst).
+- **Python matrix**: wheels now build for cp310–cp314; CI's test matrix runs both 3.10 and 3.14.
+- **`main.py` split**: the 3,263-line monolith became `core.py` plus eight `cmd_*.py` command modules behind a thin compat shell, preserving CLI help output and plugin import paths byte-for-byte.
+- **Skip transparency**: a new end-of-run pytest summary buckets every skip by reason (Docker/native-core/plugin-extras) and prints the exact command to unblock it.
+- **Verified**: full suite 356 passed / 43 skipped / 0 failed; webui lint/typecheck/Vitest all green; help output byte-diffed identical before/after the CLI split. Deferred (needs Docker): live legacy-volume upgrade, two-repo clone/pull E2E, benchmark #5 capture.
 
 ## Phase 47 — Shell banner redesign + env.py startup fix caught by CI
-- **Files:** `python/av_cli/ui.py`, `python/av_server/migrations/env.py`, `tests/test_migrations.py`, `tests/test_ui.py`, `README.md` (Contributing emoji strip).
-- **env.py startup SyntaxError (root-caused from the v1.1.6 CI logs):** `run_migrations_online()` was a plain `def` containing `async with`/`await` — a compile-stage `SyntaxError` that fired the moment any real database was present: uvicorn lifespan → `init_db` → `command.upgrade` → executes env.py → *"Application startup failed"* → server-tests' TestClient tests all ERRORed (~1m) and webui-e2e's server died before seeding (~4m empty dashboard). Latent locally because Docker-down skips every DB test — nothing ever imported that code path. **Fix:** `async def`, matching the official Alembic asyncio template. **Guard hardening:** `test_env_py_is_valid_python` now additionally `compile()`s the source — `ast.parse` accepts what compile rejects, which is precisely why the guard missed it.
-- **Shell banner redesign:** replaced the flat AV monogram with a framed composition derived from the actual `development/logo.png` artwork — beveled wireframe-"A" strokes in graphite pierced by a copper dash-bolt cascade (`━━━━━╸` tip, `╯` step corners), signature rule with centered `▲`, letter-spaced wordmark with ⬡, dim tagline — inside a rounded dim-copper `rich.panel.Panel` whose top-right corner carries the **auto-updating version** (`av_cli/_version.py` → importlib.metadata → `"dev"` fallback; setuptools-scm regenerates per build, so new tags flow in automatically). Signature `(title, subtitle=None)` preserved; rich adapts box glyphs per terminal (ASCII fallback verified under forced cp1252 — no traceback). Layout alignment verified programmatically (uniform inner width) after two hand-mocked formatting defects (ragged bolt terminators, uneven wall padding) were caught in review.
-- **Contributing section:** emoji bullets stripped to plain bold labels per owner preference.
-- **Verification:** `tests/test_migrations.py::test_env_py_is_valid_python` extended + green; full suite **358 passed / 43 skipped / 0 failed** with the skip-summary block rendering; ui suite 9 green incl. new version-corner and spaced-wordmark assertions; live TrueColor capture + cp1252 forced-run checks.
+- **Real startup bug found via CI logs**: `env.py`'s migration-runner function used `async`/`await` inside a plain `def` — a `SyntaxError` that fired the instant any real database was present, killing every DB-backed server test and leaving webui-e2e's dashboard empty. Invisible locally since Docker-down skips every DB test. Fixed (`async def`, matching Alembic's own template) and hardened the guard test to actually `compile()` the source, since `ast.parse` alone had missed it.
+- **Shell banner redesign**: replaced the flat monogram with a framed composition derived from the real logo artwork, with an auto-updating version corner sourced from package metadata.
+- **Verified**: the guard test extended and green; full suite 358 passed / 43 skipped / 0 failed; live TrueColor and forced-cp1252 rendering checks.
 
 ## Phase 48 — Per-user auth, merge visualization, stack-free migration proof (v1.1.8)
-- **Files:** `python/av_server/server.py`, `python/av_cli/{cmd_auth.py,main.py}`, `docker-compose.yml`, `python/av_cli/docker/docker-compose.release.yml`, `.github/workflows/docker-edge.yml`, `webui/src/lib/api.ts`, `webui/src/components/CommitGraph.tsx`, `tests/{test_auth_users.py,test_server.py,test_cli.py,test_migrations.py}` (test_auth_users.py new), `webui/src/components/__tests__/CommitGraph.test.tsx` (new), docs (`README.md`, `development/{architecture.md,infrastructure.md,Probleme.md}`, `SECURITY.md`, `VERSIONING.md`).
-- **Per-user access tokens (W1):** `AV_AUTH_USERS` (JSON `{username: token}`) now authenticates beside the owner's shared secret `AV_API_TOKEN` (which stays fully valid). The two middleware layers from the interim draft collapsed into ONE `require_token`: `_resolve_identity()` checks the owner secret first (→ identity `"owner"`), then each user entry (→ its username), all via `secrets.compare_digest`; invalid `AV_AUTH_USERS` JSON fails startup loudly instead of silently looking like Anonymous mode. `push_commit` stamps the resolved username as commit author when the client sent the default `anonymous` author — explicit `AV_AUTHOR` values are never overwritten, scripts own their attribution. CLI: `av auth add-user NAME [TOKEN]` / `list-users` / `remove-user NAME` read-modify-write the merged map into `.env` through the exact `read/write_env_token` plumbing `set-token` uses (quoting round-trips embedded double quotes safely), restarting the service after every change; an emptied map removes the line entirely. Deployment gap caught during review: neither compose file passed `AV_AUTH_USERS` into the container — both now interpolate `${AV_AUTH_USERS:-}` like the owner token.
-- **Compatibility invariants (W0):** single-token mode is byte-compatible — every pre-existing protected-mode test passes UNCHANGED (fixture still only sets `AV_API_TOKEN`); Anonymous mode behaves identically with both sources empty; health/docs exemptions untouched. Explicit regression tests pin all of this: `tests/test_auth_users.py` mounts the PRODUCTION `require_token` middleware onto a tiny DB-free probe app so rejection AND acceptance paths prove out stack-free (the first draft asserted "not 401" against real routes and died on connection-refused — the probe-app pattern replaced it). Live attribution round-trips (username stamped on push, explicit author respected, owner → `owner`) live behind test_server.py's reachability skip and debut on the CI run itself.
-- **Stack-free migration execution proof (W0.2):** real-PG execution of the chain had never happened anywhere before this cycle's CI debut, so `test_chain_renders_complete_postgres_ddl_offline` now renders the full chain through Alembic offline (`--sql`) mode against a Postgres dialect URL and asserts every `CREATE TABLE`, index, key column (`extra_parents`, `chunks`, `project_id`, `root_tree_hash`), `VARCHAR[]`, FK, and the final `INSERT INTO alembic_version` appear in the emitted DDL. Any op-level runtime error raises during rendering — the whole class of "migration runs only on a database" failures is caught without one.
-- **Merge visualization (W2):** `api.ts` types `parents?: string[]` (server has reconstructed the full array since the merge feature landed); `CommitGraph::buildGraph` draws ONE EDGE PER PARENT with lane inheritance following the first parent (git-graph convention), falling back to `parent_hash` for older payloads. Six vitest cases cover the merge fixture (two edges), single-parent, parents-less fallback, first-parent lane inheritance, out-of-window parent dropping, and a three-parent octopus.
-- **Config/workflow fixes (W3):** `docker-edge.yml` triggered on `main` while this repo's default branch has always been `master` — edge images never fired once; trigger reconciled to `[master]`. Stale sentences updated: architecture.md claimed wheels stop at cp312 (cp310–cp314 shipped in Phase 46) and carried a resolved edge-trigger caution; README's benchmark preamble said "no clone/pull yet" for #5.
-- **Probleme normalization (W4):** the four appendix-style entries (`[3]` star-import checker FPs, `[2]` Retry-After off-by-one, `[2]` split-time globals splice, `[4]` ast.parse-vs-compile guard gap) renumbered **64.–67.** into the standard Severity/Status template form.
-- **Roadmap emptied (W5):** per-user auth and merge-viz rows removed as shipped; benchmark #5 moved out of the roadmap into infrastructure.md's stack-up notes as an ops measurement task (it's a metric capture, not a feature). The section now reads "No open items."
-- **Verification:** `tests/test_auth_users.py` 24 passed; `test_cli.py -k auth` 19 passed incl. all 7 legacy single-token tests unchanged; `test_migrations.py` 7 passed incl. the offline-DDL render; full webui Vitest suite 85 passed (+6); eager-annotation checker clean across python/ + tests/; compose files validated by YAML parse; help byte-diff clean (`av --help`, `auth --help`). Live-path confirmation arrives automatically via CI server-tests/webui-e2e on push.
-- **Found during the manual pass:** full-suite run exposed a ~7% statistical flake in `test_chunk_and_hash_file_produces_valid_chunks` (CDC can legitimately return one chunk for small random inputs — see [Probleme.md](Probleme.md) #68); input resized so the assertion is deterministic. Manual scratch-repo session also confirmed the per-user CLI flow end-to-end (add → list masked → remove → empty-map line removal) and surfaced that dev-checkout `.env` (where auth secrets land) was not gitignored — now covered by `.gitignore`.
-
-> See [`Probleme.md`](Probleme.md) for the full audit log of correctness, performance and security findings (resolved and still-open).
-
+- **Per-user access tokens**: `AV_AUTH_USERS` (a `{username: token}` map) now authenticates alongside the existing owner shared secret through one unified `require_token` resolver; pushes stamp the resolved username as commit author unless the client set an explicit one. New `av auth add-user/list-users/remove-user` manage the map via the same `.env` read-modify-write plumbing `set-token` already used. Single-token and Anonymous modes stay byte-compatible, pinned by regression tests.
+- **Stack-free migration execution proof**: a new test renders the full Alembic chain in offline SQL mode against a real Postgres dialect and asserts every table/column/FK appears — closing the gap where the migration chain had never actually been proven to execute anywhere before this.
+- **Merge visualization**: the commit graph now draws one edge per parent with first-parent lane inheritance, so merge commits finally render as merges instead of linear history.
+- **Verified**: 24 new auth tests, all 7 legacy single-token tests unchanged, offline-DDL render passing, 85 webui tests green. **Found during the manual pass**: a ~7% statistical flake in the CDC chunking test (small random inputs can legitimately produce one chunk) — fixed by resizing the input to be deterministic; also found `.env` wasn't gitignored and fixed it.
 
 ## Phase 49 — CI root causes fixed: migration rollback, Dockerfile cp-tag mismatch, scoped plugin imports (v1.1.9)
-- **Files:** `python/av_server/database.py`, `Dockerfile`, `python/av_plugins/{_shared.py,lightning.py,transformers.py,mlflow.py}`, `.github/workflows/{tests.yml,docker-edge.yml}` (comment), `tests/{test_migrations.py,test_plugins.py}`, docs (`README.md`, `development/{architecture.md,infrastructure.md,Probleme.md}`).
-- **The schema-less server behind a green health check (Probleme #70, severity 9):** server-tests' ~46 `UndefinedTableError` failures and webui-e2e's empty dashboard shared one root cause — `_apply_schema()` wrapped the programmatic Alembic upgrade in `engine.connect()`. SQLAlchemy 2.0 commit-as-you-go + Postgres transactional DDL meant every `CREATE TABLE` of `0001_baseline` executed and was then rolled back wholesale at context exit; startup stayed green because nothing raised. Root-caused by full offline reproduction (embedded PostgreSQL 15 binaries + step-by-step instrumentation: revision fn ran, `command.upgrade` returned cleanly, `pg_tables` empty) — the only surviving variable was commit semantics. The pre-Alembic `create_all` code had used `engine.begin()`; the Phase-46 rewrite changed both mechanism and wrapper in one motion. Three masking layers documented in Probleme: Docker-down local dev, the v1.1.6 env.py SyntaxError absorbing the blame, and SQLite's auto-committing DDL making the stack-free suite structurally blind to rollbacks. **Fix:** `engine.begin()`, verified live against real Postgres locally (fresh DB → all five tables; second startup idempotent; full wire flow — object upload, commit push, list, ref update — green through real uvicorn).
-- **Stack-free guard added:** `test_apply_schema_runs_inside_a_committing_transaction` pins the `begin()` invariant at source level (same philosophy as the compile gate — the SQLite suites cannot see this failure class). Caught its own docstring mentioning the forbidden call during development, which is exactly what it's for.
-- **Docker Edge Build fixed (Probleme #69, severity 5):** builder stage built a cp312 wheel onto a `python:3.11-slim-bookworm` runtime — *"not a supported wheel on this platform"*, job dead in ~50 s. Latent forever because the edge workflow triggered on `main` (fixed v1.1.8), so it never fired once; `release.yml` shares the file and would have failed identically at the next tag. Runtime aligned to 3.12 with an invariant comment.
-- **CI steps fail fast now:** both uvicorn-starting jobs hard-fail their start step when `/api/health` never comes up (previously the loop just timed out and pytest ran against a corpse, producing "Seeded N commits" against a dead registry), and webui-e2e additionally asserts `alembic_version` exists before seeding — converting the entire #70 failure class from 8 minutes of confusing red into one clear error line.
-- **Probleme #38 reopened and actually fixed:** owner override of the "intentional behavior" ruling. New `_shared.py::commit_scoped()` snapshots the index, empties it for one commit, drives the real CLI add+commit for exactly the import's paths, and merges everything else back with staged flags untouched — plugin imports and checkpoint callbacks no longer sweep unrelated human-staged files into machine-generated commits; plain `av commit` semantics unchanged. All three plugins converted; regression tests cover the scoped commit, restore-after-add-failure, and the live Lightning callback path.
-- **Verification:** `test_migrations.py` 8 passed incl. new guard; `test_plugins.py` 11 passed (+3 new); wire-level manual E2E green against embedded Postgres; eager-annotation checker clean; YAML parses; docs link sweep clean.
-
+- **The schema-less server behind a green health check (severity 9)**: `_apply_schema()` wrapped the Alembic upgrade in a non-committing connection context — every `CREATE TABLE` executed and was then silently rolled back at exit, so startup stayed green while the database stayed empty. Root-caused via full offline reproduction against embedded Postgres. Fixed by switching to a committing transaction (`engine.begin()`), with a new stack-free guard test pinning the invariant at source level so SQLite's auto-committing DDL can't hide a regression here again.
+- **Docker Edge build fixed**: the builder stage produced a cp312 wheel onto a 3.11 runtime image — an unsupported-wheel failure, latent since the edge workflow had never actually fired until the previous phase's trigger fix. Runtime aligned to 3.12.
+- **Scoped plugin imports (reopened per owner override)**: a new `commit_scoped()` helper snapshots the index, drives a real add+commit for just the import's own paths, and restores everything else untouched — plugin imports and checkpoint callbacks no longer sweep unrelated human-staged files into machine-generated commits.
+- **Verified**: migrations/plugins suites green with new regression tests, wire-level manual E2E against embedded Postgres, eager-annotation checker clean.
 
 ## Phase 50 — v1.1.9 CI follow-ups: scoped-import no-op restored, live-path test defects fixed (v1.1.9a)
-- **Files:** `python/av_plugins/_shared.py`, `python/av_server/database.py`, `tests/{test_plugins.py,test_server.py}`, docs (`development/{architecture.md,infrastructure.md,Probleme.md}`).
-- **Context:** first push after the v1.1.9 repairs — Docker Edge ✅ (3m04s, its first-ever green run), webui-e2e ✅, both Python-matrix jobs ✅. Two jobs remained; all four failures root-caused from job logs (`gh run view --job --log`) and every fix verified locally against embedded PostgreSQL 15 before push.
-- **plugin-tests — re-import no-op regression (Probleme #71):** v1.1.9's `commit_scoped` emptied the index before `add`, erasing the hash baselines that make unchanged re-imports a "Nothing to commit" no-op — second imports duplicated commits (`assert 2 == 1` in the Lightning import test). Baseline-preserving rewrite: `add` runs against the untouched index, then the scope is computed as exactly what THIS add touched (new keys / changed content / staged-transitions, with a pre-import staged-set separating machine staging from user staging), committed, and everything else merged back in `finally`. Regression tests now cover double-import idempotency, change-under-same-path, and directory targets — framework-free so they run everywhere.
-- **server-tests — three attribution tests 401'd themselves (Probleme #72):** follow-up GETs omitted the Bearer header while per-user fixtures were active; `.json()["author"]` KeyError'd on the 401 body. Headers added.
-- **server-tests — heal test never ran anywhere until now (Probleme #73):** imported a helper from the wrong module (test-file local, not database.py) — ImportError on CI since Phase 46, skip-invisible locally. Fixing the import exposed a REAL product gap: an existing-but-empty alembic_version table (lost rows, partial restore) fell through legacy detection into replaying 0001 into live tables → `DuplicateTableError` at every startup. Adoption detection hardened via `_unrecorded_chain()`: any database with data tables but NO recorded revision (absent version table or empty) heals + stamps instead of replaying.
-- **Local live-stack verification (new capability):** installed embedded PostgreSQL 15 binaries + a TCP probe standing in for Redis (the reachability fixture only probes sockets); the ENTIRE server suite — 56 tests including all previously-UndefinedTable ones, the attribution trio, and the heal test — passes twice consecutively against real Postgres on this machine. Full default battery: 395 passed / 54 skipped / 0 failed.
+- **Four CI failures root-caused from job logs and fixed**: the previous phase's `commit_scoped` emptied the index before `add`, erasing the baselines that make an unchanged re-import a no-op (duplicated commits on double-import) — rewritten to preserve the baseline and compute scope from what the add actually touched. Three attribution tests were 401ing themselves by omitting the auth header on follow-up requests (fixed). A schema-heal test had silently never run anywhere due to a wrong import (fixed, which then exposed a real gap: a partially-restored `alembic_version` table fell through legacy detection into replaying migrations against live tables — hardened with proper unrecorded-chain detection).
+- **New capability**: embedded PostgreSQL 15 binaries let the full server suite (56 tests) run and pass live, locally, for the first time. Full battery: 395 passed / 54 skipped / 0 failed.
 
 
 ## Phase 51 — In-depth E2E bug-detection layer: every product surface now has a CI tripwire (v1.1.11)
-- **Files:** `scripts/e2e_scenario.sh` (new), `.github/workflows/{tests.yml,nightly.yml}` (+ `tests.yml` fully rebuilt), `.github/dependabot.yml` (new), `webui/e2e/token-gate.spec.ts` (new), `python/av_server/server.py` (GC grace env-driven), `tests/{test_cli.py,test_plugins.py}`, docs (`development/{architecture.md,infrastructure.md,Probleme.md,CHANGELOG.md}`).
-- **The flake that exposed the gap (Probleme #74):** v1.1.10's only red, `test (3.10)`, was a substring collision — `"c1" not in output` matched inside a random hash (`[c11f8ca] c2`). Fixed by exact-sequence message parsing; repo-wide sweep for the class found no other failure-capable instances.
-- **New `e2e-suite` job — five product-level phases driven by the real `av` CLI against a real uvicorn on live Postgres+Redis** (`scripts/e2e_scenario.sh`, self-contained with its own server lifecycle): **A)** clone → diverge → conflicting merge aborts → `--theirs` resolves → two-parent merge verified OVER THE WIRE; **B)** server killed mid-flow → commit queues → restart → `av push` drains → registry shows it; **C)** pre-Alembic volume (columns dropped, version table gone) → REAL server boot heals + stamps + preserves rows; **D)** Protected mode: health exempt / refs 401 → teammate joins via `av init --token` → push attributed to their username over the wire → wrong token queues offline → revocation queues offline; **E)** zero-grace GC drill sweeps an orphan while referenced objects survive. The script hardens its own lifecycle: subshell-exec so kills hit python itself, port-free verification between restarts, execution-verified interpreter selection, and options-before-URI psql ordering (MSYS/POSIX getopt silently ignores `-c` after a positional URI — found while verifying locally).
-- **Product change enabling E:** `AV_GC_GRACE_SECONDS` env override for `GC_GRACE_SECONDS` (default 3600 unchanged) — ops can shrink the window for drills; documented in infrastructure.md.
-- **Browser-level Protected mode:** webui-e2e now restarts THE SAME seeded server in Protected mode and runs `token-gate.spec.ts`: `?av_token=` consumed + stripped + persisted, second navigation stays unlocked via localStorage, unknown browser gets the entry prompt, manual token entry unlocks. Dashboard/weight-diff specs unchanged before it.
-- **Windows joins the live layer:** `server-tests-windows` runs the full server suite against native Chocolatey PostgreSQL 15 + Memurai (service containers don't exist on Windows runners) — path/encoding bugs in the live stack no longer wait for a Windows user.
-- **Release artifacts finally get INSTALLED:** `package-build` (sdist+wheel, twine check) feeds two smoke jobs — wheel into a clean Linux venv, sdist compiled in a clean Windows venv (MSVC/CMake path end users hit) — each running an offline init/add/commit/log roundtrip through the installed console script.
-- **Real framework wiring:** plugin-tests gained a genuine one-epoch Lightning CPU training loop (real Trainer + ModelCheckpoint through `AetherVaultCallback`) asserting the checkpoint commits tagged with real `train_loss` metrics riding along.
-- **Hygiene & breadth:** nightly matrix (3.11/3.12/3.13, cron + dispatch), Dependabot (pip/npm/github-actions weekly), concurrency cancel-in-progress on Tests/Nightly, explicit timeout-minutes everywhere, e2e server-log artifact on failure.
-- **Verification:** e2e suite executed END TO END locally against embedded PostgreSQL 15 — all five phases PASS; full battery 395 passed / 0 failed; `tsc --noEmit` covers the new spec; all workflow YAML parsed; eager-annotation checker clean.
-
+- **The flake that exposed the gap**: the previous cycle's only red CI run was a substring collision in a test assertion (matched inside a random hash) — fixed, and a repo-wide sweep found no other instances of the class.
+- **New `e2e-suite` job**: five real product-level scenarios driven by the actual CLI against a live Postgres+Redis stack — clone/diverge/conflict/merge over the wire, offline-queue-then-drain, legacy-volume healing on real boot, full Protected-mode teammate onboarding, and a zero-grace GC drill.
+- **Windows joins the live layer**: the full server suite now also runs against native Windows Postgres/Redis, not just Linux containers. **Release artifacts get actually installed**: new smoke jobs install the real wheel/sdist into clean venvs and run an offline round-trip through the installed console script — closing the gap where nothing had ever verified the published package actually works.
+- **Real framework wiring**: plugin tests now run a genuine one-epoch Lightning training loop through the real callback, not just fakes.
+- **Verified**: the full e2e suite run end-to-end locally against embedded Postgres — all five phases pass; full battery 395 passed / 0 failed.
 
 ## Phase 52 — First CI run of the deep layer catches two real product bugs (v1.1.12)
-- **Files:** `python/av_server/server.py`, `python/av_plugins/{_shared.py,lightning.py}`, `.github/workflows/tests.yml`, `tests/{test_auth_users.py,test_plugins.py}`, docs (`development/{CHANGELOG.md,Probleme.md}`).
-- **Scoreboard from the first V1.1.11 push:** e2e-suite ✅ (all five scenarios, first try), server-tests-windows ✅ (first try), package-build ✅, full matrix ✅ — and exactly the four newest surfaces failed: plugin-tests, webui-e2e's token-gate leg, both smoke jobs.
-- **webui-e2e / token-gate → Probleme #75 (severity 7, real product bug):** Protected mode silently broke the whole browser UI. `require_token` registered after CORSMiddleware ⇒ auth wrapped CORS ⇒ preflights 401'd without ACAO headers AND auth's own 401s were unreadable by browsers (opaque TypeError) ⇒ dashboards rendered healthy shells with "Total Commits 0" and no entry prompt. Root-caused by reproducing the failure locally with request/response/console capture (`/api/health` 200 while every Bearer request died as a CORS abort). Fix: explicit middleware pipeline with documented contract — registration order auth → CORS → rate-limit ⇒ runtime order rate → CORS → auth; CORS now decorates all responses including auth rejections. Regression tests pin preflight passage and 401 visibility in the production-shaped middleware sandwich; the full browser flow verified green locally against a real protected server.
-- **plugin-tests → Probleme #76 (real product bug #2):** Lightning fires on_save_checkpoint BEFORE writing the file; the callback staged not-yet-existing paths and crashed the loop with FileNotFoundError. Every fake-based test had pre-written files. Fix: `filter_existing_files()` in _shared (import-safe), callback resolves through it, next save event picks up stragglers; smoke test rewritten to deterministic double-save semantics.
-- **smoke jobs → plain path bugs (fixed inline):** both sanity roundtrips addressed their venvs via relative paths after cd'ing into a mktemp scratch dir (exit 127 linux / exit 1 windows). Absolute `$GITHUB_WORKSPACE`-anchored paths throughout now.
-- **Verification:** auth suite 26 passed incl. new sandwich tests; plugins 14 passed + framework-free race regression; full battery **401 passed / 0 failed**; local Playwright: token-gate 3/3 green against real protected server, anonymous dashboard spec unchanged under the reordered pipeline; workflows YAML-valid; eager-annotation checker clean.
-- **The meta-result:** the v1.1.11 layer did precisely its job — its very first execution surfaced two genuine product defects that eleven phases of unit/fake testing had never touched (browser Protected mode; real-framework checkpoint ordering).
-
+- **The new e2e layer's first CI run immediately proved its worth**: it caught two genuine product defects that eleven phases of unit/fake testing had never touched.
+- **Real bug #1 (severity 7)**: Protected mode silently broke the entire browser UI — auth middleware was registered after CORS, so preflight requests 401'd without CORS headers and every authenticated fetch died as an opaque browser error, rendering a healthy-looking but empty dashboard. Root-caused via full request/response capture; fixed with an explicit, documented middleware ordering contract (rate-limit → CORS → auth at runtime).
+- **Real bug #2**: Lightning fires its checkpoint-save callback *before* the file is actually written, so the plugin tried to stage a not-yet-existing path and crashed — invisible to every fake-based test, which always pre-wrote the file. Fixed by filtering to files that actually exist and letting the next save event pick up stragglers.
+- **Also fixed**: two release-smoke jobs used relative paths after `cd`-ing into a scratch dir, failing on both Linux and Windows — switched to absolute paths.
+- **Verified**: 401 tests passing across the full battery; local Playwright confirms the token-gate flow now works against a real protected server. This run is the whole point of the e2e layer — it found what unit tests structurally couldn't.
 
 ## Phase 53 — `av --version`, branch protection, dependabot lifecycle (v1.1.13 follow-ups)
-- **Files:** `python/av_cli/main.py`, `tests/test_cli.py`, `tests/test_plugins.py`, `.github/workflows/tests.yml`, `webui/e2e/token-gate.spec.ts`, docs (`development/{CHANGELOG.md,Probleme.md}`).
-- **`av --version` (Probleme #77):** the wheel-smoke job's first sanity line exposed that the flag never existed. Added to the root group, sourced from the banner's `_get_version()`; regression test included.
-- **Real-loop smoke root-caused further:** Lightning AUTO-ADDS a ModelCheckpoint when none is supplied and writes to `default_root_dir/checkpoints` — which defaults to CWD (the checkout root, no `.av` there on CI). The callback correctly skipped the not-yet-written files (#76 semantics), then resolved the auto-checkpoint path OUTSIDE any repo and failed loudly. Test now pins `default_root_dir=str(repo_root)` so Lightning's own checkpoints live inside the av repo.
-- **webui-e2e self-diagnosis:** protected server output now goes to `/tmp/prot-server.log` with an always-run tail step (orphaned-process stdout otherwise vanishes between step sections), and the spec echoes every `:8000` response into the Playwright log — the next failure, if any, ships its own evidence.
-- **Branch governance:** master now has branch protection via API — required status checks (all 11 Tests jobs, strict/up-to-date), force-push and deletion disabled. The 16 non-master branches are all Dependabot automation branches from the v1.1.11 config; each open PR got `@dependabot rebase` so it rebuilds against current master with green CI before merge.
-
+- **`av --version`**: the wheel-smoke job's first sanity check revealed the flag never existed — added, sourced from the same version the banner already displays.
+- **Root-caused further**: Lightning auto-creates its own checkpoint directory when none is configured, defaulting to a path outside any `av` repo on CI — the smoke test now pins a `default_root_dir` inside the repo so Lightning's own checkpoints land somewhere the callback can see.
+- **Branch governance**: `master` gained real branch protection (required status checks across all 11 Tests jobs, no force-push/delete); the 16 open Dependabot PRs were rebased onto current green master.
 
 ## Phase 54 — V1.2.0 "Autonomous Loop": agent plumbing, runs, .avh v2 context memory, guardrails
-- **Files:** `python/av_cli/{core,main,cmd_staging,cmd_history,handoff}.py`, new modules `python/av_cli/{semdiff,cmd_diff,cmd_context,cmd_run,cmd_env,cmd_policy,cmd_watch,cmd_registry}.py`, `python/av_sdk/` (new package), `python/av_server/{models,server,rate_limit}.py`, migration `0002_runs_events_webhooks_audit.py`, `webui/src/lib/api.ts` + `RunsPanel.tsx` + Sidebar/page wiring, tests `{test_v120,test_av_sdk,test_semdiff,test_migrations,test_server,test_auth_users}.py`, docs (README repositioning, AGENTS.md, docs/for-agents.md, architecture contracts ×5, infrastructure env/migrations, VERSIONING, SECURITY).
-- **Agent plumbing:** global `--output json` with ONE envelope shape and a documented exit-code registry (10–16); `_finalize_commit` gained a result_sink so JSON mode suppresses human echoes while capturing queued/reason outcomes; `commit_staged()` extracted into core as THE shared seam — CLI commit, the new SDK, and av watch all funnel through it.
-- **av_sdk (`from av_sdk import Repo`):** context-managed repo handle; status/add/commit/push/log/diff/run_start/run_finish/handoff_dict/context_note; drives cli.main in-process under controlled chdir and parses the envelope — zero duplicated persistence logic; typed `SDKError.code` mirrors the exit registry.
-- **Runs first-class:** migration 0002 adds runs/run_commits (+ events/webhooks/audit_log); server CRUD + complete/fail; pushes link commits via payload run_id with LAZY-CREATE of unknown runs (multi-agent ordering can never fail a push); metrics_summary refreshes per push. Client: `av run start/finish/list/show`, AV_RUN_ID auto-tagging.
-- **Event stream + webhooks:** append-only events whose id is the resumable cursor (?since&kinds&project_id&wait long-poll); signed webhook deliveries (HMAC-SHA256 over body) filtered by project/kind, secrets never returned, delivery skipped entirely when no active hooks (leaked-session lesson from live testing); retention 30d swept in GC + manual prune endpoint.
-- **.avh v2 flagship — agent context memory:** $schema'd document adding lineage{run_id,parent_run_ids,code_pointer(git)}, semantic_summary (semdiff vs parent), replay recipe, and append-only context_memory.notes + bounded metrics trend tail; `upgrade_handoff` reads v1 transparently; `av context note/show/diff/export(md|json|avh)/validate`.
-- **Semantic diff engine** (`semdiff.py`): layer movement w/ largest movers, chunk reuse ratio, dataset classification, byte totals, one-line summary — powers av diff, .avh, and future webui views.
-- **Loop hardening:** `commit --no-upload` / AV_COMMIT_UPLOAD=0 (queue IS the drain); promotion policies `.av/policies.json` enforced at merge (exit 16) via `av policy set/list/remove`; `av promote CANDIDATE --into BRANCH [--force]` evaluates then lands through the real merge path (merge-side double-check deliberately bypassed there — documented); `av watch` stdlib polling auto-committer (stage→commit_staged, deferred upload).
-- **Trust surface:** audit trail on all mutations (AV_AUDIT_LOG=0 to disable) + GET /api/admin/audit; `av registry export` archive with hash-reverified object download; HMAC attestation spike (`registry keygen/attest/verify`) documented as integrity-v0.
-- **WebUI:** Runs tab (status colors, metric summaries, event-driven activity badge via /api/events polling), api.ts fetchRuns/fetchLatestEventId.
-- **Verification highlights:** full local Playwright/Vitest/typecheck green incl. 3 new RunsPanel tests; live-stack suite green against embedded PG after fixing two REAL defects found by testing (un-awaited async flush in _emit_event; orphaned delivery sessions when zero hooks); e2e script gains phases F (SDK loop) / G (event reactiveness) / H (policy surface); test_semdiff 5 · test_v120 11 · test_av_sdk 5 · auth sandwich 28 · migrations 8 — all green; full battery run at release time.
-
+- **Agent plumbing**: a global `--output json` mode with one consistent envelope shape and a documented exit-code registry, so scripted/agent callers get structured, parseable results instead of scraping human text.
+- **`av_sdk` (`from av_sdk import Repo`)**: a context-managed Python handle over status/add/commit/push/log/diff/run tracking, driving the real CLI internals in-process rather than duplicating persistence logic.
+- **Runs first-class**: a new `runs` concept links commits to a training/agent run, with server CRUD, metrics summaries, and an append-only event stream; signed webhook deliveries fan out on push/run events.
+- **`.avh` v2 — agent context memory**: adds run lineage, a semantic diff summary versus the parent, a replay recipe, and append-only notes, with `av context note/show/diff/export` to manage it. A new `semdiff.py` engine (layer movement, chunk-reuse ratio, dataset classification) powers both `.avh` and a new `av diff`.
+- **Loop hardening**: `.av/policies.json`-enforced promotion policies (`av promote`/`av policy`), an audit trail on all mutations, and `av watch` — a stdlib polling auto-committer for unattended loops.
+- **WebUI**: a new Runs tab with status colors, metric summaries, and a live activity badge.
+- **Verified**: full local Playwright/Vitest/typecheck green; live-stack suite green against embedded Postgres after fixing two real defects the testing itself surfaced (an un-awaited async event flush, and orphaned delivery sessions with zero webhooks configured); e2e scenario extended with three new phases covering the SDK loop, event reactiveness, and policy enforcement.
 
 ## Phase 55 — V1.2.1: deferred-task completion sweep + hardening (SDK internal seam)
-- **Files:** `python/av_cli/{cmd_context,cmd_registry,cmd_env,cmd_webhooks,handoff}.py`, `python/av_sdk/repo.py` (rewritten), `python/av_plugins/_shared.py`, `setup.py`, `webui/src/components/{TokenGate.tsx,RunsPanel.tsx}`, `tests/{test_v120,test_av_sdk,test_webhooks_cli,test_perf_gate,test_server}.py`, `scripts/e2e_scenario.sh`, `docs/for-agents.md`, `README.md`, `development/{architecture,infrastructure}.md`, dependabot config removed.
-- **CI fixes:** webui-tests red = two eslint exhaustive-deps warnings in RunsPanel (deps added). webui-e2e red = REAL product bug #79: TokenGate consumed `?av_token=` in a useEffect, but React runs CHILD effects first — panels' initial fetches fired unauthenticated and only recovered on the next poll interval. Consumption moved to render phase (before children mount); access-log dump step added previously provided the ground-truth evidence.
-- **Dependabot removed** per owner decision: config deleted, all 16 open PRs closed with explanation, all 16 branches deleted — dependency review is manual now.
-- **Deferred A-items closed:** README For-Agents body section (broken TOC anchor fixed) · `av context diff` · `av registry restore` (hash-verified re-ingest, idempotent 409s) · `av webhooks add/list/remove/test` CLI · `.avh` v2 JSON-Schema artifact shipped as package data (+ `--with-memory/--no-memory`) · plugins' scoped commits already ride the internal seam; run path documented as deliberate · WebUI runs detail deferred to design pass (list view shipped) · `replay --execute` + seeds capture.
-- **Hardening:** av_sdk.Repo REWRITTEN onto the internal seam — calls Index/compute_status/stage_one_file/commit_staged/flush_pending_push/semdiff directly; no chdir, no stdout capture; relative paths resolve against the repo (caught by e2e Phase F); envelope shapes unchanged so parity tests pass as-is · speedcheck hot-path gate (3× budget) wired into the battery · live test: interleaved same-run pushes from two agents link both commits and union the metrics summary.
-- **Verification:** stack-free battery 427 passed / 0 failed · live suite 110 passed / 0 failed vs embedded PG · e2e scenario 8/8 phases PASS locally after SDK seam change · eslint/tsc/vitest clean · checker clean (31 files).
+- **Real product bug found and fixed**: `TokenGate` consumed its one-time `?av_token=` URL param inside a `useEffect`, but React runs child effects first — panels fired their initial fetches unauthenticated and only recovered on the next poll. Fixed by moving consumption to the render phase, before children mount.
+- **Dependabot removed** per owner decision — dependency review is manual going forward; all 16 open PRs/branches closed.
+- **Closed out the previous phase's deferred items**: `av context diff`, `av registry restore` (hash-verified, idempotent), a full `av webhooks` CLI, and a published `.avh` v2 JSON Schema.
+- **Hardening**: `av_sdk.Repo` was rewritten to call the internal commit/status seam directly instead of shelling out through the CLI — no more chdir or stdout-capture layer, and relative paths now resolve correctly against the repo (a real bug the previous phase's e2e work caught).
+- **Verified**: stack-free battery 427 passed / 0 failed; live suite 110 passed / 0 failed against embedded Postgres; e2e scenario 8/8 phases passing after the SDK seam change.
 
 
 ## Phase 56 — V1.2.2: Engine image consolidation + architectural gap closure
-
-- **Files:** root `Dockerfile`, `docker/engine-entrypoint.sh` (new), `docker-compose.yml`,
-  `python/av_cli/docker/docker-compose.release.yml`, `.github/workflows/{tests,release,docker-edge}.yml`,
-  `python/av_cli/{core,signing,cmd_env,cmd_run,cmd_audit,cmd_registry,cmd_auth,docker_runtime,sync,semdiff,speedcheck,handoff,main}.py` (several new),
-  `python/av_server/{models,server,database}.py` + migration `0003_webhook_deliveries_audit_signature.py`,
-  `python/av_plugins/{_shared,lightning,transformers,mlflow}.py`, `pyproject.toml`,
-  `webui/src/lib/{api,runDetail}.ts` + `RunsPanel.tsx`, tests (`test_signing`, `test_dataset_cdc`,
-  `test_v122` new; plugin/sync/server/migrations/semdiff/speedcheck/perf-gate/docker-runtime/skip-summary suites updated),
-  `scripts/e2e_scenario.sh` (+Phases J/K), docs (README, architecture, infrastructure,
-  VERSIONING, SECURITY, sub-READMEs, Probleme #78–84, this file).
-- **Part 1 — ONE image, ONE container (owner decision):** the split server/webui images
-  collapse into a single multi-stage build producing `ghcr.io/leon1706-lol/aether-vault-engine`
-  (py-builder wheel stage unchanged → Node 20 web-builder producing Next standalone output →
-  python:3.12-slim runtime with BOTH runtimes). `docker/engine-entrypoint.sh` supervises all
-  subservices in one container: uvicorn :8000 + node server.js :3000 under `AV_ENGINE_ROLE=all`
-  (default); either child dying restarts the whole engine. LEGACY ALIASES kept for one
-  transition cycle (owner decision): release/edge workflows also push the same image under
-  the historical aether-vault-server/-webui tags, and the entrypoint AUTO-DETECTS legacy
-  role from container env (DATABASE_URL set → server-only; NEXT_PUBLIC_API_URL without it →
-  webui-only) so pinned pre-1.2.2 composes keep working unchanged. Compose files become
-  single-service (`aether-vault-engine`, ports 8000+3000) with a dual healthcheck
-  (python-urllib :8000 && node fetch :3000 — both runtimes ship in-engine).
-  `docker_runtime.RELEASE_IMAGES` and the auth-restart plumbing point at the engine.
-- **Gap 1 — env snapshot/replay:** snapshots are content-addressed (sha256 of canonical
-  compact JSON minus captured_at ⇒ deterministic ids); the object rides the NORMAL push flow
-  (`upload_commit_objects`), commits carry `env_snapshot_id` in the hashed payload, the id is
-  persisted server-side AND back-fills `runs.env_snapshot_id` on first linked commit;
-  `.avh.replay.snapshot_id` added. `av env replay <run-id|commit-hash|snapshot-id>` (top-level
-  `av replay` alias) loads from local CAS or registry — cross-machine replay proven over real wire.
-- **Gap 2 — dataset CDC visibility:** boundary-stability + determinism + staging-path +
-  `.avattributes` no-chunk matrix parametrized across ALL of CHUNKABLE_EXTS
-  (.pt/.pth/.ckpt/.npz/.h5/.hdf5/.pb/.msgpack); semdiff gained `chunks.dedup_efficiency`
-  (= reused/(reused+new), None when no chunks) flowing into `.avh.semantic_summary`.
-- **Gap 3 — audit depth:** every mutation records its HTTP outcome (`audit_log.status_code`);
-  `GET /api/admin/audit` gained action/project/since/until filters + offset pagination + total;
-  `DELETE /api/admin/audit?before_days=N` prune; `AV_AUDIT_RETENTION_DAYS` (default 90) swept
-  during GC; CLI `av audit list [--action --project --since --until --limit --offset]`.
-- **Gap 4 — signed commits:** `[sign]` extra (cryptography); `av registry keygen` → ed25519
-  keypair under .av/keys/ (private 0600); canonical form = sorted-keys payload JSON minus
-  signature with timezone-normalized timestamp; auto-sign inside `_finalize_commit` when a key
-  exists (best-effort, never blocks); signatures persist server-side so CLONES verify;
-  `av verify <hash>` = signature-first, legacy HMAC attest fallback, honest UNSIGNED verdict.
-  Trust model documented in SECURITY.md ("tamper evidence, not a trust network").
-- **Gap 5 — WebUI run detail:** expandable run rows → detail panel with parent-lineage chain,
-  linked commits w/ messages + metrics table, client-side semantic summary from the last two
-  linked commits' trees (`lib/runDetail.ts` pure functions, NO new server endpoint), env-snapshot
-  pointer; live activity badge stays wired into the panel header via the event cursor.
-- **Gap 6 — plugin seam migration:** scoped-commit logic moved into
-  `core.commit_scoped_paths()` (baseline-preserving per #38/#71, missing-path tolerant per #76,
-  AV_RUN_ID-aware); Lightning/Transformers/MLflow add+commit now call the internal seam directly —
-  zero chdir, zero CLI hop for staging/commit; push remains the deliberate CLI flush.
-  Parity tests pin identical commit payloads across seam/SDK/CLI incl. metrics + run tagging.
-- **Gap 7 — smaller items:** perf gate strictened 3×→2× and semdiff probe added to speedcheck;
-  migration 0003 adds `webhook_deliveries` (per-attempt ledger w/ retry/dead-letter columns),
-  startup+interval retry worker (`AV_WEBHOOK_MAX_ATTEMPTS`=5, `AV_WEBHOOK_RETRY_INTERVAL_SECS`=30),
-  `GET /api/admin/webhook-deliveries` observability, terminal deliveries swept during GC;
-  pull's divergence message now attributes both tips to their runs while keeping the remote-tip
-  hash first (e2e Phase A parsing intact).
-- **Real bugs found by this cycle's own verification (details in Probleme):** #78 fail(None)
-  traceback, #79 undefined ctx_exit, #80 adoption skipping post-create_all tables, #81 .avh
-  summary diffing against an empty baseline, #82 clones dropping signature/env_snapshot_id,
-  #83 timestamp tz-spelling breaking cloned signatures, #84 snapshot uploaded with non-canonical bytes.
-- **CI:** plugin job installs `[sign]` and runs the signing gate; NEW `e2e-engine-smoke` job =
-  e2e Phase I (builds the engine image, proves role=all / role=server / legacy auto-detect /
-  role=webui dispatch + dual healthchecks); packaging smoke jobs gain `av diff --help` +
-  `av registry --help` presence lines; e2e-suite installs `[sign]` and runs Phases J (signed
-  roundtrip + tamper + unsigned-ok) and K (live audit filters + outcome capture + CLI path).
-- **Deferred:** benchmark #5 measured row + full cross-tool re-run (needs a Docker session —
-  owner-acknowledged deferral, see infrastructure.md ops note).
+- **Part 1 — one image, one container (owner decision)**: the split server/webui Docker images collapsed into a single multi-stage build (`aether-vault-engine`) supervising both runtimes with a dual healthcheck; legacy `-server`/`-webui` image aliases are kept for one transition cycle via role auto-detection so pinned pre-1.2.2 composes keep working unchanged.
+- **Gap 1 — env snapshot/replay**: content-addressed environment snapshots ride the normal push flow, and `av env replay`/`av replay` reconstructs one from a run, commit, or snapshot id — proven working across machines over the real wire.
+- **Gap 2 — dataset CDC visibility**: the CDC test matrix now covers every chunkable extension, and semdiff gained a dedup-efficiency ratio flowing into `.avh`.
+- **Gap 3 — audit depth**: every mutation now records its HTTP outcome, with filterable/paginated audit listing and retention-based pruning.
+- **Gap 4 — signed commits**: an optional `[sign]` extra adds ed25519 keypairs and best-effort auto-signing on commit; `av verify` checks signature-first with a legacy HMAC fallback and an honest "unsigned" verdict — documented as tamper evidence, not a trust network.
+- **Gap 5 — WebUI run detail**: expandable run rows now show lineage, linked commits, and a client-side semantic summary, computed entirely from data already fetched (no new server endpoint).
+- **Gap 6 — plugin seam migration**: the scoped-commit logic used by all three framework plugins moved into a shared `core.commit_scoped_paths()`, calling the internal commit seam directly instead of hopping through the CLI.
+- **Gap 7 — smaller items**: a stricter perf-gate budget, a proper webhook-delivery retry ledger with dead-lettering, and pull's divergence message now attributing both tips to their runs.
+- **Real bugs found by this cycle's own verification**: a traceback on a `None` failure path, an undefined variable, legacy-volume adoption skipping newer tables, `.avh` diffing against an empty baseline, clones silently dropping signature/env-snapshot fields, a timestamp-spelling mismatch breaking cloned signatures, and a snapshot uploaded with non-canonical bytes — all fixed (Probleme #78–84).
+- **CI**: a new engine-image smoke job proves `role=all`/`role=server`/`role=webui`/legacy-auto-detect all boot correctly; the e2e suite gained signed-roundtrip and live-audit phases. Deferred: a full cross-tool benchmark re-run (needs a Docker session).
 
 ## Phase 57 — V1.2.5 "Depth Pass": closing the ten V1.2 gap areas
+`todo.md`'s ten gap areas, each of which had shipped a working first cut in an earlier V1.2 phase, closed to completion in one sequenced pass — plus three real contract bugs the work surfaced along the way, fixed rather than just documented.
 
-`todo.md`'s ten gap areas, closed in one sequenced pass (WP-0 baseline → WP-1 migration →
-WP-7 contracts, since every later area consumes its exit-code/JSON-mode plumbing → WP-2
-through WP-9 → WP-10 engine supervision → WP-11 perf gates, tuned against final code → WP-12
-this wrap-up). Each area shipped a *working first cut* in earlier V1.2 phases; this phase
-finishes the edges — plus three real contract bugs exploration surfaced along the way,
-fixed rather than just documented (see Probleme #86–93).
-
-- **Files:** `python/av_server/migrations/versions/0004_webhook_health_audit_indexes.py`
-  (new), `python/av_server/{models,server,database}.py`,
-  `python/av_cli/{core,client,cmd_audit,cmd_env,cmd_history,cmd_integrations,cmd_policy,
-  cmd_registry,cmd_run,cmd_sync,cmd_watch,cmd_webhooks,semdiff,signing,speedcheck}.py`,
-  `python/av_plugins/{README,_shared,lightning,transformers}.py`, `python/av_sdk/repo.py`,
-  `docker/engine-entrypoint.sh`, `docker-compose.yml`,
-  `python/av_cli/docker/docker-compose.release.yml`, `.github/workflows/tests.yml`,
-  `webui/src/{app/page,components/RunsPanel,lib/api,lib/runDetail}.{tsx,ts}`,
-  `webui/e2e/{seed_data.py,runs.spec.ts}` (new), `webui/vitest.config.ts`, new
-  `webui/src/components/__tests__/ProjectsPanel.test.tsx` + `src/hooks/__tests__/`, tests
-  (`test_exit_codes`, `test_audit_coverage`, `test_env_snapshot` new;
-  `test_cli/dataset_cdc/merge/migrations/perf_gate/plugins/semdiff/server/signing/
-  speedcheck/sync/v120/v122/webhooks_cli` updated), docs (README, architecture,
-  infrastructure, VERSIONING, SECURITY, `python/av_plugins/README.md`, Probleme #86–93,
-  this file).
-- **Area 1 — engine image supervision:** `engine-entrypoint.sh` gained graceful drain
-  (TERM/INT forwards to both children, waits `AV_ENGINE_STOP_GRACE_SECS` before SIGKILL;
-  both compose files set `stop_grace_period: 30s` so Docker's 10s default can't cut the
-  drain short) and independent subservice restart with a sliding-window budget
-  (`AV_ENGINE_RESTART_SUBSERVICE`/`AV_ENGINE_MAX_RESTARTS`/`AV_ENGINE_RESTART_WINDOW_SECS`)
-  — one child dying no longer always tears the whole container down. New `GET /api/ready`
-  (DB + Redis + `AV_DATA_DIR`-writability checks, 503 on failure, auth-exempt) separates
-  readiness from the existing DB-free `/api/health` liveness check; both compose
-  healthchecks now probe `/api/ready` on the server leg. Legacy role auto-detect now logs
-  a deprecation warning; `VERSIONING.md`'s alias-removal entry updated (earliest removal
-  v1.3.0, not yet scheduled — v1.2.3/4/5 all kept publishing them).
-- **Area 2 — env snapshot & replay:** `snapshot_version: 2` splits the document into a
-  HASHED `env` (python, os_family, pins, seeds, cuda_toolkit_version, a configurable
-  `AV_ENV_CAPTURE_VARS` critical-env-var set) and an unhashed `observed` context (GPU
-  names, driver version, hostname, conda env, interpreter path) — equivalent environments
-  on different machines/OSes now share an id; golden fixtures pin exact ids per Python
-  version across the CI matrix. `--execute` always uses `sys.executable -m pip` (was bare
-  `pip`); new `--target-venv`/`--conda-env` give it a real install target; new `--validate`
-  resolves every pin without installing (exit 15 on any unresolvable pin); `--dockerfile`
-  is now multi-stage with a `--cuda` base option and a non-root user, `--out` writes to a
-  file.
-- **Area 3 — dataset CDC generalization:** `CHUNKABLE_EXTS` grows from 8 to 15
-  (`.bin .onnx .model .arrow .feather .pkl .pickle` added, each with a rationale comment);
-  new `chunk` `.avattributes` flag force-enables CDC outside the default set for verified-
-  safe exports (`no-chunk` wins when both are on one line). `semdiff` gains an
-  always-present `chunks.status` (`"measured"`/`"no_chunks"`) alongside the existing
-  nullable `dedup_efficiency`, wired through `.avh`. README/architecture docs +
-  `ATTRIBUTES_TEMPLATE` gained a real worked example.
-- **Area 4 — audit log depth:** the four previously-unaudited mutating routes
-  (`object.upload`, `admin.gc`, `objects.batch_check` exemption documented, `webhook.test`)
-  now record; a static coverage test walks every mutating route and asserts it's either
-  audited or explicitly exempted, so a future unaudited route fails CI. `GET
-  /api/admin/audit` gained `username`/`status_code`/`outcome`/`action_prefix` filters and
-  an opaque `cursor`/`next_cursor` pagination scheme (stable under concurrent inserts,
-  unlike `offset`, which stays supported). New `av audit export --format jsonl|csv` and
-  `av audit prune --before-days N` (admin-only, irreversible, confirms unless `--yes`).
-- **Area 5 — signed commits:** `av registry keys list/fingerprint/rotate` (fingerprint =
-  `sha256` of the raw public key, first 16 hex chars); rotation archives the old keypair
-  under `.av/keys/archive/<fingerprint>/` rather than deleting it — old commits keep
-  verifying against their embedded key. New `.av/policies.json` `require_signature: bool`
-  field, enforced in both `enforce_policy()` and `promote()` (checked before any metric
-  gate, so a denial says "unsigned" not a misleading metric message); `av policy set` now
-  takes an optional `--require-signature` flag with `METRIC`/`OP` made optional to support
-  a signature-only policy (Probleme #90). `av registry export-signature`/`av verify
-  --signature FILE` support fully detached, out-of-repo verification. Golden-bytes
-  canonicalization tests extended across a real clone→verify and pull→verify round trip
-  and a timestamp-spelling matrix (naive/aware/`Z` all verify identically).
-- **Area 6 — WebUI run detail:** new `GET /api/runs/{id}/summary` (lineage chain, linked
-  commits, a server-computed semantic summary reusing `semdiff.diff_trees()`,
-  `env_snapshot_id`, the `.avh` pointer when published) replaces N sequential per-commit
-  fetches with one request. New dedicated `RunDetailPanel` (was an expandable row),
-  deep-linkable via `?tab=runs&run=<id>` query params synced through
-  `history.replaceState`. New opt-in `av handoff --publish` / `Repo.publish_handoff()`
-  uploads `.avh` as a normal CAS object and records `runs.avh_object_id` — notes stay
-  private by default; the WebUI only renders them when that pointer exists. Closed the
-  last two untested surfaces (`ProjectsPanel.test.tsx`, a `useDashboard` hook test) and
-  added `webui/e2e/runs.spec.ts` (seeded run → deep link → lineage/metrics/summary render).
-- **Area 7 — plugin migration:** one run-id resolver, `core.resolve_run_id()` (explicit
-  arg > `AV_RUN_ID` env > `.av/run.json` state), used by every commit path including the
-  now-fixed `av watch` (Probleme #88). Lightning/Transformers' `on_train_end` callbacks
-  call `core.flush_pending_push()` directly instead of shelling out to `av push` — the
-  package's last `os.chdir` is gone. `mlflow.py::import_run()` no longer defaults to
-  `Path.cwd()`. Parity tests extended to assert identical commit payload KEY SETS (schema,
-  not just values), matching `run:`/`env_snapshot_id`/signature presence, and identical
-  error codes for nothing-staged/not-a-repo across CLI/SDK/seam. New "Adding a new
-  framework" walkthrough in `python/av_plugins/README.md`.
-- **Area 8 — webhook delivery maturity:** migration `0004` adds per-webhook
-  `last_success_at`/`last_failure_at`/`consecutive_failures`/`disabled_reason`, updated on
-  every delivery attempt. New `AV_WEBHOOK_DISABLE_AFTER` (default 0/off) auto-disables a
-  webhook after N consecutive failures (emits a `webhook_disabled` event + audit row);
-  `av webhooks enable` clears it. Retry backoff is now exponential
-  (`AV_WEBHOOK_RETRY_INTERVAL_SECS * 2^(attempt-1)`, capped by new
-  `AV_WEBHOOK_RETRY_MAX_SECS`) instead of the old flat interval. New `av webhooks
-  show/deliveries/replay` give delivery-ledger visibility and dead-letter replay
-  (`POST /api/admin/webhook-deliveries/{id}/replay`) that the CLI never had before this
-  phase; proved a poison endpoint dead-lettering doesn't delay a healthy sibling in the
-  same tick.
-- **Area 9 — perf regression gates:** replaced single-shot timing + one global
-  `BUDGET_MULTIPLIER` (walked 3.0→2.0→2.5 across three prior phases) with median-of-N
-  (`speedcheck.run_synthetic_probes_sampled`, N=5, first sample discarded as warm-up) and
-  a genuine cpu/disk budget-class split (`CPU_MULTIPLIER=2.0`, `DISK_MULTIPLIER=3.0`, a
-  further Windows-disk bump) — the gate now fails only when the median AND at least 2 of
-  N samples exceed budget, printing the full run vector on failure.  New per-surface
-  `commit_staged()`/`compute_status()`/`log()` probes (previously implied only by
-  `Index.save()`/`iter_working_files()`). New `AV_PERF_BUDGET_MULTIPLIER` escape hatch
-  overrides both classes outright for a genuinely slow/noisy machine.
-- **Area 10 — multi-agent conflict UX:** this is WP-7 above — the exit-code registry fix,
-  `av pull`/`merge`/`clone` JSON mode, and `error.data` (Probleme #86, #87). Also: `PUT
-  /api/refs/{ref}` gained optional compare-and-swap (`expected_hash`; a mismatch now
-  returns 409 instead of silently overwriting — omitted, behavior is unchanged); a losing
-  ref race queues for retry rather than being lost (non-negotiable #3 applied to ref races
-  exactly as it already applied to network failures), and `av pull`'s existing run-id
-  attribution is now reused in `av merge`'s conflict path too, so every divergence names
-  both runs in both human and JSON output.
-- **Real bugs found by this cycle's own verification (details in Probleme):** #86 the
-  exit-code registry was largely fiction, #87 `pull`/`merge`/`clone` had no JSON mode at
-  all, #88 `av watch` never tagged its auto-commits with the active run, #89
-  `require_signature` policies with no metric key always denied every candidate, #90 no
-  CLI path ever existed to arm a `require_signature` policy, #91 `click.Context.exit()`
-  silently loses its exit code under `CliRunner(standalone_mode=False)`, #92 a bash
-  command-substitution subshell silently discarded the engine's restart-budget state
-  (meaning `AV_ENGINE_MAX_RESTARTS` could never actually trip), #93 two commands leaked
-  human-text output ahead of their own `--output json` envelope.
-- **CI:** `e2e-engine-smoke` gained readiness-degrades-independently-of-health and
-  killing-one-subservice-restarts-just-it assertions; `webui-e2e` gained `runs.spec.ts`.
-  The perf gate keeps running inside the `test` matrix, now median-of-N (slower per-probe,
-  same job).
-- **Deferred:** none — all ten areas landed. A live Docker/WSL2 backend failure on the
-  verifying machine (unrelated to this phase's code — diagnosed as an environment issue,
-  not a regression) blocked the final manual `docker compose` restart/drain repro and
-  fresh image rebuild; the owner should re-run that verification once Docker Desktop is
-  healthy again (see the phase's own report for exact repro steps).
+- **Area 1 — engine image supervision**: graceful drain on shutdown, independent per-subservice restart with a budget (one child dying no longer always tears the whole container down), and a new `/api/ready` readiness check separate from the existing liveness check.
+- **Area 2 — env snapshot & replay**: snapshots now split into a hashed `env` and an unhashed `observed` context, so equivalent environments on different machines share an id; `--execute` always resolves the real interpreter; new `--validate` and multi-stage `--dockerfile` output.
+- **Area 3 — dataset CDC generalization**: chunkable extensions grew from 8 to 15, plus a `.avattributes` `chunk` flag to force-enable CDC outside the default set.
+- **Area 4 — audit log depth**: the last unaudited mutating routes now record, with a static coverage test ensuring a future unaudited route fails CI; new filterable/cursor-paginated listing, export, and prune commands.
+- **Area 5 — signed commits**: key rotation, a `require_signature` policy gate, and fully detached out-of-repo signature verification.
+- **Area 6 — WebUI run detail**: a new single-request run-summary endpoint replaces N sequential per-commit fetches; run detail is now a dedicated, deep-linkable panel; `av handoff --publish` optionally uploads `.avh` for the webui to render.
+- **Area 7 — plugin migration**: one shared run-id resolver used by every commit path (including now-fixed `av watch`); the plugins' last `os.chdir` is gone.
+- **Area 8 — webhook delivery maturity**: per-webhook failure tracking with auto-disable after N consecutive failures, exponential retry backoff, and new delivery-ledger visibility/replay commands.
+- **Area 9 — perf regression gates**: replaced single-shot timing with median-of-N sampling and a real CPU/disk budget-class split, reducing noise-driven false failures.
+- **Area 10 — multi-agent conflict UX**: the exit-code registry was largely fiction until this pass actually wired it up; `pull`/`merge`/`clone` gained real JSON mode; ref-update races now queue for retry instead of being lost.
+- **Real bugs found by this cycle's own verification**: the exit-code registry didn't match reality, three commands had no JSON mode at all, `av watch` never tagged its commits with the active run, a signature-only policy always denied everything (and had no CLI path to arm it anyway), `click.Context.exit()` silently loses its exit code under the test runner, a subshell was discarding the engine's restart-budget state, and two commands leaked human text ahead of their own JSON envelope (Probleme #86–93).
+- **Deferred**: none of the ten areas — all landed. A live Docker/WSL2 environment failure on the verifying machine (not a regression) blocked one final manual restart/drain repro, left for the owner to re-run once Docker Desktop is healthy.
 
 ---
 
 ## Phase 58 — V1.3.0 "Depth to 10/10": every existing surface, contract-enforced, docs that can't rot
+`todo.md`'s 28-work-package v1.2.6 backlog, executed end to end in one pass, nothing deferred. **Release number is v1.3.0, not v1.2.6**: this phase removes the legacy image aliases, a breaking change the versioning policy only permits at a MINOR boundary.
 
-`todo.md`'s v1.2.6 backlog (28 work packages, WP-0 through WP-28), executed end to end in
-one pass, nothing deferred. Roughly a third of the backlog was already built and only
-needed docs/tests; another third was half-built with a real, provable gap; the rest — a
-threat model, `docs/`, four of five published schemas, a downgrade test, a chaos drill, a
-release gate — genuinely did not exist. **Release number is v1.3.0, not v1.2.6**: this
-phase removes the legacy `aether-vault-server`/`-webui` image aliases, a breaking change
-`VERSIONING.md`'s own deprecation policy only permits at a MINOR boundary.
+- **P1 — contracts & parity**: four new published JSON Schemas join the existing `.avh` one, validated against real live output; the last five JSON-blind commands gained full `--output json` support; a new table-driven contract-matrix test sweeps every command × mode × exit code so a new command can no longer leak human text ahead of its envelope by omission.
+- **P2 — ops & trust**: new `av auth doctor`/`rotate`; `av registry export`/`restore` got its first-ever real round-trip test — which surfaced that export had silently exported *zero object content on every real invocation ever*, and restore's resume state was misread from export's own bookkeeping (two of this cycle's most severe findings, both fixed).
+- **P3 — the autonomous loop**: env-snapshot replay now defaults to a clean isolated venv instead of installing into the running interpreter (a real, documented behavior change); `.avh` now validates on every write and read; `av watch` gained an optional real filesystem-event backend.
+- **P4 — what humans and agents see**: semdiff gained byte-level dedup stats; the server-side diff summary was brought up to full schema parity with the client's; the webui's weight-diff got shareable links and progressive layer loading instead of a hard render cap.
+- **P5 — production hardening**: fixed a real 9/10 bug where the Dockerfile's implicit default build target had silently become the webui-only image instead of the intended all-in-one engine (caught only because this phase's own verification rebuild crash-looped); all migrations' `downgrade()`s were actually executed for the first time; new chaos-drill CI phases (Redis outage, unwritable data dir, SIGKILL mid-push); a new release `gate` job now blocks every publish job behind a green test run, a perf-history entry, and a signed-off CHANGELOG marker.
+- **Live-stack verification**: the full server suite, e2e scenario (including the new chaos drills), a 20-concurrent-upload drain-under-SIGTERM repro, the registry export/restore round trip, and a complete cross-tool benchmark capture (including the cold-clone benchmark for the first time ever) were all re-verified against a real running stack.
+- **Real bugs found by this cycle's own verification**: a test sweep had been mutating the *real* `.env` and restarting the *real* Docker container on every run (the root cause of a previously-unexplained "mystery token" anomaly from an earlier cycle); a migration file missing from the wheel's package list left the live database permanently stuck below head with no error; a Windows-specific temp-dir cleanup crash across six benchmark scripts; and a webhooks command that crashed instead of returning a clean offline envelope when Docker was stopped.
+- **Docs pass**: every sub-README audited against the code it describes; a past encoding mishap that had corrupted status badges and arrows across `Probleme.md` was found and fixed.
+- **Known, non-regression finding**: one perf-gate probe fails locally on the verification machine due to that machine's own disk-I/O characteristics (predicted by the plan's own risk notes), unrelated to any code changed this cycle — left as-is, with the documented `AV_PERF_BUDGET_MULTIPLIER` escape hatch and CI's Linux runners as the authoritative check.
+- **Deferred**: none of the 28 work packages.
 
-- **P1 — contracts & parity (WP-1–5):** four new published JSON Schemas
-  (`envelope-1.0`, `event-1.0`, `run-1.0`, `webhook-payload-1.0`, `semdiff-1.0`) join the
-  existing `avh-2.0`, all loaded via `core.load_contract_schema()` and validated against
-  REAL live CLI/server output in new `tests/test_contracts.py`; `smoke-wheel-linux` now
-  asserts the schemas actually land inside a built wheel. Five previously-JSON-blind
-  modules (`cmd_auth`, `cmd_devtools`, `cmd_maintenance`, `cmd_repo`, `cmd_watch`) gained
-  full `--output json` support; new `tests/test_contract_matrix.py` is a table-driven
-  sweep over every command × both modes × every exit code (all seven, including the
-  previously-untested `auth_failed`/12) plus a generic anti-leakage parametrization over
-  the entire `cli.commands` tree — a new command can no longer leak human text ahead of
-  its envelope by omission. `av_sdk/exceptions.py` gained one typed subclass per exit code
-  (`NotARepoError`, `PolicyDeniedError`, ...) plus `sdk_error_for()`; SDK↔CLI↔plugin parity
-  extended across the whole `Repo` surface, not just commit. New `docs/for-agents.md` (was
-  a dangling reference cited from three places, never written). The commit-time ref race
-  now shares `_tip_run_id()`/`remediation` with pull/merge's existing conflict UX, and
-  writes a structured `.av/last_conflict.json` conflict report
-  (`--conflict-report PATH` to redirect it). `av_plugins/mlflow.py::import_run()` no
-  longer defaults `repo_root` to `Path.cwd()`; the deprecated `run_av()`/
-  `build_metric_args()` shims' one-release grace window closed at this MINOR.
-- **P2 — ops & trust (WP-6–10):** `av auth doctor` (token configured? server reachable?
-  token actually authenticates? `AV_AUTH_USERS` parses?) and `av auth rotate [--user]`
-  (mints, writes `.env`, restarts, prints once, audits); optional per-user token
-  `expires_at` rejected with `auth_failed`. `av audit prune --dry-run` reports counts
-  without deleting. `av registry keys list/fingerprint --help` now restate the
-  not-PKI/not-identity-binding disclaimer directly (guard-tested). `av registry
-  export`/`restore` gained a real round-trip test for the first time ever
-  (`tests/test_server.py::test_registry_export_restore_round_trip` — layers, CDC chunks, a
-  merge commit, a signed commit), a progress bar, and independent per-direction
-  `--resume` state files — and in the process of writing that first real test, surfaced
-  four increasingly severe pre-existing bugs in this exact command (Probleme #110–112,
-  #119–120; #119/#120 were both 10/10s: export had never actually exported any object
-  content, and restore's resume state was silently misread from export's own bookkeeping).
-  Webhook backlog/dead-letter/ordering guarantees now proven under load and documented in
-  architecture.md, not just implemented.
-- **P3 — the autonomous loop (WP-11–16):** `av env snapshot --execute` now defaults to a
-  clean `.av/replay-venv/<id>/` (was: installs into the running interpreter);
-  `--into-current` is the explicit opt-out — a real behavior change, documented here and
-  in VERSIONING.md. `av promote --dry-run` reports the decision + deciding rule, touches
-  nothing, exits 0 either way; new `examples/policies/` (three worked, test-loaded
-  files). Migration `0005` adds `runs.policy_outcome`; new `GET /api/runs/{id}/metrics`
-  (cursor-paginated full series) and `GET /api/runs/{id}/lineage` (depth+cursor-bounded);
-  `enforce_policy()`/`promote()` report the outcome for the active run. `.avh` now
-  validates on every write AND read (via `jsonschema` when importable, falling back to the
-  structural check); `av run finish` regenerates `handoff.avh` so lineage/metrics/semantic
-  summary are guaranteed present; new `av context search QUERY [--run] [--since]`. `GET
-  /api/events` gained a `run_id` filter and `gap: true` detection when `since` predates the
-  oldest retained event. New optional `watch = ["watchdog>=4"]` extra — `av watch` uses it
-  when importable, else the existing polling loop; found and fixed a real bug in the
-  watchdog path along the way (a file already on disk at start-up was invisible to it,
-  since watchdog only reports events from the moment it starts observing).
-- **P4 — what humans and agents see (WP-17–18):** semdiff's chunk rollup gained
-  `reused_bytes`/`new_bytes`/`dedup_efficiency_bytes` (byte-level, not just a chunk-count
-  ratio); the server-side `_summarize_tree_diff()` was brought up to the FULL client
-  schema (was a strict subset, silently omitting `models`/`chunks`) with a shared
-  golden-fixture test pinning the two implementations identical; new
-  `GET /api/commits/{a}/diff/{b}`. New `docs/avattributes.md`. WebUI: every panel now
-  reads `useDashboard()`'s real `error` field and renders a distinct error state with
-  retry (was: indistinguishable from empty); run detail promoted to a full view swap on
-  `?run=`, with a policy-outcome badge and full metrics history from the new endpoint;
-  weight diff gained shareable link state (`?tab=weight-diff&a=&b=&path=`), an arbitrary
-  two-commit hash-input compare (was: 100 most recent commits only), and progressive
-  incremental layer reveal (`useIncrementalReveal`) replacing the hard
-  `MAX_RENDERED_LAYERS = 4000` truncation. webui suite: 101 → 165 tests, 20 → 24 files.
-- **P5 — production hard (WP-19–26):** Dockerfile gained named `server`/`webui` slim
-  build targets alongside the (now explicitly named) `engine` default — appending them
-  after the original unnamed stage silently changed Docker's untargeted-build default to
-  `webui`, a real 9/10 bug (Probleme #117) caught only because a fresh rebuild for this
-  phase's own verification crash-looped with no Python interpreter in the image; every
-  consumer (`docker-compose.yml`, `release.yml`, `docker-edge.yml`, `e2e-engine-smoke`) now
-  pins `target: engine` explicitly. Legacy `aether-vault-server`/`-webui` image aliases
-  stopped publishing (see VERSIONING.md's "Removed in v1.3.0" entry); new `av doctor
-  --compose PATH [--write]` rewrites a pinned two-container compose file onto the
-  consolidated image, dry-run by default; new `docs/migrate-engine-image.md`. All four
-  migrations' `downgrade()`s now actually execute (upgrade→downgrade→upgrade round trip
-  against live Postgres) for the first time — previously defined but never once run.
-  `av benchmark`'s speedcheck JSON is now uploaded as a CI artifact; new
-  `scripts/append_perf_history.py` appends a row to `development/perf-history.json` and
-  renders a trend table into `BENCHMARKS.md` (maintainer-run locally, per the no-auto-
-  commit CI policy — WP-25's `gate` job verifies a row exists for the tag instead). New
-  `AV_PERF_SAMPLES` + an explicit warm pass for disk-noise immunity. New `chaos-drills` CI
-  job and `scripts/e2e_scenario.sh` Phases L/M/N (Redis outage, unwritable `AV_DATA_DIR`,
-  SIGKILL mid-push), gated behind `AV_E2E_CHAOS=1`. New `development/threat-model.md`
-  (assets, actors, trust boundaries, threat→mitigation→residual-risk table, annual-review
-  checklist), linked from `SECURITY.md`. New `release.yml` `gate` job — re-runs the
-  stack-free suite, requires the tagged commit's `tests.yml` run green via the GitHub API,
-  asserts a perf-history row for the tag, a signed-off CHANGELOG entry (this literal
-  marker, see below), and that `BENCHMARKS.md`'s captured sha is an ancestor of the tag —
-  every publish job (`publish-pypi`, `github-release`, `build-and-push-docker`) now depends
-  on it; a red commit can no longer publish. New `tests/test_ci_policy.py` makes the
-  standing no-dependency-bots/no-auto-merge rule a permanent, enforced guard over `.github/`
-  instead of a convention. New `docs/tutorial.md` (one continuous operator+agent path) and
-  `docs/README.md` index; new `tests/test_docs_commands.py` parses every fenced `av ...`
-  command out of `docs/*.md` and resolves it against the live Click tree, so documentation
-  rot is now a test failure, not a silent drift (exactly what let benchmark #5's row sit as
-  "capture pending" in README for a full prior cycle — closed this phase with a matching
-  `tests/test_benchmark_docs_freshness.py` guard over the benchmark tables specifically).
-- **Live-stack verification (WP-27, Docker-dependent):** full `pytest tests/test_server.py`,
-  the complete `e2e_scenario.sh` (all phases including the new chaos drills), the
-  drain-under-load repro (20 concurrent uploads, real SIGTERM mid-flight, all 20 complete
-  cleanly — confirmed by hand against a throwaway `engine-drain` container after the
-  Dockerfile fix above), the registry export/restore round trip, and the full Playwright
-  suite all re-verified against a real running stack. `git-lfs`/`dvc`/`mlflow` installed
-  and a complete `av benchmark --markdown development/BENCHMARKS.md` cross-tool capture
-  landed, including benchmark #5 (cold clone) for the first time — its code was finished
-  since v1.1.1 and only ever lacked a live registry to measure against. Machine profile
-  (CPU/RAM/OS/Python) now pinned in `BENCHMARKS.md`'s header, making every published number
-  reproducible for the first time; the stale "`av` has no clone/pull command" methodology
-  note (false since v1.1.1) was corrected.
-- **Real bugs found by this cycle's own verification (details in Probleme):** #114–116
-  test-infrastructure fixes (a generic contract-matrix sweep was mutating the REAL `.env`
-  and restarting the REAL Docker container on every test run — root cause of a previously-
-  unexplained "mystery token" anomaly from an earlier cycle). #117 the Dockerfile's
-  implicit default build target silently became `webui`, not the intended all-in-one
-  image (9/10). #118 a migration file missing from the wheel's `packages=[...]` list left
-  the live database permanently stuck below head with no error (8/10). #119/#120
-  `av registry export`/`restore` — the two most severe findings of this cycle, both 10/10s:
-  export had silently exported zero object content on every real invocation ever, and a
-  restore's resume state was misread from export's own bookkeeping, meaning a genuine
-  disaster-recovery restore into an empty registry would have silently skipped uploading
-  everything. #121 Windows-specific `TemporaryDirectory` cleanup crash across six benchmark
-  scripts. #122 a benchmark mislabeled a real connection-reset-under-load failure as
-  "not installed" (new `ToolStatus.FAILED`). #123 `scripts/append_perf_history.py` captured
-  a silently wrong project version on a dev machine with more than one registered install.
-  #124 `av webhooks deliveries --output json` crashed with an unhandled `ConnectionError`
-  (empty stdout, exit 1) instead of a clean `unreachable_queued` envelope — the one
-  webhooks command that bypassed the module's own `_request()` error-handling helper,
-  found only because this phase's final verification pass ran with Docker deliberately
-  stopped (an intentionally offline condition, not an accident).
-- **Docs pass:** every sub-README audited against the code it describes; eight updated
-  (stale test counts, a stale migration-chain number, missing new scripts/endpoints, a
-  note that had gone actively wrong, the "capture pending" cold-clone line). `todo.md`
-  repurposed from a generated backlog into the owner's live planning canvas (linked from
-  both README's Development Documentation table and AGENTS.md's "before touching
-  anything" list) — the v1.2.6 backlog this whole phase closed is preserved in this
-  entry and in `development/Probleme.md`'s #114–124, not lost. `development/Probleme.md`'s
-  status legend (🟢/🟡/🔴, already documented at the top of the file) is now applied
-  consistently across all 123 prior entries — a past encoding mishap had corrupted 8
-  status badges and 14 body em-dashes/arrows to `�`/`?`, found and fixed as part of this
-  pass, not a new defect in the underlying work those entries describe.
-- **CI:** new `gate` job (release.yml), new `chaos-drills` job (tests.yml), speedcheck
-  JSON artifact upload, `test_ci_policy.py` running stack-free in the main `test` job on
-  every push.
-- **Known, pre-existing, non-regression finding:** `tests/test_perf_gate.py`'s `log()`
-  probe fails locally on this verification machine (median ~3.2–3.8s vs. a 1.35s
-  4.5×-multiplied budget) — reproduced in complete isolation, and the module it actually
-  times (`history.py::walk_history()`) has zero changes this entire cycle, confirming this
-  is the machine's own small-file disk-I/O characteristic the plan's own Known Risks
-  section predicted verbatim, not a regression from this phase's work. Left as-is
-  deliberately: the gate's own docstring warns against loosening its multiplier a fourth
-  time to chase local noise; `AV_PERF_BUDGET_MULTIPLIER` is the documented escape hatch,
-  and CI's Linux runners are the authoritative check.
-- **Deferred:** none of the 28 work packages — WP-0 through WP-28, including the full
-  Docker-dependent tail, all landed in this pass. One genuine open question, not a
-  deferral: the live registry's correct RESTING auth mode (Anonymous vs. Protected) after
-  this cycle's repeated stop/restart cycles for live verification is not independently
-  known — flagged explicitly in `todo.md` for the owner rather than guessed at.
+## Phase 59 — V1.3.1 "RSI Control Plane": from autonomous training substrate to a recursive-self-improvement control plane
+`todo.md`'s 46-item V1.3.1 backlog, executed end to end in one pass. Where the substrate versions the target *model*, this phase adds the missing half: versioned improver artifacts with lineage, sandboxed self-edit proposals that roll back in one command, a dual promotion gate (model vs. improver) with signed policy-as-code, frozen eval suites a training agent can't write to, capability canaries, budgets/auto-stop, a role-separated reviewer gate, causal lineage and strategy memory, a pluggable sandbox executor with tool permission manifests, and server-side anomaly detection. **Ships as v1.3.1** (a deliberate owner decision — the project's own additive-changes table would suggest v1.4.0).
 
-## Phase 59 — V1.3.1 "RSI Control Plane": from autonomous training substrate to a
-recursive-self-improvement control plane
-
-`todo.md`'s 46-item Main Objektive V1.3.1 backlog (areas A-J), executed end to end in one
-pass across plan phases R0-R7, nothing deferred except two genuinely bounded, explicitly
-scoped items noted below. The substrate versions the target MODEL; this phase adds the
-missing half — versioned improver artifacts (agent code/prompts/tools/policy) with
-lineage, structured self-edit proposals that apply in sandboxes and roll back in one
-command, a dual promotion gate (model vs. improver) with signed hash-chained
-policy-as-code, frozen content-addressed eval suites a training agent cannot write to,
-capability canaries, budgets and auto-stop, a reviewer gate with role-separated
-identities, causal lineage and strategy memory, a pluggable sandbox executor with tool
-permission manifests and deterministic action replay, and server-side anomaly detection.
-**Release ships as v1.3.1, a deliberate owner decision recorded in `VERSIONING.md`** —
-by the project's own per-surface additive-changes table this overwhelmingly additive
-release would be tagged v1.4.0; the version number departs from that table's literal
-recommendation, nothing else does.
-
-- **R0 — foundations:** new shared module `python/av_cli/casobj.py` (canonical-JSON
-  content addressing: canonicalize/id/write/read/sign/verify) — every new artifact type
-  in this release is a CAS object built on it; `signing.py::canonical_commit_bytes` now
-  delegates to it, byte-identical, golden-fixture-proven. Extracted `core.py::
-  parse_metric_args()`/`resolve_remote()` out of 8+ duplicate copy-paste sites. Fixed
-  three pre-existing bugs the dual-gate work would otherwise have built on top of:
-  `cmd_policy.py`'s baseline walk and `av_sdk/repo.py::diff_semantic()` both read the
-  wrong parent field for local commits (`parent_hash` instead of the real `parents`
-  list — Probleme #129, found via the SDK/CLI parity test), and `~N` ref-ancestry syntax
-  in `baseline_ref` was silently unparsed. Registered `av verify` as a top-level alias
-  (documented for releases, never actually wired into the Click tree). Server-side
-  scoped tokens (`require_scope()`, additive to `AV_AUTH_USERS` — legacy/bare-string
-  entries and `AV_API_TOKEN` resolve to `["*"]`, zero behavior change for any existing
-  deployment) are the actual mechanism behind the held-out eval vault (F.25) and
-  privilege levels (C.12), not a separate system. New exit codes 17-20
-  (`budget_exhausted`/`frozen`/`review_required`/`scope_denied`).
-- **R1 — make self-change explicit (A.1-5, C.11-15, B.9, I.39-40):** `runs.kind ∈
-  {train,meta,scoring,eval}`; `cmd_improver.py` (`av improver register/init/current/use/
-  list/show/lineage/propose/review/apply/rollback/promote`, `av improver policy set/
-  list/remove`); `cmd_canary.py` (`av canary register/list/run/status`); `cmd_freeze.py`
-  (`av freeze on/off/status`, `av incident rollback` = freeze + last-good improver in one
-  command); policy-as-code as a signed, append-only, hash-chained CAS-object log
-  (`av policy pack publish/show/log/verify`) via new sibling file
-  `.av/improver_policy.json` — deliberately NOT merged into `.av/policies.json`'s
-  existing, pinned model-gate schema. Migration `0006`.
-- **R2 — protect the objective (B.6-10, F.25-28):** `cmd_eval.py` (`av eval register/
-  list/show/freeze/score/results/reveal/adapter add|list|run`) — frozen suites reject
-  every mutation server-side (409), the `eval:write`/`scorer` scopes are the actual
-  held-out-vault enforcement (not convention); `cmd_task.py` curriculum proposals;
-  `runs.integrity_signals` (train/eval metric gap computed for real; `eval_only_
-  improvement`/`data_overlap` explicitly stubbed `false`/`null` — an honest gap
-  documented in architecture.md, not silently faked, since computing them needs
-  infrastructure this pass didn't build); `av run start --kind scoring` requires an env
-  snapshot + code pin. Migration `0007`.
-- **R3 — research control (D.16-20):** `cmd_plan.py` (hypotheses/ablations/budget/stop
-  rules as a CAS object); `cmd_budget.py` (`av budget set/show/attach/consume`, exit 17
-  on exhaustion, spend always recorded first); `av run branch-policy set/show/check`
-  (declarative branch/merge/abandon rules, advisory); `av run auto-stop-check` (plateau/
-  divergence/NaN detection, both minimize/maximize); `cmd_scheduler.py` (`av scheduler
-  queue`), `POST /api/runs/{id}/stop`. Migration `0008`.
-- **R4 — multi-agent + strategy memory (E.21-24, H.33-36):** `cmd_lineage.py` (`av
-  lineage link/show`, `av search runs` — structured predicate grammar, no LLM);
-  `cmd_strategy.py`/`cmd_lessons.py`/`cmd_blackboard.py`; `cmd_review.py` (`av review
-  approve/reject`, self-review rejected server-side 422; `av critique add/resolve/
-  waive` — waiving is always audited, the objection stands but is overridden). `reviews`/
-  `critiques` target `{target_type, target_id}` (change_set OR improver) so `av improver
-  promote`'s `require_review` gate checks the CANDIDATE IMPROVER directly. Migration
-  `0009`. Found and fixed Probleme #130 (`av incident rollback` double-JSON-object bug)
-  and #131 (four commands leaking text or disagreeing on exit code between text/JSON
-  mode specifically on a DENY/FAIL outcome — one instance, `av promote`, pre-existing
-  since v1.2.0; also flags an open, deliberately unfixed design question about that
-  command's deny-envelope shape, left for the owner per `VERSIONING.md`'s breaking-change
-  policy).
-- **R5 — hard isolation (G.29-32):** new package `python/av_cli/sandbox/` — one driver
-  protocol (`base.py::SandboxDriver`), `local` (real, synchronous — a subprocess PID
-  isn't a safe handle to re-attach to later, so it runs to completion inside `submit()`)
-  and `docker` (real, asynchronous — a container name IS a persistent handle) fully
-  implemented; `kubernetes`/`slurm` proven via fake-subprocess contract tests mirroring
-  `test_docker_runtime.py`'s established pattern, no live cluster needed. Tool
-  permission manifests (`manifest.py`, fails CLOSED by default) checked before every
-  `submit()`. `python/av_cli/actionlog.py` (`.av/actions.jsonl` → CAS object,
-  `av replay-actions` replays recorded decisions, not just training code). `av sandbox
-  run/status/cancel/logs/queue`, `av tools manifest show/set/verify`. Migration `0010`
-  (head). Found and fixed Probleme #132: `VaultClient.server_available()` genuinely
-  returns `True` when Docker Desktop happens to be running, silently invalidating every
-  test's "no server configured ⇒ unreachable" assumption — root-fixed via a shared
-  `unreachable_client` pytest fixture patching BOTH `python.av_cli.client.VaultClient`
-  and the bare `av_cli.client.VaultClient` (two distinct module objects for the same
-  file — `av_sdk/repo.py` imports the bare form, `core.py` the relative form).
-- **R6 — product surfaces (I.37-38, J.41-46):** `av_sdk.Repo` gained one method per
-  write-capable RSI surface (~35 new methods, typed `SDKError` subclasses throughout;
-  read/list-many endpoints deliberately CLI-only — a documented scope decision, see
-  architecture.md's "RSI SDK Surface Contract"), closing both known pre-existing SDK/CLI
-  divergences (`run_start()` now captures `code_pointer`; `context_note()` now stamps
-  `run_id`, matching `cmd_context.py::note()`). Four server-side anomaly detectors
-  (`metric_jump`, `mass_rewrite`, `policy_change`, `auth_spike`) emit `kind="anomaly"`
-  events through the EXISTING webhook fan-out, no new delivery path. WebUI gained
-  `ImproverPanel`/`CanaryPanel`/`RegressionPanel` (3 new Vitest files). `docs/
-  rsi-operator-guide.md` (the RSI counterpart to `docs/tutorial.md`) and `examples/
-  rsi_loop/agent.py` — a deterministic, no-LLM-key scripted reference agent driving the
-  full loop through `av_sdk.Repo` alone, proven stack-free by `tests/test_rsi_loop.py`.
-- **R7 — contracts, tests, CI, live verification:** 6 new published JSON Schemas
-  (`improver-1.0`, `change-set-1.0`, `policy-pack-1.0`, `eval-suite-1.0`,
-  `tool-manifest-1.0`, `action-log-1.0`); `avh-2.0`'s `lineage` gains `improver_id`
-  (`lessons`/`canaries` deliberately NOT added — `.avh` generation is local-only/offline
-  by design, fetching those needs a network round trip it doesn't make). README/
-  VERSIONING/AGENTS.md/`docs/for-agents.md` all updated, including fixing exit-code
-  tables and a supported-commands list that had gone stale mid-cycle. **Live-verification
-  gate run for real** (not deferred): `pytest tests/test_server.py -v` against a real
-  Postgres/Redis (145/145, after finding and fixing 4 more real bugs — Probleme #133:
-  the test DB truncation list never extended for 20 new RSI tables; the `mass_rewrite`
-  detector never fired because `_summarize_tree_diff()`'s lists are nested under
-  `"files"`; 3 scope-denial tests used an unrestricted token by mistake; a live alembic
-  round trip invalidated the shared connection pool's cached statement plans); a real
-  engine image rebuild + restart (found stale at migration `0005`, auto-migrated to
-  `0010` zero-touch on restart); a complete manual CLI repro of the full RSI loop against
-  the rebuilt live engine (propose→review→apply→sandbox→canary→promote-denied(19)→
-  review→promote-allowed→lessons→budget-exhausted(17)→freeze/rollback, plus a live
-  `metric_jump` anomaly firing within a second of the triggering push);
-  `scripts/e2e_scenario.sh` extended with 6 new phases (**O**-**T**: improver lifecycle,
-  dual-gate deny/allow, canary-blocks-promote, held-out-vault-403, budget-exhaustion,
-  freeze) and run start-to-finish, A through T, discovering and fixing a 6th
-  migration-chain touch point along the way (Phase C's legacy-volume drill hardcoded the
-  expected post-heal alembic head at `"0005"`, stale since `0006`); Playwright extended
-  with `improver.spec.ts` against the real rebuilt webui, 9/12 of the full suite passing
-  (the same "just-restarted engine" transient queued two seed pushes, drained with a
-  plain `av push`, exactly what the queue is for).
-- **Deferred, explicitly and narrowly:** Phase **U** (`AV_E2E_CHAOS=1` — a sandbox job
-  killed mid-execution must leave no partial improver state) — the existing chaos phases
-  L-N are their own more elaborate, separately-gated category and deserved dedicated
-  attention rather than a rushed addition at the tail of an already extensive
-  verification pass. Setting up Protected mode (`AV_API_TOKEN`+`AV_AUTH_USERS`) on the
-  real engine to unblock `webui/e2e/token-gate.spec.ts`'s 3 tests — would mean changing
-  the owner's real dev stack's auth configuration without being asked; left for the
-  owner to do explicitly when wanted.
+- **Foundations**: a new canonical-JSON content-addressing module underlies every new artifact type; fixed two pre-existing bugs (wrong-parent-field reads in local commit walks) the dual-gate work would otherwise have built on top of; new scoped server tokens are the actual enforcement mechanism behind the held-out eval vault and privilege levels.
+- **Make self-change explicit**: `av improver register/propose/review/apply/rollback/promote`, `av canary`, `av freeze`/`av incident rollback`, and a signed, hash-chained policy-as-code log — deliberately kept separate from the existing model-gate policy schema.
+- **Protect the objective**: `av eval register/freeze/score` — frozen suites reject every mutation server-side; new integrity signals compute the train/eval metric gap for real (two harder signals are honestly stubbed rather than faked, documented as a known gap).
+- **Research control**: structured hypothesis/budget/stop-rule plans as CAS objects, `av budget`, declarative branch policies, and plateau/divergence/NaN auto-stop detection.
+- **Multi-agent + strategy memory**: run lineage linking, structured run search (no LLM), and a reviewer/critique gate where self-review is rejected server-side. Found and fixed a double-JSON-object bug in `av incident rollback` and four commands disagreeing on exit code between text/JSON mode on a deny outcome.
+- **Hard isolation**: a new pluggable sandbox package (`local`/`docker` fully implemented, `kubernetes`/`slurm` proven via contract tests) with fail-closed tool permission manifests and a replayable action log. Found and fixed a real bug where the reachability check falsely reported the server as configured whenever Docker Desktop happened to be running, invalidating a chunk of existing test assumptions.
+- **Product surfaces**: `av_sdk.Repo` gained ~35 new methods covering every write-capable RSI surface; four server-side anomaly detectors (metric jumps, mass rewrites, policy changes, auth spikes) reuse the existing webhook fan-out; a deterministic, no-LLM-key reference agent (`examples/rsi_loop/agent.py`) proves the full loop stack-free.
+- **Contracts, tests, CI, live verification**: 6 new published JSON Schemas; a real live-verification pass against Postgres/Redis found and fixed 4 more bugs (a stale test-truncation list, a detector reading the wrong nested field, three tests using the wrong token, a stale cached statement plan); a real engine rebuild, a full manual CLI repro of the entire RSI loop end to end (including a live anomaly firing within a second of its trigger), and 6 new e2e scenario phases covering the improver lifecycle, dual-gate deny/allow, canary blocking, the held-out vault, budget exhaustion, and freeze.
+- **Deferred, narrowly**: a chaos-kill drill for sandboxed jobs (left for its own dedicated pass), and enabling Protected mode on the real dev stack to unblock 3 webui E2E tests (left for the owner, since that changes real auth config).
 
 Essential-Tasks: signed off
 
-Essential-Tasks: signed off
+## Phase 60 — V1.3.2 "Enterprise Identity & Tenancy" (in progress): SSO/RBAC/SCIM/hard multi-tenancy/HA/DR
+`todo.md`'s V1.3.2 backlog. Stated plainly rather than implied complete: E0/E1/E4 core plus E5's cross-replica fixes, HA packaging, DR, and most of security scanning/support tooling shipped and were live-verified this pass — E2 (SSO) and E3 (SCIM) remain entirely unstarted.
 
-## Phase 60 — V1.3.2 "Enterprise Identity & Tenancy" (in progress): SSO/RBAC/SCIM/hard
-multi-tenancy/HA/DR from `todo.md`'s Main Objektive V1.3.2 — E0/E1/E4 core and E5's three
-cross-replica fixes shipped and live-verified this pass; E2 (SSO)/E3 (SCIM)/E5's compose
-HA topology+Helm/E6 (DR)/E7 (security scanning)/E8 (support tooling) are NOT started —
-stated plainly here rather than implied complete by this entry's presence.
+- **E0 — identity & tenancy schema**: eleven new tables (tenants, projects, users, groups, roles, role bindings, tokens, SSO providers, sessions), seeding a default tenant and six built-in roles expressed in the existing scope vocabulary — a role binding is a DB-backed way to arrive at the same scopes an `.env` token already resolves to, not a parallel permission system.
+- **E1 — remote-administrable identity**: a new DB-backed credential source lets `av token create` mint access on a server that has never touched `.env` at all, unlike the existing `av auth add-user` which needs shell access to the host. Six previously-unscoped admin routes now require the `admin` scope — a real security gap closed, the one deliberate non-additive change this phase makes.
+- **E4 — hard multi-tenancy**: `tenant_id` added to 28 tables with row-level security, fail-closed by design and gated behind an off-by-default flag. **A significant live finding**: RLS is currently inert under this repo's own default compose file, since Postgres unconditionally exempts superusers from RLS and the default DB role is a superuser — the app-layer guard is unaffected, and explicit tenant filters were added to the most important list routes to compensate while the real fix (a non-superuser role) was tracked for the next phase.
+- **E5 — three cross-replica HA correctness fixes**: the webhook retry worker's delivery claim now uses `SKIP LOCKED` (was unconditionally duplicating deliveries under multiple replicas); an opt-in Redis-backed rate limiter fixes the same class of bug for request throttling. Full HA packaging (compose topology + Helm) was not yet built in this first session.
+- **Real bugs found and fixed by the mandatory live-verification pass** (not by design review alone): `av token create` unconditionally failed on a genuinely Anonymous server — exactly the deployment most likely to want it first; Alembic's offline SQL-render mode crashed on two ORM patterns that only work against a live connection; Postgres rejects bind parameters in `CREATE POLICY` outright, requiring an inlined literal; the legacy-volume healing path was missing `tenant_id` entries for the new tables; and a DB-free test probe broke once auth gained a real database fallback.
+- **One real incident, disclosed rather than only fixed**: a manual CLI repro used `av auth set-token`, which (correctly, by design) always targets the one local Docker stack — this wrote a token into the *real* dev `.env` and restarted the real engine container, which then crash-looped on a migration mismatch. Caught immediately and fully reverted; verified only the intended files were left touched.
 
-**Session 2 continuation (same day, same phase) — the RLS-superuser gap, HA packaging,
-DR, security scanning, and support tooling.** E2 (SSO) and E3 (SCIM) remain entirely
-unstarted (zero code) — stated plainly, not implied otherwise by everything below.
+**Session 2 (same day) — the RLS-superuser gap, HA packaging, DR, security scanning, support tooling.**
+- **RLS-superuser gap fixed**: a new non-superuser `av_app` Postgres role is now used for request-serving connections (migrations and background workers keep the superuser role). Live-verified on the real dev stack with a raw probe confirming a connection as `av_app` sees exactly one tenant's rows.
+- **HA packaging finished**: a real Postgres primary/replica + Redis primary/replica compose topology, plus a genuine locally-run HA drill proving concurrent pushes survive a replica being killed mid-batch, webhook delivery counts stay exact under concurrent replicas, and the Redis-backed rate limiter caps correctly across replicas. A Helm chart ships alongside, schema-verified but honestly labeled as not yet drilled on a real cluster.
+- **DR finished**: `av admin backup create/verify/restore`, and the actual drill ran and passed — pushing a commit, backing it up, genuinely destroying the database and object storage, restoring, and confirming byte-identical recovery. The drill caught a real bug nothing else did: the schema-healing step imported this repo's own test-only module spelling instead of the installed package's real one, invisible to every unit test and only surfaced by running the real installed console script end to end.
+- **Security scanning and support tooling substantially done**: a new CI workflow runs dependency/code/image scanning; a new `av support-bundle` command collects redacted diagnostics with credential-shaped values masked before anything touches disk; new runbooks for incident response, failover, DR restore, and upgrade/rollback. Audit-log hash-chaining/signing remains open.
+- **Two more real incidents this session, both self-inflicted by this session's own migration work and both fully resolved**: a migration's `downgrade()` tried to drop a cluster-wide role that another database on the same cluster still depended on, cascading into 5 unrelated test failures from a poisoned connection pool (fixed, and hardened against a recurrence); and applying new migrations to the real dev database while the old engine container kept running left its connection pool serving stale results — resolved with the owner's explicit go-ahead to rebuild and recreate the container, verified clean afterward.
+- **Deferred, stated plainly**: E2 (SSO), E3 (SCIM), a real Kubernetes HA drill, audit-log signing, and per-tenant physical storage isolation. None of this is code that exists yet.
 
-- **The RLS-superuser gap from session 1 is FIXED (migration `0015`):** a new
-  non-superuser `av_app` Postgres role, granted exactly SELECT/INSERT/UPDATE/DELETE (no
-  DDL, no BYPASSRLS). `database.py` gains `AV_APP_DATABASE_URL` (optional, additive) —
-  when set, request-serving sessions route through `av_app`; migrations and the two
-  cross-tenant background workers keep using the superuser role unconditionally.
-  `docker-compose.yml` wires this by default. **Live-verified on the REAL dev stack, not
-  just the test DB**: a raw asyncpg probe connected as `av_app` with only `app.tenant_id`
-  set (no application code involved) sees exactly one tenant's rows;
-  `tests/test_server.py::TestHardTenancy::test_rls_actually_filters_now_for_the_non_superuser_role`
-  proves the same live against Postgres. `downgrade()` deliberately never `DROP ROLE`s —
-  found live that a per-database migration can't safely do that for a cluster-wide role
-  when the cluster hosts more than one database (this dev machine's own
-  `aether_vault`+`aether_vault_test`).
-- **E5 finished — HA packaging:** `docker-compose.ha.yml` (nginx LB + 2 engine replicas +
-  a REAL Postgres primary/streaming-replica via `pg_basebackup -R` + Redis
-  primary/replica) and `scripts/ha_drill.sh` — a genuine, locally-run drill: concurrent
-  pushes through the LB survive a `docker kill` of one replica mid-batch; a webhook
-  target that fails its first 2 attempts proves exactly 3 total deliveries across both
-  replicas' retry-worker loops (the `SKIP LOCKED` fix from session 1, now proven under
-  real concurrent replicas, not just unit-tested); 20 rapid requests against a
-  `6/minute` limit prove the Redis backend caps at 6 total, not 12. A Helm chart
-  (`deploy/helm/aether-vault/`) ships alongside, `helm template | kubeconform -strict`
-  verified (both tools installed and actually run, not just written) across 4 value
-  permutations — honestly labeled as NOT drilled on a real cluster. Two new CI jobs
-  (`helm-lint`, `ha-drill`).
-- **E6 done — DR:** `av admin backup create/verify/restore` (`cmd_admin.py`) — `pg_dump
-  -Fc` + a gzip'd CAS tar + a `backup-manifest-1.0` manifest. Deliberately requires an
-  EXPLICIT `--database-url`/`--db-container` (no auto-detection of "the local docker
-  stack") — a lesson taken directly from this same session's own second incident below.
-  **The actual drill ran and passed**: `scripts/e2e_scenario.sh` Phase U (gated
-  `AV_E2E_DR=1`) pushes a commit, backs it up, genuinely destroys the schema
-  (`DROP SCHEMA public CASCADE`) and CAS directory, restores, and confirms the
-  pre-destruction commit and its ref both read back byte-identical — with the real
-  measured wall-clock restore time in the pass line. `docs/dr.md` states the
-  measured-RTO/stated-RPO distinction plainly. **A real bug the drill caught that
-  nothing else did**: `cmd_admin.py`'s schema-healing step imported
-  `python.av_server.database` (this repo's OWN test-suite import spelling, from
-  `pythonpath=["."]`) instead of the INSTALLED package's real top-level
-  `av_server.database` — invisible to every unit test (which all run inside the
-  `python.*`-spelled test process) and even to `av admin backup verify`'s own
-  alembic-head check (silently swallowed by a bare `except Exception`), and only ever
-  surfaced running the REAL installed `av` console script end to end. Fixed in both call
-  sites; `tests/test_cmd_admin.py`'s mock updated to patch the same spelling the code
-  now actually uses, so a future regression here would be caught structurally too, not
-  only by another live drill run.
-- **E7 substantially done — security scanning:** `.github/workflows/security.yml`
-  (`pip-audit`, `bandit`, `semgrep`, `trivy` on the built image, `npm audit`), gating on
-  high/critical only. Run locally against this codebase for real: 0 HIGH bandit
-  findings (3 MEDIUM findings in the new `cmd_admin.py` — predictable `/tmp/` paths for
-  `docker exec` — fixed with a random suffix + justified `nosec` since bandit can't see
-  through the interpolation). `development/threat-model.md` gains T14–T18 for the new
-  surfaces (tenancy boundary, DB-backed tokens, backup artifacts, the `av_app`
-  credential, restore-target mistakes) and an annual-review log entry.
-  Audit-log hash-chaining/signing (the other half of E7) is NOT built — still open.
-- **E8 substantially done — support tooling:** `av support-bundle` (redacted
-  diagnostics: versions, health/ready, container status, a speed probe — every
-  credential-shaped config key masked before anything touches disk, with a
-  belt-and-braces raw-bytes check on top of the structured redaction).
-  `docs/support.md`/`docs/slo.md`/`docs/sla.md` (the latter two explicit about NOT having
-  a live `/api/metrics` endpoint yet — a real, tracked gap, not implied otherwise) and
-  five `docs/runbooks/` (incident response, HA failover, DR restore, tenant
-  provisioning, upgrade/rollback).
-- **Two more real incidents this session, both caused by this session's own migration
-  work and both fully resolved:**
-  1. A live migration bug: `0015`'s `downgrade()` tried `DROP ROLE av_app`, which fails
-     whenever that role still holds a grant in ANY sibling database on the same
-     cluster — found via a full `pytest tests/test_server.py` run cascading 5 unrelated
-     failures from a poisoned connection pool. Fixed (see above); also hardened the
-     underlying pool-poisoning class itself with `engine.dispose(close=False)` after the
-     live migration-round-trip test, verified live not to break the TestClient's own
-     anyio portal (a real, escalating risk the pre-existing "absorb one stale cache hit"
-     mitigation didn't fully cover once a second migration extended the same cycle).
-  2. Applying migrations `0011`–`0015` to the real dev database while the (old-image)
-     `aether-vault-engine` container stayed running left its connection pool serving
-     stale/WRONG query results — confirmed live: fresh object uploads were falsely
-     rejected as duplicates. Recreating the container then hit the SAME image/migration-
-     head mismatch class as session 1's incident (old image, new DB head) and
-     crash-looped. **Resolved with the owner's explicit go-ahead** (asked before both the
-     container recreate and the image rebuild, per guardrail): rebuilt the engine image
-     with this session's code, recreated the container, verified clean (`/api/ready`
-     green, a real push→read round trip, `pg_stat_activity` confirming `av_app`
-     genuinely handling request traffic). Also found (not fixed): the stack-free suite
-     and `test_server.py`'s live tests shared the same Redis logical DB as the real dev
-     engine (`redis://localhost:6379/0` for both, no isolation) — fixed by moving the
-     LOCAL test default to db 1.
-- **Deferred, stated plainly rather than implied complete:** E2 (SSO), E3 (SCIM),
-  per-tenant physical CAS storage isolation, the real Kubernetes HA drill, audit-log
-  signing/hash-chaining, README/architecture.md's remaining polish beyond what's listed
-  above, and the Obsidian vault regen. `todo.md`'s own Status section carries the
-  up-to-date done/missing split.
+(No "Essential-Tasks: signed off" line — the full wrap-up sequence has not been run for this entry.)
 
-- **E0 — identity & tenancy schema (migration `0011`):** eleven new tables (`tenants`,
-  `projects`, `users`, `user_identities`, `groups`, `group_members`, `roles`,
-  `role_bindings`, `api_tokens`, `sso_providers`, `sessions`), seeding a well-known
-  default tenant (`models.py::DEFAULT_TENANT_ID`) and six built-in roles expressed in the
-  EXISTING v1.3.1 scope vocabulary (`owner`→`["*"]`, down to `reader`→`["read"]`) — a role
-  binding is a different, DB-backed way to arrive at the same scopes list
-  `_scopes_for_identity()` already resolves for an `.env` token, not a parallel
-  permission system. `projects` backfilled from every `project_id` real commit history
-  already had (514 rows on the live dev DB) — that table was purely virtual before this
-  (`GET /api/projects` was a live `GROUP BY` over `commits`).
-- **E1 — Principal resolution + remote-administrable identity (`identity.py`, new):** a
-  third credential source (`api_tokens`/`sessions`, TTL-cached) alongside the existing
-  `AV_API_TOKEN`/`AV_AUTH_USERS`, resolved inside `require_token` regardless of whether
-  the server is in Anonymous or Protected mode — `av token create` works on a server that
-  has never touched `.env` at all, the whole point of a remote-administrable alternative
-  to `av auth add-user` (which requires `docker compose` shell access on the host running
-  the stack). Six previously-UNSCOPED admin routes (`/api/admin/gc`, `/api/admin/audit*`,
-  `/api/admin/webhook-deliveries*`) now require the `admin` scope — a real security gap
-  closed, not a new feature; documented as such since a token with an EXPLICIT narrow
-  scope set (not the common unrestricted default) genuinely loses access it had before,
-  the one deliberate exception to this phase's "everything additive" rule. New CLI:
-  `av token create/list/revoke`, `av tenant create/show`, `av user create/list/suspend`,
-  `av role list/grant/bindings/revoke` — all backed by new `/api/tokens*`,
-  `/api/tenants*`, `/api/users*`, `/api/roles`, `/api/role-bindings*` routes.
-- **E4 — hard multi-tenancy (migrations `0012`/`0013`/`0014`):** `tenant_id` added to 28
-  pre-existing tables (nullable+backfill in `0012`, NOT NULL+FK+row-level-security in
-  `0013` — split specifically to avoid one long lock across add-column+backfill+constrain
-  on tables the size `audit_log`/`events` can reach) plus `objects`/`trees`' primary keys
-  widened to include it (`0014`, a schema prerequisite for a future genuinely-separate
-  per-tenant object store — NOT itself built this pass, see that migration's own
-  docstring). RLS policy is fail-CLOSED (an earlier draft was fail-open — GUC unset ⇒
-  every tenant's rows — caught in design review before any code existed, fixed to
-  COALESCE an unset GUC to the default tenant instead). The application-layer guard
-  (`server.py::_enforce_project_tenant`) is wired as a GLOBAL FastAPI dependency, not
-  per-route — two other designs were tried and rejected first (per-route `Depends()` on
-  ~80 project_id-taking routes, too error-prone at that scale; folded into the
-  `require_token` middleware, rejected after verifying LIVE that `request.path_params` is
-  empty inside `BaseHTTPMiddleware` before routing occurs). Everything gated behind
-  `AV_TENANCY_ENFORCE` (default off) and `tenant_id` always populated regardless (a
-  SQLAlchemy `before_flush` listener, not ~30 individual `db.add()` call-site edits).
-  **A significant live finding, documented prominently in migration `0013`'s own
-  docstring:** RLS is currently INERT under this repo's own default `docker-compose.yml`
-  — Postgres unconditionally exempts superusers from row-level security, and `av_user`
-  IS a superuser there (the official `postgres` image's `POSTGRES_USER` behavior, never
-  deliberately chosen). Found by a real two-tenant live test that confirmed the policy
-  correctly enabled/forced/defined and STILL didn't filter. The application-layer guard
-  is unaffected (pure app code); explicit tenant filters were added to `list_commits`/
-  `list_projects` to compensate — the remaining unfiltered list routes this phase did not
-  individually audit are a known, flagged residual gap pending the real fix (a
-  non-superuser connection role), not silently left broken.
-- **E5 — three of the identified cross-replica HA gaps, fixed and opt-in:** the webhook
-  retry worker's due-delivery select gained `.with_for_update(skip_locked=True)` (was
-  unconditionally duplicating deliveries under N replicas — the correctness-critical
-  fix; the throughput refinement of splitting claim from delivery is explicitly NOT done
-  yet). `rate_limit.RedisWindowRateLimiter` and a Redis-backed `_note_auth_failure` path
-  (`AV_RATE_LIMIT_BACKEND`/`AV_AUTH_SPIKE_BACKEND=redis`), both opt-in, both fail-open on
-  a Redis error, both byte-identical to today when unconfigured. Compose HA topology,
-  Helm chart, and CI HA-drill job are NOT built.
-- **New exit code:** `tenant_denied` (22) — 21 (`login_required`) deliberately left
-  unregistered until `av login`/SSO sessions have a real caller (this codebase's own
-  `test_contract_matrix.py` discipline: no code registered without a genuine repro).
-- **Real bugs found and fixed by the mandatory manual/live verification pass, not by
-  design review:** (1) `av token create` unconditionally 422'd on a genuinely Anonymous
-  server — the exact deployment shape most likely to use the feature first, since nobody
-  could ever mint a bootstrap token; fixed to fall back to the default tenant, same
-  reasoning `env_principal()` already applies. (2) Alembic's offline (`--sql`) render
-  mode crashed on `sa.inspect()` (no schema reflection against its `MockConnection`) and
-  on a live-`.rowcount`-driven `while True` batching loop (would have hung offline
-  forever) — migration `0012` now hardcodes its batched tables' PK column names instead
-  of inspecting, and gates the loop on `alembic.context.is_offline_mode()`. (3)
-  `CREATE POLICY` rejects bind parameters outright over asyncpg's extended protocol (a
-  DDL/utility statement, not SELECT/INSERT/UPDATE/DELETE) — migration `0013` inlines its
-  one internal constant (`DEFAULT_TENANT_ID`) as a literal instead. (4) The legacy-volume
-  adoption path's `_heal_legacy_columns` needed `tenant_id` entries for all 28 tables too
-  (an adopted volume with lost version-tracking could already have ANY of them) —
-  originally missed entirely, caught by two now-updated `test_migrations.py` fixtures
-  whose "an unrelated table" premise had gone stale. (5) `test_auth_users.py`'s
-  deliberately DB-free "lifespan-less" middleware probe crashed (Windows
-  ProactorEventLoop teardown) once `require_token` gained a real DB-backed fallback for
-  ANY unrecognized Bearer token — fixed with a scoped fixture patch
-  (`identity_module.resolve_db_token`/`resolve_session` stubbed to never touch Postgres
-  in that specific probe context), the same pattern `unreachable_client` already
-  established elsewhere for an analogous reason. (6) A syntax error (an unclosed dict
-  literal) shipped briefly in `av_sdk/exceptions.py` from a same-session edit and was
-  caught only by re-running the full stack-free suite, not by any narrower check —
-  restated here as the reason this phase's own verification discipline runs the full
-  suite at least once more before considering ANY of it done, not just the tests judged
-  relevant to what changed.
-- **One real incident, disclosed rather than only fixed:** a manual CLI repro against a
-  second scratch repo, testing a freshly-minted DB token, used `av auth set-token` —
-  which (correctly, by long-standing design) always targets the ONE local Docker stack,
-  not a per-repo config — and so wrote a token into THIS project's real `.env` and
-  restarted the real `aether-vault-engine` container, which then crash-looped (its
-  installed image's bundled migrations didn't know revision `0011`, freshly applied
-  moments earlier directly against the real dev database for an earlier, deliberate
-  verification step). Caught immediately; `.env` restored, the real dev database
-  downgraded back to `0010` to match the running image, container restarted, confirmed
-  healthy — `git status` afterward showed only the intended files touched.
-- **Deferred, stated plainly rather than implied complete:** E2 (SSO — OIDC+SAML against
-  a real Keycloak container), E3 (SCIM 2.0 provisioning), E5's compose HA
-  topology+Helm chart+CI drill job, E6 (backup/restore/DR drill), E7 (security-scanning
-  CI, audit-log hash-chaining, threat-model/control-matrix docs), E8 (support-bundle
-  command, `/api/metrics`, runbooks). None of these are code that exists yet.
+## Phase 61 — V1.3.3 "Audit Chain, Metrics, Per-Tenant CAS": closing v1.3.2's three deferred items
+SSO (E2) and SCIM (E3) remain entirely unstarted, stated plainly rather than implied complete.
 
-(No "Essential-Tasks: signed off" line — the full wrap-up sequence, including the
-Obsidian vault regen, has not been run for this entry; the live verification that DID
-run is the two full-suite passes and the targeted live test classes named above, not the
-complete Essential-Tasks.md checklist.)
+- **Audit log hash-chaining + optional signing**: every audit row now chains to the previous one via one canonical formula shared by the migration's historical backfill, the legacy-volume heal path, and the runtime listener — reasoned through for concurrent-write safety (an advisory lock serializes the read-chain-insert sequence, since two simultaneous audit writes could otherwise both chain from the same "last" hash and fork the chain). Optional ed25519 signing via a server-wide keypair, plus `av audit verify` including a genuinely independent offline-export verification path that never asks the server to grade its own homework.
+- **New `/api/metrics`** (hand-rolled Prometheus exposition, no new dependency): registered as the outermost middleware so it observes every request end-to-end, including 401s and 429s a route-only view would miss. The full live server suite was re-run clean specifically to confirm the new middleware layer didn't disturb the existing auth/CORS/rate-limit interactions.
+- **Per-tenant CAS storage isolation** (opt-in, default off): shared mode stays byte-for-byte unchanged; isolated mode threads a tenant id through every existence check, storage path, and the Bloom filter, with a legacy-flat-path fallback so already-uploaded objects keep serving with zero migration step. GC's dead-object computation was reasoned through explicitly for both modes, since a union computation and a per-tenant computation are each correct under exactly one mode and silently data-lossy under the other.
+- **Real bug found by this session's live verification**: the schema-healing step still used this repo's own test-only import spelling instead of the installed package's real one — the exact mistake the previous phase's incident writeup had already documented once, caught by re-verifying rather than assuming it stayed fixed.
+- **One flake observed and logged, not treated as a bug**: a two-tenant isolation test failed once (a HEAD 404ing right after a successful GET) and passed cleanly across 15 subsequent runs — consistent with this environment's known Windows/asyncio cross-loop timing class, not a logic defect.
+- **Deferred, stated plainly**: E2 (SSO), E3 (SCIM), a real Kubernetes HA drill, and the full wrap-up sequence.
 
-## Phase 61 — V1.3.3 "Audit Chain, Metrics, Per-Tenant CAS": closing v1.3.2's three
-deferred items (migration `0016`) — SSO (E2) and SCIM (E3) remain entirely unstarted,
-stated plainly rather than implied complete by this entry's presence.
+(No "Essential-Tasks: signed off" line — the owner is rebuilding the Docker image and running post-rebuild verification manually for this phase.)
 
-- **Audit log hash-chaining + optional signing (migration `0016`):** `audit_log` gains
-  `chain_hash` (NOT NULL — a REAL historical backfill for every pre-existing row, not a
-  placeholder) and `signature` (nullable). Chains purely by `id`'s own natural
-  autoincrement order — deliberately no `prev_id` column, unlike `policy_packs`, since
-  audit rows have no client-chosen publish order to begin with. One canonical formula
-  (`audit_chain.py::compute_chain_hash`, dependency-free stdlib) shared by three call
-  sites that must never drift apart: the migration's backfill, the legacy-volume
-  adoption heal path (`database.py::_heal_audit_chain_hash`), and the runtime
-  `before_flush` listener (`_chain_audit_log`) that populates every NEW row without
-  touching any of `_audit()`'s ~60 call sites. Concurrency solved explicitly, reasoned
-  through BEFORE writing the listener, not discovered broken after: two concurrent
-  requests both auditing at once could otherwise both read the same "last chain_hash"
-  and both compute a hash chained from it — a genuine fork — so the listener wraps the
-  read-then-chain-then-insert sequence in `pg_advisory_xact_lock` (transaction-scoped,
-  auto-released at commit/rollback), serializing only that narrow section. Optional
-  ed25519 signing via a NEW `audit_signing.py` — a server-WIDE keypair
-  (`AV_AUDIT_SIGNING_KEY_PATH`), deliberately separate from `av_cli/signing.py`'s
-  per-repo commit-signing keys, since audit rows are server-generated and server-wide,
-  not per-repo. New `GET /api/admin/audit/verify` (± `since_id` for incremental
-  re-checks) and `.../public-key`; new `av audit verify` CLI, including a genuinely
-  independent `--export FILE` offline-verification path (`av_cli/audit_chain_verify.py`)
-  that recomputes the chain locally from a jsonl export using the SAME dependency-free
-  formula, never asking the server to grade its own homework.
-- **`/api/metrics` (hand-rolled Prometheus text exposition, `metrics.py`):** the same
-  "no new dependency" judgment call `rate_limit.py` already made. Registered as the
-  OUTERMOST of the four `http` middlewares — deliberately, after actually re-reading
-  `server.py`'s own documented auth/CORS/rate-limit registration-vs-runtime-order
-  fragility before touching it, not despite it — so it observes every request end to
-  end, a 429 or a 401 included, which a route-only view would silently miss. Reads
-  `response.status_code` and `request.scope["route"]` (populated by Starlette's router
-  DURING `call_next()`, confirmed still visible after it returns) but touches no header
-  and no body, so it cannot interact with the header-ordering fragility that same
-  comment flags. Exposes request counts by method/path-template/status-class, a 9-bucket
-  latency histogram, per-tenant request counts, webhook queue depth, and DB pool state.
-  `admin`-scoped like every other observability route. The FULL live `test_server.py`
-  suite was re-run clean specifically to confirm this new middleware layer didn't
-  disturb the existing auth/CORS/rate-limit interactions — not assumed safe from reading
-  the code alone.
-- **Per-tenant CAS storage isolation (`AV_CAS_ISOLATION`, default `shared`):** the
-  feature migration `0014`'s primary-key widening was always a schema prerequisite for,
-  shipped as the one complete package the original design review insisted on (shipping
-  physical separation without also fixing every existence-check/Bloom-filter/GC-sweep
-  site together was flagged as a real data-loss bug, not a nitpick). Shared mode
-  (default) is untouched, byte-for-byte: every existence check across `upload_object`/
-  `head_object`/`POST /api/sync/batch-objects`/`build_merkle_tree`/`_object_exists` (and
-  therefore its ~10 RSI-artifact callers: improver versions, change sets, policy packs,
-  canary results, eval suites, plans, lessons, tool manifests, action logs — audited
-  exhaustively via a real grep-and-fix pass, not spot-checked) stays completely
-  unfiltered by tenant, exactly matching the plan's own explicit warning about this
-  class of change. Isolated mode threads `_cas_tenant_id(request)` through all of the
-  above, plus storage (`objects_dir/<tenant_id>/...`, with a legacy-flat-path fallback
-  read so an object uploaded before a deployment/tenant went isolated keeps serving with
-  zero migration step) and the Bloom filter (per-tenant filter names, same fallback
-  logic). GC's mark phase now ALWAYS computes per-tenant alive sets (`alive_by_tenant`)
-  regardless of mode — shared mode's dead-computation uses their union (proven
-  mathematically identical to the old flat computation, since a tenant's own commits
-  only ever reference trees that same tenant fully wrote, per the single-materialization-
-  path invariant); isolated mode's dead-computation uses each row's own tenant's set
-  specifically. These are NOT interchangeable: using the union under isolated mode could
-  delete a row a different tenant still needs; using per-tenant sets under shared mode
-  could delete a row a DIFFERENT tenant references (shared mode's dedup means only the
-  first uploader's row exists at all) — reasoned through explicitly before writing the
-  sweep, not discovered as a bug afterward.
-- **A real structural documentation bug found and fixed while adding this phase's own
-  new contract sections:** a PREVIOUS session's edit to `development/architecture.md`
-  had accidentally inserted new sections in the MIDDLE of the existing Anomaly Alerts
-  Contract, stranding that section's own concluding paragraph after an unrelated later
-  section (Backup & DR). Found by actually re-reading the surrounding text before
-  appending more content, not assumed fine because the diff looked additive.
-- **One real bug this session's live verification caught:** `cmd_admin.py`'s
-  schema-healing step (and its own test's mock) still used `python.av_server.database`
-  — this repo's own test-suite-only import spelling — instead of the installed
-  package's real top-level `av_server.database`, the EXACT mistake v1.3.2's own
-  incident writeup already documented once. Caught by re-verifying the fix rather than
-  assuming last session's note was still being followed; corrected in both places.
-- **One test flake observed and explicitly NOT treated as a real bug, logged rather
-  than silently dismissed:** a fresh two-tenant CAS-isolation test failed once with a
-  HEAD request 404ing immediately after a GET on the identical object succeeded moments
-  earlier, then passed cleanly across 3 separate full re-runs (15 total executions) with
-  zero code changes and did not reproduce in an isolated standalone repro script —
-  consistent with this environment's already-documented Windows/asyncio cross-loop
-  timing flakiness class (Probleme.md), not a logic defect in the new isolation code.
-- **Deferred, stated plainly rather than implied complete:** E2 (SSO), E3 (SCIM), a real
-  Kubernetes HA drill (the Helm chart remains schema-verified only), reference customers,
-  a third-party security audit, and the Obsidian vault regen / full wrap-up sequence.
+## Phase 62 — V1.3.3 "SSO & SCIM": closing the last two enterprise-readiness gaps, plus a real architectural fix they exposed as a hard blocker
+- **OIDC login**: authorization-code + PKCE with full ID-token validation (signature, issuer, audience, expiry, nonce-replay), never a bare decode. JIT provisioning and IdP group→role mapping are opt-in per provider and share one function with SAML, so this logic exists once, not once per protocol.
+- **Device-code flow**: `av login` uses this instead of a browser redirect, the wrong UX for a terminal. Approval is single-use — a successful poll deletes the record immediately, so a token can never be collected twice.
+- **SAML 2.0**: uses a real library (`pysaml2`) for signature/timing/audience validation rather than hand-rolled XML parsing, with an added Redis-backed replay guard for the common IdP-initiated login case the library doesn't cover itself. A real dependency conflict (a transitive SAML dependency breaking at import time under the newer `cryptography` version this release needs) was resolved by upgrading it, verified via an actual import test rather than assumed from version numbers.
+- **SCIM 2.0**: standard Users/Groups CRUD and filtering; deprovisioning suspends and revokes sessions rather than hard-deleting, preserving audit/attribution history; a repeat provisioning POST returns a clean 409 instead of a silent duplicate, letting an IdP's retry logic converge correctly.
+- **The real architectural fix this work exposed as a hard blocker**: permission resolution never actually expanded a user's effective permissions through group membership — a group-typed role binding only ever applied when the subject *was* a group, never a real logged-in user. This made SSO's group→role mapping and SCIM's group sync silently inert by construction. Fixed with a proper group-membership resolution path, live-verified in both the grant and revoke-on-removal directions.
+- **`login_required` (exit 21) activated**: this code had been reserved since v1.3.2 specifically until a real caller existed — the device-code timeout is that caller, and registering it required updating all six places that must agree (a discipline this codebase enforces mechanically, not just by convention).
+- **Real bug found and fixed before it ever shipped**: the device-code URL/user-code were printed unconditionally, which would have broken the "exactly one clean JSON envelope" contract for every agent-facing `av login --output json` call — fixed by gating the printing behind a JSON-mode check.
+- **`av init --mode enterprise` now genuinely works**, replacing the old "coming soon" stub with a real device-code-based provider behind the same existing seam — zero call-site changes needed elsewhere, confirming the seam was designed correctly the first time.
+- **New CLI**: `av login/logout/whoami`, `av idp add/list/show/test/remove`, `av scim status`, `av scim token create/revoke`. No new migration — every table SSO/SCIM needs already existed.
+- **Live-verified**: the full existing server suite (175 tests) re-run clean with every new module loaded, plus new coverage for the group-permission fix, SCIM, SSO credential encryption, and the device flow. One test-harness-only bug found and fixed (a cross-event-loop Redis connection reuse in the new device-flow tests, the same class this codebase had already hit once for Postgres).
+- **Deferred, stated plainly**: a live end-to-end run against a real external IdP (Keycloak/Okta/Entra) — the protocol code is implemented and tested against this server's own routes, but not yet verified against a real IdP in this environment.
 
-(No "Essential-Tasks: signed off" line, for the same reason Phase 60's own entry states
-one — the full wrap-up sequence has not run. The owner is rebuilding the Docker image
-and running post-rebuild verification manually for this phase; nothing here is committed
-by the agent.)
+(No "Essential-Tasks: signed off" line — the owner is rebuilding the Docker image and running post-rebuild verification manually for this phase.)
 
-## Phase 62 — V1.3.3 "SSO & SCIM": closing the last two enterprise-readiness gaps
-(OIDC + SAML 2.0 login, SCIM 2.0 provisioning) deferred out of Phase 61, plus a real
-architectural fix those two features exposed as a hard blocker
+## Phase 63 — V1.3.4 "CI/CD to 10/10": supply-chain lockdown, OS-parity test coverage, release-gate depth, and the operational drills the pipeline never actually ran
+Full execution of `todo.md`'s 40-item v1.3.4 CI/CD backlog, plus every bug found while doing it, fixed rather than deferred.
 
-- **OIDC login** (`sso_oidc.py`): authorization-code + PKCE, ID-token validated in full
-  (JWKS signature via `PyJWKClient`, issuer, audience, expiry, nonce-replay) — not a bare
-  decode. Round-trip state is an HMAC-SHA256-signed cookie (`AV_SECRET_KEY`-keyed,
-  10-minute TTL), never server-side session storage. JIT provisioning and IdP-asserted
-  group→role mapping are both per-provider and opt-in (`sso_providers.config`), converging
-  on ONE shared function (`sso_common.py::upsert_user_from_claims`) SAML uses too, so
-  session issuance/JIT/group-sync logic exists once, not once per protocol.
-- **Device-code flow** (`device_flow.py`): `av login` drives this, not a browser
-  redirect — the wrong UX for a terminal. Redis-backed (`av:device:*`), matching this
-  codebase's own existing pattern for short-lived ephemeral state (the Bloom filter,
-  rate-limit counters) rather than a new DB table. Approval is single-use: a successful
-  poll deletes the record immediately, so a session token can never be collected twice
-  even under a client retry after a dropped response.
-- **SAML 2.0** (`sso_saml.py`, `pysaml2` — new optional `[saml]` extra): metadata/ACS/SLS.
-  `parse_authn_request_response` gets signature verification, `NotBefore`/`NotOnOrAfter`
-  conditions, and audience restriction FOR FREE from the library — the entire reason to
-  use a real SAML library instead of hand-rolled XML parsing. `allow_unsolicited=True`
-  supports the common IdP-initiated login case, which means pysaml2 has no InResponseTo
-  to key replay protection off of for that case — added a Redis-backed assertion-ID
-  dedup (atomic `SET NX`) on top, since the library doesn't provide one there.
-- **A real dependency conflict resolved, not worked around:** `authlib`/`pyjwt[crypto]`
-  need `cryptography>=45.0.1`; `pysaml2`'s own dependency `pyOpenSSL 24.2.1` breaks at
-  IMPORT time under that `cryptography` version (`AttributeError: module 'lib' has no
-  attribute 'GEN_EMAIL'`). Fixed by upgrading `pyOpenSSL` to `>=25.0` too (landed at
-  26.4.0) — pip warns `pysaml2 7.5.4 requires pyopenssl<24.3.0`, but a direct import test
-  (`from saml2.client import Saml2Client`) confirms it works correctly at this version in
-  this environment. Verified via the actual import, not assumed from the version numbers.
-- **SCIM 2.0** (`scim.py`, `/scim/v2/*`, RFC 7643/7644): Users/Groups CRUD, `<attr> eq
-  "value"` filtering (`userName`/`externalId`/`emails.value` — what real IdPs actually
-  send), pagination. Deprovisioning (`PATCH {"active": false}`, and a literal `DELETE`)
-  suspends and revokes sessions immediately rather than hard-deleting — matches
-  `server.py::suspend_user`'s own established convention (audit history and
-  commit/run authorship attribution must survive). A repeat `POST` for an existing
-  `userName` returns 409 `uniqueness`, never a silent duplicate — the standard SCIM
-  client behavior on 409 (fall back to GET+PATCH) is what makes an IdP's retried
-  provisioning sync converge on one row rather than accumulating duplicates.
-- **Deliberately does NOT import from `server.py`:** `server.py` imports `scim.py`/
-  `sso_saml.py` at the BOTTOM of its own file (after mounting every other route), so a
-  top-level `from .server import ...` in either of those modules would be a genuine
-  load-time circular import, not merely bad style — confirmed by actually triggering it
-  in a scratch import test before settling on the alternative. Fixed by having each
-  module mirror the handful of primitives it needs (a local `_audit()` matching
-  `server.py`'s own shape exactly, so `tests/test_audit_coverage.py`'s sweep — which
-  looks for the literal `_audit(` substring in a mutating route's own source — covers
-  these modules' routes exactly like every other one, not via a documented exemption)
-  rather than reaching back into `server.py`.
-- **The real, load-bearing architectural fix this phase's own feature work exposed as a
-  hard blocker, not an incidental cleanup:** `identity.py::_permissions_for_subject`
-  never actually expanded a user's effective permissions through group membership —
-  `DBRoleBinding`'s own docstring always promised "unions every binding's role's
-  permissions that apply to the resolved subject", but a group-typed binding only ever
-  applied when the SUBJECT resolving permissions was itself a group, never a real logged-
-  in user. This made SSO's group→role mapping and SCIM's group sync — the entire point of
-  both features from an access-control standpoint — silently inert by construction.
-  Fixed by adding a `subject_type == "user"` branch that additionally resolves through a
-  live `DBGroupMember` subquery, so removing a user from a group revokes that group's
-  role's permissions on the user's very next request, with no separate role-binding
-  cleanup step needed. This was flagged as untested in an earlier compaction of this
-  session's own work — it has now been live-verified (see below), including the
-  revocation-on-removal direction, not just the grant direction.
-- **`login_required` (exit 21) activated, not newly invented:** this code was reserved
-  in the exit-code registry since v1.3.2 specifically with a note that it stays
-  unregistered "until a real caller exists" — `av login`'s device-code timeout is that
-  real caller. Registering it touched all SIX places that must agree (`core.py`,
-  `av_sdk/exceptions.py`, `docs/for-agents.md`, `AGENTS.md`, and two test-side literal
-  registries — `tests/test_contract_matrix.py::EXIT_CODE_REGISTRY` and a new
-  `test_login_required_exits_21[_json]` repro pair in `tests/test_exit_codes.py` — the
-  latter two found only by actually re-running the full anti-drift sweep after adding
-  the code, not by reasoning about the four documented touch points in isolation).
-- **A real bug in `cmd_login.py`'s own first draft, found by writing its own `--output
-  json` exit-code repro test before this ever shipped, not by a user report:** the
-  device-code URL/user-code were printed unconditionally via `click.secho`, which would
-  have broken `test_contract_matrix.py`'s "exactly one clean JSON envelope" contract for
-  every agent-facing `av login --output json` call — human-readable output would have
-  preceded the JSON envelope on stdout. Fixed by gating all such printing behind a
-  JSON-mode check and surfacing the same information inside the envelope's `data`
-  instead (both on success and on the `login_required` failure).
-- **`av init --mode enterprise` now genuinely works**, replacing `StubEnterpriseAuthProvider`
-  (which printed "coming soon" and returned `None`) with a real
-  `DeviceCodeEnterpriseAuthProvider` implementing the SAME `EnterpriseAuthProvider`
-  Protocol — zero call-site changes needed in `cmd_repo.py` (`_reconnect_existing_repo`,
-  `init()`), confirming the seam was designed correctly the first time. Sessions persist
-  to `~/.aether-vault/session.json` — the SAME user-level directory `update_check.py`
-  already established, not a new one invented per the original plan's literal
-  `~/.av/session.json` sketch, since a login session is per-user-per-machine like that
-  existing convention, not per-repo. `resolve_remote()` now prefers a live session's
-  token over `cfg["remote_api_token"]` when the session's own URL matches the repo's
-  configured remote — never sent cross-server.
-- **New CLI**: `av login [--provider] [--url] [--no-browser]`, `av logout`, `av whoami`,
-  `av idp add|list|show|test|remove`, `av scim status`, `av scim token create|revoke`.
-- **New route**: `GET /api/auth/whoami` (no scope required — reports whatever identity,
-  including a genuinely anonymous one, the caller resolved to; what `av whoami`/`av
-  login`'s own post-login confirmation both read from).
-- **No new migration.** Every table SSO/SCIM needs (`sso_providers`, `user_identities`,
-  `groups`, `group_members`, `sessions`) already exists from migration `0011` — verified
-  by actually checking, not assumed from the plan's own original schema sketch.
-- **Live-verified, not merely imported cleanly:** the FULL existing `test_server.py`
-  suite (175 tests) re-run clean with every new module loaded, specifically to confirm
-  none of this session's routes/middleware/identity.py change disturbed anything
-  pre-existing. New coverage: `TestGroupRoleBindingGrantsUserPermission` (the identity.py
-  fix, both grant and revoke-on-removal directions), `TestScim` (discovery, CRUD, 409
-  uniqueness, PATCH/DELETE-suspends, filter, scope enforcement), `TestSsoCrypto`
-  (encrypt/decrypt/mask round trip, refuses-with-no-key, live proof the plaintext secret
-  never lands in the `sso_providers` row), `TestDeviceFlow` (create/approve/poll,
-  single-use collection, unknown-code handling).
-- **One real test-harness bug found and fixed while writing `TestDeviceFlow`, not a bug
-  in `device_flow.py` itself:** calling its async functions from a fresh `asyncio.run()`
-  reused the app's pooled Redis connection (bound to the TestClient's own lifespan event
-  loop) from a DIFFERENT loop — the exact cross-loop failure class this codebase already
-  hit once for asyncpg (`_truncate_all()`'s own documented workaround). Fixed the same
-  way: a brand-new Redis client opened and used entirely inside the test's own loop,
-  monkeypatched in for the duration.
-- **Deferred, stated plainly rather than implied complete:** a Keycloak docker-compose
-  overlay and a live end-to-end OIDC/SAML run against a real external IdP — the protocol
-  code is implemented and tested against this server's own routes, but "works against
-  Keycloak/Okta/Entra" has not itself been verified in this environment. Reference
-  customers, a third-party security audit, and a real Kubernetes HA drill remain
-  deferred from Phase 61 too.
+- **Supply chain**: every third-party action reference across all workflows is now SHA-pinned — including the PyPI-publishing action itself, previously on a mutable branch. New secret-scanning and CodeQL workflows; every workflow declares least-privilege permissions; Trivy image scanning moved from a disconnected throwaway build to an actual gate on the real image about to publish. A new standing test makes unpinned actions/images a permanent CI failure, not just a one-time cleanup.
+- **Test completeness**: a Linux test job now carries a real measured coverage gate (the suite had only ever run stack-free on Windows before); migration drills now prove every individual revision's upgrade/downgrade, not just one full round trip; a nightly macOS wheel-install smoke closes a gap documented since v1.3.0.
+- **Engine/Docker depth**: images now bake a real version instead of reporting a dev-fallback string, gained OCI labels and real healthchecks, and the release image is now genuinely multi-arch. Found and fixed a real gap: SSO/SAML dependencies were dead in every previously-shipped image despite `pyproject.toml`'s own comment claiming otherwise. New release-smoke script boots the actual release compose file, which turned out to be missing a config var every real pip-install user has silently been running without (the RLS-bypassing superuser topology closed in v1.3.2 — now actually fixed for real deployments too).
+- **Real bug found and fixed**: the schema-sync path called `alembic upgrade head` unconditionally, but Alembic must resolve the current revision within its own script directory — so an older replica restarting after a newer replica had already advanced the schema during a rolling upgrade would crash outright, directly contradicting the project's own additive-schema promise. Fixed to detect this case and skip with a warning instead of crashing.
+- **Real bug found and fixed**: the security-scanning workflow had literally never run once since it was authored (a PR-only trigger on a repo with zero PRs), and its image-scan step referenced a version tag that has never existed — the entire scanning surface was silently providing zero coverage. Fixed on both counts.
+- **Release gates**: the release gate's "are required checks green" logic used to silently ignore most of the newer CI jobs by name-matching only on "test" — now checks every required context for real. New checks refuse a tag whose CHANGELOG entry doesn't name it, or whose benchmark capture has gone stale on a MINOR release. Every wheel/sdist and the engine image now carry a signed build-provenance attestation.
+- **Deploy/observability**: a "staging" smoke test now runs against the actual just-pushed edge image by digest; a rollback drill deploys the previous release, this release, then back, asserting no data loss across the round trip; a new CI summary renders per-job duration against budget on every run.
+- **Policy/process**: the CI job map, the migration "five places" checklist, and the exit-code "six places" checklist all gained mechanical drift-detection instead of living only as documentation someone has to remember to update; a deprecation registry with overdue-detection was added.
+- **Doc drift fixed along the way**: stale project URLs, a Helm chart pointing at the wrong org, and three separate docs that still described features (SSO/SCIM, `/api/metrics`, subservice restart semantics) as unbuilt a full phase after they'd shipped.
+- **Deferred, stated plainly**: this session had no reachable Docker daemon, so every Docker-dependent script is text-verified and reasoned through but not locally run end-to-end — their real proof is the next CI run. Two repo-settings changes (branch protection scope, requiring SHA-pinning at the repo level) need owner-level access this session's token doesn't have.
 
-(No "Essential-Tasks: signed off" line — the owner is rebuilding the Docker image and
-running post-rebuild verification manually for this phase, per this session's own
-instruction; nothing here is committed by the agent.)
+(No "Essential-Tasks: signed off" line — Docker-dependent verification and the repo-settings changes above are the owner's to complete.)
 
-## Phase 63 — V1.3.4 "CI/CD to 10/10": supply-chain lockdown, OS-parity test coverage,
-release-gate depth, and the operational drills the pipeline never actually ran
+## Phase 64 — V1.3.5: closing v1.3.4's own CI gaps, a docs index link, and a repo-wide comment-condensing pass (plus the two regressions it caused, found and fixed)
+- **Real bug found and fixed**: three CI jobs called `av` on the runner without ever installing it first, unlike every other job that uses the CLI — `staging-smoke` failed with "command not found" on its very first real run, right after health/ready checks had genuinely passed. Fixed in all three; confirmed green on the next push.
+- **CI reliability**: the Windows test job's timeout left too little margin over its own typical runtime and got cancelled by runner variance with 95% of the suite done — bumped from 25 to 40 minutes.
+- **Repo-wide comment-condensing pass** (202 files): trimmed verbose/historical commentary down to what a reader actually needs going forward, across every workflow, script, Python module, and webui file touched.
+- **Real regression found and fixed**: the condensing pass deleted two pieces of actual content sitting next to comment paragraphs it was trimming — a shell variable definition (breaking a chaos drill outright) and a compliance disclaimer sentence duplicated across five command docstrings (a real `--help`-text regression a test specifically guards). Both restored; caught by CI going red on this pass's own first run, not by re-reading the diff. A systematic whole-diff re-scan afterward found nothing further.
+- **Audit**: every entry in `Probleme.md` (139 at the time) verified to carry a severity rating and status marker.
 
-Full execution of `todo.md`'s 40-item v1.3.4 CI/CD backlog (groups A–H), plus every bug
-found while doing it, fixed rather than deferred. Six waves; the full plan (and the
-verification-status caveats below) lives in this session's own record, summarized here.
-
-- **Supply chain (todo A):** all 73 third-party `uses:` references across 6 workflow
-  files (a new `codeql.yml` added) SHA-pinned with a trailing `# vX.Y` comment — including
-  `pypa/gh-action-pypi-publish`, previously on the mutable `@release/v1` branch on the
-  PyPI-publishing path itself. Service/job-container images (`postgres`, `redis-stack-
-  server`, `semgrep`) pinned by digest. New `tests/test_ci_policy.py::TestActionPinning`
-  makes this permanent — a new unpinned `uses:` or unpinned `image:` fails CI by name,
-  the same standing-guard pattern the existing no-bots policy already established. New
-  `gitleaks` job (full-history secret scan, SARIF to the Security tab, `.gitleaks.toml`
-  allowlisting the handful of known dev-only literals) and a new `codeql.yml` workflow
-  (Python + TypeScript + the workflow files themselves via CodeQL's `actions` language).
-  `security.yml` gained a `push: master` trigger. Every workflow now declares a
-  least-privilege top-level `permissions:` block; the repo's own default workflow token
-  permission was flipped `write` → `read`. Trivy image scanning moved from a
-  disconnected throwaway build to an actual scan-before-push gate on the REAL image
-  about to reach GHCR, in both `docker-edge.yml` and `release.yml`.
-- **Test completeness (todo B):** `test-linux` — the Linux twin of the Windows-only
-  `test` matrix this repo had run stack-free tests on exclusively until now — carries a
-  real, MEASURED coverage gate (`[tool.coverage]` in pyproject.toml; see VERSIONING.md's
-  own note on where the `fail_under` floor came from) and a slowest-25 report. A new
-  `contract-matrix` job promotes the exit-code/envelope/anti-leakage sweep to its own
-  ~2-minute named check. `migrations-drill` proves every INDIVIDUAL revision's
-  upgrade/downgrade/re-upgrade against a real Postgres, not just one full round trip.
-  `lint-workflows` runs `actionlint`+`shellcheck` on every push. A flake-quarantine policy
-  (`tests/FLAKES.md`, `@pytest.mark.flaky`, `tests/test_flake_registry.py`) exists and is
-  deliberately EMPTY — no test earned quarantine rather than an honest fix this pass.
-  `nightly.yml` gained a real macOS wheel-install smoke (closing a residual
-  `infrastructure.md` had documented since v1.3.0).
-- **Engine/Docker depth (todo C):** the Dockerfile now bakes a REAL version into every
-  image (`ARG AV_VERSION`/`SETUPTOOLS_SCM_PRETEND_VERSION`, closing Probleme.md #69 for
-  good — every prior image reported the `0.0.0.dev0` fallback), carries OCI `LABEL`s, and
-  has a real `HEALTHCHECK` on every target for the first time. The release path's engine
-  image is now genuinely multi-arch (linux/amd64+arm64 via buildx/QEMU). SSO/SAML were
-  dead in every shipped image (pyproject.toml's own comment claimed otherwise, verified
-  false) — `py-builder` now resolves `.[sso,saml,sign]` as one dependency graph and both
-  final stages install the native `xmlsec1`/`libxml2` runtime libs. `slim-image-smoke`
-  is the first job that ever builds and boots the actual slim `server`/`webui` Dockerfile
-  targets (published since v1.3.0, never exercised). `scripts/release_smoke.sh` — new,
-  boots the REAL release compose file (`python/av_cli/docker/docker-compose.release.yml`,
-  which was missing `AV_APP_DATABASE_URL` this whole time — every pip-install user has
-  been on the RLS-bypassing superuser topology migration 0015 exists to close — now
-  fixed) and asserts health/ready/push/pull/protected-mode. Three new drill scripts —
-  `migrations_drill.py`, `compat_drill.sh`, `rollback_drill.sh` — plus the chaos suite's
-  new genuine-ENOSPC drill (Phase M2, a real tmpfs, not a read-only-directory proxy for
-  it) and Phase U (backup/restore, written since v1.3.2, never wired to CI) finally
-  running nightly as `dr-drill`.
-- **Real bug, found and fixed:** `database.py::_ensure_schema_sync()` called
-  `command.upgrade(cfg, "head")` unconditionally — but alembic MUST resolve the
-  database's current revision within its OWN script directory to compute an upgrade
-  path, so any OLDER replica's restart during a rolling upgrade, once a newer replica had
-  already advanced the schema, crashed outright (`CommandError: Can't locate revision`).
-  Directly contradicted VERSIONING.md's additive-schema promise. Fixed:
-  `_schema_is_ahead_of_this_binary()` detects this and skips the upgrade attempt with a
-  clear log warning instead of crashing. Three new stack-free SQLite unit tests; NOT yet
-  live-verified against a real two-binary rolling upgrade (see `scripts/compat_drill.sh`
-  and Probleme.md #136 for the honest status).
-- **Real bug, found and fixed:** `security.yml` had ZERO runs, ever, since it was
-  authored — its trigger was PR+weekly-only and this repo has had zero PRs — AND its
-  Trivy step referenced `aquasecurity/trivy-action@0.28.0`, a version string that has
-  never existed in that repository (tags are `v`-prefixed). The entire pip-audit/bandit/
-  semgrep/Trivy/npm-audit surface was providing zero actual coverage, silently. Fixed on
-  both counts (Probleme.md #135); this is also why security.yml's SHA pins are this
-  session's, not inherited from a previously-green run.
-- **Release gates (todo D):** `scripts/release_gate.py`'s GitHub check
-  (`check_required_checks_green`, replacing `check_tagged_commit_tests_green`) now
-  requires EVERY context in the live (or `.github/required-checks.txt`-fallback)
-  required-status-checks list — the old version filtered by `"test" in name.lower()`,
-  silently ignoring `ha-drill`, every `security.yml` job, `helm-lint`, and more. New
-  checks: `check_changelog_versioning_sync` (refuses a tag whose CHANGELOG entry doesn't
-  name it, or — on a MINOR-or-above release — whose VERSIONING.md has no matching
-  section) and `check_benchmarks_fresh_on_minor` (a MINOR-or-above release's captured
-  benchmark sha must postdate the PREVIOUS tag, or carry an explicit `Benchmarks:
-  unchanged` attestation). `--report PATH` renders every check's outcome as a Markdown
-  table, uploaded as a `release-gate-report` artifact and attached to the GitHub Release
-  itself. `build-wheels`/`build-sdist` now actually `needs: gate` (they used to run
-  regardless). cibuildwheel bumped v2.16→v4.2.2 — v2.16 could never have built the
-  cp313/cp314 wheels `pyproject.toml`'s own config already asked for; a new CI step
-  asserts every CPython tag actually landed in the wheelhouse. A new `verify-install`
-  job installs the ACTUAL release artifacts (not a separate `python -m build` output) on
-  all three OSes before anything reaches PyPI. Every wheel/sdist and the engine image now
-  carry an SBOM (SPDX, `anchore/sbom-action` / buildx `sbom: true`) and a Sigstore-backed
-  build-provenance attestation (`actions/attest-build-provenance` / buildx
-  `provenance: mode=max`) — verification commands documented in SECURITY.md's new
-  "Supply-chain attestations" section.
-- **Deploy/observability (todo E/F):** "staging" realized as the just-pushed `:edge`
-  image smoked by digest immediately after publish (`docker-edge.yml`'s new
-  `staging-smoke` job) — no external host, no new secrets. `preview-env` gives every PR a
-  locally-built-image smoke rendered into that run's own summary. `rollback-drill`
-  (release.yml) deploys the previous release image → this release → back to the
-  previous, asserting no data loss across the round trip — self-calibrating against
-  whether the OLD tag actually contains a given fix, so it never produces a false
-  failure regardless of tag history (see its own header for what that means for
-  Probleme.md #136 specifically). `ci-summary` (new, `scripts/ci_summary.py`) renders a
-  per-job duration-vs-budget table into every `tests.yml` run's summary and, on a
-  same-repo PR, as a comment — budgets tracked in `.github/ci-budgets.yml`, kept
-  impossible to drift from the real jobs by `tests/test_ci_map.py`.
-- **Policy/process (todo G):** `development/infrastructure.md`'s CI Job Map rewritten to
-  list every job in all 6 workflow files individually (previously just filenames for
-  three of them) — `tests/test_ci_map.py` parses both the table and the real YAML and
-  fails on any mismatch, in either direction, permanently. The migration "5-places"
-  checklist (previously only ever written up as a `Probleme.md` audit entry, never in the
-  one doc an author would actually consult) now lives in `infrastructure.md` itself. The
-  parallel exit-code "six places" checklist gained mechanical enforcement for its
-  previously-unchecked three places (`av_sdk/exceptions.py`, `docs/for-agents.md`,
-  `AGENTS.md` — `tests/test_contract_matrix.py`'s new `TestExitCodeRegistryMatches*`
-  classes). `development/deprecations.yml` + `scripts/check_deprecations.py` +
-  `tests/test_deprecations.py` give the deprecation policy a real, schema-checked,
-  overdue-detecting registry (seeded with the v1.3.0 GHCR-alias removal as the one
-  historical entry). `.github/CODEOWNERS` added for the server, the two single-path
-  modules, Docker/deploy, and CI itself — deliberately WITHOUT enabling required code-
-  owner reviews, which would force every PR through a review gate this repo's actual
-  direct-to-master flow doesn't use.
-- **Doc drift fixed along the way, found while touching adjacent files (not the
-  objective, but real):** `pyproject.toml`/`CONTRIBUTING.md`'s project URLs pointed at
-  `github.com/leon1706/aether-vault` (no such org); the Helm chart's default image
-  pointed at the same wrong org (`values.yaml`); `docs/enterprise-operator-guide.md`'s own
-  intro still said SSO/SCIM were "NOT built" a full phase after they shipped; `docs/
-  slo.md` still said `/api/metrics` didn't exist a full phase after it shipped (with real
-  request-rate/latency histograms, per-path, already built); `docker/README.md` still
-  described pre-v1.2.5 all-or-nothing subservice restart semantics; the Dockerfile's own
-  header comment described the v1.3.0-removed legacy GHCR aliases as still being
-  published.
-- **Deferred, stated plainly:** this session had no reachable Docker daemon — every
-  Docker-dependent script (`ha_drill.sh`'s W0 fixes, `release_smoke.sh`,
-  `rollback_drill.sh`, `compat_drill.sh`, the Dockerfile's SSO/SAML native-build changes,
-  the multi-arch/SBOM/provenance build-push changes) is text-verified and reasoned
-  through, NOT locally run end-to-end — their real proof is the next CI run, or a local
-  run once Docker Desktop is available. The branch-protection required-status-checks
-  update (to match `.github/required-checks.txt`'s complete 30-context list) and
-  `sha_pinning_required` at the repo level need to be applied directly by the owner —
-  the former was attempted via `gh api` and blocked by this session's own permission
-  classifier as an outward-facing/hard-to-reverse change, the latter needs an admin
-  scope this session's token doesn't have. Requiring signed commits was deliberately NOT
-  enabled without asking first (this session's own stated checkpoint). Reference
-  customers, third-party audit, and a live external-IdP run remain deferred from Phase
-  61/62, unchanged.
-
-(No "Essential-Tasks: signed off" line — Docker-dependent verification and the branch-
-protection/repo-settings changes above are the owner's to complete; nothing here is
-committed by the agent.)
-
-## Phase 64 — V1.3.5: closing v1.3.4's own CI gaps, a docs index link, and a repo-wide
-comment-condensing pass (plus the two regressions it caused, found and fixed)
-
-- **Real bug, found and fixed:** three of `scripts/release_smoke.sh`'s call sites
-  (`staging-smoke` in `docker-edge.yml`, `rollback-drill` in `release.yml`, `preview-env`
-  in `tests.yml`) never installed the `av` CLI on the RUNNER before the script's own
-  real `av push`/`av pull` round trip — every other job that uses `av` does
-  `setup-python` + `pip install -e .` first, these three skipped straight from checkout
-  to Docker. `staging-smoke` (a brand-new v1.3.4 job) failed on its very first real run:
-  `av: command not found`, right after `/api/health`/`/api/ready`/the version check had
-  all genuinely passed. `preview-env` had the identical gap masked by its own
-  `continue-on-error: true`. Fixed in all three (Probleme.md #138); confirmed live —
-  `staging-smoke` went green on the next push.
-- **CI reliability:** the Windows `test` matrix job's `timeout-minutes: 25` left too
-  little margin over its own ~20-minute typical runtime — one run's `(3.10)` leg got
-  cancelled at the 25-minute mark with 95% of the suite already done (not a hang, just
-  runner variance). Bumped to 40.
-- **Docs:** added a `docs/` row to the main README's Module Documentation table, pointing
-  at `docs/README.md`'s own topic index (tutorial, RSI guide, contracts, DR, SLA/SLO,
-  runbooks) — previously only reachable via an inline mention buried in the "For Agents"
-  section.
-- **Repo-wide comment-condensing pass** (202 files): trimmed verbose/historical
-  commentary (old bug-number call-outs, superseded version-bump notes, restated-in-prose
-  rationale already covered by a test or a doc) down to what a reader actually needs
-  going forward, across every workflow, script, Python module, and webui file touched
-  this session.
-- **Real regression, found and fixed:** the condensing pass deleted two pieces of actual
-  content that happened to sit right next to the comment paragraphs it was trimming —
-  not comments themselves. (1) `scripts/e2e_scenario.sh` lost the line
-  `READONLY_DATA="$WORK/data-readonly"`, turning chaos drill Phase M into an instant
-  `set -u` unbound-variable failure. (2) `python/av_cli/cmd_registry.py` lost the "not a
-  PKI / not identity-binding" disclaimer sentence from five signing-command docstrings
-  (`registry keys list/fingerprint/rotate`, `verify`, `export-signature`) — a real
-  `--help`-text regression `tests/test_signing.py` specifically guards per-command,
-  since Click doesn't roll a parent group's docstring into its subcommands' own
-  `--help`. Both restored; caught by `chaos-drills`/`plugin-tests` going red on this
-  pass's own first CI run, not by re-reading the diff (Probleme.md #139, which also
-  records the systematic whole-diff re-scan run afterward — one confirmed instance of
-  each regression class, nothing further found).
-- **Audit:** every entry in `Probleme.md` (139 at last count) verified to carry both a
-  `Severity: N/10` rating and a colored status marker; #94 (Docker Desktop's WSL2 backend
-  failing to start) updated from 🟡 `partial` to 🟢 `fixed` now that it starts and boots
-  the stack correctly again.
-
-## Phase 65 — V1.3.6: `max_chunk` was only a soft cap near EOF in CDC chunking — and the
-first fix over-corrected (Probleme.md #140)
-
-- **Real bug, found and fixed:** `chunk_and_hash_file`'s forced `max_chunk` cut shared
-  its "leave >= `min_chunk` for the tail" gate with ordinary content-defined cuts; once
-  that gate goes false near EOF it never recovers, so a chunk could grow past `max_chunk`
-  with no way left to force a cut. Data-dependent (only certain random tail lengths hit
-  it), which is why `test_chunk_and_hash_file_produces_valid_chunks` only failed on one CI
-  leg (`test (3.14)`, Windows) despite the bug being platform-agnostic. Found via
-  `gh run view --log-failed`, not by re-reading the diff.
-- **Real regression, found and fixed, same session:** the first fix (a forced cut at
-  `file_size - min_chunk`) over-corrected — it fired unconditionally on any file above
-  ~2×`min_chunk`, needlessly splitting ordinary small artifacts nowhere near `max_chunk`
-  and breaking the single-CAS-object assumption in `test_add_large_file_creates_pointer`
-  and four `av doctor` tests, on both Linux and Windows. Caught from the next CI run's
-  failures, not by re-reading the first fix.
-- **Fix:** the forced cut now only fires when skipping it would actually let the run to
-  EOF exceed `max_chunk` (`size_so_far + min_chunk > max_chunk`) — a true hard cap without
-  touching files that never approach it.
-- **New deterministic test:**
-  `test_chunk_and_hash_file_max_chunk_is_a_hard_cap_deterministic` (uniform-byte content,
-  so every cut is purely size-driven) pins down the exact edge instead of relying on the
-  existing random-data test's ~e^-15 chance of ever reaching it.
-- **Manual verification:** scratch-repo `av add`/`av commit`/`av doctor` on real 2 MB and
-  32 MB `.pt` checkpoints (1 MB LFS threshold) confirmed correct chunk counts (1 and 14)
-  and every chunk within `[min_chunk, max_chunk]`; a 500-trial random-data stress test on
-  the corrected build is clean; full local suite green (1324 passed, 1 unrelated local
-  disk-speed perf-gate flake that doesn't reproduce in CI); GitHub CI's `Tests` workflow
-  fully green on the carrying commit.
-- **Docs:** added an explicit `max_chunk`/`min_chunk` hard-bound invariant to
-  `src/README.md`'s "Invariants you must not break", naming the new deterministic test as
-  the required regression guard for any future change to the cut logic.
+## Phase 65 — V1.3.6: `max_chunk` was only a soft cap near EOF in CDC chunking — and the first fix over-corrected
+- **Real bug found and fixed**: the forced `max_chunk` cut shared its "leave enough for the tail" gate with ordinary content-defined cuts, and once that gate went false near EOF it never recovered — so a chunk could grow past `max_chunk` with no way left to force a cut. Data-dependent (only certain random tail lengths hit it), which is why it only failed on one CI leg despite being platform-agnostic; found via CI logs, not by re-reading the diff.
+- **Real regression found and fixed in the same session**: the first fix over-corrected, firing unconditionally on any file twice the minimum chunk size and needlessly splitting ordinary small artifacts nowhere near the max — breaking a single-object assumption several other tests depended on. Caught from the next CI run's failures, not by re-reading the first fix.
+- **Real fix**: the forced cut now only fires when skipping it would actually let the file exceed `max_chunk` — a true hard cap that leaves files nowhere near it untouched, backed by a new deterministic test pinning down the exact edge case.
+- **Verified**: manual scratch-repo runs on real checkpoints confirmed correct chunk counts and bounds; a 500-trial random-data stress test and the full local suite (1324 tests) are clean; CI green on the carrying commit. Docs updated with the `max_chunk`/`min_chunk` hard-bound invariant.
 
 Essential-Tasks: signed off

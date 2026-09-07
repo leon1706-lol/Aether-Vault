@@ -55,6 +55,12 @@ defers to — part of the contract, not optional.
   finding, the change, the proof, nothing else. No blow-by-blow of hypotheses tried,
   investigation narrative, or restated code. This is a MUST going forward, not a style
   preference: condense at write time, don't write long and condense later.
+- **CHANGELOG.md entries: condensed, not narrated.** Same rule as Probleme.md, same
+  reason. Keep the schema (`## Phase N — Title` + bold-led bullets, one bullet per
+  unique task/fix), but each bullet is **~2 sentences, a bit more only if the task
+  genuinely needs it** — what changed and why it matters, not file lists, investigation
+  narrative, or verification play-by-play. Condense at write time; don't write long and
+  fix it up later.
 - **Comments: short and precise.** A comment earns its place by telling a
   reader something the code can't — a non-obvious *why*, an invariant, a real gotcha.
   Useless (restates the code, or narrates process — "found live", "see Probleme.md #N")
