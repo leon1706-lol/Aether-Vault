@@ -230,17 +230,29 @@ def check_required_checks_green(repo: str, tag: str, gh_token: str | None,
     if not required:
         return False, f"could not resolve a required-checks list at all ({source})"
 
-    url = f"https://api.github.com/repos/{repo}/commits/{tag}/check-runs"
-    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
-    if gh_token:
-        req.add_header("Authorization", f"Bearer {gh_token}")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        return False, f"could not query GitHub check-runs for {tag}: {exc}"
-
-    runs = data.get("check_runs", [])
+    # Paginated: a commit that's had even one re-triggered workflow run easily carries
+    # 70+ check-runs (every matrix leg of every workflow), well past this endpoint's
+    # 30-per-page default -- an unpaginated GET silently truncates to the first page and
+    # reports real, green required contexts as "no check-run found" just because they
+    # landed on a later page (see Probleme.md: this cost several false gate failures
+    # before being caught).
+    runs: list[dict] = []
+    url = f"https://api.github.com/repos/{repo}/commits/{tag}/check-runs?per_page=100"
+    while url:
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        if gh_token:
+            req.add_header("Authorization", f"Bearer {gh_token}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                link_header = resp.headers.get("Link", "")
+        except urllib.error.URLError as exc:
+            return False, f"could not query GitHub check-runs for {tag}: {exc}"
+        runs.extend(data.get("check_runs", []))
+        url = None
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                url = part.split(";")[0].strip().lstrip("<").rstrip(">")
     by_name: dict[str, list[dict]] = {}
     for r in runs:
         by_name.setdefault(r.get("name", ""), []).append(r)
