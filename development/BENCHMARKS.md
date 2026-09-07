@@ -152,7 +152,8 @@ Time to run `av gc` on the remote CAS server after committing and pushing 20 sma
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 2026-09-02 | 1.2.5.dev6+g8ef634b58.d20260902 | 13.2 ms | 59.5 ms | 84.8 ms | 111.1 ms | 1436.3 ms | 43.8 ms | 224.4 ms | 1933.3 ms | 12392.8 ms |
 | 2026-09-02 | 1.2.5.dev6+g8ef634b58.d20260902 | 17.5 ms | 58.5 ms | 100.1 ms | 97.8 ms | 1380.1 ms | 36.8 ms | 173.8 ms | 1790.0 ms | 9504.0 ms |
+| 2026-09-07 | 1.3.6 | 9.0 ms | 17.1 ms | 16.7 ms | 45.6 ms | 535.3 ms | 8.1 ms | 97.7 ms | 695.7 ms | 2789.5 ms |
 
-2 capture(s) total, showing the most recent 2. Machine varies across captures (see each entry's `os`/`python` in `development/perf-history.json`) — read this as a rough trend, not an apples-to-apples benchmark; `av test --speed` / the perf gate (`tests/test_perf_gate.py`) are the authoritative regression check for a single machine.
+3 capture(s) total, showing the most recent 3. Machine varies across captures (see each entry's `os`/`python` in `development/perf-history.json`) — read this as a rough trend, not an apples-to-apples benchmark; `av test --speed` / the perf gate (`tests/test_perf_gate.py`) are the authoritative regression check for a single machine.
 
 <!-- PERF-HISTORY:END -->

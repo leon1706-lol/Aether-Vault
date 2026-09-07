@@ -2397,3 +2397,38 @@ comment-condensing pass (plus the two regressions it caused, found and fixed)
   `Severity: N/10` rating and a colored status marker; #94 (Docker Desktop's WSL2 backend
   failing to start) updated from 🟡 `partial` to 🟢 `fixed` now that it starts and boots
   the stack correctly again.
+
+## Phase 65 — V1.3.6: `max_chunk` was only a soft cap near EOF in CDC chunking — and the
+first fix over-corrected (Probleme.md #140)
+
+- **Real bug, found and fixed:** `chunk_and_hash_file`'s forced `max_chunk` cut shared
+  its "leave >= `min_chunk` for the tail" gate with ordinary content-defined cuts; once
+  that gate goes false near EOF it never recovers, so a chunk could grow past `max_chunk`
+  with no way left to force a cut. Data-dependent (only certain random tail lengths hit
+  it), which is why `test_chunk_and_hash_file_produces_valid_chunks` only failed on one CI
+  leg (`test (3.14)`, Windows) despite the bug being platform-agnostic. Found via
+  `gh run view --log-failed`, not by re-reading the diff.
+- **Real regression, found and fixed, same session:** the first fix (a forced cut at
+  `file_size - min_chunk`) over-corrected — it fired unconditionally on any file above
+  ~2×`min_chunk`, needlessly splitting ordinary small artifacts nowhere near `max_chunk`
+  and breaking the single-CAS-object assumption in `test_add_large_file_creates_pointer`
+  and four `av doctor` tests, on both Linux and Windows. Caught from the next CI run's
+  failures, not by re-reading the first fix.
+- **Fix:** the forced cut now only fires when skipping it would actually let the run to
+  EOF exceed `max_chunk` (`size_so_far + min_chunk > max_chunk`) — a true hard cap without
+  touching files that never approach it.
+- **New deterministic test:**
+  `test_chunk_and_hash_file_max_chunk_is_a_hard_cap_deterministic` (uniform-byte content,
+  so every cut is purely size-driven) pins down the exact edge instead of relying on the
+  existing random-data test's ~e^-15 chance of ever reaching it.
+- **Manual verification:** scratch-repo `av add`/`av commit`/`av doctor` on real 2 MB and
+  32 MB `.pt` checkpoints (1 MB LFS threshold) confirmed correct chunk counts (1 and 14)
+  and every chunk within `[min_chunk, max_chunk]`; a 500-trial random-data stress test on
+  the corrected build is clean; full local suite green (1324 passed, 1 unrelated local
+  disk-speed perf-gate flake that doesn't reproduce in CI); GitHub CI's `Tests` workflow
+  fully green on the carrying commit.
+- **Docs:** added an explicit `max_chunk`/`min_chunk` hard-bound invariant to
+  `src/README.md`'s "Invariants you must not break", naming the new deterministic test as
+  the required regression guard for any future change to the cut logic.
+
+Essential-Tasks: signed off

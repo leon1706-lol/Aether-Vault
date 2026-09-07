@@ -357,6 +357,18 @@ real product-code fix (below) that closes a genuine schema-compatibility gap.
   prove themselves until a tag past this release's own fixes exists to drill against —
   see each script's own header for exactly what that means.
 
+## v1.3.6 additive surfaces (see development/CHANGELOG.md Phases 64-65)
+
+Not a product-surface release (no new HTTP routes/DB schema/CLI commands) — this is the
+first real tag cut since v1.2.4, so it carries everything accumulated in CHANGELOG.md
+since then, most recently: closing v1.3.4's own CI gaps and a repo-wide comment-condensing
+pass (Phase 64/V1.3.5), and a CDC-chunking correctness fix (Phase 65/V1.3.6,
+Probleme.md #140) where `chunk_and_hash_file`'s `max_chunk` cap could silently become a
+soft cap near EOF. Existing contracts (JSON envelopes, exit codes, `.avh`, HTTP payloads)
+are unchanged; the fix only changes chunk boundaries a `.pt`/`.pth`/etc. artifact above
+the LFS threshold is split into on disk, which is an internal storage/dedup detail, not a
+user-facing contract.
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades

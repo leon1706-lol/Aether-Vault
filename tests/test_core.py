@@ -98,6 +98,34 @@ def test_chunk_and_hash_file_produces_valid_chunks(tmp_path):
     assert covered == len(data)
 
 
+def test_chunk_and_hash_file_max_chunk_is_a_hard_cap_deterministic(tmp_path):
+    """Deterministic counterpart to the random-data test above: uniform-byte content
+    never trips the gear-hash mask (each cut here is purely size-driven), so this pins
+    down the exact max_chunk/min_chunk edge instead of relying on random data's ~e^-15
+    chance of ever reaching it. Regression cover for two real bugs -- max_chunk silently
+    becoming a soft cap near EOF, and the fix for that over-firing and splitting files
+    nowhere near max_chunk."""
+    p = tmp_path / "checkpoint.pt"
+
+    # Below max_chunk + min_chunk: no forced cut should ever be needed.
+    p.write_bytes(b"\x00" * (2 * 1024 * 1024))
+    chunks = aether_core.chunk_and_hash_file(str(p))
+    assert chunks == [{"hash": chunks[0]["hash"], "size": 2 * 1024 * 1024, "offset": 0}]
+
+    # Comfortably past max_chunk + min_chunk: must be forced to split, and every
+    # resulting chunk -- including the tail -- must respect [min_chunk, max_chunk].
+    size = 20 * 1024 * 1024
+    p.write_bytes(b"\x00" * size)
+    chunks = aether_core.chunk_and_hash_file(str(p))
+    assert len(chunks) >= 2
+    covered = 0
+    for c in chunks:
+        assert 512 * 1024 <= c["size"] <= 8 * 1024 * 1024
+        assert c["offset"] == covered
+        covered += c["size"]
+    assert covered == size
+
+
 def test_chunk_and_hash_file_boundaries_stable_under_local_edit(tmp_path):
     """The actual dedup claim: an edit inside one region must leave every chunk entirely
     before the edit point byte-identical (same boundary offset AND hash).

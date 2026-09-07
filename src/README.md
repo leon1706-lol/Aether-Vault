@@ -25,6 +25,13 @@ pybind11 boundary lives in `python/`.
    machine, or dedup silently stops working.
 3. **Untrusted inputs**: safetensors headers are attacker-controllable - keep the
    bounds checks on `header_size` / `data_offsets` intact.
+4. **`chunk_and_hash_file`'s `max_chunk` is a true hard cap, `min_chunk` a true floor,
+   on every chunk including the last.** Both directions have broken before (Probleme.md):
+   a near-EOF cut got silently suppressed and let a chunk exceed `max_chunk`; the fix for
+   that then over-fired and split ordinary files nowhere near `max_chunk`. Any change to
+   the cut logic needs `test_chunk_and_hash_file_max_chunk_is_a_hard_cap_deterministic`
+   (deterministic) green, not just the random-data test (only ~e^-15 odds of ever
+   reaching the edge).
 
 ## Rebuild after editing
 

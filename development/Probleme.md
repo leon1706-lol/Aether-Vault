@@ -1680,3 +1680,15 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Verification:** `bash -n`/`ast.parse` confirm both files are syntactically valid; the previously-failing signing-docstring test now passes 7/7 locally. Only these two regressions are confirmed so far — the rest of the 202-file, 7,008-deletion commit is being verified by CI's own full suite rather than manual re-reading.
 
 **Caution for future passes of this kind:** a real assignment or a compliance-relevant sentence can sit inside what looks like a comment paragraph — never drop a line spanning from comment into code without checking each retained/dropped line individually.
+
+---
+
+### 140. `chunk_and_hash_file`'s `max_chunk` was only a soft cap near EOF — and the first fix over-corrected, splitting ordinary files that never approached it
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-07), found via a CI failure in `test_chunk_and_hash_file_produces_valid_chunks` (`gh run view --log-failed`).
+
+**Problem:** The forced `max_chunk` cut was gated by the same "leave >= `min_chunk` for the tail" check as ordinary content-defined cuts; once that check goes false near EOF it never becomes true again, so a chunk could grow past `max_chunk` with no way left to force a cut (data-dependent, hence CI-flaky). The first fix (a forced cut at `file_size - min_chunk`) over-corrected: it fired unconditionally on any file above ~2×`min_chunk`, splitting ordinary small artifacts that were never at risk of exceeding `max_chunk` and breaking the single-CAS-object assumption in `test_add_large_file_creates_pointer` and four `av doctor` tests, on both Linux and Windows.
+
+**Fix:** The forced cut now only fires when skipping it would actually let the run to EOF exceed `max_chunk` (`size_so_far + min_chunk > max_chunk`), making `max_chunk` a true hard cap without touching files that never approach it.
+
+**Verification:** New deterministic test (`test_chunk_and_hash_file_max_chunk_is_a_hard_cap_deterministic`, uniform-byte content so cuts are purely size-driven) plus the original random-data test and all six previously-failing tests pass; a 500-trial random-data stress test is clean; a manual scratch-repo `av add`/`av commit`/`av doctor` pass on real 2 MB and 32 MB `.pt` checkpoints (1 MB LFS threshold) confirmed correct chunk counts and bounds; full local suite green (1324 passed); GitHub CI's `Tests` workflow fully green on the carrying commit (`d074625`).
