@@ -250,3 +250,14 @@ def import_mlflow(run_id: str, tracking_uri: str | None, tag: str | None) -> Non
     from av_plugins.mlflow import import_run
     import_run(run_id, repo_root=repo_root, tracking_uri=tracking_uri, tag=tag)
     click.secho(f"Imported MLflow run: {run_id}", fg="green")
+
+
+@click.command("import-pytorch")
+@click.argument("checkpoint_path", type=click.Path(exists=True))
+@click.option("--tag", default=None, help="Additional tag to attach to the imported commit.")
+def import_pytorch(checkpoint_path: str, tag: str | None) -> None:
+    """Backfill a pre-existing vanilla PyTorch checkpoint not captured live by AetherVaultCheckpointer."""
+    repo_root = ensure_repo()
+    from av_plugins.pytorch import import_checkpoint
+    import_checkpoint(checkpoint_path, repo_root=repo_root, tag=tag)
+    click.secho(f"Imported PyTorch checkpoint: {checkpoint_path}", fg="green")

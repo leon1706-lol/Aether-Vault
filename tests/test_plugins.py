@@ -86,6 +86,7 @@ def test_run_av_commit_with_no_changes_raises_nothing_to_commit(tmp_path):
 _HAS_LIGHTNING = importlib.util.find_spec("lightning") is not None or importlib.util.find_spec("pytorch_lightning") is not None
 _HAS_TRANSFORMERS = importlib.util.find_spec("transformers") is not None
 _HAS_MLFLOW = importlib.util.find_spec("mlflow") is not None
+_HAS_TORCH = importlib.util.find_spec("torch") is not None
 
 
 @pytest.mark.skipif(_HAS_LIGHTNING, reason="lightning is installed; ImportError path not exercised")
@@ -296,6 +297,284 @@ def test_mlflow_import_run_raises_when_no_artifacts(tmp_path, monkeypatch):
 
     with pytest.raises(AetherVaultException):
         import_run(run_id, repo_root=repo_root, tracking_uri=tracking_uri)
+
+
+# ---------------------------------------------------------------------------
+# Vanilla PyTorch (v1.4.0): no framework callback to hook, so AetherVaultCheckpointer is
+# an object the training loop calls explicitly instead of a framework-injected callback.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(_HAS_TORCH, reason="torch is installed; ImportError path not exercised")
+def test_pytorch_plugin_raises_clear_importerror_when_missing():
+    with pytest.raises(ImportError, match="aether-vault\\[pytorch\\]"):
+        import python.av_plugins.pytorch  # noqa: F401
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_checkpointer_commits_checkpoint(tmp_path):
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer
+
+    repo_root = _init_repo(tmp_path)
+    model = nn.Linear(4, 1)
+
+    ckpt = AetherVaultCheckpointer(repo_root / "ckpts", tag="unit-test")
+    ckpt.save(model, epoch=1, metrics={"loss": 0.2})
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    committed_files = trees[0]["tree"]
+    assert any(p.endswith(".pt") for p in committed_files)
+    assert "unit-test" in trees[0]["tags"]
+    assert trees[0]["metrics"] == {"loss": 0.2}
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_save_message_omits_step_when_not_given(tmp_path):
+    """Regression: a vanilla loop very often tracks epoch alone (no global step, unlike
+    Lightning/Transformers), and the commit message must not literally read "step=None"."""
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer
+
+    repo_root = _init_repo(tmp_path)
+    ckpt = AetherVaultCheckpointer(repo_root / "ckpts")
+    ckpt.save(nn.Linear(4, 1), epoch=2)
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    assert trees[0]["message"] == "epoch=2"
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_checkpointer_commits_dataset_on_start(tmp_path):
+    from python.av_plugins.pytorch import AetherVaultCheckpointer
+
+    repo_root = _init_repo(tmp_path)
+    dataset_path = repo_root / "train.parquet"
+    dataset_path.write_text("dummy dataset")
+
+    ckpt = AetherVaultCheckpointer(repo_root / "ckpts", dataset_paths=str(dataset_path),
+                                    tag="unit-test")
+    ckpt.start()
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    assert trees[0]["tags"] == ["dataset"]
+    assert "train.parquet" in trees[0]["tree"]
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_checkpoint_commit_does_not_sweep_staged_files(tmp_path):
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer
+
+    repo_root = _init_repo(tmp_path)
+    unrelated = _stage_unrelated(repo_root)
+
+    ckpt = AetherVaultCheckpointer(repo_root / "ckpts", tag="unit-test")
+    ckpt.save(nn.Linear(4, 1), epoch=0)
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    assert not any(p == "notes.py" for p in trees[0]["tree"])
+
+    from av_cli.index import Index
+    idx = Index(repo_root)
+    assert idx.get_entry("notes.py")["staged"] is True
+    assert unrelated.exists()
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_save_records_optimizer_and_scheduler_state(tmp_path):
+    import torch
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer
+
+    repo_root = _init_repo(tmp_path)
+    model = nn.Linear(4, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+
+    ckpt_dir = repo_root / "ckpts"
+    with_opt = AetherVaultCheckpointer(ckpt_dir, tag="with-opt")
+    with_opt.save(model, epoch=0, optimizer=optimizer, scheduler=scheduler,
+                  path=ckpt_dir / "with_opt.pt")
+
+    without_opt = AetherVaultCheckpointer(ckpt_dir, tag="without-opt")
+    without_opt.save(model, epoch=0, path=ckpt_dir / "without_opt.pt")
+
+    payload_with = torch.load(ckpt_dir / "with_opt.pt", weights_only=False)
+    assert "optimizer" in payload_with
+    assert "scheduler" in payload_with
+
+    payload_without = torch.load(ckpt_dir / "without_opt.pt", weights_only=False)
+    assert "optimizer" not in payload_without
+    assert "scheduler" not in payload_without
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_load_checkpoint_restores_model_optimizer_scheduler(tmp_path):
+    import torch
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer, load_checkpoint
+
+    repo_root = _init_repo(tmp_path)
+    model = nn.Linear(4, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+
+    ckpt = AetherVaultCheckpointer(repo_root / "ckpts")
+    ckpt_path = repo_root / "ckpts" / "roundtrip.pt"
+    ckpt.save(model, epoch=3, step=99, optimizer=optimizer, scheduler=scheduler,
+              metrics={"loss": 0.5}, path=ckpt_path)
+    saved_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    # Mutate the live model/optimizer/scheduler so the restore is provably real.
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.0)
+    optimizer.step()
+    scheduler.step()
+
+    new_model = nn.Linear(4, 1)
+    new_optimizer = torch.optim.SGD(new_model.parameters(), lr=0.01)
+    new_scheduler = torch.optim.lr_scheduler.StepLR(new_optimizer, step_size=1)
+
+    payload = load_checkpoint(ckpt_path, model=new_model, optimizer=new_optimizer,
+                              scheduler=new_scheduler)
+
+    for key, tensor in saved_state.items():
+        assert torch.equal(new_model.state_dict()[key], tensor)
+    assert payload["epoch"] == 3
+    assert payload["step"] == 99
+    assert payload["metrics"] == {"loss": 0.5}
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_latest_checkpoint_returns_newest(tmp_path):
+    import time
+
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer, latest_checkpoint
+
+    repo_root = _init_repo(tmp_path)
+    ckpt_dir = repo_root / "ckpts"
+    assert latest_checkpoint(ckpt_dir) is None  # directory doesn't exist yet
+
+    ckpt = AetherVaultCheckpointer(ckpt_dir)
+    model = nn.Linear(4, 1)
+    ckpt.save(model, epoch=0, path=ckpt_dir / "epoch0.pt")
+    time.sleep(0.01)
+    ckpt.save(model, epoch=1, path=ckpt_dir / "epoch1.pt")
+
+    assert latest_checkpoint(ckpt_dir) == str(ckpt_dir / "epoch1.pt")
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_import_checkpoint(tmp_path):
+    import torch
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import import_checkpoint
+
+    repo_root = _init_repo(tmp_path)
+    ckpt_path = repo_root / "old_run" / "epoch4.pt"
+    ckpt_path.parent.mkdir(parents=True)
+    torch.save({"av_format": 1, "model": nn.Linear(4, 1).state_dict(),
+                "metrics": {"loss": 0.4}}, ckpt_path)
+
+    import_checkpoint(str(ckpt_path), repo_root=repo_root, tag="backfill")
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 1
+    assert "pytorch-import" in trees[0]["tags"]
+    assert "backfill" in trees[0]["tags"]
+    assert trees[0]["metrics"] == {"loss": 0.4}
+
+    # Re-importing the same, unchanged checkpoint must be a no-op, not a second commit.
+    import_checkpoint(str(ckpt_path), repo_root=repo_root, tag="backfill")
+    assert len(_commit_trees(repo_root)) == 1
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_finish_flushes_pending_push(tmp_path, unreachable_client):
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer
+
+    repo_root = _init_repo(tmp_path)
+    ckpt = AetherVaultCheckpointer(repo_root / "ckpts", tag="unit-test")
+    ckpt.save(nn.Linear(4, 1), epoch=0)
+
+    from python.av_cli.core import load_pending_push
+    assert load_pending_push(repo_root), "commit should have queued (server unreachable)"
+
+    result = ckpt.finish()
+    assert set(result) == {"drained", "still_queued"}
+    assert load_pending_push(repo_root), "queue should still be present (server unreachable)"
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_context_manager_starts_and_finishes(tmp_path, unreachable_client):
+    import torch.nn as nn
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer
+
+    repo_root = _init_repo(tmp_path)
+    dataset_path = repo_root / "train.parquet"
+    dataset_path.write_text("dummy dataset")
+
+    with AetherVaultCheckpointer(repo_root / "ckpts", tag="unit-test",
+                                  dataset_paths=str(dataset_path)) as ckpt:
+        ckpt.save(nn.Linear(4, 1), epoch=0)
+
+    trees = _commit_trees(repo_root)
+    assert any(t["tags"] == ["dataset"] for t in trees)
+    assert any("unit-test" in t["tags"] for t in trees)
+
+
+@pytest.mark.skipif(not _HAS_TORCH, reason="torch not installed")
+def test_pytorch_real_training_loop_smoke(tmp_path):
+    """A REAL two-epoch vanilla-PyTorch training loop through AetherVaultCheckpointer --
+    the fake-model tests above prove the seam, this proves the actual torch wiring: a
+    real nn.Linear model, a real SGD optimizer, real loss values flowing into metrics."""
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from python.av_plugins.pytorch import AetherVaultCheckpointer
+
+    repo_root = _init_repo(tmp_path)
+    model = nn.Linear(4, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    ds = TensorDataset(torch.randn(8, 4), torch.randn(8))
+    loader = DataLoader(ds, batch_size=4)
+
+    with AetherVaultCheckpointer(repo_root / "ckpts", tag="real-loop-smoke") as ckpt:
+        for epoch in range(2):
+            last_loss = None
+            for x, y in loader:
+                optimizer.zero_grad()
+                loss = ((model(x).squeeze(-1) - y) ** 2).mean()
+                loss.backward()
+                optimizer.step()
+                last_loss = loss
+            ckpt.save(model, epoch=epoch, optimizer=optimizer,
+                      metrics={"train_loss": last_loss})
+
+    trees = _commit_trees(repo_root)
+    assert len(trees) == 2, f"expected 2 checkpoint commits, got {len(trees)}"
+    committed_files = [p for t in trees for p in t["tree"]]
+    assert any(p.endswith(".pt") for p in committed_files)
+    assert all("real-loop-smoke" in t["tags"] for t in trees)
+    assert any("train_loss" in t["metrics"] for t in trees), \
+        f"expected train_loss metric, got: {[t['metrics'] for t in trees]}"
 
 
 # ---------------------------------------------------------------------------

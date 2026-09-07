@@ -248,10 +248,16 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Aether-Vault with the Lightning/Transformers/MLflow/sign extras
+      # The default PyPI torch on Linux is the CUDA build (~2.5GB); every test in this
+      # job runs on CPU. Pre-installing from the CPU index leaves the extras install
+      # below already satisfied, so this makes the job faster, not slower.
+      - name: Pre-install CPU-only torch
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Install Aether-Vault with the Lightning/Transformers/MLflow/PyTorch/sign extras
         # [sign] so the signed-commit gate (tests/test_signing.py) runs here rather than
         # skipping everywhere -- this is the only job with cryptography installed by default.
-        run: pip install -e .[dev,lightning,transformers,mlflow,sign]
+        run: pip install -e .[dev,lightning,transformers,mlflow,pytorch,sign]
 
       - name: Run framework-plugin tests (+ signed-commit gate)
         run: pytest tests/test_plugins.py tests/test_signing.py -v

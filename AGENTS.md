@@ -42,6 +42,7 @@ defers to — part of the contract, not optional.
 | Semantic diffs | `python/av_cli/semdiff.py` |
 | Agent SDK | `python/av_sdk/` (`from av_sdk import Repo`) |
 | Server | `python/av_server/server.py`, models in `models.py`, migrations in `migrations/versions/` |
+| Framework plugins | `python/av_plugins/` (Lightning/Transformers/MLflow/PyTorch) — seam is `_shared.commit_scoped()`/`push_pending()`, never `core.commit_staged` directly; new plugin follows `python/av_plugins/README.md`'s recipe |
 
 ## Conventions
 

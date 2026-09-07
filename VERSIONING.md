@@ -369,6 +369,37 @@ are unchanged; the fix only changes chunk boundaries a `.pt`/`.pth`/etc. artifac
 the LFS threshold is split into on disk, which is an internal storage/dedup detail, not a
 user-facing contract.
 
+## v1.4.0 additive surfaces (see development/CHANGELOG.md Phase 67)
+
+Vanilla PyTorch join Lightning/Transformers/MLflow as a first-class `av_plugins`
+framework: unlike those, plain PyTorch has no callback system to hook, so instead of a
+framework-injected callback the plugin is an explicit object the training loop calls.
+Every surface below is additive and off-by-default (nothing changes for an install that
+never adds the `[pytorch]` extra or calls `av import-pytorch`).
+
+- **Python package**: `av_plugins.pytorch` — `AetherVaultCheckpointer` (`start()`/`save()`/
+  `finish()`, also a context manager), plus module-level `load_checkpoint()`,
+  `latest_checkpoint()`, and `import_checkpoint()`. Built on the same seam as every other
+  plugin (`_shared.commit_scoped()`/`push_pending()` → `core.commit_scoped_paths()`/
+  `core.flush_pending_push()` directly — no chdir, no CLI hop).
+- **CLI**: `av import-pytorch <checkpoint_path> [--tag TAG]` — backfills a pre-existing
+  checkpoint not captured live by the checkpointer, mirroring `import-lightning`/
+  `import-transformers`/`import-mlflow`.
+- **Packaging**: new optional extra `pytorch = ["torch>=2.0"]` in
+  `[project.optional-dependencies]`.
+- **On-disk artifact contract**: `AetherVaultCheckpointer.save()` writes a `torch.save`
+  payload tagged `{"av_format": 1, ...}` — `model`/`optimizer`/`scheduler` state dicts
+  (each omitted, not null, when not passed), `epoch`/`step`/`metrics` when given. This is
+  a new, versioned artifact shape (bump `av_format` on any future incompatible change),
+  not a change to any existing JSON envelope/exit-code/`.avh` contract.
+- **Tags**: commits from the checkpointer carry the caller's own `tag` (if any, matching
+  the other plugins); backfills via `import_checkpoint()`/`av import-pytorch` add
+  `pytorch-import`, matching `lightning-import`/`transformers-import`/`mlflow-import`.
+- **`torch.load` behavior note, not a contract break**: `load_checkpoint()` tries
+  `weights_only=True` first (torch >= 2.6's own safe default) and falls back to
+  `weights_only=False` only if that rejects the file — relevant if a caller's `extra=`
+  payload holds arbitrary picklables.
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades

@@ -18,10 +18,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #                own test below instead.
 #   test, benchmark - subprocess-heavy; invoking them here would recursively run the suite.
 #   webui      - starts Docker + opens a real browser tab; a human/ops tool, not agent-relevant.
-#   import-lightning/transformers/mlflow - need the real ML framework installed to do
-#                anything beyond their own (already clean) ImportError path.
+#   import-lightning/transformers/mlflow/pytorch - need the real ML framework installed
+#                to do anything beyond their own (already clean) ImportError path.
 _LEAKAGE_EXEMPT = {"watch", "test", "benchmark", "webui", "import-lightning",
-                    "import-transformers", "import-mlflow"}
+                    "import-transformers", "import-mlflow", "import-pytorch"}
 
 
 def _iter_command_paths():

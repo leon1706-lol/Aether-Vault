@@ -3,12 +3,15 @@
 Owns the optional framework-native callbacks that stage and commit checkpoints
 automatically during training, plus symmetric import commands for backfilling
 artifacts that already exist. Installed via extras:
-`pip install aether-vault[lightning]`, `[transformers]`, `[mlflow]`.
+`pip install aether-vault[lightning]`, `[transformers]`, `[mlflow]`, `[pytorch]`.
 
 - `lightning.py` - `AetherVaultCallback` for PyTorch Lightning + `import_checkpoint()`.
 - `transformers.py` - `AetherVaultTrainerCallback` for HuggingFace Transformers +
   `import_checkpoint()`.
 - `mlflow.py` - `import_run()` - pulls artifacts and metrics from an MLflow server.
+- `pytorch.py` - `AetherVaultCheckpointer` for vanilla PyTorch (no framework callback to
+  hook, so this is an object the training loop calls explicitly) + `load_checkpoint()` /
+  `latest_checkpoint()` for resume + `import_checkpoint()`.
 - `_shared.py` - the seam every plugin is built on: `commit_scoped()` delegates to
   `av_cli.core.commit_scoped_paths()` (direct staging + single-writer commit, no CLI
   hop, no chdir); `push_pending()` delegates to `av_cli.core.flush_pending_push()`
@@ -68,9 +71,11 @@ staging/commit/push logic. Using `transformers.py` as the template:
    API returns.
 5. **Register the extra** in `pyproject.toml` (`[project.optional-dependencies]`) as
    `yourframework = ["yourframework>=X.Y"]`, and add a CLI-level `av import-yourframework`
-   command in `python/av_cli/main.py` mirroring the existing `import-lightning` /
-   `import-transformers` / `import-mlflow` commands if a backfill CLI entry point makes
-   sense for it.
+   command in `python/av_cli/cmd_integrations.py` mirroring the existing `import-lightning` /
+   `import-transformers` / `import-mlflow` / `import-pytorch` commands if a backfill CLI
+   entry point makes sense for it — then import and register it in `python/av_cli/main.py`
+   (an import line + a `cli.add_command(...)` call; the command body itself lives in
+   `cmd_integrations.py`, not `main.py`).
 6. **Tests**: add to `tests/test_plugins.py` — a real-callback test using the actual
    library (matches the file's existing pattern, `pytest.importorskip`-guarded so it
    skips cleanly without the extra installed), an import-error-message test (extra

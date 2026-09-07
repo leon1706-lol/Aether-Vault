@@ -159,6 +159,7 @@ from .cmd_integrations import (  # noqa: E402
     handoff,
     import_lightning,
     import_mlflow,
+    import_pytorch,
     import_transformers,
     webui_cmd,
 )
@@ -290,6 +291,7 @@ cli.add_command(webui_cmd)
 cli.add_command(import_lightning)
 cli.add_command(import_transformers)
 cli.add_command(import_mlflow)
+cli.add_command(import_pytorch)
 
 
 # Historical namespace surface (tests/benchmarks import these from here):

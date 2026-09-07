@@ -11,7 +11,7 @@ DOCKER_HINT = "docker compose up -d db redis aether-vault-engine"
 
 _DOCKER_MARKERS = ("docker compose", "postgres/redis", "live aether-vault-engine")
 _CORE_MARKERS = ("aether_core",)
-_PLUGIN_MARKERS = ("lightning", "transformers", "mlflow")
+_PLUGIN_MARKERS = ("lightning", "transformers", "mlflow", "torch")
 
 
 def extract_reason(report) -> str:

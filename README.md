@@ -131,8 +131,8 @@ Split into two focused diagrams — what happens on your machine, and how it tal
 
 ```mermaid
 graph TD
-    Plugins("av_plugins<br>(Lightning · Transformers callbacks)")
-    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit ·<br>improver · canary · freeze · incident · eval · task · plan · budget ·<br>scheduler · review · critique · lineage · search · strategy · lessons ·<br>blackboard · sandbox · replay-actions · tools)")
+    Plugins("av_plugins<br>(Lightning · Transformers · vanilla PyTorch callbacks)")
+    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-pytorch · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit ·<br>improver · canary · freeze · incident · eval · task · plan · budget ·<br>scheduler · review · critique · lineage · search · strategy · lessons ·<br>blackboard · sandbox · replay-actions · tools)")
     CPP("aether_core (C++)<br>(Splits Safetensors & CDC-Chunks Checkpoints,<br>Hashes in Parallel)")
     LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
     PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
@@ -200,7 +200,7 @@ and how it's wired in, this table is the index.
 | `python/` | All Aether-Vault Python packages: CLI, registry server, plugins | [README](python/README.md) |
 | `python/av_cli/` | The `av` CLI: commands, local DAG/CAS, sync, merge, log, chunking, signing, doctor | [README](python/av_cli/README.md) |
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
-| `python/av_plugins/` | Lightning / Transformers / MLflow auto-commit callbacks | [README](python/av_plugins/README.md) |
+| `python/av_plugins/` | Lightning / Transformers / MLflow / vanilla PyTorch auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
 | `tests/` | 1,287-test suite across 69 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
@@ -240,11 +240,12 @@ and how it's wired in, this table is the index.
 
 ## Framework Plugins
 
-Native callbacks for PyTorch Lightning and HuggingFace Transformers that auto-commit checkpoints during training:
+Native callbacks for PyTorch Lightning and HuggingFace Transformers that auto-commit checkpoints during training, plus a checkpointer for vanilla PyTorch (no framework):
 
 ```bash
 pip install aether-vault[lightning]      # PyTorch Lightning
 pip install aether-vault[transformers]   # HuggingFace Transformers
+pip install aether-vault[pytorch]        # vanilla PyTorch
 ```
 
 ```python
@@ -255,9 +256,25 @@ trainer = Trainer(callbacks=[AetherVaultCallback(tag="experiment-1", dataset_pat
 # HuggingFace Transformers
 from av_plugins.transformers import AetherVaultTrainerCallback
 trainer = Trainer(..., callbacks=[AetherVaultTrainerCallback(tag="experiment-1", dataset_paths="data/train.csv")])
+
+# Vanilla PyTorch -- no framework callback to hook, so this is an object your own loop
+# calls explicitly instead of a framework-injected callback:
+from av_plugins.pytorch import AetherVaultCheckpointer
+with AetherVaultCheckpointer("checkpoints/", tag="experiment-1", dataset_paths="data/train.pt") as ckpt:
+    for epoch in range(n_epochs):
+        train_one_epoch(...)
+        ckpt.save(model, epoch=epoch, optimizer=optimizer, metrics={"val_loss": val_loss})
 ```
 
 Each callback commits with the current step/epoch as the message and numeric metrics attached via `--metric`, flushing a final `av push` at the end of training. `dataset_paths` is staged once at training start, tagged `dataset` for lineage tracking. Re-importing an unchanged checkpoint is a no-op; scoped commits leave your staged files untouched.
+
+To resume from an `AetherVaultCheckpointer` checkpoint:
+
+```python
+from av_plugins.pytorch import load_checkpoint, latest_checkpoint
+payload = load_checkpoint(latest_checkpoint("checkpoints/"), model=model, optimizer=optimizer)
+start_epoch = payload["epoch"] + 1
+```
 
 ### Importing existing artifacts
 
@@ -265,6 +282,7 @@ Each callback commits with the current step/epoch as the message and numeric met
 av import-lightning path/to/epoch=12.ckpt --tag backfill
 av import-transformers path/to/checkpoint-1000 --tag backfill
 av import-mlflow <run_id> --tag backfill   # requires: pip install aether-vault[mlflow]
+av import-pytorch path/to/epoch12.pt --tag backfill
 ```
 
 ---

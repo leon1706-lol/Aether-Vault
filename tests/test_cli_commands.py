@@ -1,5 +1,5 @@
 """Direct tests for the CLI commands not already covered by tests/test_cli.py:
-branch, push, gc, list-meta, config, graph, webui, and the three import-* commands.
+branch, push, gc, list-meta, config, graph, webui, and the four import-* commands.
 """
 import json
 import sys
@@ -375,7 +375,7 @@ def test_update_docker_already_up_to_date(repo, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# av import-lightning / import-transformers / import-mlflow
+# av import-lightning / import-transformers / import-mlflow / import-pytorch
 #
 # The real av_plugins modules raise ImportError at import time when the optional extra
 # isn't installed, so a fake module is injected directly into sys.modules before invoking
@@ -438,3 +438,23 @@ def test_import_mlflow_cli_wraps_plugin_function(repo, monkeypatch):
     assert calls["args"][2] == "sqlite:///x.db"
     assert calls["args"][3] == "backfill"
     assert "Imported MLflow run" in result.output
+
+
+def test_import_pytorch_cli_wraps_plugin_function(repo, monkeypatch, tmp_path):
+    calls = {}
+
+    def fake_import_checkpoint(checkpoint_path, repo_root=None, tag=None):
+        calls["args"] = (checkpoint_path, repo_root, tag)
+
+    fake_module = types.ModuleType("av_plugins.pytorch")
+    fake_module.import_checkpoint = fake_import_checkpoint
+    monkeypatch.setitem(sys.modules, "av_plugins.pytorch", fake_module)
+
+    ckpt = tmp_path / "epoch1.pt"
+    ckpt.write_bytes(b"fake checkpoint")
+
+    result = invoke("import-pytorch", str(ckpt), "--tag", "backfill")
+    assert result.exit_code == 0, result.output
+    assert calls["args"][0] == str(ckpt)
+    assert calls["args"][2] == "backfill"
+    assert "Imported PyTorch checkpoint" in result.output

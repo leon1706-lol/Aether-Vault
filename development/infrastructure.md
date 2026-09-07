@@ -346,7 +346,7 @@ naming a job that no longer exists, both fail CI. Keep this table's job-id backt
 | Contract matrix + exit codes + CI policy, as their own named check | `contract-matrix` |
 | Per-revision migration upgrade/downgrade/re-upgrade drill (live Postgres) | `migrations-drill` |
 | `actionlint` + `shellcheck` over every workflow/script | `lint-workflows` |
-| Plugins incl. real Lightning training loop + signed-commit gate (`[sign]` extra) | `plugin-tests` |
+| Plugins incl. real Lightning + vanilla-PyTorch training loops + signed-commit gate (`[sign]` extra) | `plugin-tests` |
 | WebUI lint/typecheck/Vitest | `webui-tests` |
 | Server live stack (Postgres+Redis): TestClient + real-wire | `server-tests` |
 | Same, native Windows services | `server-tests-windows` |

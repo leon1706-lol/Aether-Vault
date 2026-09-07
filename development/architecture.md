@@ -54,7 +54,7 @@ flowchart TB
         CPP["C++17 core (aether_core)<br/>parallel hashing · safetensors split · CDC"]
         BIND["pybind11 bindings"]
         CLI["Python CLI (av_cli)<br/>Click · rich · questionary"]
-        PLG["Plugins (av_plugins)<br/>Lightning · Transformers · MLflow"]
+        PLG["Plugins (av_plugins)<br/>Lightning · Transformers · MLflow · PyTorch"]
         WEBUI["Next.js dashboard (webui)<br/>App Router · Vitest · Playwright"]
     end
     subgraph REGISTRY["Dockerized registry"]
@@ -91,7 +91,7 @@ CI mirrors the runtime split as five jobs in `.github/workflows/tests.yml`: the 
   - feature modules — `index.py` (`Index`), `merge.py` (pure algorithms), `sync.py` (clone/pull primitives), `history.py` (log walking/rendering), `attributes.py` (`.avattributes` directives), `client.py` (`VaultClient`), `pointer.py`, `fsutil.py`, `handoff.py`, `repl.py`, `docker_runtime.py`, `update_check.py`, `speedcheck.py`, `signing.py` (ed25519 commit signatures).
   - agent-facing command groups — `cmd_diff.py`, `cmd_context.py`, `cmd_run.py` (+ SDK), `cmd_env.py` (snapshot/replay incl. top-level `av replay` alias), `cmd_policy.py`, `cmd_watch.py`, `cmd_registry.py` (export/restore/keygen/attest/verify), `cmd_webhooks.py`, `cmd_audit.py` (audit-trail query).
 - `python/av_server/`: the FastAPI CAS registry — `server.py` (routes, GC, auth middleware, CORS, rate limiting), `models.py` (SQLAlchemy schema incl. `extra_parents`/`chunks`), `database.py` (Alembic runner), `migrations/` (versioned schema chain), `rate_limit.py` (fixed-window limiter), `redis_cache.py`, `storage.py` (`CASStorage`).
-- `python/av_plugins/`: optional Lightning/Transformers/MLflow callbacks that drive the CLI in-process via `_shared.py`.
+- `python/av_plugins/`: optional Lightning/Transformers/MLflow/vanilla-PyTorch callbacks that drive `core.commit_scoped_paths()`/`core.flush_pending_push()` directly via `_shared.py` (no chdir, no CLI hop).
 - `src/`: the C++17 performance core — `core.cpp` (safetensors split + CDC chunker + parallel hashing), `sha256.cpp`, `thread_pool.h`; bound as the `aether_core` pybind11 extension.
 - `webui/`: Next.js App Router dashboard — sidebar tabs, Weight Diff, TokenGate, Vitest unit tests, Playwright E2E under `webui/e2e/`.
 - `tests/`: roughly 330-test suite across 20 files — CLI, core bindings, server live-stack, sync, merge, plugins.
@@ -356,14 +356,15 @@ Auth surfaces through `TokenGate` (one-time `?av_token=` handoff, described in A
 
 ## Plugin Contract
 
-Optional framework callbacks — Lightning, Transformers, MLflow — auto-stage and auto-commit checkpoints during training. Heavyweight frameworks import lazily inside their plugin modules, so installing `aether-vault` never pays for torch unless a callback actually runs.
+Optional framework callbacks — Lightning, Transformers, MLflow, vanilla PyTorch — auto-stage and auto-commit checkpoints during training. Heavyweight frameworks import lazily inside their plugin modules, so installing `aether-vault` never pays for torch unless a callback actually runs.
 
 | Module | Framework | Surface |
 |---|---|---|
 | `python/av_plugins/lightning.py` | PyTorch Lightning | Live `Trainer` callback + `import_checkpoint` backfill |
 | `python/av_plugins/transformers.py` | HuggingFace Transformers | Live `TrainerCallback` + `import_checkpoint` backfill |
 | `python/av_plugins/mlflow.py` | MLflow | `import_run` backfill (requires the `[mlflow]` extra) |
-| `python/av_plugins/_shared.py` | all | The in-process CLI bridge every plugin routes through |
+| `python/av_plugins/pytorch.py` | Vanilla PyTorch (no framework) | `AetherVaultCheckpointer` (explicit, not a hooked callback — see below) + `load_checkpoint`/`latest_checkpoint` resume + `import_checkpoint` backfill |
+| `python/av_plugins/_shared.py` | all | The seam every plugin routes through: direct `core.commit_scoped_paths()`/`core.flush_pending_push()` calls, no chdir, no CLI hop |
 
 Plugins drive add/commit through an internal seam: `_shared.py::commit_scoped()`
 delegates to `core.commit_scoped_paths()` — the same function agent tooling uses — which
@@ -378,7 +379,9 @@ to `core.flush_pending_push()` directly.
 
 Callbacks commit with the current step or epoch as the message, attach numeric training metrics as first-class metrics, and flush a final `av push` when training ends — so an interrupted run still leaves every intermediate checkpoint committed and queued. `dataset_paths` stages once at training start, tagged `dataset`, because there is no reliable way to auto-detect a dataset's on-disk path from a generic `Dataset`/`DataLoader` object; opt-in beats wrong-guess.
 
-Backfill runs through matching import paths, each available as both a Python function and a CLI command: `av import-lightning`, `av import-transformers`, `av import-mlflow`. Imports read metrics found alongside the checkpoint (Lightning's `callback_metrics`, Transformers' `trainer_state.json` log history, MLflow's own run metrics), tag commits `lightning-import` / `transformers-import` / `mlflow-import`, and re-importing unchanged content is a no-op.
+Vanilla PyTorch has no callback system to hook (unlike Lightning/Transformers), so `AetherVaultCheckpointer` is an object the training loop calls explicitly instead of a framework-injected callback — `save()` writes the `torch.save` checkpoint (model + optional optimizer/scheduler state, tagged `av_format: 1`) AND commits it in one call, `start()`/`finish()` cover the same dataset-commit and training-end-push semantics as the other plugins' hooks, and it doubles as a context manager (`with AetherVaultCheckpointer(...) as ckpt:`).
+
+Backfill runs through matching import paths, each available as both a Python function and a CLI command: `av import-lightning`, `av import-transformers`, `av import-mlflow`, `av import-pytorch`. Imports read metrics found alongside the checkpoint (Lightning's `callback_metrics`, Transformers' `trainer_state.json` log history, MLflow's own run metrics, PyTorch's own `metrics` key), tag commits `lightning-import` / `transformers-import` / `mlflow-import` / `pytorch-import`, and re-importing unchanged content is a no-op.
 
 ## Release Contract
 

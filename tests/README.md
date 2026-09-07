@@ -24,6 +24,10 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
   `.avattributes` matrix across EVERY chunkable extension.
 - `test_signing.py` - ed25519 keygen/auto-sign/verify: roundtrip, tamper on every
   field, unsigned-ok, canonical golden bytes (skips without `[sign]`).
+- `test_plugins.py` - `av_plugins`' seam: real-callback tests for Lightning/Transformers/
+  vanilla PyTorch (skip cleanly without the extra), MLflow run import, the scoped-commit
+  guarantee (unrelated staged files untouched), and the seam/SDK/CLI parity section
+  (payload shape, run-id linkage, env_snapshot_id, queued semantics, error codes).
 - `test_v122.py` / `test_v120.py` / `test_av_sdk.py` / `test_semdiff.py` /
   `test_webhooks_cli.py` - version-surface units incl. dedup_efficiency flow-through,
   schema-file validation, SDK seam parity.

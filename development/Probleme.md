@@ -1692,3 +1692,15 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** The forced cut now only fires when skipping it would actually let the run to EOF exceed `max_chunk` (`size_so_far + min_chunk > max_chunk`), making `max_chunk` a true hard cap without touching files that never approach it.
 
 **Verification:** New deterministic test (`test_chunk_and_hash_file_max_chunk_is_a_hard_cap_deterministic`, uniform-byte content so cuts are purely size-driven) plus the original random-data test and all six previously-failing tests pass; a 500-trial random-data stress test is clean; a manual scratch-repo `av add`/`av commit`/`av doctor` pass on real 2 MB and 32 MB `.pt` checkpoints (1 MB LFS threshold) confirmed correct chunk counts and bounds; full local suite green (1324 passed); GitHub CI's `Tests` workflow fully green on the carrying commit (`d074625`).
+
+---
+
+### 141. New `AetherVaultCheckpointer.save()` commit message literally read `"epoch=2 step=None"` when only `epoch` was tracked
+
+**Severity:** 2/10 · **Status:** 🟢 `fixed` (2026-09-08), found in the mandatory manual scratch-repo session for the v1.4.0 vanilla-PyTorch plugin (`av log` output).
+
+**Problem:** The message format was copied verbatim from `lightning.py`'s `f"epoch={trainer.current_epoch} step={trainer.global_step}"`, but Lightning's `Trainer` always populates both fields while a vanilla PyTorch loop very often tracks only `epoch` — every real commit message read `"epoch=N step=None"`, which reads as a bug to anyone inspecting `av log`.
+
+**Fix:** `save()` now builds the message from only the parts actually given (`epoch=N`, `step=N`, both, or neither → falls back to the checkpoint's filename), never printing a literal `None`.
+
+**Verification:** New regression test `test_pytorch_save_message_omits_step_when_not_given` (asserts the commit message is exactly `"epoch=2"` when only `epoch` is passed); confirmed by hand in the same manual scratch-repo session (`av log` after the fix shows a clean `"epoch=99"`, no `step=None`).

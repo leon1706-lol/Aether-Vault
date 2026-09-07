@@ -49,6 +49,9 @@ dependencies = [
 lightning = ["lightning>=2.0.0"]
 transformers = ["transformers>=4.30.0"]
 mlflow = ["mlflow>=2.0.0"]
+# v1.4.0: vanilla PyTorch plugin (av_plugins.pytorch, av import-pytorch) — no framework
+# hook to piggyback on, so this is torch itself rather than a framework that pulls it in.
+pytorch = ["torch>=2.0"]
 # v1.2.2 signed commits: ed25519 keygen/auto-sign/verify (av registry keygen, av verify).
 sign = ["cryptography>=42.0.0"]
 # v1.3.0: `av watch` uses real filesystem event notifications when this is installed,

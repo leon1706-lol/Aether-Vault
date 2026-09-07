@@ -12,7 +12,7 @@ workflows:
     contract-matrix: 5            # estimated
     migrations-drill: 6           # estimated
     lint-workflows: 5             # estimated
-    plugin-tests: 5               # observed 2min + margin
+    plugin-tests: 8               # v1.4.0: +torch install cost (CPU-only wheel, cached)
     webui-tests: 4                # observed 1min + margin
     server-tests: 4               # observed 1min + margin
     server-tests-windows: 18      # observed 15min + margin

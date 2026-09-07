@@ -38,6 +38,7 @@ def test_classify_plugin_extras():
     assert classify_skip("transformers is installed; ImportError path not exercised") \
         == "plugin-extras"
     assert classify_skip("mlflow not installed") == "plugin-extras"
+    assert classify_skip("torch not installed") == "plugin-extras"
 
 
 def test_classify_other_falls_through():

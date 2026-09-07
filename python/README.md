@@ -11,8 +11,8 @@ checkout - that split is why `[tool.pytest.ini_options] pythonpath = ["."]` exis
   CAS, staging, sync/clone/pull, merge, chunking, signing, doctor. See `av_cli/README.md`.
 - `av_server/` - the Dockerized content-addressable registry backed by PostgreSQL
   (Merkle DAG) + RedisBloom. See `av_server/README.md`.
-- `av_plugins/` - optional Lightning / Transformers / MLflow auto-commit callbacks.
-  See `av_plugins/README.md`.
+- `av_plugins/` - optional Lightning / Transformers / MLflow / vanilla-PyTorch
+  auto-commit callbacks. See `av_plugins/README.md`.
 - `av_sdk/` - `from av_sdk import Repo`, the in-process alternative to shelling out to
   the CLI for an agent driving Aether-Vault directly. `repo.py` mirrors the CLI's own
   surface (add/commit/push/log/status/diff_semantic/context_note/handoff_dict/
