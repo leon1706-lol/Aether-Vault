@@ -1,12 +1,7 @@
 name: Tests
 
 on:
-  # tags-ignore: a tag never changes code -- re-running the full suite against a commit
-  # that already ran it (on the branch push that produced it) only races release.yml's
-  # gate, which checks required checks via a single point-in-time API call and always
-  # finds this workflow's freshest run, not the one that already went green.
   push:
-    tags-ignore: ['**']
   pull_request:
 
 # Least-privilege default -- every job here only reads the repo, builds, and uploads
