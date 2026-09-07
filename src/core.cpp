@@ -303,11 +303,8 @@ py::list chunk_and_hash_file(const std::string& path,
         uint64_t hash = 0;
         uint64_t chunk_start = 0;
         uint64_t pos = 0;
-        // Last byte offset for which enough_left_after_cut still holds. If overflow is
-        // reached only after pos passes this point, the file_size-vs-min_chunk gate would
-        // suppress every remaining cut (it only gets stricter as pos grows) and let the
-        // final chunk run past max_chunk. last_chance forces one cut exactly here -- the
-        // only position left that can keep both this chunk and the tail within bounds.
+        // Last position where a cut still leaves >= min_chunk for the tail; enough_left_after_cut
+        // blocks every cut past it. last_chance below fires exactly here to keep max_chunk a hard cap.
         uint64_t last_valid_cut_pos = (file_size > min_chunk) ? file_size - min_chunk : 0;
         std::vector<char> buffer(1024 * 1024);
         while (file) {
@@ -317,16 +314,17 @@ py::list chunk_and_hash_file(const std::string& path,
                 hash = (hash << 1) + GEAR[static_cast<uint8_t>(buffer[static_cast<size_t>(i)])];
                 pos++;
                 uint64_t size_so_far = pos - chunk_start;
-                // Any cut requires min bytes to remain AFTER it, else the tail chunk would
-                // violate the minimum -- this makes max_chunk a soft cap on its own, so
-                // last_chance below backstops it into a hard cap for files large enough to
-                // hold two min-sized chunks.
+                // A cut needs >= min_chunk left for the tail, else max_chunk is only a soft cap.
                 bool enough_left_after_cut = (file_size - pos >= min_chunk);
                 bool boundary = ((hash & mask) == 0) &&
                                 (size_so_far >= min_chunk) &&
                                 (size_so_far < max_chunk);
                 bool overflow = size_so_far >= max_chunk;   // hard cap: never exceed max
-                bool last_chance = (pos == last_valid_cut_pos) && (size_so_far >= min_chunk);
+                // Fires only if skipping it would run past max_chunk to EOF (size_so_far +
+                // min_chunk, since no cut is possible after this pos) -- else ordinary
+                // files get a needless extra cut.
+                bool last_chance = (pos == last_valid_cut_pos) && (size_so_far >= min_chunk) &&
+                                   (size_so_far + min_chunk > max_chunk);
                 if ((boundary || overflow || last_chance) && enough_left_after_cut && pos < file_size) {
                     offsets.push_back(pos);
                     chunk_start = pos;
