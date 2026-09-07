@@ -4,8 +4,13 @@ success; it is read-only by construction -- every check only reads state and exi
 non-zero to block the release, never merges/approves/opens/pushes anything.
 
 Usage: python scripts/release_gate.py --tag vX.Y.Z [--repo-root PATH] [--skip-gh-check]
-                                        [--skip-tests] [--report PATH]
+                                        [--skip-tests] [--wait-timeout-minutes N] [--report PATH]
 Exits 0 if every check passes, 1 (with a clear message naming which check failed) otherwise.
+
+The required-checks-green check polls rather than checking once (default: up to 30min,
+every 30s) -- a tag pushed right alongside its carrying commit routinely finds tests.yml
+still `in_progress`; it fails immediately, without waiting out the rest of the timeout,
+the moment any required check definitively fails.
 """
 import argparse
 import json
@@ -218,24 +223,17 @@ def _required_contexts(repo_root: Path, repo: str, gh_token: str | None) -> tupl
     return lines, f"fallback file {fallback_path.relative_to(repo_root)} (live API unavailable)"
 
 
-def check_required_checks_green(repo: str, tag: str, gh_token: str | None,
-                                 repo_root: Path) -> tuple[bool, str]:
-    """Requires EVERY context the live (or fallback) required-checks list names to be
-    green, not a name-substring guess (an earlier version filtered by "test" in the name
-    and silently ignored several real CI jobs). Read-only (GET only)."""
+def _fetch_all_check_runs(repo: str, tag: str, gh_token: str | None) -> tuple[list[dict] | None, str | None]:
+    """Paginated GET of every check-run for a commit. A commit that's had even one
+    re-triggered workflow run easily carries 70+ check-runs (every matrix leg of every
+    workflow), well past this endpoint's 30-per-page default -- an unpaginated GET
+    silently truncates to the first page and reports real, green required contexts as
+    "no check-run found" just because they landed on a later page (see Probleme.md: this
+    cost several false gate failures before being caught). Returns (runs, None) or
+    (None, error_message)."""
     import urllib.error
     import urllib.request
 
-    required, source = _required_contexts(repo_root, repo, gh_token)
-    if not required:
-        return False, f"could not resolve a required-checks list at all ({source})"
-
-    # Paginated: a commit that's had even one re-triggered workflow run easily carries
-    # 70+ check-runs (every matrix leg of every workflow), well past this endpoint's
-    # 30-per-page default -- an unpaginated GET silently truncates to the first page and
-    # reports real, green required contexts as "no check-run found" just because they
-    # landed on a later page (see Probleme.md: this cost several false gate failures
-    # before being caught).
     runs: list[dict] = []
     url = f"https://api.github.com/repos/{repo}/commits/{tag}/check-runs?per_page=100"
     while url:
@@ -247,33 +245,91 @@ def check_required_checks_green(repo: str, tag: str, gh_token: str | None,
                 data = json.loads(resp.read().decode("utf-8"))
                 link_header = resp.headers.get("Link", "")
         except urllib.error.URLError as exc:
-            return False, f"could not query GitHub check-runs for {tag}: {exc}"
+            return None, f"could not query GitHub check-runs for {tag}: {exc}"
         runs.extend(data.get("check_runs", []))
         url = None
         for part in link_header.split(","):
             if 'rel="next"' in part:
                 url = part.split(";")[0].strip().lstrip("<").rstrip(">")
+    return runs, None
+
+
+def _evaluate_required_checks(required: list[str], runs: list[dict], source: str,
+                               tag: str) -> tuple[str, str]:
+    """Pure (no network) classification of one snapshot of check-runs against the
+    required list. Returns (state, detail) where state is 'green' (every required
+    context completed successfully), 'failed' (at least one definitively did not --
+    retrying won't help, so the caller should stop polling), or 'pending' (still waiting
+    on something that hasn't finished yet, or hasn't registered a check-run at all --
+    normal right after a fresh push, so the caller should keep polling)."""
     by_name: dict[str, list[dict]] = {}
     for r in runs:
         by_name.setdefault(r.get("name", ""), []).append(r)
 
-    problems = []
+    pending, failed = [], []
     for name in required:
         matches = by_name.get(name, [])
         if not matches:
-            problems.append(f"{name}: no check-run found")
+            pending.append(f"{name}: no check-run found yet")
             continue
         # The MOST RECENT run of that name (a re-run replaces, not appends).
         latest = max(matches, key=lambda r: r.get("started_at") or "")
-        if not (latest.get("status") == "completed" and latest.get("conclusion") == "success"):
-            problems.append(f"{name}: {latest.get('conclusion') or latest.get('status')}")
+        if latest.get("status") == "completed" and latest.get("conclusion") == "success":
+            continue
+        elif latest.get("status") == "completed":
+            failed.append(f"{name}: {latest.get('conclusion')}")
+        else:
+            pending.append(f"{name}: {latest.get('status')}")
 
-    if problems:
-        return False, (
-            f"{len(problems)}/{len(required)} required check(s) not green for {tag} "
-            f"(required-checks source: {source}): {'; '.join(problems)}"
+    if failed:
+        return "failed", (
+            f"{len(failed)}/{len(required)} required check(s) failed for {tag} "
+            f"(required-checks source: {source}): {'; '.join(failed)}"
         )
-    return True, f"all {len(required)} required check-run(s) green for {tag} (required-checks source: {source})"
+    if pending:
+        return "pending", (
+            f"{len(pending)}/{len(required)} required check(s) not yet green for {tag} "
+            f"(required-checks source: {source}): {'; '.join(pending)}"
+        )
+    return "green", f"all {len(required)} required check-run(s) green for {tag} (required-checks source: {source})"
+
+
+def check_required_checks_green(repo: str, tag: str, gh_token: str | None,
+                                 repo_root: Path, timeout_seconds: int = 1800,
+                                 poll_interval: int = 30, sleep_fn=None, fetch_fn=None) -> tuple[bool, str]:
+    """Requires EVERY context the live (or fallback) required-checks list names to be
+    green, not a name-substring guess (an earlier version filtered by "test" in the name
+    and silently ignored several real CI jobs). Read-only (GET only).
+
+    Waits and re-polls (default: every 30s, up to 30min) while checks are merely pending
+    -- a tag pushed right after its carrying commit routinely finds `tests.yml` etc.
+    still `in_progress`, and a single point-in-time check used to fail on that alone
+    (Probleme.md). Fails immediately, without waiting out the rest of the timeout, the
+    moment any required check definitively fails, since no amount of waiting fixes that.
+    `sleep_fn`/`fetch_fn` are injection points for tests; production uses `time.sleep`
+    and `_fetch_all_check_runs`.
+    """
+    import time as _time
+
+    sleep_fn = sleep_fn or _time.sleep
+    fetch_fn = fetch_fn or (lambda: _fetch_all_check_runs(repo, tag, gh_token))
+
+    required, source = _required_contexts(repo_root, repo, gh_token)
+    if not required:
+        return False, f"could not resolve a required-checks list at all ({source})"
+
+    deadline = _time.monotonic() + timeout_seconds
+    detail = "never queried"
+    while True:
+        runs, err = fetch_fn()
+        if err:
+            return False, err
+        state, detail = _evaluate_required_checks(required, runs, source, tag)
+        if state in ("green", "failed"):
+            return state == "green", detail
+        if _time.monotonic() >= deadline:
+            return False, f"timed out after {timeout_seconds}s waiting for required checks -- {detail}"
+        sleep_fn(poll_interval)
 
 
 def run_stack_free_suite(repo_root: Path) -> tuple[bool, str]:
@@ -320,6 +376,11 @@ def main() -> int:
     parser.add_argument("--gh-token", default=None, help="Token for the GitHub API check (falls back to $GITHUB_TOKEN)")
     parser.add_argument("--skip-gh-check", action="store_true",
                         help="Skip the tagged-commit-is-green GitHub API check (for local dry runs without network/token)")
+    parser.add_argument("--wait-timeout-minutes", type=float, default=30,
+                        help="How long the required-checks-green check polls before giving up on checks stuck "
+                             "pending (default 30, covers tests.yml's ~20-25min typical run). Ignored with "
+                             "--skip-gh-check. A required check that definitively fails still returns immediately, "
+                             "regardless of this value.")
     parser.add_argument("--skip-tests", action="store_true",
                         help="Skip re-running the stack-free suite (it's what CI's own `test` job just ran — for a fast local dry run)")
     parser.add_argument("--report", type=Path, default=None,
@@ -333,7 +394,10 @@ def main() -> int:
     if not args.skip_tests:
         checks.append(("stack-free suite", run_stack_free_suite(args.repo_root)))
     if not args.skip_gh_check:
-        checks.append(("required checks green", check_required_checks_green(args.repo, args.tag, gh_token, args.repo_root)))
+        checks.append(("required checks green", check_required_checks_green(
+            args.repo, args.tag, gh_token, args.repo_root,
+            timeout_seconds=args.wait_timeout_minutes * 60,
+        )))
     checks.append(("perf-history.json has this release", check_perf_history_has_tag(args.repo_root, args.tag)))
     checks.append(("BENCHMARKS.md captured sha is current", check_benchmarks_captured_sha_is_an_ancestor(args.repo_root, args.tag)))
     checks.append(("BENCHMARKS.md is fresh (MINOR-or-above releases)", check_benchmarks_fresh_on_minor(args.repo_root, args.tag)))

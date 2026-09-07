@@ -22,7 +22,11 @@ jobs:
   gate:
     name: Release gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 30min is the required-checks-green poll window itself (scripts/release_gate.py's
+    # own default) -- a tag pushed alongside its carrying commit routinely finds
+    # tests.yml still running, and this job now waits that out instead of failing
+    # immediately. +10min covers checkout/install/the stack-free suite re-run.
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:

@@ -1,14 +1,17 @@
 """v1.3.0 (todo.md item 30): scripts/release_gate.py's checks — each read-only, unit-
 tested independently of the GitHub API / a real release, per the script's own module
-docstring on why it's factored out of release.yml this way. The GitHub API check itself
-(check_required_checks_green, v1.3.4 rename of check_tagged_commit_tests_green) needs a
-real network call and isn't unit-tested here; it's exercised for real by the `gate` job
-in CI. Its own pure helpers (_required_contexts' fallback-file parsing) ARE unit-tested
-below since they need no network at all.
+docstring on why it's factored out of release.yml this way. check_required_checks_green
+(v1.3.4 rename of check_tagged_commit_tests_green) still needs a real network call for
+its actual GitHub query (_fetch_all_check_runs, exercised for real by the `gate` job in
+CI, not unit-tested here) -- but its poll/retry/fail-fast decision logic
+(_evaluate_required_checks, and the wait loop itself) takes injectable `fetch_fn`/
+`sleep_fn` specifically so that logic CAN be unit-tested below without any network or
+real waiting.
 """
 import importlib.util
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "release_gate.py"
@@ -342,3 +345,117 @@ def test_write_report_renders_a_markdown_table_and_overall_verdict(tmp_path):
     assert "check one" in text and "✅ PASS" in text
     assert "check two" in text and "❌ FAIL" in text
     assert "**Overall: FAILED**" in text
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_required_checks (pure classification, no network) and
+# check_required_checks_green's poll/retry/fail-fast loop (network injected out via
+# fetch_fn/sleep_fn) -- Probleme.md: a single point-in-time check used to fail a real
+# release the moment any required check was merely still `in_progress`.
+# ---------------------------------------------------------------------------
+
+def _run(name, status, conclusion, started_at="2020-01-01T00:00:00Z"):
+    return {"name": name, "status": status, "conclusion": conclusion, "started_at": started_at}
+
+
+def test_evaluate_required_checks_green_when_all_succeed():
+    runs = [_run("a", "completed", "success"), _run("b", "completed", "success")]
+    state, detail = rg._evaluate_required_checks(["a", "b"], runs, "src", "v1")
+    assert state == "green"
+    assert "all 2 required" in detail
+
+
+def test_evaluate_required_checks_pending_when_still_in_progress():
+    state, detail = rg._evaluate_required_checks(["a"], [_run("a", "in_progress", None)], "src", "v1")
+    assert state == "pending"
+    assert "in_progress" in detail
+
+
+def test_evaluate_required_checks_pending_when_check_run_hasnt_registered_yet():
+    state, detail = rg._evaluate_required_checks(["a"], [], "src", "v1")
+    assert state == "pending"
+    assert "no check-run found" in detail
+
+
+def test_evaluate_required_checks_failed_when_completed_unsuccessfully():
+    state, detail = rg._evaluate_required_checks(["a"], [_run("a", "completed", "failure")], "src", "v1")
+    assert state == "failed"
+    assert "failure" in detail
+
+
+def test_evaluate_required_checks_uses_most_recent_run_per_name():
+    runs = [
+        _run("a", "completed", "failure", started_at="2020-01-01T00:00:00Z"),
+        _run("a", "completed", "success", started_at="2020-01-02T00:00:00Z"),
+    ]
+    state, _detail = rg._evaluate_required_checks(["a"], runs, "src", "v1")
+    assert state == "green"
+
+
+def test_check_required_checks_green_returns_immediately_when_already_green(tmp_path, monkeypatch):
+    monkeypatch.setattr(rg, "_required_contexts", lambda repo_root, repo, token: (["a"], "src"))
+    calls = {"fetch": 0, "sleep": 0}
+
+    def fetch():
+        calls["fetch"] += 1
+        return [_run("a", "completed", "success")], None
+
+    ok, detail = rg.check_required_checks_green(
+        "o/r", "v1", None, tmp_path, timeout_seconds=100, poll_interval=1,
+        sleep_fn=lambda s: calls.__setitem__("sleep", calls["sleep"] + 1), fetch_fn=fetch,
+    )
+    assert ok, detail
+    assert calls == {"fetch": 1, "sleep": 0}  # no polling needed at all
+
+
+def test_check_required_checks_green_polls_through_pending_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(rg, "_required_contexts", lambda repo_root, repo, token: (["a"], "src"))
+    responses = [
+        ([_run("a", "in_progress", None)], None),
+        ([_run("a", "queued", None)], None),
+        ([_run("a", "completed", "success")], None),
+    ]
+    sleeps = []
+    ok, detail = rg.check_required_checks_green(
+        "o/r", "v1", None, tmp_path, timeout_seconds=100, poll_interval=1,
+        sleep_fn=sleeps.append, fetch_fn=lambda: responses.pop(0),
+    )
+    assert ok, detail
+    assert sleeps == [1, 1]  # two rounds of pending before the third fetch went green
+
+
+def test_check_required_checks_green_fails_fast_without_waiting_out_the_timeout(tmp_path, monkeypatch):
+    """A definitive failure must return immediately -- retrying achieves nothing, and
+    a huge timeout_seconds here proves the loop isn't just happening to finish fast."""
+    monkeypatch.setattr(rg, "_required_contexts", lambda repo_root, repo, token: (["a"], "src"))
+    sleeps = []
+    ok, detail = rg.check_required_checks_green(
+        "o/r", "v1", None, tmp_path, timeout_seconds=9999, poll_interval=1,
+        sleep_fn=sleeps.append, fetch_fn=lambda: ([_run("a", "completed", "failure")], None),
+    )
+    assert not ok
+    assert "failed" in detail
+    assert sleeps == []
+
+
+def test_check_required_checks_green_times_out_when_stuck_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr(rg, "_required_contexts", lambda repo_root, repo, token: (["a"], "src"))
+
+    def tiny_real_sleep(_seconds):
+        time.sleep(0.01)  # a real (tiny) sleep so the monotonic deadline actually advances
+
+    ok, detail = rg.check_required_checks_green(
+        "o/r", "v1", None, tmp_path, timeout_seconds=0.03, poll_interval=0.01,
+        sleep_fn=tiny_real_sleep, fetch_fn=lambda: ([_run("a", "in_progress", None)], None),
+    )
+    assert not ok
+    assert "timed out" in detail
+
+
+def test_check_required_checks_green_propagates_a_fetch_error_immediately(tmp_path, monkeypatch):
+    monkeypatch.setattr(rg, "_required_contexts", lambda repo_root, repo, token: (["a"], "src"))
+    ok, detail = rg.check_required_checks_green(
+        "o/r", "v1", None, tmp_path, fetch_fn=lambda: (None, "network exploded"), sleep_fn=lambda s: None,
+    )
+    assert not ok
+    assert "network exploded" in detail
