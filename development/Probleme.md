@@ -1793,7 +1793,7 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 149. `tests/test_daemon.py`'s full 53-test file never prints its own pytest summary line on this dev box (environmental, not a code bug)
 
-**Severity:** 1/10 · **Status:** 🔴 `closed` (2026-09-11), not fixed because there is nothing in the test or product code to fix — same class of issue as #144.
+**Severity:** 1/10 · **Status:** 🟢 **superseded by #152 — this diagnosis was wrong.** Real GitHub Actions CI hit the exact same symptom on a real Windows runner (not this dev sandbox) the first time this branch's PR ran; #152 found and fixed the actual bug (a racy test, not a sandbox limitation). Left below verbatim as the historical record of the (incorrect) investigation.
 
 **Problem:** Running the whole file in one `pytest` invocation reliably shows 51 clean dots + 1 skip + zero failures, then the process exits code 0 without ever printing the final `"N passed..."` summary line — reproduced 4+ times, with `-u`, with `tee`, and at both low (~487MB) and moderate (~625MB) free memory. `--collect-only` confirms 53 tests exist and that the last one is `test_call_daemon_filters_env_before_sending_on_the_wire`; a raw run shows that exact test name print with no `PASSED`/`FAILED` suffix, i.e. the process is cut mid-test, not mid-summary.
 
@@ -1824,3 +1824,15 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** None applicable — there is no algorithm to fix. `history.walk_history()` already does exactly one `exists()` + one `open()`/`json.load()` per commit via `find_commit_file()`'s exact-hash fast path (no directory glob, confirmed by reading the source), i.e. already O(limit) as P8 intended; the entire cost is this dev machine's per-file-open latency (Windows Defender + Norton real-time scanning, both confirmed present and heavily loaded throughout this session, e.g. #144's process-supervision findings) applying even to freshly-created temp files with zero product code involved.
 
 **Verification:** The raw-stdlib isolation script above reproduces the same ~16-17ms/file cost with zero av_cli code in the loop, proving the regression (if it were one) can't be in this codebase. `AV_PERF_BUDGET_MULTIPLIER` exists exactly for this class of noise (documented in `test_perf_gate.py`'s own docstring); CI and any real user's machine (no comparable per-file AV-scan tax) are expected to hit the un-multiplied budget normally.
+
+---
+
+### 152. `test_should_stop_watchdog_does_not_fire_while_active` had a real race that silently killed pytest's own process, real GitHub Actions CI included — #149 wrongly blamed the local sandbox
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-11), found because this PR's own CI run hit the *exact* symptom #149 attributed to a local-sandbox-only limitation — proving that diagnosis wrong, on a real, unconstrained Windows GitHub Actions runner.
+
+**Problem:** This test sets `server._stop.set()` as its very last line, then returns immediately — nothing waits for the background watchdog thread (started via `_start_should_stop_watchdog`, polling every 20ms) to actually observe `_stop` and act on it. `monkeypatch`'s teardown then restores the REAL `os._exit` before that next ~20ms poll runs. The watchdog thread, still alive and still polling on its own schedule, wakes up sometime after the test has already ended, sees `should_stop()` now true, and calls the now-genuine `os._exit(0)` — silently killing the *entire pytest process*, mid-way through whatever later test happens to be running at that moment. This produces exactly the symptom #149 documented: a clean-looking run that cuts off with zero failures and exit code 0, no summary line — reproduced identically on a real GitHub Actions Windows runner in this PR's own CI (`test (3.14)`'s "Run test suite" step reported `success` despite the truncated output, and the downstream `check_readme_test_freshness.py` step failed only because it couldn't find a summary line to parse).
+
+**Fix:** The test now waits on the same `exited` event *after* setting `_stop`, mirroring the pattern the companion test (`test_should_stop_watchdog_fires_on_idle_timeout`) already used correctly — guaranteeing the mocked `os._exit` fires, and is observed, while the monkeypatch is still active, before the test function returns and teardown restores the real one.
+
+**Verification:** `pytest tests/test_daemon.py` (all 53 tests, one process, no `-k` splitting) run 3 times in a row after the fix, each producing a complete, clean summary line (`52 passed, 1 skipped`) — the exact invocation that never once completed cleanly all session before this fix, including on real CI. #149's entry above is left in place as the historical record of the incorrect investigation; its status line now points here.
