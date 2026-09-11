@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -20,8 +21,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #   webui      - starts Docker + opens a real browser tab; a human/ops tool, not agent-relevant.
 #   import-lightning/transformers/mlflow/pytorch - need the real ML framework installed
 #                to do anything beyond their own (already clean) ImportError path.
+#   daemon start/restart - spawn a real detached background process; `daemon status`/`stop`
+#                are deliberately NOT exempt (both are read-only/no-op-safe with no daemon
+#                running, so their clean-JSON behavior is real coverage worth keeping).
+# Entries are either a bare top-level name (exempts every subcommand under that group) or a
+# full (name, subcommand, ...) tuple for finer-grained exemption within one group.
 _LEAKAGE_EXEMPT = {"watch", "test", "benchmark", "webui", "import-lightning",
-                    "import-transformers", "import-mlflow", "import-pytorch"}
+                    "import-transformers", "import-mlflow", "import-pytorch",
+                    ("daemon", "start"), ("daemon", "restart")}
 
 
 def _iter_command_paths():
@@ -32,14 +39,22 @@ def _iter_command_paths():
     code" in core.py, a pre-existing, accepted exception to the envelope contract)."""
     def _walk(name, cmd, prefix):
         full = prefix + [name]
-        if hasattr(cmd, "commands"):  # a Group
-            for sub_name, sub_cmd in cmd.commands.items():
-                yield from _walk(sub_name, sub_cmd, full)
+        if isinstance(cmd, click.Group):
+            # list_commands()/get_command(), not `.commands.items()` -- the top-level `cli`
+            # group lazily imports each command module on first resolution (V1.5.0 perf
+            # work), so its `.commands` dict is empty until something asks for a name.
+            # get_command() forces the import; list_commands() enumerates names without one.
+            for sub_name in cmd.list_commands(None):
+                sub_cmd = cmd.get_command(None, sub_name)
+                if sub_cmd is not None:
+                    yield from _walk(sub_name, sub_cmd, full)
         else:
             yield (" ".join(full), full)
 
-    for name, cmd in cli.commands.items():
-        yield from _walk(name, cmd, [])
+    for name in cli.list_commands(None):
+        cmd = cli.get_command(None, name)
+        if cmd is not None:
+            yield from _walk(name, cmd, [])
 
 
 ALL_COMMAND_PATHS = list(_iter_command_paths())
@@ -64,7 +79,7 @@ class TestAntiLeakage:
     @pytest.mark.parametrize("display_name,args", ALL_COMMAND_PATHS,
                              ids=[p[0] for p in ALL_COMMAND_PATHS])
     def test_command_emits_clean_json_or_usage_error(self, repo, monkeypatch, display_name, args):
-        if args[0] in _LEAKAGE_EXEMPT:
+        if args[0] in _LEAKAGE_EXEMPT or tuple(args) in _LEAKAGE_EXEMPT:
             pytest.skip(f"{display_name}: documented exception, see module docstring")
         # Applied unconditionally (not just to the known av auth commands) so a future
         # command gaining a similar real-infrastructure touch is safe by default.

@@ -69,8 +69,16 @@ def _resolve(tokens: list[str]) -> tuple[click.Command, list[str]]:
         i += 1
         if not opt.is_flag and "=" not in tokens[i - 1]:
             i += 1  # this option takes a separate value token
-    while i < len(tokens) and isinstance(cmd, click.Group) and tokens[i] in cmd.commands:
-        cmd = cmd.commands[tokens[i]]
+    while i < len(tokens) and isinstance(cmd, click.Group):
+        # get_command(), not `tokens[i] in cmd.commands` -- the top-level `cli` group lazily
+        # imports each command module on first resolution (V1.5.0 perf work), so its
+        # `.commands` dict is empty until something actually asks for a name. get_command()
+        # is the one path that works identically whether a group is lazy (cli itself) or
+        # eagerly populated (every nested group, e.g. `auth`/`env`/`registry`).
+        next_cmd = cmd.get_command(None, tokens[i])
+        if next_cmd is None:
+            break
+        cmd = next_cmd
         i += 1
     return cmd, tokens[i:]
 

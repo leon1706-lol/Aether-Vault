@@ -52,7 +52,15 @@ def __getattr__(name: str):
         from .client import VaultClient
 
         return VaultClient
-    raise AttributeError
+    # Same idea for cmd_devtools' two symbols (`test`/`benchmark`'s home module, otherwise
+    # only imported on first `av test`/`av benchmark` invocation via _load_devtools above) --
+    # a caller reading `main.BENCHMARK_NAMES`/`main._update_readme_test_badge` directly still
+    # gets the real value, on demand, without forcing cmd_devtools eager for every command.
+    if name in ("BENCHMARK_NAMES", "_update_readme_test_badge"):
+        from . import cmd_devtools
+
+        return getattr(cmd_devtools, name)
+    raise AttributeError(name)
 
 
 # --- Point-13 split: helpers live in core.py; commands live in cmd_*.py ---
@@ -104,9 +112,9 @@ def cli(ctx: click.Context, verbose: bool, silent: bool, output_mode: str, show_
     setup_logging(verbose, silent)
 
     if show_version:
-        from .ui import _get_version
+        from .fsutil import get_version
 
-        click.echo(f"av {_get_version()}")
+        click.echo(f"av {get_version()}")
         raise click.exceptions.Exit(0)
 
     if ctx.invoked_subcommand is not None:
@@ -121,177 +129,366 @@ def cli(ctx: click.Context, verbose: bool, silent: bool, output_mode: str, show_
         return
 
     cfg = load_config(repo_root)
+    from .cmd_repo import _reconnect_existing_repo
+
     _reconnect_existing_repo(repo_root, cfg)
     from . import repl
 
     repl.run_repl(repo_root, login_mode=cfg.get("login_mode", "local"))
 
 
-# --- Command registration (order == av --help order) ---
+# --- Command registration ---
+#
+# V1.5.0 perf work: every one of the ~45 command modules below used to be imported
+# unconditionally right here, so even `av --version`/`--help` paid for every module's full
+# dependency tree. Each module is now registered as one small loader against the exact
+# command name(s) it produces; `_AuthRetryGroup.get_command` (core.py) imports+registers a
+# module only the first time one of its names is actually resolved -- `av commit` now only
+# ever imports `cmd_history`, never the other 44 modules. `--help`/completion need no import
+# at all: `list_commands` is just this dict's keys, sorted (click.Group's own default
+# `list_commands` is already alphabetical, so this preserves the exact prior `--help` order).
+# `cli.add_command(...)` inside each loader is unchanged from the eager code it replaces --
+# only WHEN it runs changed, never WHAT it registers.
 
-from .cmd_repo import _reconnect_existing_repo, init, update  # noqa: F401  # noqa: E402
-from .cmd_staging import add, config, file, status, unstage  # noqa: E402
-from .cmd_history import (  # noqa: E402
-    branch,
-    checkout,
-    commit,
-    list_meta,
-    log,
-    push,
-    stash,
-)
-from .cmd_sync import clone, merge, pull  # noqa: E402
-from .cmd_auth import auth, auth_add_user, auth_list_users, auth_remove_user  # noqa: E402
-from .cmd_token import token  # noqa: E402
-from .cmd_tenant import tenant  # noqa: E402
-from .cmd_user import user  # noqa: E402
-from .cmd_role import role  # noqa: E402
-from .cmd_login import login, logout, whoami  # noqa: E402
-from .cmd_idp import idp  # noqa: E402
-from .cmd_scim import scim  # noqa: E402
-from .cmd_admin import admin  # noqa: E402
-from .cmd_support import support_bundle  # noqa: E402
-from .cmd_maintenance import doctor, gc  # noqa: E402
-from .cmd_devtools import BENCHMARK_NAMES, benchmark, test_cmd  # noqa: E402
-from .cmd_devtools import _update_readme_test_badge  # noqa: F401,E402
-from .cmd_integrations import (  # noqa: E402
-    graph,
-    handoff,
-    import_lightning,
-    import_mlflow,
-    import_pytorch,
-    import_transformers,
-    webui_cmd,
-)
 
-cli.add_command(init)
-cli.add_command(update)
-cli.add_command(config)
-cli.add_command(add)
-cli.add_command(file)
-cli.add_command(unstage)
-cli.add_command(status)
-cli.add_command(commit)
-cli.add_command(branch)
-cli.add_command(checkout)
-cli.add_command(log)
-from .cmd_diff import diff  # noqa: E402
+def _load_repo(group: click.Group) -> None:
+    from .cmd_repo import init, update
 
-cli.add_command(diff)
-from .cmd_context import context  # noqa: E402
+    group.add_command(init)
+    group.add_command(update)
 
-cli.add_command(context)
-from .cmd_run import run  # noqa: E402
 
-cli.add_command(run)
-from .cmd_env import env  # noqa: E402
+def _load_staging(group: click.Group) -> None:
+    from .cmd_staging import add, config, file, status, unstage
 
-cli.add_command(env)
-from .cmd_env import replay as replay_cmd  # noqa: E402
+    for cmd in (config, add, file, unstage, status):
+        group.add_command(cmd)
 
-# Top-level alias so agents can `av replay <run|commit|snapshot-id>` directly
-# (v1.2.2); `av env replay` remains the canonical home.
-cli.add_command(replay_cmd)
-from .cmd_policy import policy as policy_group, promote  # noqa: E402
-from .cmd_watch import watch  # noqa: E402
 
-cli.add_command(watch)
-from .cmd_registry import registry, verify as registry_verify  # noqa: E402
+def _load_history(group: click.Group) -> None:
+    from .cmd_history import branch, checkout, commit, list_meta, log, push, stash
 
-cli.add_command(registry)
-# Top-level alias: docs have always told users to run `av verify <hash>`, so this
-# registers the same object under both names -- mirrors the `replay`/`env replay` pattern.
-cli.add_command(registry_verify)
-from .cmd_webhooks import webhooks  # noqa: E402
+    for cmd in (commit, branch, checkout, log, stash, list_meta, push):
+        group.add_command(cmd)
 
-cli.add_command(webhooks)
-from .cmd_audit import audit as audit_group  # noqa: E402
 
-cli.add_command(audit_group)
-from .cmd_improver import improver  # noqa: E402
+def _load_sync(group: click.Group) -> None:
+    from .cmd_sync import clone, merge, pull
 
-cli.add_command(improver)
-from .cmd_freeze import freeze, incident  # noqa: E402
+    for cmd in (clone, pull, merge):
+        group.add_command(cmd)
 
-cli.add_command(freeze)
-cli.add_command(incident)
-from .cmd_canary import canary  # noqa: E402
 
-cli.add_command(canary)
-from .cmd_eval import eval_group  # noqa: E402
+def _load_auth(group: click.Group) -> None:
+    from .cmd_auth import auth, auth_add_user, auth_list_users, auth_remove_user
 
-cli.add_command(eval_group)
-from .cmd_task import task  # noqa: E402
+    group.add_command(auth)
+    # Top-level aliases: same click Command objects also live as subcommands of `auth`
+    # itself (`av auth add-user` == `av add-user`).
+    group.add_command(auth_add_user)
+    group.add_command(auth_list_users)
+    group.add_command(auth_remove_user)
 
-cli.add_command(task)
-from .cmd_plan import plan  # noqa: E402
 
-cli.add_command(plan)
-from .cmd_budget import budget  # noqa: E402
+def _load_token(group: click.Group) -> None:
+    from .cmd_token import token
 
-cli.add_command(budget)
-from .cmd_scheduler import scheduler  # noqa: E402
+    group.add_command(token)
 
-cli.add_command(scheduler)
-from .cmd_review import critique, review  # noqa: E402
 
-cli.add_command(review)
-cli.add_command(critique)
-from .cmd_lineage import lineage, search  # noqa: E402
+def _load_tenant(group: click.Group) -> None:
+    from .cmd_tenant import tenant
 
-cli.add_command(lineage)
-cli.add_command(search)
-from .cmd_strategy import strategy  # noqa: E402
+    group.add_command(tenant)
 
-cli.add_command(strategy)
-from .cmd_lessons import lessons  # noqa: E402
 
-cli.add_command(lessons)
-from .cmd_blackboard import blackboard  # noqa: E402
+def _load_user(group: click.Group) -> None:
+    from .cmd_user import user
 
-cli.add_command(blackboard)
-from .cmd_sandbox import replay_actions, sandbox  # noqa: E402
+    group.add_command(user)
 
-cli.add_command(sandbox)
-cli.add_command(replay_actions)
-from .cmd_tools import tools  # noqa: E402
 
-cli.add_command(tools)
+def _load_role(group: click.Group) -> None:
+    from .cmd_role import role
 
-cli.add_command(policy_group)
-cli.add_command(promote)
-cli.add_command(clone)
-cli.add_command(pull)
-cli.add_command(merge)
-cli.add_command(stash)
-cli.add_command(list_meta)
-cli.add_command(push)
-cli.add_command(gc)
-cli.add_command(auth)
-cli.add_command(auth_add_user)
-cli.add_command(auth_list_users)
-cli.add_command(auth_remove_user)
-cli.add_command(token)
-cli.add_command(tenant)
-cli.add_command(user)
-cli.add_command(role)
-cli.add_command(login)
-cli.add_command(logout)
-cli.add_command(whoami)
-cli.add_command(idp)
-cli.add_command(scim)
-cli.add_command(admin)
-cli.add_command(support_bundle)
-cli.add_command(doctor)
-cli.add_command(test_cmd)
-cli.add_command(benchmark)
-cli.add_command(graph)
-cli.add_command(handoff)
-cli.add_command(webui_cmd)
-cli.add_command(import_lightning)
-cli.add_command(import_transformers)
-cli.add_command(import_mlflow)
-cli.add_command(import_pytorch)
+    group.add_command(role)
+
+
+def _load_login(group: click.Group) -> None:
+    from .cmd_login import login, logout, whoami
+
+    for cmd in (login, logout, whoami):
+        group.add_command(cmd)
+
+
+def _load_idp(group: click.Group) -> None:
+    from .cmd_idp import idp
+
+    group.add_command(idp)
+
+
+def _load_scim(group: click.Group) -> None:
+    from .cmd_scim import scim
+
+    group.add_command(scim)
+
+
+def _load_admin(group: click.Group) -> None:
+    from .cmd_admin import admin
+
+    group.add_command(admin)
+
+
+def _load_support(group: click.Group) -> None:
+    from .cmd_support import support_bundle
+
+    group.add_command(support_bundle)
+
+
+def _load_maintenance(group: click.Group) -> None:
+    from .cmd_maintenance import doctor, gc
+
+    group.add_command(doctor)
+    group.add_command(gc)
+
+
+def _load_devtools(group: click.Group) -> None:
+    from .cmd_devtools import benchmark, test_cmd
+
+    group.add_command(test_cmd)
+    group.add_command(benchmark)
+
+
+def _load_integrations(group: click.Group) -> None:
+    from .cmd_integrations import (
+        graph,
+        handoff,
+        import_lightning,
+        import_mlflow,
+        import_pytorch,
+        import_transformers,
+        webui_cmd,
+    )
+
+    for cmd in (graph, handoff, webui_cmd, import_lightning, import_transformers,
+                import_mlflow, import_pytorch):
+        group.add_command(cmd)
+
+
+def _load_diff(group: click.Group) -> None:
+    from .cmd_diff import diff
+
+    group.add_command(diff)
+
+
+def _load_context(group: click.Group) -> None:
+    from .cmd_context import context
+
+    group.add_command(context)
+
+
+def _load_run(group: click.Group) -> None:
+    from .cmd_run import run
+
+    group.add_command(run)
+
+
+def _load_env(group: click.Group) -> None:
+    from .cmd_env import env
+    from .cmd_env import replay as replay_cmd
+
+    group.add_command(env)
+    # Top-level alias so agents can `av replay <run|commit|snapshot-id>` directly
+    # (v1.2.2); `av env replay` remains the canonical home.
+    group.add_command(replay_cmd)
+
+
+def _load_policy(group: click.Group) -> None:
+    from .cmd_policy import policy as policy_group
+    from .cmd_policy import promote
+
+    group.add_command(policy_group)
+    group.add_command(promote)
+
+
+def _load_watch(group: click.Group) -> None:
+    from .cmd_watch import watch
+
+    group.add_command(watch)
+
+
+def _load_registry(group: click.Group) -> None:
+    from .cmd_registry import registry
+    from .cmd_registry import verify as registry_verify
+
+    group.add_command(registry)
+    # Top-level alias: docs have always told users to run `av verify <hash>`, so this
+    # registers the same object under both names -- mirrors the `replay`/`env replay` pattern.
+    group.add_command(registry_verify)
+
+
+def _load_webhooks(group: click.Group) -> None:
+    from .cmd_webhooks import webhooks
+
+    group.add_command(webhooks)
+
+
+def _load_audit(group: click.Group) -> None:
+    from .cmd_audit import audit as audit_group
+
+    group.add_command(audit_group)
+
+
+def _load_improver(group: click.Group) -> None:
+    from .cmd_improver import improver
+
+    group.add_command(improver)
+
+
+def _load_freeze(group: click.Group) -> None:
+    from .cmd_freeze import freeze, incident
+
+    group.add_command(freeze)
+    group.add_command(incident)
+
+
+def _load_canary(group: click.Group) -> None:
+    from .cmd_canary import canary
+
+    group.add_command(canary)
+
+
+def _load_eval(group: click.Group) -> None:
+    from .cmd_eval import eval_group
+
+    group.add_command(eval_group)
+
+
+def _load_task(group: click.Group) -> None:
+    from .cmd_task import task
+
+    group.add_command(task)
+
+
+def _load_plan(group: click.Group) -> None:
+    from .cmd_plan import plan
+
+    group.add_command(plan)
+
+
+def _load_budget(group: click.Group) -> None:
+    from .cmd_budget import budget
+
+    group.add_command(budget)
+
+
+def _load_scheduler(group: click.Group) -> None:
+    from .cmd_scheduler import scheduler
+
+    group.add_command(scheduler)
+
+
+def _load_review(group: click.Group) -> None:
+    from .cmd_review import critique, review
+
+    group.add_command(review)
+    group.add_command(critique)
+
+
+def _load_lineage(group: click.Group) -> None:
+    from .cmd_lineage import lineage, search
+
+    group.add_command(lineage)
+    group.add_command(search)
+
+
+def _load_strategy(group: click.Group) -> None:
+    from .cmd_strategy import strategy
+
+    group.add_command(strategy)
+
+
+def _load_lessons(group: click.Group) -> None:
+    from .cmd_lessons import lessons
+
+    group.add_command(lessons)
+
+
+def _load_blackboard(group: click.Group) -> None:
+    from .cmd_blackboard import blackboard
+
+    group.add_command(blackboard)
+
+
+def _load_sandbox(group: click.Group) -> None:
+    from .cmd_sandbox import replay_actions, sandbox
+
+    group.add_command(sandbox)
+    group.add_command(replay_actions)
+
+
+def _load_tools(group: click.Group) -> None:
+    from .cmd_tools import tools
+
+    group.add_command(tools)
+
+
+def _load_daemon(group: click.Group) -> None:
+    from .cmd_daemon import daemon
+
+    group.add_command(daemon)
+
+
+_LOADERS_BY_NAMES: list[tuple[tuple[str, ...], object]] = [
+    (("init", "update"), _load_repo),
+    (("config", "add", "file", "unstage", "status"), _load_staging),
+    (("commit", "branch", "checkout", "log", "stash", "list-meta", "push"), _load_history),
+    (("clone", "pull", "merge"), _load_sync),
+    (("auth", "add-user", "list-users", "remove-user"), _load_auth),
+    (("token",), _load_token),
+    (("tenant",), _load_tenant),
+    (("user",), _load_user),
+    (("role",), _load_role),
+    (("login", "logout", "whoami"), _load_login),
+    (("idp",), _load_idp),
+    (("scim",), _load_scim),
+    (("admin",), _load_admin),
+    (("support-bundle",), _load_support),
+    (("doctor", "gc"), _load_maintenance),
+    (("test", "benchmark"), _load_devtools),
+    (("graph", "handoff", "webui", "import-lightning", "import-transformers",
+      "import-mlflow", "import-pytorch"), _load_integrations),
+    (("diff",), _load_diff),
+    (("context",), _load_context),
+    (("run",), _load_run),
+    (("env", "replay"), _load_env),
+    (("policy", "promote"), _load_policy),
+    (("watch",), _load_watch),
+    (("registry", "verify"), _load_registry),
+    (("webhooks",), _load_webhooks),
+    (("audit",), _load_audit),
+    (("improver",), _load_improver),
+    (("freeze", "incident"), _load_freeze),
+    (("canary",), _load_canary),
+    (("eval",), _load_eval),
+    (("task",), _load_task),
+    (("plan",), _load_plan),
+    (("budget",), _load_budget),
+    (("scheduler",), _load_scheduler),
+    (("review", "critique"), _load_review),
+    (("lineage", "search"), _load_lineage),
+    (("strategy",), _load_strategy),
+    (("lessons",), _load_lessons),
+    (("blackboard",), _load_blackboard),
+    (("sandbox", "replay-actions"), _load_sandbox),
+    (("tools",), _load_tools),
+    (("daemon",), _load_daemon),
+]
+
+for _names, _loader in _LOADERS_BY_NAMES:
+    for _name in _names:
+        _AuthRetryGroup._LAZY_LOADERS[_name] = _loader
+del _names, _loader
 
 
 # Historical namespace surface (tests/benchmarks import these from here):

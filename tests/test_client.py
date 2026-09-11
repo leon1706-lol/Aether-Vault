@@ -150,3 +150,62 @@ def test_download_object_raises_authentication_error_on_401(monkeypatch, tmp_pat
 
     with pytest.raises(AuthenticationError):
         client.download_object("deadbeef", tmp_path / "out.bin")
+
+
+# ---------------------------------------------------------------------------
+# V1.5.0 perf work: server_available() TTL cache
+# ---------------------------------------------------------------------------
+
+
+def test_server_available_caches_within_ttl(monkeypatch):
+    client = VaultClient()
+    calls = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return _FakeResponse(200)
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+
+    assert client.server_available() is True
+    assert client.server_available() is True
+    assert client.server_available() is True
+    assert len(calls) == 1, "second/third call should be served from the TTL cache, not a real HTTP GET"
+
+
+def test_server_available_cache_expires_after_ttl(monkeypatch):
+    client = VaultClient()
+    calls = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return _FakeResponse(200)
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+
+    fake_time = [1000.0]
+    monkeypatch.setattr("python.av_cli.client.time.monotonic", lambda: fake_time[0])
+
+    assert client.server_available() is True
+    fake_time[0] += VaultClient._SERVER_AVAILABLE_CACHE_TTL + 0.5
+    assert client.server_available() is True
+    assert len(calls) == 2, "a call after the TTL window elapsed must re-probe"
+
+
+def test_server_available_cache_is_per_instance(monkeypatch):
+    """Two separate VaultClient objects (e.g. two commands in the same test process)
+    must not share cached availability -- each does its own first real probe."""
+    calls = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return _FakeResponse(200)
+
+    a = VaultClient()
+    b = VaultClient()
+    monkeypatch.setattr(a.session, "get", fake_get)
+    monkeypatch.setattr(b.session, "get", fake_get)
+
+    assert a.server_available() is True
+    assert b.server_available() is True
+    assert len(calls) == 2

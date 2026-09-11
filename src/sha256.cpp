@@ -1,4 +1,5 @@
 #include "sha256.h"
+#include <algorithm>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
@@ -55,14 +56,37 @@ void SHA256::transform() {
 }
 
 void SHA256::update(const uint8_t * data_in, size_t length) {
-    for (size_t i = 0; i < length; ++i) {
-        data[datalen] = data_in[i];
-        datalen++;
+    // V1.5.0 perf work: this used to copy one byte at a time (a branch + a store per byte)
+    // -- the single largest pure-CPU cost in the whole C++ core, since every hash in the
+    // system (whole-file, per-chunk, per-layer) flows through here. Same three-phase shape
+    // as any streaming hash's bulk update: top up a pending partial block, then memcpy+
+    // transform whole 64-byte blocks straight out of the caller's buffer, then buffer
+    // whatever's left over. `transform()` itself (the actual SHA-256 compression function)
+    // and its output are completely unchanged -- this only changes how bytes get into
+    // `data[]` before it, so the digest for any given input is bit-for-bit identical to
+    // before (see tests/test_core.py's randomized-chunk-split property test).
+    size_t i = 0;
+    if (datalen > 0) {
+        size_t need = 64 - datalen;
+        size_t take = std::min(need, length);
+        memcpy(data + datalen, data_in, take);
+        datalen += static_cast<uint32_t>(take);
+        i += take;
         if (datalen == 64) {
             transform();
             bitlen += 512;
             datalen = 0;
         }
+    }
+    while (length - i >= 64) {
+        memcpy(data, data_in + i, 64);
+        transform();
+        bitlen += 512;
+        i += 64;
+    }
+    if (i < length) {
+        memcpy(data, data_in + i, length - i);
+        datalen = static_cast<uint32_t>(length - i);
     }
 }
 

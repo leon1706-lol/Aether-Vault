@@ -48,6 +48,8 @@ def gc() -> None:
 
 def _print_real_repo_speed_diagnostics(repo_root: Path) -> None:
     """`av doctor --speed` — read-only timing snapshot of the current repo."""
+    from . import speedcheck
+
     probes = speedcheck.run_real_repo_probes(repo_root, load_config, iter_working_files)
     click.echo("")
     click.secho("=== Speed diagnostics (this repo) ===", bold=True, fg="cyan")
@@ -406,6 +408,8 @@ def doctor(fix: bool, dry_run: bool, speed: bool, compose_path: str | None, writ
     speed_probes = None
     if speed:
         if json_mode:
+            from . import speedcheck
+
             speed_probes = [{"label": label, "elapsed_ms": elapsed_ms} for label, elapsed_ms in
                             speedcheck.run_real_repo_probes(repo_root, load_config, iter_working_files)]
         else:

@@ -1,7 +1,12 @@
 """User-level SSO session storage for `av login`/`logout`/`whoami` (v1.3.3). Lives at
-`~/.aether-vault/session.json` -- the same user-level directory `update_check.py`
-already established (`USER_CONFIG_DIR`), since a login session is per-user-per-machine,
-not per-repo. Never imported by `server.py`/`av_server` -- purely a CLI-side concern.
+`~/.aether-vault/session.json` -- the same user-level directory `fsutil.USER_CONFIG_DIR`
+establishes, since a login session is per-user-per-machine, not per-repo. Never imported
+by `server.py`/`av_server` -- purely a CLI-side concern.
+
+Deliberately imports `USER_CONFIG_DIR` from `fsutil`, not `update_check` -- `update_check`
+pulls in `requests`/`packaging`, which every `av` command was eagerly paying for through
+this exact import chain before V1.5.0's perf pass (main.py -> cmd_login -> session_store
+-> update_check -> requests). `fsutil` has none of that weight.
 """
 from __future__ import annotations
 
@@ -10,8 +15,7 @@ import os
 import stat
 from pathlib import Path
 
-from .fsutil import atomic_write_json
-from .update_check import USER_CONFIG_DIR
+from .fsutil import USER_CONFIG_DIR, atomic_write_json
 
 SESSION_PATH = USER_CONFIG_DIR / "session.json"
 

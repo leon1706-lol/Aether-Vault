@@ -400,6 +400,35 @@ never adds the `[pytorch]` extra or calls `av import-pytorch`).
   `weights_only=False` only if that rejects the file — relevant if a caller's `extra=`
   payload holds arbitrary picklables.
 
+## v1.5.0 additive surfaces (see development/CHANGELOG.md Phase 68)
+
+A performance release. Two surface-level changes cross the MINOR threshold; everything
+else (import-graph lazy loading, C++ GIL release, SHA-256 bulk update, deterministic
+threaded `add`, commit-path scoping) is an internal speed change with no altered
+contract.
+
+- **New CLI command group**: `av daemon start/stop/status/restart` — an opt-in,
+  off-by-default warm background process serving `add`/`status`/`commit` faster. Calls
+  the exact same click command objects as the in-process path, so it changes latency
+  only, never a command's output/exit-code/JSON-envelope contract. Disabled by default;
+  `AV_NO_DAEMON=1` always wins regardless of any opt-in.
+- **Default-behavior change**: `av add`/`av status` now skip a built-in list of directory
+  names (`venv`, `.venv`, `node_modules`, `build`, `dist`, `.tox`, `.mypy_cache`,
+  `.pytest_cache`, `.eggs`, `site-packages`, ...) and honor a project's `.gitignore` (root
+  patterns only — no `**`, negation and anchoring supported) when present, in addition to
+  the existing `.avignore`. `AV_NO_DEFAULT_IGNORES=1` restores the old walk-everything
+  behavior exactly. A file explicitly `av add`-ed inside an otherwise-ignored directory
+  stays tracked (ignore rules only affect the implicit walk, never an explicit path).
+- **Threading, on by default**: `av add`'s file-hashing/staging work is now parallelized
+  (`--threads`/`AV_THREADS`/`.av/config`'s `"threads"` key, auto-sized to the CPU count by
+  default). Output is guaranteed byte-identical to the old single-threaded path regardless
+  of thread count — `.av/index`, the object set, and the tree hash are all proven
+  deterministic across `AV_THREADS` ∈ {1,2,4,8}. `AV_THREADS=1` takes the literal old
+  code path, not a one-worker pool, as an explicit escape hatch.
+- **Not a contract change**: `.av/index`/`pending_push` dropped `indent=2` (still valid
+  JSON, just not pretty-printed — nothing reads these files by hand); this is purely a
+  storage-format compaction of files nothing outside `av` itself parses.
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades

@@ -37,7 +37,7 @@ from .exceptions import (
     StorageError,
     ValidationError,
 )
-from .fsutil import atomic_write_json, atomic_write_text, find_commit_file
+from .fsutil import atomic_write_json, atomic_write_json_compact, atomic_write_text, find_commit_file
 from .index import Index
 from .pointer import (
     create_pointer,
@@ -53,7 +53,6 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
-from . import speedcheck
 from . import __version__
 from .exceptions import AetherVaultException, AmbiguousCommitHash, NetworkError, StorageError, ValidationError
 from .index import Index
@@ -89,6 +88,90 @@ def _get_aether_core():
     return _aether_core
 
 
+# ---------------------------------------------------------------------------
+# V1.5.0: deterministic multithreading -- `--threads`/`AV_THREADS`/`.av/config "threads"`
+# resolve to one thread count, shared by the Python-side worker pool (parallel `add`, see
+# cmd_staging.py) and the C++ core's own shared pool (aether_core.set_max_threads) so both
+# layers agree instead of the Python pool's N workers each spawning their own C++ pool.
+# ---------------------------------------------------------------------------
+
+_native_threads_configured = False
+
+
+def cpu_count_for_threading() -> int:
+    """CPU count for auto-sizing, cgroup/affinity-aware where Python exposes it -- so a
+    CI container with a 2-CPU quota doesn't oversubscribe just because the host has 64."""
+    getter = getattr(os, "process_cpu_count", None)  # 3.13+
+    if getter is not None:
+        n = getter()
+        if n:
+            return n
+    affinity = getattr(os, "sched_getaffinity", None)  # POSIX only
+    if affinity is not None:
+        try:
+            n = len(affinity(0))
+            if n:
+                return n
+        except OSError:
+            pass
+    return os.cpu_count() or 1
+
+
+def resolve_threads(repo_root: Path | None, cli_threads: int | None = None) -> int:
+    """`--threads` > `AV_THREADS` > `.av/config "threads"` > auto. Returns 0 for "auto"
+    (callers pass 0 straight through to `aether_core.set_max_threads`, which already
+    treats 0 as hardware_concurrency()); a positive return is an explicit override.
+    `AV_THREADS=1` is a real escape hatch, not just "a pool of one" -- callers should treat
+    exactly 1 as "take the old single-threaded code path", useful for isolating whether a
+    bug is threading-related.
+    """
+    if cli_threads is not None and cli_threads > 0:
+        return cli_threads
+    env_val = os.environ.get("AV_THREADS", "").strip()
+    if env_val:
+        try:
+            n = int(env_val)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+    if repo_root is not None:
+        try:
+            cfg_threads = load_config(repo_root).get("threads")
+        except Exception:
+            cfg_threads = None
+        if isinstance(cfg_threads, int) and cfg_threads > 0:
+            return cfg_threads
+    return 0
+
+
+def python_pool_size(threads: int) -> int:
+    """Resolves `resolve_threads()`'s 0="auto" into a concrete Python ThreadPoolExecutor
+    size. Capped at 8: SHA-256 hashing is memory-bandwidth-bound well before 8 threads on
+    typical hardware, and each in-flight hash holds its own read buffer -- unlike the C++
+    pool (capped higher, at 16, in shared_pool()), which does finer-grained per-chunk work."""
+    n = threads if threads > 0 else cpu_count_for_threading()
+    return max(1, min(n, 8))
+
+
+def configure_native_threads(repo_root: Path | None, cli_threads: int | None = None) -> int:
+    """Resolves the effective thread count and configures the C++ core's shared pool to
+    match -- once per process (idempotent). Deliberately NOT called from every command's
+    entry point: only call this from a path that's already loading `aether_core` anyway
+    (currently: `hash_file_safe`, right before its own `aether_core.hash_file` call) so a
+    command that never hashes anything still never pays the extension's import cost.
+    Returns the resolved count (0=auto) for the caller to also size a Python-side pool via
+    `python_pool_size()`."""
+    global _native_threads_configured
+    threads = resolve_threads(repo_root, cli_threads)
+    if not _native_threads_configured:
+        aether_core = _get_aether_core()
+        if aether_core is not None and hasattr(aether_core, "set_max_threads"):
+            aether_core.set_max_threads(threads)
+        _native_threads_configured = True
+    return threads
+
+
 def setup_logging(verbose: bool, silent: bool) -> None:
     if silent:
         logger.setLevel(logging.CRITICAL)
@@ -111,6 +194,23 @@ def setup_logging(verbose: bool, silent: bool) -> None:
 # os.walk descends into `.av/objects` (potentially tens of thousands of CAS shards)
 # on every `add`/`status`.
 _IGNORED_DIRS = {".av", ".git", "__pycache__"}
+
+# V1.5.0: sane built-in defaults for the directories that show up in nearly every real ML
+# repo but were never in _IGNORED_DIRS -- their absence here (not a competitor's algorithm)
+# is what made `av status`/`av add .` walk an entire virtualenv or node_modules tree on
+# every invocation. Distinct from _IGNORED_DIRS above: these are a documented, opt-out-able
+# convenience default, not a hard repo-format invariant. Set AV_NO_DEFAULT_IGNORES=1 to track
+# one of these directories anyway -- `.avignore` has no negation mechanism (deliberately, see
+# load_avignore_patterns()'s docstring), so there is no per-directory override for this list.
+_DEFAULT_IGNORED_DIR_NAMES = frozenset({
+    "venv", ".venv", "env", "node_modules", "build", "dist", ".tox", ".nox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".eggs", "site-packages",
+    ".ipynb_checkpoints",
+})
+
+
+def _default_ignores_enabled() -> bool:
+    return os.environ.get("AV_NO_DEFAULT_IGNORES", "").strip().lower() not in ("1", "true", "yes")
 
 
 def load_avignore_patterns(repo_root: Path) -> list[str]:
@@ -138,9 +238,86 @@ def _matches_avignore(name: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
 
 
+class _GitignoreRule:
+    """One parsed `.gitignore` line. `anchored` = pattern contained a `/` before its last
+    character (git: match only from the `.gitignore`'s own directory down, not at any
+    depth). `dir_only` = pattern ended in `/` (only matches directories)."""
+
+    __slots__ = ("pattern", "negate", "dir_only", "anchored")
+
+    def __init__(self, pattern: str, negate: bool, dir_only: bool, anchored: bool):
+        self.pattern = pattern
+        self.negate = negate
+        self.dir_only = dir_only
+        self.anchored = anchored
+
+
+def _parse_gitignore_lines(lines: list[str]) -> list[_GitignoreRule]:
+    """Real (if partial) gitignore semantics: `#` comments, blank lines, `!` negation,
+    leading-`/` anchoring, trailing-`/` directory-only. Deliberately doesn't implement `**`
+    cross-directory globs or escaped `\\#`/`\\!` -- documented gap, same spirit as
+    `.avignore`'s own "gitignore-lite" scope note. A pattern's own directory component (if
+    any, e.g. `build/output`) is matched against the full relative path; a bare name (e.g.
+    `*.log`) matches at any depth, exactly like real git.
+    """
+    rules: list[_GitignoreRule] = []
+    for raw in lines:
+        line = raw.rstrip("\n").rstrip("\r")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        negate = line.startswith("!")
+        if negate:
+            line = line[1:]
+        dir_only = line.endswith("/") and not line.endswith("\\/")
+        if dir_only:
+            line = line[:-1]
+        if not line:
+            continue
+        anchored = "/" in line[:-1] or line.startswith("/")
+        line = line.lstrip("/")
+        if not line:
+            continue
+        rules.append(_GitignoreRule(line, negate, dir_only, anchored))
+    return rules
+
+
+def load_gitignore_rules(repo_root: Path) -> list[_GitignoreRule]:
+    """Reads the repo-root `.gitignore`, if present. Nested per-directory `.gitignore`
+    files (real git supports one per subdirectory) are out of scope here -- a single
+    root-level file covers the overwhelming majority of real repos and keeps this a
+    bounded, testable piece of surface rather than a full gitignore engine."""
+    gi_path = repo_root / ".gitignore"
+    if not gi_path.exists():
+        return []
+    try:
+        return _parse_gitignore_lines(gi_path.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return []
+
+
+def _gitignore_rule_matches(rule: _GitignoreRule, rel_posix: str, name: str, is_dir: bool) -> bool:
+    if rule.dir_only and not is_dir:
+        return False
+    if rule.anchored:
+        return fnmatch.fnmatch(rel_posix, rule.pattern)
+    return fnmatch.fnmatch(name, rule.pattern) or fnmatch.fnmatch(rel_posix, rule.pattern)
+
+
+def _is_gitignored(rel_posix: str, name: str, is_dir: bool, rules: list[_GitignoreRule]) -> bool:
+    """Last matching rule wins (real git semantics) -- a later `!pattern` can un-ignore
+    something an earlier broader pattern caught."""
+    ignored = False
+    for rule in rules:
+        if _gitignore_rule_matches(rule, rel_posix, name, is_dir):
+            ignored = not rule.negate
+    return ignored
+
+
 def iter_working_files(root: Path):
-    """Yield every working-tree file path under `root`, skipping ignored dirs/noise and
-    anything matching a `.avignore` pattern.
+    """Yield every working-tree file path under `root`, skipping ignored dirs/noise,
+    anything matching a `.avignore` pattern or the repo's `.gitignore`, and (V1.5.0) a
+    built-in default ignore list of common heavy directories (`venv`, `node_modules`, ...) --
+    see `_DEFAULT_IGNORED_DIR_NAMES` and `AV_NO_DEFAULT_IGNORES`.
 
     Prunes ignored/ignored-by-pattern directories in-place so the CAS object store (and e.g. a
     `.avignore`'d `venv/`) is never traversed in the first place, not just filtered after a full
@@ -148,17 +325,51 @@ def iter_working_files(root: Path):
     """
     repo_root = find_repo_root() or root
     avignore_patterns = load_avignore_patterns(repo_root)
+    gitignore_rules = load_gitignore_rules(repo_root)
+    default_ignores = _default_ignores_enabled()
+
+    def _rel_posix(p: Path) -> str | None:
+        # `root` isn't always under repo_root (a caller can pass an unrelated path) --
+        # gitignore matching is simply skipped for a path outside repo_root rather than
+        # crashing the whole walk over an edge case .avignore/default-dir matching never
+        # needed to care about (they only ever look at the bare name).
+        try:
+            return p.relative_to(repo_root).as_posix()
+        except ValueError:
+            return None
+
     for dirpath, dirnames, files in os.walk(root):
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in _IGNORED_DIRS and not _matches_avignore(d, avignore_patterns)
-        ]
-        for f in files:
+        dpath = Path(dirpath)
+        kept_dirnames = []
+        for d in dirnames:
+            if d in _IGNORED_DIRS:
+                continue
+            if default_ignores and d in _DEFAULT_IGNORED_DIR_NAMES:
+                continue
+            if _matches_avignore(d, avignore_patterns):
+                continue
+            if gitignore_rules:
+                rel = _rel_posix(dpath / d)
+                if rel is not None and _is_gitignored(rel, d, True, gitignore_rules):
+                    continue
+            kept_dirnames.append(d)
+        # Sorted, not insertion order -- os.walk's own order is filesystem-dependent (NTFS
+        # and ext4 don't agree), which made `.av/index` key order vary by machine even
+        # before V1.5.0's threading work. Sorting here (both the walk's own descent order
+        # via dirnames[:], and the yielded file order) is what makes the "same repo ->
+        # byte-identical index/commit hash, any machine, any thread count" guarantee real
+        # rather than incidental -- see tests/test_threads_determinism.py.
+        dirnames[:] = sorted(kept_dirnames)
+        for f in sorted(files):
             if f.endswith(".pyc") or f.endswith(".av-pointer"):
                 continue
             if _matches_avignore(f, avignore_patterns):
                 continue
-            yield Path(dirpath) / f
+            if gitignore_rules:
+                rel = _rel_posix(dpath / f)
+                if rel is not None and _is_gitignored(rel, f, False, gitignore_rules):
+                    continue
+            yield dpath / f
 
 
 def find_repo_root() -> Path | None:
@@ -220,15 +431,60 @@ class _AuthRetryGroup(click.Group):
     rather than wrapping each server-talking command individually. Re-runs the command
     from scratch after saving a token rather than silently retrying mid-operation, since
     resuming a partially-completed multi-step operation with a freshly swapped credential
-    is riskier than asking the user to re-invoke it."""
+    is riskier than asking the user to re-invoke it.
+
+    Also carries V1.5.0's lazy command registration: `main.py` used to `from .cmd_X import
+    ...` all ~45 command modules unconditionally at import time, which is most of why every
+    `av` invocation (including a plain `--version`/`--help`) paid for every command module's
+    entire dependency tree. `main.py` now registers one small loader function per module
+    against the command name(s) it produces (`_LAZY_LOADERS`) instead of importing eagerly;
+    `get_command` imports+registers a module's commands only the first time one of its names
+    is actually resolved. `list_commands` (used for `--help`/completion) needs no import at
+    all -- the loader dict's keys ARE the command names, known upfront without running any
+    loader.
+    """
+
+    _LAZY_LOADERS: dict = {}
+
+    def list_commands(self, ctx: click.Context | None) -> list[str]:
+        return sorted(set(self.commands) | set(self._LAZY_LOADERS))
+
+    def get_command(self, ctx: click.Context | None, name: str):
+        cmd = self.commands.get(name)
+        if cmd is not None:
+            return cmd
+        loader = self._LAZY_LOADERS.get(name)
+        if loader is None:
+            return None
+        loader(self)  # calls self.add_command(...) for every name this module produces
+        return self.commands.get(name)
 
     def invoke(self, ctx: click.Context):
-        from .client import AuthenticationError
-        from . import ui
-
+        # V1.5.0 perf fix: both imports below used to sit at the top of this method,
+        # unconditionally, on EVERY single command dispatch (this override wraps the whole
+        # group, so it ran even for `av --version`/`--help`) — `ui`'s module-level
+        # `questionary`/`rich` imports alone measured ~1.3-1.4s, silently defeating the P2
+        # lazy-command-registration work for literally every invocation. Deferred to inside
+        # the except block, which only runs on an actual 401 (rare, interactive-auth path).
+        #
+        # `except Exception` here (needed to catch *anything*, not just AuthenticationError,
+        # without importing `.client` up front) also catches `click.exceptions.Exit` -- which
+        # `--version`'s own handler raises on every single call -- so a plain
+        # `from .client import AuthenticationError` + isinstance check right here would
+        # import `.client` (and its `requests` dependency) on literally every invocation,
+        # reintroducing the exact cost this fix removes. Instead: peek at `sys.modules`
+        # first. Whatever raised a real AuthenticationError must have already imported
+        # `.client` to construct one, so "not imported yet" cheaply proves "not this
+        # exception" without ever triggering the import ourselves.
         try:
             return super().invoke(ctx)
-        except AuthenticationError:
+        except Exception as exc:
+            client_mod = sys.modules.get(f"{__name__.rsplit('.', 1)[0]}.client")
+            auth_error_cls = getattr(client_mod, "AuthenticationError", None) if client_mod else None
+            if auth_error_cls is None or not isinstance(exc, auth_error_cls):
+                raise
+            from . import ui
+
             # v1.2.5: exit 12 (auth_failed) via fail() in all three outcomes below, not a
             # bare sys.exit(1) — honors the documented exit-code registry and, in the
             # non-interactive case, emits a proper JSON envelope under --output json.
@@ -275,10 +531,18 @@ def load_registry(repo_root: Path) -> dict:
 
 
 def update_registry(repo_root: Path, tags: list[str], metrics: dict) -> None:
-    """Merge new tags and metric keys into the local registry."""
+    """Merge new tags and metric keys into the local registry.
+
+    A no-op commit (no new tag/metric names) skips the write+fsync entirely -- this ran
+    unconditionally on every single commit before, for a set that usually never changes.
+    """
     reg = load_registry(repo_root)
-    reg["tags"] = sorted(set(reg["tags"]) | set(tags))
-    reg["metrics"] = sorted(set(reg["metrics"]) | set(metrics.keys()))
+    new_tags = sorted(set(reg["tags"]) | set(tags))
+    new_metrics = sorted(set(reg["metrics"]) | set(metrics.keys()))
+    if new_tags == reg["tags"] and new_metrics == reg["metrics"]:
+        return
+    reg["tags"] = new_tags
+    reg["metrics"] = new_metrics
     atomic_write_json(repo_root / ".av" / "registry.json", reg)
 
 
@@ -347,7 +611,7 @@ def save_pending_push(repo_root: Path, pending: list[dict]) -> None:
     if not pending:
         path.unlink(missing_ok=True)
         return
-    atomic_write_json(path, pending)
+    atomic_write_json_compact(path, pending)
 
 
 def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) -> None:
@@ -357,7 +621,9 @@ def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) 
     save_pending_push(repo_root, pending)
 
 
-def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) -> bool:
+def upload_commit_objects(
+    repo_root: Path, client: "VaultClient", tree: dict, only_paths: set[str] | None = None
+) -> bool:
     """Upload every tracked file's object/layer shards referenced by a commit tree,
     covering `code` and `artifact` alike (a remote checkout needs code's bytes too).
 
@@ -367,11 +633,22 @@ def upload_commit_objects(repo_root: Path, client: "VaultClient", tree: dict) ->
     when every upload succeeded; callers MUST queue rather than call push_commit() on
     False -- never land commit metadata referencing bytes that were never stored.
 
+    `only_paths`, when given, scopes the scan to just those tree entries -- O(files
+    changed in this commit) instead of O(every tracked file), since an unchanged file's
+    object was already confirmed present server-side when IT was committed. V1.5.0:
+    `commit_staged`'s live path passes the staged set here; the offline-queue RETRY path
+    (`flush_pending_push`, below) deliberately does NOT -- a queued commit is exactly the
+    "something already went wrong" case where re-scanning that commit's full historical
+    tree as a self-healing pass is worth the extra cost.
+
     Uploads are batch-checked then sent in parallel (small thread pool). When
     `.av/env_snapshot.json` exists it is uploaded through this same object flow.
     """
     candidates: dict[str, Path] = {}  # hash -> object file on disk, dedup'd
-    for info in tree.values():
+    scan_items = tree.items() if only_paths is None else (
+        (rel_path, info) for rel_path, info in tree.items() if rel_path in only_paths
+    )
+    for _rel_path, info in scan_items:
         parts = list(info.get("layers", [])) + list(info.get("chunks", []))
         for part in parts:
             p_hash = part["hash"]
@@ -474,6 +751,11 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
 def hash_file_safe(path: str) -> str:
     aether_core = _get_aether_core()
     if aether_core:
+        if not _native_threads_configured:
+            # First real use of the extension in this process -- configure its shared
+            # thread pool here rather than at every command's entry point, so a command
+            # that never hashes anything never pays aether_core's import cost. Idempotent.
+            configure_native_threads(find_repo_root())
         try:
             return aether_core.hash_file(path)
         except Exception as exc:
@@ -488,6 +770,75 @@ def hash_file_safe(path: str) -> str:
     return sha256.hexdigest()
 
 
+def hash_and_publish_whole_file(repo_root: Path, fpath: Path) -> str:
+    """Hashes `fpath` and, if its content isn't already in the CAS, publishes it there --
+    in one read where possible, instead of hash_file_safe() reading the whole file once to
+    learn its hash and then a second full read via shutil.copy2 to actually store it (the
+    dominant I/O cost for a repo of many small files, which is exactly the shape of the
+    commit/add benchmark's own fixture). Returns the whole-file SHA-256.
+
+    Trade-off, stated plainly: since the destination name isn't known until the file is
+    hashed, this always writes to a temp file first and only keeps it if the object didn't
+    already exist -- a genuinely new/changed file (the common case once the mtime/size
+    no-op check above has already returned False) pays exactly one read + one write; a file
+    whose content turns out to duplicate an already-stored object pays one wasted temp
+    write it immediately discards. Bounded, and never slower than the old always-two-reads
+    path for the common case.
+    """
+    aether_core = _get_aether_core()
+    if aether_core is not None and hasattr(aether_core, "hash_and_copy"):
+        if not _native_threads_configured:
+            configure_native_threads(repo_root)
+        obj_dir = repo_root / ".av" / "objects"
+        # Hash straight into a scratch temp name first -- its final shard directory isn't
+        # known until the hash comes back.
+        scratch = obj_dir / f".stage-tmp.{uuid.uuid4().hex[:12]}"
+        obj_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            file_hash = aether_core.hash_and_copy(str(fpath), str(scratch))
+        except Exception as exc:
+            print(
+                f"Warning: aether_core.hash_and_copy failed, using Python fallback: {exc}",
+                file=sys.stderr,
+            )
+            scratch.unlink(missing_ok=True)
+        else:
+            obj_path = repo_root / ".av" / "objects" / file_hash[:2] / file_hash[2:]
+            if obj_path.exists():
+                scratch.unlink(missing_ok=True)
+            else:
+                obj_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.replace(scratch, obj_path)
+                except OSError:
+                    scratch.unlink(missing_ok=True)
+                    raise
+            return file_hash
+
+    # Pure-Python fallback (no aether_core, or it failed above): still one read, via
+    # hashlib updated incrementally as each block is both hashed and written.
+    file_hash_obj = hashlib.sha256()
+    obj_dir = repo_root / ".av" / "objects"
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    scratch = obj_dir / f".stage-tmp.{uuid.uuid4().hex[:12]}"
+    try:
+        with open(fpath, "rb") as src, open(scratch, "wb") as dst:
+            while chunk := src.read(8 * 1024 * 1024):
+                file_hash_obj.update(chunk)
+                dst.write(chunk)
+        file_hash = file_hash_obj.hexdigest()
+        obj_path = repo_root / ".av" / "objects" / file_hash[:2] / file_hash[2:]
+        if obj_path.exists():
+            scratch.unlink(missing_ok=True)
+        else:
+            obj_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(scratch, obj_path)
+        return file_hash
+    finally:
+        if scratch.exists():
+            scratch.unlink(missing_ok=True)
+
+
 # IMPORTANT — single source of truth for file metadata (Unix epoch).
 # These deliberately do NOT use the C++ core: std::filesystem::last_write_time has an
 # implementation-defined clock epoch (e.g. 1601 on Windows / 100ns ticks) that does not
@@ -497,10 +848,12 @@ def hash_file_safe(path: str) -> str:
 # os.stat is a single cheap syscall, so there is no meaningful speed loss in keeping all
 # size/mtime handling in Python and reserving the C++ core for hashing only.
 def get_file_meta_safe(path: str) -> dict:
-    p = Path(path)
-    if not p.exists():
+    # One stat() call, not exists()+stat() (two syscalls for the common case where the
+    # file exists, which is nearly every call on a real repo) -- V1.5.0 perf work.
+    try:
+        stat = os.stat(path)
+    except OSError:
         return {"exists": False, "size": 0, "mtime_ns": 0}
-    stat = p.stat()
     return {"exists": True, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
@@ -653,34 +1006,72 @@ CHUNKABLE_EXTS = {
 }
 
 
-def stage_one_file(
+def _atomic_publish_object(obj_path: Path, write_fn) -> None:
+    """Publishes a CAS object at `obj_path` by writing to a temp file in the same shard
+    directory first, then `os.replace` -- never write straight to the final content-
+    addressed name. `write_fn(tmp_path)` does the actual write (a plain copy, or a streamed
+    reassembly from a source offset).
+
+    V1.5.0: this closes a race that existed even before threading -- two files with
+    identical content (a common case for ML checkpoints: an unchanged encoder re-saved
+    alongside a changed head) hash to the same `obj_path`, and a `Ctrl-C` mid-`shutil.copy2`
+    could already leave a torn object under that name for a single-threaded `av add`.
+    Parallel staging (see cmd_staging.py) makes the *concurrent*-write version of this race
+    real too: two worker threads racing the exact same destination name.
+    """
+    if obj_path.exists():
+        return
+    obj_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = obj_path.with_name(f"{obj_path.name}.tmp.{uuid.uuid4().hex[:8]}")
+    try:
+        write_fn(tmp)
+        # Another thread may have published the same content-addressed object while this
+        # one was writing its own temp copy -- that's fine, os.replace still lands
+        # atomically; the loser's temp file just becomes the (byte-identical) final file.
+        os.replace(tmp, obj_path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _compute_stage_result(
     repo_root: Path,
-    idx: Index,
     threshold_bytes: int,
     fpath: Path,
     rel_path: str,
+    file_type: str,
+    existing_entry: dict | None,
     attr_flags: set | None = None,
-) -> bool:
-    """Hashes and stores a single file's current content (LFS threshold check, safetensors
-    layer-split if applicable, CDC chunking, pointer creation) and records it in the
-    index. Returns whether anything actually changed. `attr_flags` carries this path's
-    `.avattributes` directives, resolved once per invocation by the caller."""
+) -> dict | None:
+    """Pure per-file work for `av add`: hashing, safetensors layer-split, CDC chunking, CAS
+    object writes, and pointer-file creation for one path. Touches nothing shared across
+    files (every write is namespaced by either `file_hash` via `_atomic_publish_object`'s
+    temp+replace, or by `fpath`'s own unique name for the pointer file) and never touches
+    `Index` or `click` -- safe to run on a worker thread. Returns None if nothing changed,
+    else a result dict for the caller to apply to the index and print, in whatever order
+    the caller chooses (V1.5.0: always the original sorted-input order, regardless of which
+    worker finished first -- see cmd_staging.py's `add`).
+    """
     attr_flags = attr_flags or set()
     meta = get_file_meta_safe(str(fpath))
-
-    existing = idx.get_entry(rel_path)
     if (
-        existing
+        existing_entry
         and meta["exists"]
-        and meta["size"] == existing["size"]
-        and meta["mtime_ns"] == existing["mtime_ns"]
+        and meta["size"] == existing_entry["size"]
+        and meta["mtime_ns"] == existing_entry["mtime_ns"]
     ):
-        return False
-
-    file_hash = hash_file_safe(str(fpath))
-    file_type = idx.classify_file(rel_path)
+        return None
 
     if file_type == "artifact" and meta["size"] > threshold_bytes:
+        # Needed regardless of whether layer-split/chunking below actually fires -- kept as
+        # a separate read here (unlike the plain-file branch at the bottom of this
+        # function) because a successful split reads the file again anyway for its own
+        # per-layer/per-chunk hashing; folding the whole-file hash into that pass too is a
+        # real further optimization, just a separate/riskier one than this function takes on.
+        file_hash = hash_file_safe(str(fpath))
         layers: list[dict] = []
         chunks: list[dict] = []
 
@@ -698,20 +1089,21 @@ def stage_one_file(
                     l_hash = lr["hash"]
                     l_size = lr["size"]
                     l_offset = lr["offset"]
-                    l_obj_dir = repo_root / ".av" / "objects" / l_hash[:2]
-                    l_obj_dir.mkdir(parents=True, exist_ok=True)
-                    l_obj_path = l_obj_dir / l_hash[2:]
-                    if not l_obj_path.exists():
+                    l_obj_path = repo_root / ".av" / "objects" / l_hash[:2] / l_hash[2:]
+
+                    def _write_layer(tmp_path, _offset=l_offset, _size=l_size):
                         with open(fpath, "rb") as src_f:
-                            src_f.seek(l_offset)
-                            with open(l_obj_path, "wb") as dst_f:
-                                remaining = l_size
+                            src_f.seek(_offset)
+                            with open(tmp_path, "wb") as dst_f:
+                                remaining = _size
                                 while remaining > 0:
                                     chunk = src_f.read(min(8 * 1024 * 1024, remaining))
                                     if not chunk:
                                         break
                                     dst_f.write(chunk)
                                     remaining -= len(chunk)
+
+                    _atomic_publish_object(l_obj_path, _write_layer)
                     layers.append({"name": lr["name"], "hash": l_hash, "size": l_size})
             except Exception as exc:
                 logger.warning(f"Layer splitting failed for {rel_path}, falling back to whole-file: {exc}")
@@ -734,60 +1126,95 @@ def stage_one_file(
                         c_hash = cr["hash"]
                         c_size = cr["size"]
                         c_offset = cr["offset"]
-                        c_obj_dir = repo_root / ".av" / "objects" / c_hash[:2]
-                        c_obj_dir.mkdir(parents=True, exist_ok=True)
-                        c_obj_path = c_obj_dir / c_hash[2:]
-                        if not c_obj_path.exists():
+                        c_obj_path = repo_root / ".av" / "objects" / c_hash[:2] / c_hash[2:]
+
+                        def _write_chunk(tmp_path, _offset=c_offset, _size=c_size):
                             with open(fpath, "rb") as src_f:
-                                src_f.seek(c_offset)
-                                with open(c_obj_path, "wb") as dst_f:
-                                    remaining = c_size
+                                src_f.seek(_offset)
+                                with open(tmp_path, "wb") as dst_f:
+                                    remaining = _size
                                     while remaining > 0:
                                         block = src_f.read(min(8 * 1024 * 1024, remaining))
                                         if not block:
                                             break
                                         dst_f.write(block)
                                         remaining -= len(block)
+
+                        _atomic_publish_object(c_obj_path, _write_chunk)
                         chunks.append({"hash": c_hash, "size": c_size, "offset": c_offset})
                 except Exception as exc:
                     logger.warning(f"Chunking failed for {rel_path}, falling back to whole-file: {exc}")
                     chunks = []
 
         if not layers and not chunks:
-            obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
-            obj_dir.mkdir(parents=True, exist_ok=True)
-            obj_path = obj_dir / file_hash[2:]
-            if not obj_path.exists():
-                shutil.copy2(fpath, obj_path)
+            obj_path = repo_root / ".av" / "objects" / file_hash[:2] / file_hash[2:]
+            _atomic_publish_object(obj_path, lambda tmp: shutil.copy2(fpath, tmp))
 
         ptr_path = get_pointer_path(fpath)
         ptr_content = create_pointer(fpath, file_hash, meta["size"])
         with open(ptr_path, "w") as ptr_f:
             ptr_f.write(ptr_content)
 
-        pointer_rel_path = rel_path + ".av-pointer"
-        idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, pointer_rel_path, auto_save=False)
-        if layers:
-            idx.entries[rel_path]["layers"] = layers
-        if chunks:
-            idx.entries[rel_path]["chunks"] = chunks
         split_desc = (
             f"{len(layers)} layers" if layers
             else (f"{len(chunks)} chunks" if chunks else "whole-file")
         )
-        if current_output_mode() != "json":
-            click.secho(f"Staged [ARTIFACT] {rel_path} (LFS, {split_desc})", fg="green")
-    else:
-        obj_dir = repo_root / ".av" / "objects" / file_hash[:2]
-        obj_dir.mkdir(parents=True, exist_ok=True)
-        obj_path = obj_dir / file_hash[2:]
-        if not obj_path.exists():
-            shutil.copy2(fpath, obj_path)
+        return {
+            "rel_path": rel_path, "hash": file_hash, "size": meta["size"],
+            "mtime_ns": meta["mtime_ns"], "file_type": file_type,
+            "pointer": rel_path + ".av-pointer", "layers": layers, "chunks": chunks,
+            "message": f"Staged [ARTIFACT] {rel_path} (LFS, {split_desc})",
+        }
 
-        idx.add_entry(rel_path, file_hash, meta["size"], meta["mtime_ns"], file_type, None, auto_save=False)
-        if current_output_mode() != "json":
-            click.secho(f"Staged [{file_type.upper()}] {rel_path}", fg="green")
+    # Plain code/small-artifact file: no split candidate, so this is exactly the case
+    # hash_and_publish_whole_file exists for -- one read instead of hash_file_safe's read
+    # followed by a second full read via shutil.copy2.
+    file_hash = hash_and_publish_whole_file(repo_root, fpath)
+    return {
+        "rel_path": rel_path, "hash": file_hash, "size": meta["size"],
+        "mtime_ns": meta["mtime_ns"], "file_type": file_type, "pointer": None,
+        "layers": [], "chunks": [],
+        "message": f"Staged [{file_type.upper()}] {rel_path}",
+    }
 
+
+def apply_stage_result(idx: Index, result: dict) -> None:
+    """Applies one `_compute_stage_result()` result to the index and prints its message --
+    the only part of staging that touches shared state, so callers (sequential or the
+    parallel `add` in cmd_staging.py) always run this on the main thread, one result at a
+    time, in whatever order they've chosen (V1.5.0: original sorted-input order)."""
+    idx.add_entry(
+        result["rel_path"], result["hash"], result["size"], result["mtime_ns"],
+        result["file_type"], result["pointer"], auto_save=False,
+    )
+    if result["layers"]:
+        idx.entries[result["rel_path"]]["layers"] = result["layers"]
+    if result["chunks"]:
+        idx.entries[result["rel_path"]]["chunks"] = result["chunks"]
+    if current_output_mode() != "json":
+        click.secho(result["message"], fg="green")
+
+
+def stage_one_file(
+    repo_root: Path,
+    idx: Index,
+    threshold_bytes: int,
+    fpath: Path,
+    rel_path: str,
+    attr_flags: set | None = None,
+) -> bool:
+    """Hashes and stores a single file's current content and records it in the index.
+    Returns whether anything actually changed. Thin sequential wrapper around
+    `_compute_stage_result`/`apply_stage_result` -- kept as the one entry point every
+    existing caller (plugins, `av watch`, `av stash push`, tests) already uses; the
+    parallel `add` path in cmd_staging.py calls the two halves directly instead."""
+    file_type = idx.classify_file(rel_path)
+    result = _compute_stage_result(
+        repo_root, threshold_bytes, fpath, rel_path, file_type, idx.get_entry(rel_path), attr_flags
+    )
+    if result is None:
+        return False
+    apply_stage_result(idx, result)
     return True
 
 
@@ -855,12 +1282,24 @@ def _finalize_commit(
     result_sink=None,
     defer_upload: bool = False,
     outcome_sink=None,
+    changed_paths: set[str] | None = None,
 ) -> str:
     """Everything `av commit` does after its tree snapshot and parents are resolved: hash
     the payload deterministically over sorted JSON, persist atomically (commit object
     before ref move), advance the branch ref, clear staged flags, and push to the
     registry with the standard offline-queue fallbacks. Shared by `av merge` so its
-    two-parent commits go through the exact same code path."""
+    two-parent commits go through the exact same code path.
+
+    `changed_paths`, if given, scopes upload_commit_objects to just those tree entries
+    instead of the whole tree (V1.5.0 perf work) -- an O(commit size) upload instead of
+    O(repo size). ONLY `commit_staged` passes this (the staged set it captures itself,
+    BEFORE `idx.clear_staged()` below wipes every entry's staged flag -- capturing it here
+    from `idx` would be wrong, since `idx.clear_staged()` runs unconditionally below and,
+    for a caller like `cmd_sync.py`'s merge, the passed-in `idx` was already re-loaded
+    fresh from disk with nothing staged by the time it reaches this function). Leave this
+    None for any caller that can't state its own changed set with full confidence --
+    `upload_commit_objects` then falls back to its safe, if slower, full-tree scan.
+    """
     metrics = metrics or {}
     message = commit_data.get("message", "")
 
@@ -952,7 +1391,7 @@ def _finalize_commit(
         try:
             # Objects must reach the server before the commit -- upload_commit_objects()'s
             # return value is the only signal a real object-write failure ever produces.
-            if not upload_commit_objects(repo_root, client, tree):
+            if not upload_commit_objects(repo_root, client, tree, only_paths=changed_paths):
                 queue_pending_push(repo_root, commit_hash, remote_ref_name)
                 _queued("object_upload_failed")
                 if result_sink is None:
@@ -1055,6 +1494,7 @@ def commit_staged(
     defer_upload: bool = False,
     result_sink=None,
     outcome_sink=None,
+    idx: "Index | None" = None,
 ) -> str | None:
     """Commit whatever is currently staged — THE shared entry point.
 
@@ -1064,13 +1504,23 @@ def commit_staged(
     deterministic hash over sorted JSON, atomic local persist, ref advance, and
     push-or-queue with offline resilience.
 
+    `idx`, if given, is used as-is instead of a fresh `Index(repo_root)` load -- V1.5.0:
+    lets `commit_scoped_paths` (the plugin seam) pass the exact in-memory `Index` it already
+    scoped, saving a redundant read+reparse of the whole index file it just wrote seconds
+    earlier. Every other caller omits it and gets the original always-fresh-load behavior.
+
     Returns the new commit hash, or None when nothing was staged.
     """
     from .client import VaultClient
 
-    idx = Index(repo_root)
-    if not idx.get_staged_entries():
+    if idx is None:
+        idx = Index(repo_root)
+    staged_entries = idx.get_staged_entries()
+    if not staged_entries:
         return None
+    # Captured here, not inside _finalize_commit -- see its changed_paths docstring for why
+    # that would be unsafe for other callers (e.g. merge) sharing the same function.
+    changed_paths = set(staged_entries.keys())
     cfg = load_config(repo_root)
     client = VaultClient(*resolve_remote(repo_root, cfg))
 
@@ -1131,6 +1581,7 @@ def commit_staged(
         commit_data=commit_data, tree=tree, ref_path=ref_path, head_path=head_path,
         idx=idx, tags=tags, metrics=metrics or {},
         result_sink=result_sink, defer_upload=defer_upload, outcome_sink=outcome_sink,
+        changed_paths=changed_paths,
     )
 
 
@@ -1283,6 +1734,14 @@ def commit_scoped_paths(
         # changed under a known path (re-staged), and keys that transitioned into staged
         # because of it. Unchanged re-imports touch nothing → scoped index stays empty →
         # commit_staged returns None (the documented no-op).
+        #
+        # V1.5.0: no idx.save() here (unlike before) -- the scoped dict stays in memory and
+        # is handed straight to commit_staged(idx=idx) below, which writes it exactly once
+        # via _finalize_commit's idx.clear_staged(). Writing it here just to have
+        # commit_staged immediately re-read + overwrite it was a fully redundant read+write
+        # cycle: 3 index reads + 3 writes + a deepcopy per call, down to 1 read + up to 2
+        # writes (clear_staged's, and the merge-back below only if this staging actually
+        # committed something).
         idx.entries = {
             rel_path: entry
             for rel_path, entry in idx.entries.items()
@@ -1290,20 +1749,21 @@ def commit_scoped_paths(
             or entry.get("hash") != saved[rel_path].get("hash")
             or (entry.get("staged") and rel_path not in pre_staged)
         }
-        idx.save()
 
         return commit_staged(
             repo_root, message, tags=tuple(tags), metrics=dict(metrics or {}),
-            run_id=run_id,
+            run_id=run_id, idx=idx,
         )
     finally:
-        # Post-commit index: the scoped targets present with staged flags cleared by
-        # _finalize_commit; everything the user had before comes back unchanged.
-        fresh = Index(repo_root)
+        # Post-commit index: the scoped targets present (idx already reflects their
+        # post-commit state -- clear_staged() ran on this exact object) merged with
+        # everything the user had staged/tracked before, untouched. Reuses `idx` in memory
+        # instead of a fresh Index(repo_root) reload -- it's already exactly the right
+        # object, whether commit_staged committed something or returned None early.
         for rel_path, entry in saved.items():
-            if rel_path not in fresh.entries:
-                fresh.entries[rel_path] = entry
-        fresh.save()
+            if rel_path not in idx.entries:
+                idx.entries[rel_path] = entry
+        idx.save()
 
 
 def _collect_dirty_paths(repo_root: Path, idx: Index) -> list[str]:

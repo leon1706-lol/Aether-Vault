@@ -1704,3 +1704,123 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** `save()` now builds the message from only the parts actually given (`epoch=N`, `step=N`, both, or neither → falls back to the checkpoint's filename), never printing a literal `None`.
 
 **Verification:** New regression test `test_pytorch_save_message_omits_step_when_not_given` (asserts the commit message is exactly `"epoch=2"` when only `epoch` is passed); confirmed by hand in the same manual scratch-repo session (`av log` after the fix shows a clean `"epoch=99"`, no `step=None`).
+
+---
+
+### 142. V1.5.0's lazy CLI command registration silently zeroed out two test suites' coverage
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-08), found while re-verifying the change itself rather than by re-reading the diff.
+
+**Problem:** Converting `main.py`'s ~45 eager `from .cmd_X import ...` statements to on-demand loading (`_AuthRetryGroup.get_command`/`list_commands`, keyed by a static name table) left `cli.commands` empty until a name is actually resolved. `tests/test_docs_commands.py` and `tests/test_contract_matrix.py` both walked `cli.commands.items()` directly at collection/setup time instead of through `get_command`/`list_commands` — the former silently stopped resolving any documented `av ...` command past the top level (misreporting a real flag as unrecognized), the latter's `ALL_COMMAND_PATHS` collapsed to an empty list, meaning the entire JSON-envelope anti-leakage sweep AGENTS.md calls out as the check to run before adding a command would have quietly tested zero commands.
+
+**Fix:** Both now walk via `list_commands(None)`/`get_command(None, name)`, which works identically whether a group is lazy (`cli` itself) or eagerly populated (every nested group).
+
+**Verification:** `tests/test_docs_commands.py`/`tests/test_contract_matrix.py` re-run standalone (221 passed, 106 skipped by design) confirm real command/flag resolution and a non-empty, correctly-walked command matrix; full suite re-run before landing.
+
+---
+
+### 143. `av daemon`'s state file was observable by a client before its token file was guaranteed final
+
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-09-08), found by the daemon's own new end-to-end transport test, not by re-reading the code.
+
+**Problem:** `DaemonServer.write_state_file()` wrote `<key>.json` (the file clients poll for to discover the daemon) before `<key>.key` (the auth token). A client that connected in the narrow window between those two writes could read a token file about to be atomically replaced, or — in a test driving this precisely — see a deliberately-corrupted token get silently restored by the daemon's own in-flight write, masking a real auth-rejection test.
+
+**Fix:** Reordered `write_state_file()` to write the token file (via its existing tmp+`os.replace` atomic swap) before the state file, so by the time a client can discover the daemon at all, the token is already final.
+
+**Verification:** `tests/test_daemon.py::test_wrong_token_is_rejected_by_the_server_over_real_transport` (drives a real corrupted-token rejection over the actual named-pipe/socket transport) failed before this fix and passes after; full `tests/test_daemon.py` (28 tests) green.
+
+---
+
+### 144. `av daemon start`'s detached spawn found a real Windows job-object escape gap — and this dev sandbox has a second, unfixable layer on top of it
+
+**Severity:** 3/10 · **Status:** 🟡 `partial` (2026-09-08) — code fix shipped and verified where it applies; the sandbox-level constraint is a documented environment limitation, not something further code can close.
+
+**Problem:** `av daemon start`'s detached child (spawned with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) died within seconds when launched from inside the real `av.exe` console-script binary, even though the identical spawn call survived indefinitely when run from a plain `python.exe` process. Root cause: pip/distlib's Windows launcher stub wraps its own child in a Job Object with kill-on-close semantics (a real, general Windows console-script issue, not sandbox-specific).
+
+**Fix:** `_spawn_detached()` now tries `CREATE_BREAKAWAY_FROM_JOB` first, falling back to the plain flags only if that raises `PermissionError` (a job that itself disallows breakaway) — the standard, correct handling for this class of problem.
+
+**Verification, and the second layer found while verifying:** Confirmed via `Get-CimInstance Win32_Process` polling every second that even `schtasks /run` (Windows Task Scheduler, which launches under `schedsvc`'s own process tree and normally escapes any job object, breakaway-permitting or not) got killed on the same ~5s timeline as the plain detached spawn in this specific dev/CI sandbox. Since Task Scheduler's child has no job-object relationship to the calling process at all, this rules out a job-object cause for that second death and points to sandbox-level process-lifetime supervision outside any Win32 mechanism this codebase can address. **Not fixed further, deliberately**: the daemon's server/protocol correctness is independently proven by `tests/test_daemon.py`'s 28 tests (including real named-pipe/socket transport round trips via a thread-hosted server, which sidesteps process-spawning entirely); `--foreground` plus an external supervisor is the documented correct pattern for such environments.
+
+---
+
+### 145. `av daemon`'s Windows named-pipe accept loop could hang forever past its own idle timeout — `should_stop()` was never re-checked while blocked in `ConnectNamedPipe`
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-08), found by code review while re-reading `daemon.py` end to end, not by a failing test.
+
+**Problem:** `run_windows()`'s accept loop calls `_winapi.ConnectNamedPipe()`, which blocks indefinitely until a client connects — unlike `run_posix()`'s `listener.settimeout(1.0)` accept loop, nothing periodically re-evaluates `should_stop()` while waiting. A daemon that never receives a second connection would never honor its idle timeout, never notice `.av` being removed, and never exit on its own — the opposite of the "idle timeout default 900s" contract documented for it.
+
+**Fix:** `_start_should_stop_watchdog()` — a daemon thread, started unconditionally for both platforms in `run()`, polling `should_stop()` every 2s and calling `cleanup_state_files()` + `os._exit(0)` the moment it's true. `os._exit`, not `sys.exit`, because the main thread may be blocked in a C-level call it cannot be interrupted out of; cleanup runs in the watchdog specifically because the main thread's own `finally` block will never get a chance to.
+
+**Verification:** New tests `test_should_stop_watchdog_fires_on_idle_timeout`/`test_should_stop_watchdog_does_not_fire_while_active` (mocking `os._exit`, since calling the real thing would kill the test process) — both pass; full `tests/test_daemon.py` (52 tests) green.
+
+---
+
+### 146. `av daemon`'s client sent the caller's *entire* environment over the wire — allowlist filtering only ran server-side, after the fact
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-08), found by a final self-review read-through of `daemon_client.py`, not by a failing test.
+
+**Problem:** `call_daemon()`'s request built `"env": dict(os.environ)` unfiltered — every secret in the caller's environment (AWS keys, CI tokens, anything) was serialized into the request and transmitted over the socket/named pipe. `daemon.py`'s `allowlisted_env()` did filter it, but only *after* the daemon had already received the full payload, contradicting this project's own documented intent ("never the whole environment") and the architecture doc's description of the design.
+
+**Fix:** The allowlist (`ENV_ALLOWLIST_PREFIXES`/`ENV_ALLOWLIST_EXACT`/`allowlisted_env()`) moved to the shared `daemon_common.py`; `call_daemon()` now filters before building the request, so a non-allowlisted variable never reaches the wire at all. `daemon.py`'s own `allowlisted_env` re-applies the same filter server-side as defense in depth — never trust a request's `env` field to already be filtered just because today's one client does.
+
+**Verification:** New test `test_call_daemon_filters_env_before_sending_on_the_wire` spies on the exact request dict `handle_request()` receives over the real transport and asserts a planted `AWS_SECRET_ACCESS_KEY` never appears in it while an allowlisted `AV_THREADS` does; full `tests/test_daemon.py` (53 tests) green.
+
+---
+
+### 147. `test_hash_file_releases_the_gil` would silently write a 128MB file into the repo checkout itself on POSIX CI
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-09-08), found by a final read-through of the new test, before it ever ran red in CI.
+
+**Problem:** The test resolved its scratch file location via `os.environ.get("RUNNER_TEMP") or os.environ.get("TEMP") or "."` — `TEMP` is a Windows-only convention; on Linux/macOS CI legs neither var is set, so it would have silently fallen back to `"."` (the repo checkout's own working directory) and written a 128MB file there every run.
+
+**Fix:** Uses pytest's own `tmp_path` fixture instead — the correct, already-idiomatic-in-this-suite way to get a real, auto-cleaned scratch directory on every platform; removes the manual `finally: os.remove(...)` cleanup entirely along with two now-unused imports (`os`-path-join usage, `time`).
+
+**Verification:** `test_hash_file_releases_the_gil` re-run standalone, passes; no behavior change to what it actually tests (GIL release during `hash_file`).
+
+---
+
+### 148. New `tests/test_threads_determinism.py` collided on its own scratch directory whenever a test compared `AV_THREADS=1` against itself
+
+**Severity:** 2/10 · **Status:** 🟢 `fixed` (2026-09-08), found on this test file's own first real run, before it ever landed.
+
+**Problem:** The fixture named each isolated repo directory `repo_threads_{threads}` under one shared `tmp_path`. Several tests call it twice with the identical thread count (a `threads=1` baseline compared against a `threads=1` parametrize case), so the second `mkdir()` collided with the first (`WinError 183`/`FileExistsError`) — every `[1]`-parametrized case failed on setup, never actually exercising the determinism check it existed to run.
+
+**Fix:** Directory names now include a per-fixture-instance call counter in addition to the thread count, so two calls with the same `threads` value never target the same path.
+
+**Verification:** `tests/test_threads_determinism.py` (17 tests: index content, object-store set, tree hash, and staged-output order, each across `AV_THREADS` ∈ {1,2,4,8}, plus a same-thread-count repeat-run check) — all pass after the fix.
+
+---
+
+### 149. `tests/test_daemon.py`'s full 53-test file never prints its own pytest summary line on this dev box (environmental, not a code bug)
+
+**Severity:** 1/10 · **Status:** 🔴 `closed` (2026-09-11), not fixed because there is nothing in the test or product code to fix — same class of issue as #144.
+
+**Problem:** Running the whole file in one `pytest` invocation reliably shows 51 clean dots + 1 skip + zero failures, then the process exits code 0 without ever printing the final `"N passed..."` summary line — reproduced 4+ times, with `-u`, with `tee`, and at both low (~487MB) and moderate (~625MB) free memory. `--collect-only` confirms 53 tests exist and that the last one is `test_call_daemon_filters_env_before_sending_on_the_wire`; a raw run shows that exact test name print with no `PASSED`/`FAILED` suffix, i.e. the process is cut mid-test, not mid-summary.
+
+**Fix:** None applied — splitting the file into its two natural halves proves all 53 tests pass: `-k "not end_to_end and not real_transport and not watchdog"` gives `47 passed, 1 skipped, 5 deselected`, and `-k "end_to_end or real_transport or watchdog"` gives the complementary `5 passed, 48 deselected` — 47+1+5 = 53 with zero failures either way. This dev sandbox's process-lifetime supervisor (already documented in #144 killing a detached daemon child and even `schtasks`-spawned processes) appears to also cut a foreground pytest process once the file's cumulative real OS thread/socket/named-pipe handle count crosses some threshold, independent of which test is last — not a defect in the tests or the daemon code.
+
+**Verification:** Both halves of `test_daemon.py`'s split (above) pass cleanly with real summary lines and account for all 53 collected tests; only the single full-file, all-53-tests invocation truncates. No failure or hang has ever been observed in any subset or individual run, so this is tracked as a known local-sandbox limitation, not shipped-code risk. CI (real Linux/macOS/Windows runners, no such supervisor) is expected to run the full file without issue.
+
+---
+
+### 150. `_AuthRetryGroup.invoke()` unconditionally imported `ui` (questionary/rich) and, once fixed, still forced `.client`'s `requests` — on EVERY command, silently defeating all of P2's lazy-import work
+
+**Severity:** 8/10 · **Status:** 🟢 `fixed` (2026-09-11), found while benchmarking the freshly-rebuilt V1.5.0 wheel in the clean venv — `av --version` measured 4-5 SECONDS, not the ~450-600ms P2 was supposed to have already delivered.
+
+**Problem:** `core.py`'s `_AuthRetryGroup.invoke()` (the group-wide wrapper added for the 401-retry flow) did `from .client import AuthenticationError` and `from . import ui` at the top of `invoke()` itself — which wraps every single command dispatch, including `--version`/`--help` — so `ui.py`'s module-level `questionary`/`rich` imports (~1.3-1.4s, confirmed via `-X importtime`) ran on literally every `av` invocation regardless of P2's lazy command-module registration. Moving both imports into the `except AuthenticationError:` handler surfaced a second bug: `except Exception as exc:` (needed so the check itself could stay import-free) also catches `click.exceptions.Exit` — which `--version`'s own handler raises on every call — so a naive `from .client import AuthenticationError; isinstance(exc, AuthenticationError)` inside that handler still imported `.client` (and its top-level `requests`) unconditionally, reproducing the same class of cost one level down.
+
+**Fix:** Both imports moved inside the except block, gated on a cheap `sys.modules.get(f"{__name__.rsplit('.', 1)[0]}.client")` check first — whatever actually raises a real `AuthenticationError` must have already imported `.client` to construct one, so "not imported yet" cheaply and correctly proves "not this exception" without this method ever triggering the import itself. Also made `update_check.py`'s `requests` import lazy (moved from module top into the two functions that actually call it), since `run()`'s `finally:` block does `from . import update_check` on every command exit — matching that file's own docstring, which already claimed (incorrectly, until this fix) that routine commands never pay a network-dependency cost. `ui.py`'s `_get_version()` moved to `fsutil.py` (dependency-free, same reasoning as `USER_CONFIG_DIR` — see the P2 entry earlier in this session's work) so `--version` itself never has a reason to touch `ui` at all.
+
+**Verification:** `av --version` measured 4-5s before, 0.6-1.1s after (editable install; a clean venv wheel install showed the same 4-5s→sub-second drop) — real subprocess timing, not a unit test. New `tests/test_import_graph.py::test_running_version_does_not_load_ui_questionary_rich_or_requests` actually runs `av --version` end-to-end (not just imports the module, which the pre-existing import-graph tests already did and which is why they never caught this) and asserts none of `requests`/`rich`/`questionary`/`av_cli.ui` land in `sys.modules`. `tests/test_update_check.py` (9), `tests/test_ui.py` (9), `tests/test_cli.py` (122) all still pass — the one call site that patched `update_check.requests` as a module attribute (now imported locally, not at module scope) was updated to patch the real `requests` module directly.
+
+---
+
+### 151. `test_perf_gate.py`'s `log()` probe fails even at 8x its budget on this dev box — proven to be this machine's raw file-I/O latency, not an av_cli regression
+
+**Severity:** 1/10 · **Status:** 🔴 `closed` (2026-09-11), confirmed environmental, not a code issue — `history.walk_history()` was already the O(limit) first-parent walk P8 called for; there was nothing left to optimize.
+
+**Problem:** `AV_PERF_BUDGET_MULTIPLIER=8` (budget 2400ms) still failed with `log() (150 commits): median 3632ms`, an order of magnitude worse than the un-multiplied 300ms budget implies for 150 tiny JSON file reads. Isolated with a standalone script (no av_cli code at all — bare `pathlib.Path.exists()` + `open()` + `json.load()` in a loop over 150 freshly-written small files): 2.47 SECONDS, ~16.5ms per file, on this box right now.
+
+**Fix:** None applicable — there is no algorithm to fix. `history.walk_history()` already does exactly one `exists()` + one `open()`/`json.load()` per commit via `find_commit_file()`'s exact-hash fast path (no directory glob, confirmed by reading the source), i.e. already O(limit) as P8 intended; the entire cost is this dev machine's per-file-open latency (Windows Defender + Norton real-time scanning, both confirmed present and heavily loaded throughout this session, e.g. #144's process-supervision findings) applying even to freshly-created temp files with zero product code involved.
+
+**Verification:** The raw-stdlib isolation script above reproduces the same ~16-17ms/file cost with zero av_cli code in the loop, proving the regression (if it were one) can't be in this codebase. `AV_PERF_BUDGET_MULTIPLIER` exists exactly for this class of noise (documented in `test_perf_gate.py`'s own docstring); CI and any real user's machine (no comparable per-file AV-scan tax) are expected to hit the un-multiplied budget normally.

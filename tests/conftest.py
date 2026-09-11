@@ -6,6 +6,15 @@ import tempfile
 # with PermissionError on jobs (e.g. nightly.yml) that don't export it themselves.
 os.environ.setdefault("AV_DATA_DIR", tempfile.mkdtemp(prefix="av-test-data-"))
 
+# V1.5.0: the test suite drives commands via CliRunner().invoke(cli, ...) directly, which
+# never goes through av_cli.launcher's daemon-or-fallback decision -- so this isn't strictly
+# load-bearing today, but it's a cheap, explicit guarantee that a real `av daemon` a
+# developer happens to have running for some OTHER repo can never be reached from a test
+# (endpoint_key is repo-path-scoped, so it structurally couldn't be anyway -- belt and
+# braces). tests/test_daemon.py drives daemon_client/daemon.py directly and needs the real
+# path enabled for that, so it clears this per-test via its own autouse fixture.
+os.environ.setdefault("AV_NO_DAEMON", "1")
+
 import pytest
 from click.testing import CliRunner
 

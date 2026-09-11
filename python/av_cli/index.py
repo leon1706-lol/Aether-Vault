@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from .fsutil import atomic_write_json
+from .fsutil import atomic_write_json_compact
 
 class Index:
     def __init__(self, repo_root: Path):
@@ -22,7 +22,12 @@ class Index:
             self.entries = {}
 
     def save(self) -> None:
-        atomic_write_json(self.index_path, {"entries": self.entries})
+        # V1.5.0: sorted by key -- makes the on-disk index byte-identical for a given
+        # working tree regardless of the order entries were added in (which, combined with
+        # `iter_working_files`'s now-sorted walk, is what makes "same repo -> byte-identical
+        # index, any machine, any AV_THREADS value" an actual guarantee rather than
+        # incidental). Not a format change: same JSON shape, just deterministic key order.
+        atomic_write_json_compact(self.index_path, {"entries": dict(sorted(self.entries.items()))})
 
     def add_entry(self, rel_path: str, hash: str, size: int, mtime_ns: int, file_type: str, pointer: str | None = None, auto_save: bool = True) -> None:
         existing = self.entries.get(rel_path)

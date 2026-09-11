@@ -103,7 +103,9 @@ auto-commit, not per invocation) and the dev-only `test`/`benchmark`/`webui` (se
 `docs/contracts.md`'s exemption list). Core: status · add · commit · push · diff · run
 start/finish/list/show · context note/show/validate/export/search · env snapshot/replay ·
 policy set/list/remove/promote --dry-run · registry export/keygen/attest/verify · auth
-doctor/rotate · audit list/export/prune --dry-run. **RSI control plane** (see
+doctor/rotate · audit list/export/prune --dry-run · daemon start/stop/status/restart
+(V1.5.0, opt-in — see `development/architecture.md`'s Daemon Contract; transparently
+accelerates add/status/commit, changes no output/exit-code shape). **RSI control plane** (see
 `docs/rsi-operator-guide.md`): improver register/propose/review/apply/rollback/promote/
 lineage · canary register/run/status · freeze on/off/status · incident rollback · eval
 register/freeze/score/reveal/adapter · task propose/accept/reject · plan create/attach/
