@@ -14,6 +14,8 @@ from . import main as _root
 
 def _print_synthetic_speed_check() -> None:
     """`av test --speed` — synthetic, repeatable benchmark of av's own hot paths."""
+    from . import speedcheck
+
     with tempfile.TemporaryDirectory(prefix="av-speedcheck-") as tmp:
         probes = speedcheck.run_synthetic_probes(load_config, iter_working_files, Path(tmp))
 

@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 import requests
 from pathlib import Path
@@ -191,16 +192,31 @@ class VaultClient:
             print(f"Error listing refs: {e}")
             return {}
 
+    # V1.5.0: several real call sequences (a commit's own flush-then-check, and
+    # materialize_file's per-shard reassembly loop) call server_available() several times
+    # within a fraction of a second of each other -- each one a real 2s-timeout-capable HTTP
+    # round trip. A 1s per-instance TTL cache turns those into one real probe; it's imper-
+    # ceptible to every other caller (nearly all of which call this at most once per command).
+    _SERVER_AVAILABLE_CACHE_TTL = 1.0
+
     def server_available(self) -> bool:
+        now = time.monotonic()
+        cached = getattr(self, "_server_available_cache", None)
+        if cached is not None:
+            value, checked_at = cached
+            if now - checked_at < self._SERVER_AVAILABLE_CACHE_TTL:
+                return value
         # /api/health is always exempt from auth, deliberately — this probe must keep
         # working with zero credentials so callers can ask "is the server up" before
         # anyone has a token configured.
         url = f"{self.server_url}/api/health"
         try:
             resp = self.session.get(url, timeout=2)
-            return resp.status_code == 200
+            value = resp.status_code == 200
         except requests.exceptions.RequestException:
-            return False
+            value = False
+        self._server_available_cache = (value, now)
+        return value
 
     def report_run_policy_outcome(self, run_id: str, decision: str, rule: str | None) -> bool:
         """Best-effort telemetry: records a promote()/enforce_policy() decision against the

@@ -55,6 +55,11 @@ def test_update_check_disabled_skips_network(monkeypatch):
 
 
 def test_list_versions_sorted_descending(monkeypatch):
+    # V1.5.0: `requests` is imported lazily inside list_versions()/_fetch_latest_version()
+    # now (was a module-level `update_check.requests` attribute) so importing update_check
+    # itself never pays requests' import cost -- patch the real `requests` module directly.
+    import requests
+
     class _FakeResp:
         def raise_for_status(self):
             pass
@@ -62,7 +67,7 @@ def test_list_versions_sorted_descending(monkeypatch):
         def json(self):
             return {"releases": {"1.0.0": [{}], "1.2.0": [{}], "0.9.0": [{}], "1.1.0": []}}
 
-    monkeypatch.setattr(update_check.requests, "get", lambda *a, **k: _FakeResp())
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _FakeResp())
     versions = update_check.list_versions()
     assert versions == ["1.2.0", "1.0.0", "0.9.0"]  # 1.1.0 excluded: empty file list (yanked)
 

@@ -6,21 +6,32 @@ signing, diagnostics, and the benchmark tooling. Split so no file is a monolith:
 shared logic lives in `core.py`, commands live one-feature-per `cmd_*.py`, and
 `main.py` stays a thin compat shell.
 
-- `main.py` - cli group construction + registration ORDER (= `av --help` order), the
-  PEP 562 lazy `VaultClient`, the two monkeypatch-target owners
-  (`_find_source_root`, `_update_readme_test_badge`), re-exports of the historical
-  namespace surface.
+- `main.py` - `_AuthRetryGroup` construction, per-module lazy command registration
+  (`_LAZY_LOADERS`, V1.5.0 - a command module imports only when one of its names is
+  actually resolved; `av --help` order is `list_commands()`'s sort, unaffected), the
+  PEP 562 lazy `VaultClient`/`BENCHMARK_NAMES`/`_update_readme_test_badge`, the two
+  monkeypatch-target owners (`_find_source_root`, `_update_readme_test_badge`).
+- `launcher.py` (V1.5.0) - the real console-script entry point (`av = "av_cli.launcher:main"`
+  in `pyproject.toml`); `os`/`sys` only at module scope, decides daemon-vs-in-process
+  before importing `click` at all, falls back to `main.py:run`.
 - `core.py` - shared multi-consumer helpers: config/root/logging, staging
-  (`stage_one_file`, avignore), restore machinery (`materialize_file`,
+  (`_compute_stage_result`/`apply_stage_result`/`stage_one_file`,
+  avignore/gitignore/default-ignores), restore machinery (`materialize_file`,
   `_materialize_tree`, `_collect_dirty_paths`), pending-push trio,
-  `upload_commit_objects`, `_finalize_commit`, THE commit seam `commit_staged()`,
-  env-snapshot identity helpers, JSON envelope + exit codes.
+  `upload_commit_objects` (V1.5.0: optional `only_paths` scoping), `_finalize_commit`,
+  THE commit seam `commit_staged()`, thread-count resolution (`resolve_threads`/
+  `configure_native_threads`, V1.5.0), env-snapshot identity helpers, JSON envelope +
+  exit codes.
+- `daemon_protocol.py`/`daemon_common.py`/`daemon_client.py`/`daemon.py`/`cmd_daemon.py`
+  (V1.5.0) - the opt-in `av daemon` background command executor (`add`/`status`/`commit`
+  only); see `development/architecture.md`'s Daemon Contract for the full design.
 - command modules - `cmd_repo.py` (init/update), `cmd_staging.py`
   (config/add/file/unstage/status), `cmd_history.py`
   (commit/branch/checkout/log/stash/list-meta/push), `cmd_sync.py` (clone/pull/merge),
   `cmd_auth.py` (Protected-mode tokens + per-user management),
   `cmd_maintenance.py` (doctor/gc), `cmd_devtools.py` (test/benchmark/badge),
-  `cmd_integrations.py` (graph/handoff/webui/plugin imports).
+  `cmd_integrations.py` (graph/handoff/webui/plugin imports), `cmd_daemon.py`
+  (V1.5.0, `av daemon` start/stop/status/restart).
 - agent-facing groups - `cmd_diff.py`, `cmd_context.py`, `cmd_run.py`, `cmd_env.py`
   (snapshot/replay incl. the top-level `av replay` alias), `cmd_policy.py`,
   `cmd_watch.py`, `cmd_registry.py` (export/restore/keygen/attest/verify),

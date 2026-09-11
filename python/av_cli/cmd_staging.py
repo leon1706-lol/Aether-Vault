@@ -7,6 +7,7 @@ main.py (`_find_source_root`, `_update_readme_test_badge`) are accessed late-bou
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from .core import current_output_mode, emit_json  # noqa: E402
+from .core import _compute_stage_result  # noqa: E402
 
 
 
@@ -62,7 +63,11 @@ def config(value: int | None, remote_url: str | None, project_name: str | None) 
 
 @click.command()
 @click.argument("paths", nargs=-1, type=click.Path(exists=True))
-def add(paths: tuple) -> None:
+@click.option("--threads", type=int, default=None,
+              help="Worker threads for hashing/staging multiple files (default: auto, "
+                   "sized to CPU count; also settable via AV_THREADS or .av/config "
+                   "\"threads\"). 1 forces the old single-threaded code path.")
+def add(paths: tuple, threads: int | None) -> None:
     """Add files (or directories) to the staging index."""
     repo_root = ensure_repo()
     idx = Index(repo_root)
@@ -80,22 +85,61 @@ def add(paths: tuple) -> None:
     from . import attributes
 
     attr_rules = attributes.load_attributes(repo_root)
-    any_changed = False
-    json_staged: list[dict] = []
+
+    # (rel_path, fpath, file_type, existing_entry, attr_flags) for every path actually
+    # worth considering -- pointer files never get staged. Built once, in the exact
+    # deterministic order files_to_process already has (user's arg order, sorted within
+    # each expanded directory -- see iter_working_files), so applying results in this same
+    # order later is independent of how many threads computed them or which finished first.
+    work: list[tuple[str, Path, str, dict | None, set]] = []
     for fpath in files_to_process:
-        rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
         if is_pointer_file(fpath):
             continue
-        if stage_one_file(repo_root, idx, threshold_bytes, fpath, rel_path,
-                          attributes.flags_for(attr_rules, rel_path)):
-            any_changed = True
-            entry = idx.get_entry(rel_path) or {}
-            json_staged.append({
-                "path": rel_path,
-                "type": entry.get("type", "file"),
-                "hash": entry.get("hash"),
-                "size": entry.get("size"),
-            })
+        rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
+        work.append((
+            rel_path, fpath, idx.classify_file(rel_path), idx.get_entry(rel_path),
+            attributes.flags_for(attr_rules, rel_path),
+        ))
+
+    resolved_threads = configure_native_threads(repo_root, threads)
+    pool_size = python_pool_size(resolved_threads)
+
+    results: list[dict | None]
+    if resolved_threads == 1 or len(work) < 2 or pool_size <= 1:
+        # AV_THREADS=1 (or a single/no file) takes the literal old sequential path -- not
+        # just "a pool of one" -- so a threading-suspected bug can be isolated by comparing
+        # against this exact code path.
+        results = [
+            _compute_stage_result(repo_root, threshold_bytes, fpath, rel_path, file_type, existing, flags)
+            for rel_path, fpath, file_type, existing, flags in work
+        ]
+    else:
+        # ThreadPoolExecutor.map returns results in INPUT order regardless of completion
+        # order -- exactly what makes the apply loop below deterministic across thread
+        # counts and runs. Workers only do _compute_stage_result's pure per-file work
+        # (hash/split/chunk/CAS-write); nothing here touches `idx` or prints until the
+        # serial apply loop below.
+        with ThreadPoolExecutor(max_workers=pool_size) as pool:
+            results = list(pool.map(
+                lambda item: _compute_stage_result(
+                    repo_root, threshold_bytes, item[1], item[0], item[2], item[3], item[4]
+                ),
+                work,
+            ))
+
+    any_changed = False
+    json_staged: list[dict] = []
+    for result in results:
+        if result is None:
+            continue
+        any_changed = True
+        apply_stage_result(idx, result)
+        json_staged.append({
+            "path": result["rel_path"],
+            "type": result["file_type"],
+            "hash": result["hash"],
+            "size": result["size"],
+        })
 
     if any_changed:
         idx.save()
@@ -278,8 +322,6 @@ def status() -> None:
         return
 
     click.secho(f"On branch {branch}\n", bold=True)
-
-    staged, modified, deleted, untracked = compute_status(repo_root, idx)
 
     if staged:
         click.secho("Changes to be committed:", fg="green")

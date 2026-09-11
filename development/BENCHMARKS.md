@@ -7,7 +7,7 @@ calls to each tool — never fabricated. A tool that genuinely can't run a given
 (not installed, or the benchmark's primitive doesn't map onto it) is shown as such, not
 guessed at.
 
-**Captured:** 2026-09-03, on Windows. Aether-Vault @ `8ef634b`, git-lfs 3.7.1, dvc 3.67.1, mlflow unknown version, Python 3.14.7.
+**Captured:** 2026-09-11, on Windows. Aether-Vault @ `a73ebde`, git-lfs 3.7.1, dvc 3.67.1, mlflow unknown version, Python 3.14.7.
 
 **Caveat:** these are single-run, single-machine timings — disk/antivirus/OS-scheduler noise
 is real. Re-run before relying on any single number for a decision. Use `av benchmark --baseline`
@@ -59,16 +59,17 @@ to track regressions across captures rather than eyeballing two snapshots of thi
   fetch or DVC's local-dir remote pull — faster for that reason, not because MLflow's actual
   remote-artifact-store fetch path would be.
 
+
 ## Hashing Throughput at Scale
 
 SHA-256 (or each tool's equivalent content hash) over a single file at increasing sizes. MLflow is N/A — log_artifact() isn't a hashing primitive.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| hash 10MB file | 625.6 ms | 6,151.5 ms | 12,444.3 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 50MB file | 2,392.8 ms | 8,137.9 ms | 14,365.6 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 100MB file | 4,755.9 ms | 9,148.5 ms | 15,042.2 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 200MB file | 10,791.7 ms | 23,404.9 ms | 18,837.3 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 10MB file | 290.4 ms | 1,857.3 ms | 8,313.2 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 50MB file | 1,204.5 ms | 3,343.2 ms | 7,554.7 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 100MB file | 2,871.6 ms | 6,250.0 ms | 9,264.7 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 200MB file | 5,678.3 ms | 10,067.8 ms | 12,707.7 ms | N/A (no exposed file-hashing primitive) | GOOD |
 
 ## Safetensors Layer-Dedup Storage Savings
 
@@ -84,10 +85,10 @@ init/add/commit/push on the same 60-file mixed fixture, across all four tools.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| init | 6,978.1 ms | 14,884.9 ms | 10,726.6 ms | 12,863.2 ms | GOOD |
-| add (60 files) | 9,965.5 ms | 7,863.3 ms | 28,989.0 ms | 0.0 ms | OK |
-| commit | 11,280.9 ms | 5,728.1 ms | 1,072.9 ms | 2,865.0 ms | BAD |
-| push | 6,548.4 ms | 12,306.8 ms | 24,638.5 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | GOOD |
+| init | 1,135.9 ms | 5,855.2 ms | 5,845.7 ms | 10,220.8 ms | GOOD |
+| add (60 files) | 3,804.6 ms | 2,520.5 ms | 8,977.7 ms | 0.0 ms | OK |
+| commit | 2,139.1 ms | 2,026.9 ms | 485.7 ms | 1,702.4 ms | BAD |
+| push | 5,389.5 ms | 6,282.3 ms | 7,209.5 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | OK |
 
 ## No-Op status/add Speed at Scale
 
@@ -95,7 +96,7 @@ Re-running the staging step a second time with nothing changed.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| re-add unchanged (60 files) | 13,023.1 ms | 206.0 ms | 20,422.5 ms | N/A (no incremental staging/status primitive) | BAD |
+| re-add unchanged (60 files) | 851.6 ms | 127.7 ms | 7,078.8 ms | N/A (no incremental staging/status primitive) | BAD |
 
 ## Cold Clone / First Pull Time
 
@@ -103,7 +104,7 @@ Fresh, empty-directory checkout of a project someone else already pushed.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| clone + pull (fresh checkout) | 12,256.6 ms | 18,001.0 ms | 25,182.7 ms | N/A (no project-level clone/pull concept) | OK |
+| clone + pull (fresh checkout) | 7,716.1 ms | 28,058.9 ms | 16,861.1 ms | N/A (no project-level clone/pull concept) | GOOD |
 
 ## Partial-Checkpoint Fetch (Layer-Level Pull)
 
@@ -111,8 +112,8 @@ Fetching one 5MB layer of a 20MB checkpoint vs the whole thing, from a real remo
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| fetch single layer | 253.5 ms | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | OK |
-| fetch whole checkpoint | 1,707.3 ms | 5,839.1 ms | 14,370.6 ms | 997.4 ms | BAD |
+| fetch single layer | 38.3 ms | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | OK |
+| fetch whole checkpoint | 892.0 ms | 4,087.5 ms | 12,240.1 ms | 210.1 ms | BAD |
 
 ## Storage Footprint Over N Versions
 
@@ -133,7 +134,7 @@ Cumulative on-disk storage after each of 6 fine-tune commits (same scenario as t
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| 8 concurrent pushes | 4,905.3 ms | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | OK |
+| 8 concurrent pushes | 7,617.7 ms | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | OK |
 
 ## Garbage Collection Throughput
 
@@ -141,7 +142,7 @@ Time to run `av gc` on the remote CAS server after committing and pushing 20 sma
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| gc after 20 objects | 9,183.2 ms | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | OK |
+| gc after 20 objects | 13,677.9 ms | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | OK |
 
 
 <!-- PERF-HISTORY:START (generated by scripts/append_perf_history.py — do not hand-edit between these markers) -->
@@ -154,8 +155,9 @@ Time to run `av gc` on the remote CAS server after committing and pushing 20 sma
 | 2026-09-02 | 1.2.5.dev6+g8ef634b58.d20260902 | 17.5 ms | 58.5 ms | 100.1 ms | 97.8 ms | 1380.1 ms | 36.8 ms | 173.8 ms | 1790.0 ms | 9504.0 ms |
 | 2026-09-07 | 1.3.6 | 9.0 ms | 17.1 ms | 16.7 ms | 45.6 ms | 535.3 ms | 8.1 ms | 97.7 ms | 695.7 ms | 2789.5 ms |
 | 2026-09-07 | 1.3.7 | 9.6 ms | 15.7 ms | 12.4 ms | 17.6 ms | 301.0 ms | 9.2 ms | 80.6 ms | 440.2 ms | 2069.8 ms |
-| 2026-09-07 | 1.3.8.dev0+gd96302a26.d20260907 | 14.8 ms | 29.5 ms | 16.2 ms | 72.0 ms | 970.2 ms | 18.9 ms | 135.0 ms | 1264.6 ms | 5314.9 ms |
+| 2026-09-07 | 1.4.0 | 14.8 ms | 29.5 ms | 16.2 ms | 72.0 ms | 970.2 ms | 18.9 ms | 135.0 ms | 1264.6 ms | 5314.9 ms |
+| 2026-09-11 | 1.4.1.dev0+ga73ebdeb2.d20260911 | 14.2 ms | 29.7 ms | 16.4 ms | 661.1 ms | 619.8 ms | 20.4 ms | 105.3 ms | 1311.2 ms | 4126.7 ms |
 
-5 capture(s) total, showing the most recent 5. Machine varies across captures (see each entry's `os`/`python` in `development/perf-history.json`) — read this as a rough trend, not an apples-to-apples benchmark; `av test --speed` / the perf gate (`tests/test_perf_gate.py`) are the authoritative regression check for a single machine.
+6 capture(s) total, showing the most recent 6. Machine varies across captures (see each entry's `os`/`python` in `development/perf-history.json`) — read this as a rough trend, not an apples-to-apples benchmark; `av test --speed` / the perf gate (`tests/test_perf_gate.py`) are the authoritative regression check for a single machine.
 
 <!-- PERF-HISTORY:END -->

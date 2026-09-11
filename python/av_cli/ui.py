@@ -10,6 +10,8 @@ import sys
 
 import click
 
+from .fsutil import get_version as _get_version  # re-exported for existing callers
+
 # An environment whose install predates these deps would otherwise hit a raw
 # ModuleNotFoundError partway through this file's imports -- lists every missing package
 # at once rather than crashing on the first and rediscovering the rest one retry at a time.
@@ -48,24 +50,6 @@ _COPPER = "rgb(230,140,60)"
 _COPPER_DIM = "rgb(150,95,35)"
 _EDGE = "rgb(170,170,175)"
 _WORDMARK = "bold white"
-
-
-def _get_version() -> str:
-    """Banner version, resolved locally with zero network cost. setuptools-scm regenerates
-    `av_cli/_version.py` on every build; metadata and a literal fallback cover
-    source-checkouts without that file."""
-    try:
-        from ._version import __version__
-
-        return __version__
-    except Exception:
-        pass
-    try:
-        from importlib.metadata import version
-
-        return version("aether-vault")
-    except Exception:
-        return "dev"
 
 
 def _render_logo_art() -> list[str]:

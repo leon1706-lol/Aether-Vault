@@ -85,6 +85,23 @@
         "compute_status() (2000 files)": 1264.62,
         "log() (150 commits)": 5314.94
       }
+    },
+    {
+      "date": "2026-09-11",
+      "version": "1.4.1.dev0+ga73ebdeb2.d20260911",
+      "os": "Windows-10-10.0.19045-SP0",
+      "python": "3.14.7",
+      "probes": {
+        "Index.save() (500 entries)": 14.22,
+        "Index.load() (500 entries)": 29.68,
+        "load_config()": 16.35,
+        "iter_working_files() (2000 files)": 661.08,
+        "Storage stats (1000 objs)": 619.77,
+        "semdiff.diff_trees() (500 entries)": 20.35,
+        "commit_staged() (300 entries)": 105.3,
+        "compute_status() (2000 files)": 1311.22,
+        "log() (150 commits)": 4126.74
+      }
     }
   ]
 }

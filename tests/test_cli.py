@@ -1168,12 +1168,13 @@ def test_test_command_speed_webui_runs_bench_after_npm_test(repo, monkeypatch):
     result = invoke("test", "--speed", "--webui")
     assert result.exit_code == 0, result.output
     assert len(pytest_calls) == 1
-    # npm test, npm run bench, then av init/add/commit for the end-to-end subsection
-    assert len(calls) == 5
+    # npm test, npm run bench, then av --version/init/add/commit for the end-to-end subsection
+    assert len(calls) == 6
     assert calls[0]["args"] == [r"C:\fake\npm.cmd", "test"]
     assert calls[1]["args"] == [r"C:\fake\npm.cmd", "run", "bench"]
-    assert calls[2]["args"][0] == r"C:\fake\av.cmd" and calls[2]["args"][1] == "init"
-    assert calls[4]["args"][0] == r"C:\fake\av.cmd" and calls[4]["args"][1] == "commit"
+    assert calls[2]["args"] == [r"C:\fake\av.cmd", "--version"]
+    assert calls[3]["args"][0] == r"C:\fake\av.cmd" and calls[3]["args"][1] == "init"
+    assert calls[5]["args"][0] == r"C:\fake\av.cmd" and calls[5]["args"][1] == "commit"
     assert "Web UI speed bench" in result.output
     assert "Speed check (av CLI, end-to-end)" in result.output
 

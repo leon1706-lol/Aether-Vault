@@ -12,6 +12,37 @@ from pathlib import Path
 
 from .exceptions import AmbiguousCommitHash
 
+# User-level (not per-repo) config directory -- ~/.aether-vault. Lives here, not in
+# update_check.py, specifically so session_store.py (and anything else that just needs
+# this one path) doesn't have to import update_check.py's own `requests`/`packaging`
+# dependencies just to resolve a directory name. V1.5.0 perf work: this one misplaced
+# constant was the root cause of `requests` loading on every single `av` invocation.
+USER_CONFIG_DIR = Path.home() / ".aether-vault"
+
+
+def get_version() -> str:
+    """Banner/`--version` string, resolved locally with zero network cost. setuptools-scm
+    regenerates `av_cli/_version.py` on every build; metadata and a literal fallback cover
+    source-checkouts without that file.
+
+    Lives here (not in `ui.py`, where it originally sat next to the banner that also uses
+    it) so `av --version` -- and anything else that only needs this one string -- doesn't
+    drag in `ui.py`'s module-level `rich`/`questionary` imports. V1.5.0 perf work: measured
+    at ~1.3s of that path's cost, same class of bug as `USER_CONFIG_DIR` above.
+    """
+    try:
+        from ._version import __version__
+
+        return __version__
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version
+
+        return version("aether-vault")
+    except Exception:
+        return "dev"
+
 
 def atomic_write_text(path: Path, text: str) -> None:
     """Write text to `path` atomically (write to a temp file in the same dir, then replace).
@@ -38,6 +69,19 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 def atomic_write_json(path: Path, data) -> None:
     atomic_write_text(path, json.dumps(data, indent=2))
+
+
+def atomic_write_json_compact(path: Path, data) -> None:
+    """Same atomicity guarantee as `atomic_write_json`, without the `indent=2` pretty-
+    printing -- for machine-only files nobody hand-reads (`.av/index`, `.av/pending_push`).
+    V1.5.0 perf work: `indent=2` costs real bytes (and the `json` module's own formatting
+    work) on files rewritten wholesale on every `add`/`commit`; `.av/commits/<hash>.json`
+    deliberately keeps `atomic_write_json`'s pretty form since a human does sometimes read
+    one directly, and it isn't the hashed/signed byte form regardless (that's a separate,
+    explicit `json.dumps(..., sort_keys=True)` call in core.py/casobj.py -- see the
+    V1.5.0 CHANGELOG entry's invariant note; this helper must never be used for that call).
+    """
+    atomic_write_text(path, json.dumps(data, separators=(",", ":")))
 
 
 def find_commit_file(repo_root: Path, commit_hash: str) -> Path:

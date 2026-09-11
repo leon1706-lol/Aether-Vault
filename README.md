@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC-0097E8?style=flat-square&labelColor=1A1A1A" alt="PolyForm Noncommercial">
-  <img src="https://img.shields.io/badge/tests-1289%2F1289%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="1289 of 1289 tests passing">
+  <img src="https://img.shields.io/badge/tests-1461%2F1461%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="1461 of 1461 tests passing">
   <img src="https://img.shields.io/pypi/v/aether-vault?style=flat-square&labelColor=1A1A1A&label=pypi&logo=pypi&logoColor=white" alt="PyPI">
   <img src="https://img.shields.io/badge/docker-aether--vault--engine-2496ED?style=flat-square&labelColor=1A1A1A&logo=docker&logoColor=white" alt="Docker">
 </p>
@@ -30,7 +30,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 
 ## Known Limitations
 
-- **Perf #4 (no-op status/add)** — ~63x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
+- **Perf #4 (no-op status/add)** — ~7x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
 
 ## Table of Contents
 
@@ -80,6 +80,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
   - [`av doctor`](#av-doctor)
   - [`av test`](#av-test)
   - [`av benchmark`](#av-benchmark)
+  - [`av daemon`](#av-daemon)
 - [Release Process](#release-process)
 - [Roadmap](#roadmap)
 - [Enterprise Roadmap](#enterprise-roadmap-commercial-variant)
@@ -132,14 +133,15 @@ Split into two focused diagrams — what happens on your machine, and how it tal
 ```mermaid
 graph TD
     Plugins("av_plugins<br>(Lightning · Transformers · vanilla PyTorch callbacks)")
-    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-pytorch · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit ·<br>improver · canary · freeze · incident · eval · task · plan · budget ·<br>scheduler · review · critique · lineage · search · strategy · lessons ·<br>blackboard · sandbox · replay-actions · tools)")
-    CPP("aether_core (C++)<br>(Splits Safetensors & CDC-Chunks Checkpoints,<br>Hashes in Parallel)")
+    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · daemon · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-pytorch · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit ·<br>improver · canary · freeze · incident · eval · task · plan · budget ·<br>scheduler · review · critique · lineage · search · strategy · lessons ·<br>blackboard · sandbox · replay-actions · tools)")
+    CPP("aether_core (C++)<br>(Splits Safetensors & CDC-Chunks Checkpoints,<br>Hashes & Chunks in Parallel — shared thread pool,<br>AV_THREADS/--threads)")
     LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
     PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
     WebUI("Web UI<br>(Dashboard · Commits · Branches · Metrics · Storage ·<br>Weight Diff · Projects Tabs · localhost:3000)")
     Vault("Obsidian Vault<br>(av graph · av handoff → Markdown notes)")
     Benchmarks("development/BENCHMARKS.md<br>(av benchmark vs Git LFS · DVC · MLflow)")
     Session("Interactive Session<br>(av init / bare av → av status, av commit, ... · exit/quit)")
+    Daemon("av daemon<br>(opt-in warm process — add/status/commit,<br>Unix socket / named pipe, HMAC-token auth)")
 
     Plugins -- "Drives in-process (add/commit/push)" --> CLI
     CLI -- "1. Reads & Hashes Files" --> CPP
@@ -149,6 +151,7 @@ graph TD
     CLI -- "6. Generates Code Graph / Handoff Snapshot" --> Vault
     CLI -- "8. Benchmarks Against Competitor Tools" --> Benchmarks
     CLI -- "9. Opens Local/Enterprise Session After Init/Reconnect" --> Session
+    CLI -- "11. add/status/commit: launcher hands off to a warm<br>process if one is running (opt-in); falls back silently" --> Daemon
 ```
 
 #### Sync, Remote Registry & Release Pipeline
@@ -202,7 +205,7 @@ and how it's wired in, this table is the index.
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
 | `python/av_plugins/` | Lightning / Transformers / MLflow / vanilla PyTorch auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
-| `tests/` | 1,289-test suite across 69 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
+| `tests/` | 1,461-test suite across 75 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
@@ -295,13 +298,13 @@ av import-pytorch path/to/epoch12.pt --tag backfill
 |---|---|---|---|
 | 1 | Hashing Throughput at Scale | ~2–3x faster than Git LFS, up to 17x faster than DVC | fastest at every size tested (10–200 MB) |
 | 2 | Safetensors Layer-Dedup | **63% smaller** | 47 MB vs. 126 MB after 6 fine-tune commits |
-| 3 | Commit + Push Latency | push ~70% faster · commit ~6x slower *(by design, vs. DVC)* | av uploads during commit; DVC defers to a separate push |
-| 4 | No-Op `status`/`add` | ~63x slower than Git LFS | open finding — interpreter/import startup cost |
-| 5 | Cold Clone / First Pull | ~1.5x faster than Git LFS, ~2x faster than DVC | fresh checkout of a project someone else already pushed |
-| 6 | Partial-Checkpoint Fetch | unique capability | only tool that can fetch a single layer instead of the whole file |
+| 3 | Commit + Push Latency | push ~14% faster · commit ~4.4x slower vs. DVC (was ~10.5x pre-V1.5.0) | av uploads during commit; DVC defers to a separate push — V1.5.0 closed most of the gap (import-graph + threading fixes), not fully eliminated it |
+| 4 | No-Op `status`/`add` | ~7x slower than Git LFS | open finding — interpreter/import startup cost |
+| 5 | Cold Clone / First Pull | ~3.6x faster than Git LFS, ~2.2x faster than DVC | fresh checkout of a project someone else already pushed |
+| 6 | Partial-Checkpoint Fetch | unique capability (38 ms) | only tool that can fetch a single layer instead of the whole file |
 | 7 | Storage Footprint Curve | **63% smaller**, gap widens every commit | same dedup advantage as #2, sustained over time |
-| 8 | Concurrent Push Throughput | Aether-only | no competitor has a comparable concurrent-server primitive |
-| 9 | Garbage Collection Throughput | Aether-only | no competitor has a comparable server-side GC primitive |
+| 8 | Concurrent Push Throughput | Aether-only (7.6s / 8 pushes) | no competitor has a comparable concurrent-server primitive |
+| 9 | Garbage Collection Throughput | Aether-only (13.7s / 20 objects) | no competitor has a comparable server-side GC primitive |
 
 For full methodology, every raw number, and the rating legend, see [`development/BENCHMARKS.md`](development/BENCHMARKS.md).
 
@@ -309,7 +312,7 @@ For full methodology, every raw number, and the rating legend, see [`development
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs 1,289 tests across 69 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
+The full suite (`av test` or `pytest tests/ -q`) runs 1,461 tests across 75 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
 
 ```bash
 av test                  # full suite
@@ -861,6 +864,33 @@ av benchmark --baseline prior.json --save-json new.json   # regression-track av'
 ```
 
 Every result is a real measured number from a real subprocess/HTTP call — a tool that isn't on `PATH`, or whose primitive doesn't apply to a given benchmark, is shown as `not installed`/`N/A` with a footnote, never guessed at.
+
+#### `av daemon`
+
+**Opt-in, off by default.** A warm background process that serves `add`/`status`/`commit` —
+the three commands run often enough for Python's own interpreter/import startup to matter —
+without paying that cost on every invocation. It never changes what a command does: the
+daemon runs the exact same code path as running the command directly, so it can only make
+`av` faster, never behave differently; any connection problem falls back to the normal
+in-process path silently.
+
+```bash
+av daemon start              # spawn a detached daemon for the current repo
+av daemon status             # is one running, and for what pid/endpoint
+av daemon stop                # stop it
+av daemon restart
+av daemon start --foreground  # run in this terminal instead — for debugging
+```
+
+Running `av daemon start` **is** the opt-in — `av` never auto-spawns one on its own unless
+`AV_DAEMON=1` (or `.av/config`'s `"daemon": {"enabled": true}`) is set; `AV_NO_DAEMON=1`
+always disables it outright regardless of anything else. Transport is a Unix domain socket
+(POSIX) or a named pipe (Windows), never a network-visible port, secured by a per-daemon
+random token exchanged over a mutual HMAC handshake; state lives under
+`$XDG_RUNTIME_DIR/aether-vault/` (or `~/.aether-vault/run/` on Windows). A daemon started
+from an older `av` install is simply unreachable to a newer client (the endpoint name itself
+encodes the CLI version, protocol version, Python version, and install path) — no stale
+daemon can ever silently serve a mismatched version.
 
 #### RSI control plane
 

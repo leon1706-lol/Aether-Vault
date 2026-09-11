@@ -14,15 +14,66 @@ using json = nlohmann::json;
 namespace py = pybind11;
 namespace fs = std::filesystem;
 
+// ---------------------------------------------------------------------------
+// V1.5.0: one shared, lazily-sized thread pool instead of a fresh ThreadPool spawned and
+// joined on every single hash_file_tree/split_and_hash_safetensors/chunk_and_hash_file
+// call -- previously each call paid full OS-thread-creation cost, and a Python-side pool of
+// N workers each calling one of these would have spawned N pools of their own (~N^2
+// threads). `set_max_threads()` is the C++ end of `AV_THREADS`/`--threads`
+// (python/av_cli/core.py's resolve_threads()); 0 means "auto" (hardware_concurrency()).
+// Contract: only ever call set_max_threads() from the CLI's single main thread before any
+// hashing/chunking call, never concurrently with one -- true by construction, since av's
+// own threading model always resolves the thread count once before staging begins.
+// ---------------------------------------------------------------------------
+namespace {
+std::mutex g_pool_mutex;
+std::unique_ptr<ThreadPool> g_pool;
+size_t g_pool_size = 0;
+size_t g_configured_threads = 0;  // 0 = auto
+
+size_t resolve_thread_count(size_t requested) {
+    if (requested > 0) return requested;
+    size_t n = g_configured_threads > 0 ? g_configured_threads : std::thread::hardware_concurrency();
+    return n > 0 ? n : 1;
+}
+
+ThreadPool& shared_pool(size_t requested_threads = 0) {
+    size_t want = resolve_thread_count(requested_threads);
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    if (!g_pool || g_pool_size != want) {
+        g_pool = std::make_unique<ThreadPool>(want);
+        g_pool_size = want;
+    }
+    return *g_pool;
+}
+}  // namespace
+
+void set_max_threads(int n) {
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    g_configured_threads = n > 0 ? static_cast<size_t>(n) : 0;
+    g_pool.reset();
+    g_pool_size = 0;
+}
+
+int get_max_threads() {
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    return static_cast<int>(g_configured_threads);
+}
+
 std::string hash_file_sequential(const std::string& path) {
     if (!fs::exists(path)) throw std::runtime_error("File not found: " + path);
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("Cannot open file: " + path);
     
     SHA256 sha;
-    const size_t chunk_size = 8 * 1024 * 1024;
+    // V1.5.0: 8MB -> 1MB. The streaming digest is identical either way (SHA256::update is
+    // called once per read regardless of buffer size); this only bounds per-in-flight-hash
+    // memory under concurrency now that hash_file can run on N Python worker threads at
+    // once (GIL released above) -- N * 8MB read buffers was real headroom on this project's
+    // own 3.9GB dev box, N * 1MB is not.
+    const size_t chunk_size = 1 * 1024 * 1024;
     std::vector<char> buffer(chunk_size);
-    
+
     while (file.read(buffer.data(), buffer.size()) || file.gcount() > 0) {
         sha.update(reinterpret_cast<const uint8_t*>(buffer.data()), file.gcount());
     }
@@ -44,9 +95,8 @@ std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 
         return hash_file_sequential(path);
     }
     
-    size_t threads_to_use = num_threads > 0 ? num_threads : std::thread::hardware_concurrency();
-    ThreadPool pool(threads_to_use);
-    
+    ThreadPool& pool = shared_pool(num_threads > 0 ? static_cast<size_t>(num_threads) : 0);
+
     size_t num_chunks = (file_size + chunk_size - 1) / chunk_size;
     std::vector<std::future<std::string>> futures;
     auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
@@ -95,6 +145,59 @@ std::string hash_bytes(const std::string& data) {
     return SHA256::hash_bytes(data);
 }
 
+// V1.5.0: staging a whole-file (non-chunked, non-safetensors) object used to read the
+// source file twice -- once here to hash it, then again via shutil.copy2 to land it in the
+// CAS. That second read is the dominant cost for a repo of many small files (exactly the
+// "50 x 1KB .py + 10 x 2MB .bin" shape the commit/add benchmark fixture uses). This reads
+// `src_path` exactly once, hashing and writing to `dest_path` (expected to be a temp file
+// the caller `os.replace`s into place -- same "never write straight to the final
+// content-addressed name" contract as Python's _atomic_publish_object) in the same pass.
+// Returns the canonical whole-file SHA-256 -- identical to hash_file_sequential's output
+// for the same bytes, since it's the exact same SHA256 class/streaming loop, just with an
+// extra write alongside each read instead of a second independent read pass.
+std::string hash_and_copy(const std::string& src_path, const std::string& dest_path) {
+    if (!fs::exists(src_path)) throw std::runtime_error("File not found: " + src_path);
+    std::ifstream in(src_path, std::ios::binary);
+    if (!in) throw std::runtime_error("Cannot open file: " + src_path);
+    std::ofstream out(dest_path, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("Cannot open destination for write: " + dest_path);
+
+    SHA256 sha;
+    const size_t chunk_size = 1 * 1024 * 1024;
+    std::vector<char> buffer(chunk_size);
+
+    while (in.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || in.gcount() > 0) {
+        std::streamsize got = in.gcount();
+        sha.update(reinterpret_cast<const uint8_t*>(buffer.data()), static_cast<size_t>(got));
+        out.write(buffer.data(), got);
+        if (!out) throw std::runtime_error("Failed writing to " + dest_path);
+    }
+    out.close();
+    return sha.hexdigest();
+}
+
+// TEST-ONLY (leading underscore, no docstring promise of stability): exercises
+// SHA256::update() across an arbitrary sequence of call-size splits, which no real hashing
+// path does -- hash_file_sequential always reads in fixed 8MB buffers, so the "top up a
+// pending partial block left over from a previous update() call" branch of the V1.5.0
+// bulk-update rewrite is otherwise never hit by real usage (8MB is itself a multiple of the
+// 64-byte block size). Backs tests/test_core.py's randomized-chunk-split property test
+// proving the rewrite is bit-for-bit identical to the original byte-at-a-time version.
+std::string hash_bytes_split(const std::string& data, const std::vector<size_t>& splits) {
+    SHA256 sha;
+    size_t pos = 0;
+    for (size_t n : splits) {
+        if (pos >= data.size()) break;
+        size_t take = std::min(n, data.size() - pos);
+        sha.update(reinterpret_cast<const uint8_t*>(data.data()) + pos, take);
+        pos += take;
+    }
+    if (pos < data.size()) {
+        sha.update(reinterpret_cast<const uint8_t*>(data.data()) + pos, data.size() - pos);
+    }
+    return sha.hexdigest();
+}
+
 bool compare_metadata(const std::string& path, uint64_t expected_size, int64_t expected_mtime_ns) {
     if (!fs::exists(path)) return false;
     uintmax_t current_size = fs::file_size(path);
@@ -128,7 +231,11 @@ struct LayerResult {
     uint64_t offset;
 };
 
-py::list split_and_hash_safetensors(const std::string& path) {
+// Pure-C++ compute: no py:: types touched, safe to run under a released GIL. Split out of
+// the pybind11-facing wrapper below specifically so that wrapper can release the GIL around
+// this call -- adding py::call_guard directly to a py::list-returning def would be undefined
+// behavior (it builds Python objects with the GIL already gone). See V1.5.0 CHANGELOG entry.
+std::vector<LayerResult> split_and_hash_safetensors_core(const std::string& path) {
     if (!fs::exists(path)) throw std::runtime_error("File not found: " + path);
     uint64_t total_size = static_cast<uint64_t>(fs::file_size(path));
     if (total_size < 8) throw std::runtime_error("File too small to be a safetensors file: " + path);
@@ -188,8 +295,7 @@ py::list split_and_hash_safetensors(const std::string& path) {
         return a.abs_start < b.abs_start;
     });
 
-    size_t threads_to_use = std::thread::hardware_concurrency();
-    ThreadPool pool(threads_to_use);
+    ThreadPool& pool = shared_pool();
     std::vector<std::future<LayerResult>> futures;
     auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
 
@@ -231,20 +337,37 @@ py::list split_and_hash_safetensors(const std::string& path) {
         }));
     }
 
-    py::list results;
+    std::vector<LayerResult> results;
+    results.reserve(futures.size());
     for (auto& fut : futures) {
         try {
-            auto lr = fut.get();
-            py::dict d;
-            d["name"] = lr.name;
-            d["hash"] = lr.hash;
-            d["size"] = lr.size;
-            d["offset"] = lr.offset;
-            results.append(d);
+            results.push_back(fut.get());
         } catch (...) {
             cancel_flag->store(true);
             throw;
         }
+    }
+    return results;
+}
+
+// pybind11-facing wrapper: releases the GIL only around the pure-C++ compute above, then
+// builds the py::list (touches Python objects) with the GIL held again -- the two must
+// never overlap. This is what py::call_guard<gil_scoped_release> cannot safely express for
+// a py::list-returning def; see split_and_hash_safetensors_core's comment.
+py::list split_and_hash_safetensors(const std::string& path) {
+    std::vector<LayerResult> layer_results;
+    {
+        py::gil_scoped_release release;
+        layer_results = split_and_hash_safetensors_core(path);
+    }
+    py::list results;
+    for (auto& lr : layer_results) {
+        py::dict d;
+        d["name"] = lr.name;
+        d["hash"] = lr.hash;
+        d["size"] = lr.size;
+        d["offset"] = lr.offset;
+        results.append(d);
     }
     return results;
 }
@@ -275,7 +398,10 @@ struct ChunkResult {
     uint64_t offset;
 };
 
-py::list chunk_and_hash_file(const std::string& path,
+// Pure-C++ compute -- see split_and_hash_safetensors_core's comment for why this is split
+// out from the pybind11-facing wrapper below (safe GIL release around a non-py::-returning
+// function; unsafe to attempt directly on a py::list-returning def).
+std::vector<ChunkResult> chunk_and_hash_file_core(const std::string& path,
                              uint64_t min_chunk = 512 * 1024,
                              uint64_t avg_chunk = 2ULL * 1024 * 1024,
                              uint64_t max_chunk = 8ULL * 1024 * 1024) {
@@ -335,8 +461,7 @@ py::list chunk_and_hash_file(const std::string& path,
     }
 
     // Pass 2 (parallel): SHA-256 each [offset[i], offset[i+1]) range independently.
-    size_t threads_to_use = std::thread::hardware_concurrency();
-    ThreadPool pool(threads_to_use);
+    ThreadPool& pool = shared_pool();
     std::vector<std::future<ChunkResult>> futures;
     auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
 
@@ -375,19 +500,37 @@ py::list chunk_and_hash_file(const std::string& path,
         }));
     }
 
-    py::list results;
+    std::vector<ChunkResult> results;
+    results.reserve(futures.size());
     for (auto& fut : futures) {
         try {
-            auto cr = fut.get();
-            py::dict d;
-            d["hash"] = cr.hash;
-            d["size"] = cr.size;
-            d["offset"] = cr.offset;
-            results.append(d);
+            results.push_back(fut.get());
         } catch (...) {
             cancel_flag->store(true);
             throw;
         }
+    }
+    return results;
+}
+
+// pybind11-facing wrapper -- see split_and_hash_safetensors's comment: GIL released only
+// around the pure-C++ compute, py::list built afterward with the GIL held again.
+py::list chunk_and_hash_file(const std::string& path,
+                             uint64_t min_chunk = 512 * 1024,
+                             uint64_t avg_chunk = 2ULL * 1024 * 1024,
+                             uint64_t max_chunk = 8ULL * 1024 * 1024) {
+    std::vector<ChunkResult> chunk_results;
+    {
+        py::gil_scoped_release release;
+        chunk_results = chunk_and_hash_file_core(path, min_chunk, avg_chunk, max_chunk);
+    }
+    py::list results;
+    for (auto& cr : chunk_results) {
+        py::dict d;
+        d["hash"] = cr.hash;
+        d["size"] = cr.size;
+        d["offset"] = cr.offset;
+        results.append(d);
     }
     return results;
 }
@@ -400,10 +543,26 @@ PYBIND11_MODULE(aether_core, m) {
     // re-verifies every uploaded object against exactly that. It is bound to the sequential
     // implementation; do NOT swap in hash_file_parallel (it yields a different tree hash and
     // would break dedup, deduplication across the LFS threshold, and remote uploads).
-    m.def("hash_file", &hash_file_sequential, py::arg("path"), "Canonical whole-file SHA-256 (content-addressing object id)");
-    m.def("hash_file_tree", &hash_file_parallel, py::arg("path"), py::arg("chunk_size") = 8388608, py::arg("num_threads") = 0, "Parallel chunked SHA-256 *tree* hash (NOT a canonical file hash)");
-    m.def("hash_file_sequential", &hash_file_sequential, py::arg("path"), "Compute standard sequential SHA-256 hash of a file");
-    m.def("hash_bytes", &hash_bytes, py::arg("data"), "Compute SHA-256 hash of byte string");
+    // V1.5.0: call_guard<gil_scoped_release> only on these four scalar-returning defs --
+    // they touch no Python object inside the C++ body, so releasing the GIL for their whole
+    // duration is safe and lets a Python-side ThreadPoolExecutor get real parallelism
+    // calling them (previously impossible: the GIL was never released anywhere in this
+    // module, so N Python threads calling into C++ fully serialized regardless of the C++
+    // side's own thread pools). split_and_hash_safetensors/chunk_and_hash_file build a
+    // py::list and therefore do NOT get call_guard here -- see their *_core split above for
+    // why, and how they release the GIL safely around only their pure-compute portion.
+    m.def("hash_file", &hash_file_sequential, py::arg("path"), py::call_guard<py::gil_scoped_release>(), "Canonical whole-file SHA-256 (content-addressing object id)");
+    m.def("hash_file_tree", &hash_file_parallel, py::arg("path"), py::arg("chunk_size") = 8388608, py::arg("num_threads") = 0, py::call_guard<py::gil_scoped_release>(), "Parallel chunked SHA-256 *tree* hash (NOT a canonical file hash)");
+    m.def("hash_file_sequential", &hash_file_sequential, py::arg("path"), py::call_guard<py::gil_scoped_release>(), "Compute standard sequential SHA-256 hash of a file");
+    m.def("hash_bytes", &hash_bytes, py::arg("data"), py::call_guard<py::gil_scoped_release>(), "Compute SHA-256 hash of byte string");
+    m.def("hash_and_copy", &hash_and_copy, py::arg("src_path"), py::arg("dest_path"), py::call_guard<py::gil_scoped_release>(),
+          "Read src_path once, hashing and writing to dest_path in the same pass. Returns "
+          "the canonical whole-file SHA-256 (identical to hash_file for the same bytes). "
+          "Caller is responsible for dest_path being a temp file it atomically publishes.");
+    m.def("_hash_bytes_split", &hash_bytes_split, py::arg("data"), py::arg("splits"), py::call_guard<py::gil_scoped_release>(),
+          "TEST-ONLY, no stability promise: SHA-256 over `data` fed through update() in the "
+          "given call-size splits (any leftover feeds as one final call). Backs the V1.5.0 "
+          "bulk-update rewrite's randomized-split property test.");
     m.def("compare_metadata", &compare_metadata, py::arg("path"), py::arg("expected_size"), py::arg("expected_mtime_ns"), "Fast comparison of file size and modification time");
     m.def("get_file_metadata", &get_file_metadata, py::arg("path"), "Get file size and modification time (nanoseconds)");
     m.def("split_and_hash_safetensors", &split_and_hash_safetensors, py::arg("path"), "Parse and hash Safetensors layers");
@@ -413,4 +572,10 @@ PYBIND11_MODULE(aether_core, m) {
           "Content-defined chunking (gear-hash cut points) + parallel SHA-256 per chunk. "
           "Format-agnostic dedup for opaque checkpoint files (.pt/.pth/.ckpt). Returns "
           "[{hash, size, offset}] in file order.");
+    m.def("set_max_threads", &set_max_threads, py::arg("n"),
+          "Size the shared C++ thread pool used by hash_file_tree/split_and_hash_safetensors/"
+          "chunk_and_hash_file. n<=0 means auto (hardware_concurrency()). Call only from the "
+          "CLI's single main thread before any hashing/chunking call -- see shared_pool()'s "
+          "comment. This is the C++ end of AV_THREADS/--threads.");
+    m.def("get_max_threads", &get_max_threads, "Currently configured thread count (0 = auto).");
 }

@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import click
-import requests
 
 try:
     from packaging.version import InvalidVersion, Version
@@ -26,11 +25,12 @@ except ImportError:
     )
 
 from . import __version__
-from .fsutil import atomic_write_json
+from .fsutil import USER_CONFIG_DIR, atomic_write_json
 
 PACKAGE_NAME = "aether-vault"
 PYPI_JSON_URL = f"https://pypi.org/pypi/{PACKAGE_NAME}/json"
-USER_CONFIG_DIR = Path.home() / ".aether-vault"
+# USER_CONFIG_DIR re-exported from fsutil (its real home now) so any existing
+# `from .update_check import USER_CONFIG_DIR` caller keeps working unchanged.
 USER_CONFIG_PATH = USER_CONFIG_DIR / "config.json"
 
 _DEFAULT_USER_CONFIG = {
@@ -66,6 +66,12 @@ def save_user_config(cfg: dict) -> None:
 
 
 def _fetch_latest_version(timeout: float = 2.0) -> str | None:
+    # V1.5.0 perf fix: `requests` (and its urllib3/idna/charset_normalizer chain) used to sit
+    # at this module's top, so merely importing `update_check` -- which `run()`'s finally
+    # block does on EVERY command, even a cache-hit no-op auto-update check -- paid for it
+    # unconditionally. Imported here instead, only reached when an actual HTTP call is made.
+    import requests
+
     try:
         resp = requests.get(PYPI_JSON_URL, timeout=timeout)
         resp.raise_for_status()
@@ -114,6 +120,8 @@ def check_for_update(force: bool = False, cache_hours: float = 12.0) -> UpdateCh
 
 def list_versions() -> list[str] | None:
     """Every published version, newest first. Returns None on network failure."""
+    import requests
+
     try:
         resp = requests.get(PYPI_JSON_URL, timeout=5.0)
         resp.raise_for_status()
