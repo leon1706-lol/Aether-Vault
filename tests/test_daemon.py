@@ -662,6 +662,15 @@ def test_should_stop_watchdog_fires_on_idle_timeout(repo, monkeypatch):
 
 
 def test_should_stop_watchdog_does_not_fire_while_active(repo, monkeypatch):
+    # Real bug found via a CI failure (test_daemon.py's own pytest process getting
+    # silently killed, exit 0, no summary line -- see Probleme.md #149/#152): this test
+    # used to call server._stop.set() and return immediately, with nothing waiting for
+    # the background watchdog thread to actually observe it. monkeypatch's teardown then
+    # restores the REAL os._exit before the thread's next ~20ms poll notices should_stop()
+    # is now true -- so the watchdog calls the genuine os._exit(0) shortly after this test
+    # ends, killing the whole process mid-way through whatever test happens to be running
+    # next. Waiting on `exited` after setting `_stop` closes that race: the mocked exit is
+    # guaranteed to fire (and be observed) while the monkeypatch is still active.
     exited = threading.Event()
     monkeypatch.setattr(os, "_exit", lambda code: exited.set())
 
@@ -669,7 +678,8 @@ def test_should_stop_watchdog_does_not_fire_while_active(repo, monkeypatch):
     daemon_module._start_should_stop_watchdog(server, check_interval=0.02)
 
     assert not exited.wait(timeout=0.3), "watchdog fired despite the daemon still being within its idle window"
-    server._stop.set()  # let the background thread wind down cleanly before the test ends
+    server._stop.set()
+    assert exited.wait(timeout=3.0), "watchdog never fired within 3s of _stop being set"
 
 
 def test_call_daemon_filters_env_before_sending_on_the_wire(repo, monkeypatch):
