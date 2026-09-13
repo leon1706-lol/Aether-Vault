@@ -548,3 +548,14 @@ Asked to try again. Found a genuine Python 3.10.21 interpreter already present l
 - **Fix**: `tests/test_import_graph.py`'s `_ACHIEVABLE_HEAVY` is now version-gated (`concurrent.futures` only below 3.13, `urllib.parse` added back at 3.13+) instead of claiming something false about three of five officially-supported Python versions.
 - **Verification**: built a real Python 3.10.21 venv locally and re-ran the affected tests directly — 8/8 passed (previously 6/8 failing on that interpreter); Python 3.14 stays 8/8, no regression.
 - **Correction to Probleme.md #171**: that entry had speculated it was the likely mechanism behind this CI failure. It wasn't — updated to point at #176 instead. #171's own fix (closing `run()`'s unconditional `update_check` import) is real and unaffected by the correction.
+
+### 2026-09-13, same day: round two of monitoring the push — `target_lang="c++"` immediately exposed a second, deeper linker bug
+
+The owner pushed the previous round's fixes (`5a5b34e`) and asked to keep monitoring. `security` and `Docker Edge Build` stayed green. `launcher-native-posix` (both OSes) failed again — but with a completely different error than before, proving the `target_lang="c++"` fix from round one genuinely worked (no more `std::runtime_error` undefined references) and simply uncovered what was underneath it.
+
+- **Probleme.md #177**: `src/launcher/av_launcher.cpp` declared `extern char **environ;` INSIDE the file's own anonymous namespace, giving it internal linkage under a mangled `(anonymous namespace)::environ` name instead of binding to libc's real global — `undefined reference to '(anonymous namespace)::environ'` on Linux, the equivalent `Undefined symbols` on macOS. Always there, invisible until #172's fix stopped the link from failing on its OWN symbols first. Fixed by moving the declaration to true global scope.
+- **Probleme.md #175, corrected**: the `test_maybe_trim_idle_rearms_after_new_activity` flake from round one's own fix failed again, identically — the "widen the margin" diagnosis was wrong. The real race is a clock-tie between two back-to-back `time.monotonic()` calls (one inside `maybe_trim_idle()`, one in the test immediately after), not the later sleep that got widened. Fixed by inserting a real `time.sleep()` between them, which no amount of widening the unrelated later sleep could have touched.
+- **A stale comment fixed in passing**: `av_launcher.cpp` referenced a `launcher-native-windows` CI job that has never existed — corrected while already in the file for the `environ` fix.
+- **`test-linux`/`test` (3.10 and 3.14) residual failures**: all `test_launcher_native.py` tests failing with "shim fallback" symptoms, matching the plan `test`/`test-linux` don't set `AV_REQUIRE_LAUNCHER` so a native-compile failure silently falls back — expected to resolve as a direct consequence of the `environ` fix above, not a separate bug.
+
+Not yet re-pushed to confirm.

@@ -599,15 +599,24 @@ def test_watchdog_trims_after_idle(repo):
 
 
 def test_maybe_trim_idle_rearms_after_new_activity(repo):
-    """Real flake found live on a shared CI runner (test (3.10), V1.6.1 push): the
-    original 0.01s threshold / 0.02s sleep left only 10ms of margin against ordinary
-    scheduling jitter, which a throttled/shared runner can exceed on its own. 0.05s/0.3s
-    gives a real margin while staying fast."""
+    """Real flake found live on a shared CI runner, TWICE (test (3.10), both the V1.6.1
+    push and its own follow-up fix): the first fix widened the margin between the second
+    and third `maybe_trim_idle()` calls, but that was never the actual race. The real one
+    is between `self._trimmed_at` (set INSIDE the first `maybe_trim_idle()` call) and this
+    test's own `server._last_activity = time.monotonic()` on the very next line -- two
+    `time.monotonic()` calls close enough together that a coarse/virtualized clock on a
+    loaded CI runner can return the SAME tick for both, making `_trimmed_at >=
+    _last_activity` true (a false tie) and `maybe_trim_idle()`'s rearm check wrongly think
+    the trim already covers this "new" activity. `time.sleep()` (unlike a bare
+    `time.monotonic()` reassignment) always advances real elapsed time regardless of clock
+    granularity, so inserting one between the trim and the reassignment closes the race
+    for real -- widening the LATER sleep (the one after this fix) never touched it."""
     server = daemon_module.DaemonServer(repo, "test-version")
     server._trim_after_secs = 0.05
     server._last_activity = time.monotonic() - 1.0
     assert server.maybe_trim_idle() is True
 
+    time.sleep(0.05)  # real gap between the trim above and the "new activity" below
     server._last_activity = time.monotonic()  # a request just came in
     assert server.maybe_trim_idle() is False  # not idle long enough yet
     time.sleep(0.3)  # real time passes -- well past the threshold again

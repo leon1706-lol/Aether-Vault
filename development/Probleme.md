@@ -2106,15 +2106,15 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Verification:** local test run stays green (this box already had both installed, so this doesn't newly-verify the CI failure mode) — the actual fix can only be confirmed by the next CI run, same limit as every environment-specific dependency gap.
 
 
-### 175. A new test's own timing margins were flaky under real CI scheduling jitter
+### 175. A new test raced its own two `time.monotonic()` calls against clock-tick granularity — widening a later sleep didn't fix it, and re-failed the exact same way
 
-**Severity:** 2/10 (test-only, no product impact) · **Status:** 🟢 `fixed` (2026-09-13).
+**Severity:** 2/10 (test-only, no product impact) · **Status:** 🟢 `fixed` (2026-09-13), on the second attempt.
 
-**Problem:** `tests/test_daemon.py::test_maybe_trim_idle_rearms_after_new_activity` (added this push) used a 0.01s idle threshold and a 0.02s `time.sleep()` to cross it — only 10ms of margin against ordinary scheduling jitter, which a shared/throttled CI runner exceeded on `test (3.10)`, failing `assert server.maybe_trim_idle() is True` intermittently. Every other trim test in the same file sets `_last_activity` to a full second in the past (a real, generous margin) instead of racing a live sleep against a tiny threshold — this was the one test that didn't follow that pattern.
+**Problem:** `tests/test_daemon.py::test_maybe_trim_idle_rearms_after_new_activity` failed on `test (3.10)` twice, on two separate pushes, with the identical `assert False is True`. The first fix (widening the threshold/sleep from 0.01s/0.02s to 0.05s/0.3s) misdiagnosed it as insufficient margin against scheduling jitter — it re-failed anyway, because the real race is earlier and unrelated to that sleep at all: `maybe_trim_idle()`'s first call sets `self._trimmed_at = time.monotonic()` internally, and the very next line of the test immediately does `server._last_activity = time.monotonic()` — two back-to-back `time.monotonic()` calls close enough in real time that a coarse or virtualized clock on a loaded CI runner can return the identical tick for both. `maybe_trim_idle()`'s rearm check (`self._trimmed_at >= self._last_activity`) then reads as a tie, wrongly concluding the trim already covers this "new" activity. No amount of widening the LATER sleep touches this, since the tie happens before that sleep is ever reached.
 
-**Fix:** widened to a 0.05s threshold / 0.3s sleep — a real margin, still fast.
+**Fix:** inserted `time.sleep(0.05)` between the trim and the `_last_activity` reassignment — `sleep()` always advances real elapsed time regardless of clock granularity, unlike two bare `time.monotonic()` reads, so the tie can no longer happen.
 
-**Verification:** re-ran `pytest tests/test_daemon.py -k trim` locally (8 passed); the original failure was inherently timing-dependent and couldn't be forced to reproduce locally on demand, consistent with it being exactly the kind of jitter-sensitive flake the fix targets.
+**Verification:** re-ran `pytest tests/test_daemon.py -k trim` locally (8 passed). Neither failure was locally reproducible on demand (both are inherently a function of this dev box's own clock behavior vs. a loaded CI runner's, not something a local run can force) — the real lesson here (see the fix's own comment) is that the first attempt's local pass was never actually strong evidence of anything, since the original bug couldn't reproduce locally either.
 
 
 ### 176. The `urllib.parse`-loaded CI failure was never a leak at all — it's Python 3.10–3.12's own `pathlib.py` importing it unconditionally
@@ -2128,3 +2128,14 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** `_ACHIEVABLE_HEAVY` in `test_import_graph.py` is now version-gated — `concurrent.futures` only (never `urllib.parse`) on Python < 3.13, both on 3.13+.
 
 **Verification:** re-ran `tests/test_import_graph.py` under the real Python 3.10.21 venv (8/8 passed, previously 6/8) and under this box's normal Python 3.14 (8/8, unchanged, no regression).
+
+
+### 177. `extern char **environ;` sat inside the launcher's own anonymous namespace — `(anonymous namespace)::environ` could never link on Linux or macOS
+
+**Severity:** 7/10 (a second, independent reason the native launcher never linked on POSIX at all — layered directly underneath #172, only visible once that one was fixed) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `src/launcher/av_launcher.cpp` declares `extern char **environ;` at line 574 — inside the file's own anonymous namespace (spanning lines 74-936). An anonymous namespace gives everything declared in it internal linkage, so this created a distinct, TU-local symbol (mangled as `(anonymous namespace)::environ`) instead of referring to libc's real global `environ`. The linker could never resolve it: `undefined reference to '(anonymous namespace)::environ'` on Linux, `Undefined symbols for architecture arm64: "(anonymous namespace)::environ"` on macOS. Invisible until Probleme.md #172's `target_lang="c++"` fix stopped the link from failing on ITS OWN undefined references first — this bug was always there underneath, just never reached.
+
+**Fix:** moved the `extern char **environ;` declaration to true global scope (right after the includes, before the anonymous namespace begins), where it correctly binds to libc's actual global.
+
+**Verification:** local Windows/MSVC rebuild unaffected (the declaration is `#ifndef _WIN32`-gated, untouched on that platform); the actual Linux/macOS link fix can only be confirmed by the next `launcher-native-posix` CI run, same evidentiary limit as #172.
