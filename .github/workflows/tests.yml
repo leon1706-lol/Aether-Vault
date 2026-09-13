@@ -215,6 +215,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+    # src/core.cpp uses C++17 <filesystem>, which Apple's libc++ marks unavailable before
+    # macOS 10.15 -- macos-latest's default deployment target is older, so any step in
+    # this job that (re)builds the C++ core (the initial install, AND
+    # test_wheel_packaging.py's own `python -m build --wheel`) needs this at the JOB
+    # level, not just the first step. Harmless no-op on ubuntu-latest. Same value
+    # nightly.yml's golden-fixtures-macos/macos-install-smoke already use.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.15"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 

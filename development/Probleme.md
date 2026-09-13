@@ -2064,10 +2064,67 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 171. `run()`'s finally block always imported `update_check` on every single command, regardless of whether auto-update was ever opted into
 
-**Severity:** 3/10 (a real, unconditional cost on every `av` invocation for the overwhelming majority of users who never opt in; also the direct mechanism behind an intermittent `urllib.parse`-loaded CI failure in `test_import_graph.py`, though the exact trigger for that leak was not conclusively identified — see `development/CHANGELOG.md` Phase 70) · **Status:** 🟡 `partially fixed` (2026-09-13) — the unconditional-import cost is closed; the CI leak's root trigger remains open.
+**Severity:** 3/10 (a real, unconditional cost on every `av` invocation for the overwhelming majority of users who never opt in) · **Status:** 🟢 `fixed` (2026-09-13). **Correction:** this was originally suspected as the mechanism behind the `urllib.parse`-loaded CI failure in `test_import_graph.py` — it wasn't. That failure's real, unrelated cause is documented separately in #176; this entry's own fix (closing the unconditional `update_check` import) stands on its own merits regardless.
 
 **Problem:** the V1.5.0/V1.6.0 plan called for gating `update_check`'s import behind a cheap on-disk check for `auto_update: true`, but `main.py::run()`'s finally block always did `from . import update_check` (pulling in `packaging` unconditionally) and called `maybe_auto_update()` regardless — that function's own internal `cfg.get("auto_update", False)` check came too late to avoid the import cost, and when `auto_update` genuinely is `true`, `maybe_auto_update()` unconditionally force-fetches from PyPI (`check_for_update(force=True)`, skipping its own 12-hour cache) on every single command exit, not just periodically.
 
 **Fix:** `run()` now does a raw `USER_CONFIG_DIR/config.json` read (no `update_check` import at all) and only imports/calls into `update_check` when that file says `auto_update: true`.
 
 **Verification:** `tests/test_cli.py` (`test_run_skips_maybe_auto_update_when_not_opted_in_on_disk` new, the two existing `run()` tests updated to opt in on disk first); `tests/test_import_graph.py` still green. The force-fetch-every-command behavior for an opted-in user was not changed this pass — noted, not silently dropped.
+
+
+### 172. The native `av` launcher never actually linked successfully on Linux or macOS — masked entirely by its own silent-fallback design
+
+**Severity:** 7/10 (the native launcher's whole point is a zero-Python-startup fast path; on two of three supported platforms it silently never existed, since the same fallback that makes a missing toolchain safe also hid a real, permanent build failure) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `setup.py::BuildExtWithLauncher._build_launcher()` calls `compiler.link_executable(objects, "av", ...)` without `target_lang="c++"`. `distutils`/`setuptools`'s `UnixCCompiler.link()` picks the plain C linker driver (`gcc`/`cc`) for an `EXECUTABLE` target unless told otherwise — which never auto-links libstdc++/libc++ — so every C++ runtime symbol the launcher's `nlohmann::json` usage needs (`std::runtime_error`, `std::system_category`, …) came back "undefined reference" at link time on both `ubuntu-latest` and `macos-latest`, every time, on every push, since this code was written. Nothing ever caught it: `BuildExtWithLauncher.run()`'s own `except Exception` swallowed the `DistutilsExecError` and silently fell back to the pure-Python shim (by design, for a genuinely missing toolchain) — so `pip install -e .`/`python -m build` always "succeeded", just never with a real native binary on POSIX. Only surfaced once `AV_REQUIRE_LAUNCHER=1` (this same push) turned the fallback into a hard failure in `launcher-native-posix` CI, which is exactly what that flag exists to do.
+
+**Fix:** added `target_lang="c++"` to the `link_executable()` call — `UnixCCompiler.link()`'s own `target_cxx` branch then swaps in the C++ driver (`g++`/`clang++`), which links the C++ runtime automatically. No-op on MSVC (Windows was never affected — `cl.exe`/`link.exe` don't distinguish this way).
+
+**Verification:** local Windows/MSVC rebuild unaffected (native launcher still builds and runs identically); the actual Linux/macOS link success can only be confirmed by the next `launcher-native-posix` CI run (no toolchain on this dev box), same evidentiary limit as every other POSIX-only claim in `src/launcher/README.md`.
+
+
+### 173. `launcher-native-posix (macos-latest)` additionally failed to compile `src/core.cpp` at all — the job never set `MACOSX_DEPLOYMENT_TARGET`
+
+**Severity:** 5/10 (blocks the whole job, independent of #172 above) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `src/core.cpp` uses C++17 `<filesystem>`, which Apple's libc++ marks unavailable before macOS 10.15; `macos-latest`'s default deployment target is older. `nightly.yml`'s `golden-fixtures-macos`/`macos-install-smoke` jobs already carry `MACOSX_DEPLOYMENT_TARGET: "10.15"` for exactly this reason (with a comment explaining it) — `tests.yml`'s `launcher-native-posix` job, added later, never got the same treatment, so its macOS leg couldn't even build the C++ core, let alone the launcher.
+
+**Fix:** added `MACOSX_DEPLOYMENT_TARGET: "10.15"` at the job level (not just one step) so it also covers `test_wheel_packaging.py`'s own internal `python -m build --wheel` call later in the same job; `release.yml`'s `CIBW_ENVIRONMENT_MACOS` (new, since a macOS-specific `CIBW_ENVIRONMENT_*` replaces rather than merges with the generic one) carries the same value plus the `AV_REQUIRE_LAUNCHER=1` that would otherwise be lost for macOS release wheels specifically.
+
+**Verification:** value copied verbatim from the already-working `nightly.yml` jobs; confirmed via `python -c "import yaml; yaml.safe_load(...)"` that both edited workflow files still parse, and `tests/test_ci_map.py` (42 tests) still passes.
+
+
+### 174. `setuptools`/`setuptools-scm` genuinely absent from the persistent test environment on some Python versions — two more real "No module named" CI failures from this same push
+
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `pip`'s build isolation installs `[build-system] requires` (`setuptools`, `setuptools-scm`, `pybind11`) into a throwaway isolated environment for building the wheel, then discards it — none of those land in the persistent environment afterward unless also declared as a real runtime dependency (`pybind11` is; the other two aren't, correctly, since they're genuinely build-only). Two things in this repo's own test suite need them present anyway: `tests/test_wheel_packaging.py`'s fixture builds `--no-isolation` (reusing the environment for speed) and needs `setuptools-scm` for versioning; `tests/test_setup_launcher_fallback.py` (new this push) imports `setuptools` directly to load `setup.py` as a module and patch `setuptools.setup`. `test-linux (3.14)`/`test (3.14)` failed with `ModuleNotFoundError: No module named 'setuptools'` on every one of the new file's 11 tests plus `test_wheel_packaging.py`'s 4; `test-linux (3.10)`/`test (3.10)` failed on the `setuptools-scm` half only (that Python's environment happened to carry plain `setuptools` already, just not the scm plugin) — same underlying gap, two different partial symptoms depending on what a given Python version's base image happens to pre-bundle.
+
+**Fix:** added `setuptools>=70.1` and `setuptools-scm>=8` to the `dev` extra in `pyproject.toml`, matching the same reasoning already applied to `build` (Probleme.md's own dev-extra history this push).
+
+**Verification:** local test run stays green (this box already had both installed, so this doesn't newly-verify the CI failure mode) — the actual fix can only be confirmed by the next CI run, same limit as every environment-specific dependency gap.
+
+
+### 175. A new test's own timing margins were flaky under real CI scheduling jitter
+
+**Severity:** 2/10 (test-only, no product impact) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `tests/test_daemon.py::test_maybe_trim_idle_rearms_after_new_activity` (added this push) used a 0.01s idle threshold and a 0.02s `time.sleep()` to cross it — only 10ms of margin against ordinary scheduling jitter, which a shared/throttled CI runner exceeded on `test (3.10)`, failing `assert server.maybe_trim_idle() is True` intermittently. Every other trim test in the same file sets `_last_activity` to a full second in the past (a real, generous margin) instead of racing a live sleep against a tiny threshold — this was the one test that didn't follow that pattern.
+
+**Fix:** widened to a 0.05s threshold / 0.3s sleep — a real margin, still fast.
+
+**Verification:** re-ran `pytest tests/test_daemon.py -k trim` locally (8 passed); the original failure was inherently timing-dependent and couldn't be forced to reproduce locally on demand, consistent with it being exactly the kind of jitter-sensitive flake the fix targets.
+
+
+### 176. The `urllib.parse`-loaded CI failure was never a leak at all — it's Python 3.10–3.12's own `pathlib.py` importing it unconditionally
+
+**Severity:** 3/10 (a false claim in a doc-freshness-style test, not a product regression — but real enough to have blocked confidence in `test_import_graph.py` across two separate investigation passes) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `tests/test_import_graph.py::test_status_in_a_real_repo_does_not_load_heavy_stdlib_modules`/`test_noop_add_...` assert `urllib.parse` never loads for a real `av status`/no-op `add`. This is unconditionally false on Python 3.10, 3.11, and 3.12: those versions' own stdlib `pathlib.py` does `from urllib.parse import quote_from_bytes as urlquote_from_bytes` at MODULE scope (for `Path.as_uri()`), and `main.py` does `from pathlib import Path` — so `urllib.parse` loads before any `av_cli` code runs at all, on every single command, on those Python versions, with nothing `av_cli` can do about it short of not using `pathlib` (used everywhere in this codebase). Python 3.13's pathlib rewrite moved this out of module scope. Two earlier investigation passes (this same day) chased this as a leak — reproducing locally with matched dependencies on Python 3.14, adding `--cov`, replaying the CI test order in batches — none of which could ever have reproduced it, since the local dev box only has Python 3.14 installed and the bug is purely a function of the interpreter's own stdlib version, not test order, coverage, or dependency versions at all.
+
+**How it was actually found:** a genuine Python 3.10.21 interpreter existed locally the whole time (`C:\Users\Blackhead\.local\bin\python3.10.exe`, an `uv`-managed install, never previously tried) — building a venv from it and re-running the same `builtins.__import__` trace used in the earlier failed attempts immediately pointed at `pathlib.py`'s own import line, first try. Cross-checked against the actual CI logs for `compat (3.11)`/`compat (3.12)`/`compat (3.13)` (`gh api .../jobs/<id>/logs`) to confirm the exact version cutoff (present on 3.10/3.11/3.12, absent on 3.13/3.14) rather than assuming CPython's pathlib rewrite landed exactly at 3.13 from memory alone.
+
+**Fix:** `_ACHIEVABLE_HEAVY` in `test_import_graph.py` is now version-gated — `concurrent.futures` only (never `urllib.parse`) on Python < 3.13, both on 3.13+.
+
+**Verification:** re-ran `tests/test_import_graph.py` under the real Python 3.10.21 venv (8/8 passed, previously 6/8) and under this box's normal Python 3.14 (8/8, unchanged, no regression).

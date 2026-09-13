@@ -155,6 +155,17 @@ class BuildExtWithLauncher(_pybind11_build_ext):
         compiler.link_executable(
             objects, "av", output_dir=str(launcher_build_dir),
             libraries=link_libraries, extra_postargs=link_args,
+            # Real bug (found live via AV_REQUIRE_LAUNCHER=1 in launcher-native-posix CI,
+            # which is exactly what that flag exists to surface): distutils/setuptools'
+            # UnixCCompiler.link() picks the plain C linker driver (`gcc`) by default for
+            # an EXECUTABLE target, which never auto-links libstdc++ -- every C++ runtime
+            # symbol this launcher's `nlohmann::json` usage needs (`std::runtime_error`,
+            # `std::system_category`, ...) came back "undefined reference" at link time on
+            # both POSIX runners, MSVC unaffected since cl.exe/link.exe don't distinguish
+            # by source language the same way. `target_lang="c++"` makes it use the C++
+            # driver (`g++`/`clang++`) instead, which links libstdc++/libc++ automatically
+            # -- see distutils.unixccompiler.UnixCCompiler.link()'s own target_cxx branch.
+            target_lang="c++",
         )
         built_exe = launcher_build_dir / exe_name
         if not built_exe.exists():

@@ -131,7 +131,21 @@ def _heavy_loaded(result: subprocess.CompletedProcess) -> list[str]:
 # top-of-file comment explains why -- removing them broke `test_cli.py`'s patch-anchor
 # dependencies on `main_module.subprocess`/`main_module.shutil` specifically, a real,
 # already-diagnosed constraint from earlier in this same phase, not an oversight here).
-_ACHIEVABLE_HEAVY = ("urllib.parse", "concurrent.futures")
+#
+# V1.6.1: `urllib.parse` specifically is NOT achievable on Python 3.10-3.12 at all, on
+# ANY code path that touches `pathlib.Path` -- confirmed live (found the real CI failures
+# this test itself produced on `test (3.10)`/`test-linux (3.10)`/the nightly compat
+# matrix's 3.11/3.12 legs, traced with an import hook against the exact CI Python
+# versions, not guessed at): those versions' own stdlib `pathlib.py` does
+# `from urllib.parse import quote_from_bytes as urlquote_from_bytes` at MODULE scope (for
+# `Path.as_uri()`), and `main.py` does `from pathlib import Path` -- so `urllib.parse`
+# loads before `av_cli` code runs at all, on every single command, unavoidably. Python
+# 3.13's pathlib rewrite moved this out of module scope (verified: absent on 3.13/3.14
+# here and in CI), so the achievable set is version-gated rather than a lie on paper.
+_ACHIEVABLE_HEAVY = (
+    ("concurrent.futures",) if sys.version_info < (3, 13)
+    else ("urllib.parse", "concurrent.futures")
+)
 
 
 def test_status_in_a_real_repo_does_not_load_heavy_stdlib_modules(tmp_path):

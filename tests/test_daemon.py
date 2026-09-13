@@ -599,14 +599,18 @@ def test_watchdog_trims_after_idle(repo):
 
 
 def test_maybe_trim_idle_rearms_after_new_activity(repo):
+    """Real flake found live on a shared CI runner (test (3.10), V1.6.1 push): the
+    original 0.01s threshold / 0.02s sleep left only 10ms of margin against ordinary
+    scheduling jitter, which a throttled/shared runner can exceed on its own. 0.05s/0.3s
+    gives a real margin while staying fast."""
     server = daemon_module.DaemonServer(repo, "test-version")
-    server._trim_after_secs = 0.01
+    server._trim_after_secs = 0.05
     server._last_activity = time.monotonic() - 1.0
     assert server.maybe_trim_idle() is True
 
     server._last_activity = time.monotonic()  # a request just came in
     assert server.maybe_trim_idle() is False  # not idle long enough yet
-    time.sleep(0.02)  # real time passes -- past the threshold again
+    time.sleep(0.3)  # real time passes -- well past the threshold again
     assert server.maybe_trim_idle() is True  # idle again -> trims again
     assert server.trim_count == 2
 

@@ -79,7 +79,17 @@ docker = ["PyYAML>=6.0"]
 # console-script stub, RECORD hashes) -- V1.6.0 added those tests but never added the
 # dependency they need, so the "test" CI job passed `[dev]` without it and every one
 # failed with "No module named build" (found live, this pass).
-dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0", "httpx>=0.24.0", "jsonschema>=4.0", "PyYAML>=6.0", "build>=1.0.0"]
+# `setuptools`/`setuptools-scm` for the same class of reason -- test_wheel_packaging.py's
+# build runs `--no-isolation` (reuses this environment instead of resolving a fresh one,
+# for speed), and tests/test_setup_launcher_fallback.py imports `setuptools` directly to
+# load setup.py as a module, so both need this environment's PERSISTENT site-packages to
+# carry what pip's own [build-system] `requires` only ever installs into a throwaway
+# isolated build env (never the persistent one) -- confirmed the gap is real, not
+# hypothetical: `test-linux (3.14)` failed on exactly this (setuptools genuinely absent
+# from that Python's environment after a plain `pip install -e .[dev]`, unlike 3.10's).
+# Both are build-only tools, so neither belongs in [project.dependencies] proper.
+dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0", "httpx>=0.24.0", "jsonschema>=4.0", "PyYAML>=6.0",
+       "build>=1.0.0", "setuptools>=70.1", "setuptools-scm>=8"]
 benchmarks = ["dvc>=3.55,<4", "mlflow>=2.16"]
 # v1.3.3: SSO (OIDC) — authlib does the OAuth2/OIDC protocol work (PKCE, JWKS-based ID
 # token verification); pyjwt[crypto] is used directly for the device-code flow's own

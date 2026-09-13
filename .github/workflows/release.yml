@@ -80,6 +80,13 @@ jobs:
           # native-compile failure into a hard build failure instead of a shim fallback
           # nobody would notice until a user's `av --version` was mysteriously slow.
           CIBW_ENVIRONMENT: AV_REQUIRE_LAUNCHER=1
+          # macOS-specific env REPLACES (not merges with) CIBW_ENVIRONMENT above per
+          # cibuildwheel's own docs, so AV_REQUIRE_LAUNCHER=1 must be repeated here.
+          # MACOSX_DEPLOYMENT_TARGET=10.15 is required for src/core.cpp's C++17
+          # <filesystem> use (Apple's libc++ marks it unavailable before 10.15) -- found
+          # live via launcher-native-posix CI once AV_REQUIRE_LAUNCHER stopped masking it;
+          # same value nightly.yml's macOS jobs already use.
+          CIBW_ENVIRONMENT_MACOS: AV_REQUIRE_LAUNCHER=1 MACOSX_DEPLOYMENT_TARGET=10.15
 
       # cibuildwheel can silently skip a CPython tag it doesn't recognize rather than
       # failing the build, so this asserts every supported tag actually got built.
