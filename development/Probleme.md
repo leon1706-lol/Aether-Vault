@@ -2139,3 +2139,14 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** moved the `extern char **environ;` declaration to true global scope (right after the includes, before the anonymous namespace begins), where it correctly binds to libc's actual global.
 
 **Verification:** local Windows/MSVC rebuild unaffected (the declaration is `#ifndef _WIN32`-gated, untouched on that platform); the actual Linux/macOS link fix can only be confirmed by the next `launcher-native-posix` CI run, same evidentiary limit as #172.
+
+
+### 178. README's hardcoded test-count numbers had drifted (1824/1916 vs the real 1622) — masked until every actual test finally passed
+
+**Severity:** 2/10 (doc-freshness only, no product impact) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `.github/workflows/tests.yml`'s `test (3.14)` leg runs `scripts/check_readme_test_freshness.py` against that job's real pytest summary, hard-failing on any drift between README.md's badge/prose/table numbers and what the job actually collected. This session's earlier file-count fix (Probleme.md's own dev-extra history) only corrected the file count (82→83) via the separate, looser `test_readme_test_count_freshness.py` — the stricter CI-only script also checks the TOTAL test count, which this job actually reports as 1622 (passed+failed+error, excluding skipped, on this job's `.[dev,watch]`-only install), not the README's stale 1824 (badge) / 1916 (prose). The check likely never ran to completion on this job before, since every previous run of `test (3.14)` failed earlier (in the real pytest tests themselves) before ever reaching this step — only surfaced once every actual test started passing.
+
+**Fix:** updated README.md's badge (1824/1824 → 1622/1622), module-table row, and Test Suite prose, plus `tests/README.md`'s opening line, all to 1622/83.
+
+**Verification:** ran `scripts/check_readme_test_freshness.py` directly against the real failing CI job's saved log — now reports "test counts match this run. OK." Local `test_readme_test_count_freshness.py`/`test_benchmark_docs_freshness.py`/`test_docs_commands.py` (89 tests) still green.

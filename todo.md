@@ -9,6 +9,154 @@ are for — see `AGENTS.md`).
 
 -----
 
+
+V1.6.3
+- this phase will be all about resource and ram optimisation to make it also more lightweight for users
+- please scope an indepth plan on hoe to make it leass ram intensive but also keep it faast low latency based on these points and I deas
+- make it  fully end to end without defering anythin
+- It should Also be able to run stuff like benchmark and full suit lokaly aain afterwards
+
+plan ideas:
+
+
+V1.6.3 — footprint / RAM phase (practical list)
+Goal: same features, much smaller steady-state and peak memory, so the project runs on a constrained machine without feeling “heavy.”
+
+Principles
+
+Measure first — peak RSS by process (av CLI, daemon, engine, Postgres, Redis, WebUI).
+One owner per leak class — imports, caches, buffers, workers, Docker.
+Don’t break hash/CDC/signing invariants or multi-tenant correctness.
+Prefer streaming + bounds over “load whole model/tree.”
+
+
+A. Measure & budget (do first)
+
+RSS scoreboard — script: peak/avg RSS for av status, av add, av commit, daemon idle, engine idle, full compose.
+Import graph cost — what each cmd_* pulls in; keep lazy registration (1.5/1.6).
+Hard budgets in docs — e.g. daemon idle < X MB, CLI no-op < Y MB, engine without WebUI < Z MB.
+CI optional job — fail or warn if daemon/CLI RSS exceeds budget on a fixed fixture (best-effort).
+
+
+B. CLI & daemon (usually the laptop killers)
+
+Daemon idle-trim — you already listed WS6.1 (malloc_trim / periodic trim after idle); implement with AV_DAEMON_TRIM_SECS.
+Daemon allowlist stays narrow for hot path — don’t load commit/push stacks until needed.
+No unbounded caches — status/index: one index in memory; cap any path caches.
+Stream file reads — fixed buffer sizes for hash/CDC (already chunked; audit any read() of full files in Python).
+Index format — compact on-disk index (no fat JSON indent); optional mmap-friendly layout later.
+Agent mode — AV_NO_RICH=1 / never import heavy TUI stacks on daemon path (you started AST checks; keep them).
+Process split — document: CLI without daemon vs with; engine without WebUI for weak machines.
+
+
+C. C++ core
+
+Bound parallel workers — thread pool size min(CPU, cap); env AV_THREADS already — default cap on low RAM.
+No giant intermediate buffers in SHA/CDC/safetensors split — reuse buffers; verify peak under 1 large file.
+Release pools after batch — don’t keep per-call vectors forever on the daemon process.
+
+
+D. Server (engine)
+
+Slim engine profile — server-only without Next.js when WebUI not needed (compose profile).
+Worker/connection caps — uvicorn/gunicorn workers = 1–2 on small boxes; document.
+Upload path — stream to CAS; never hold full object in RAM.
+Rate-limiter buckets — periodic prune (your WS5.8 gap).
+Query/result limits — pagination defaults on list/log/audit; no “return entire history.”
+Bloom/Redis — fixed memory policy; don’t grow filters without bound.
+
+
+E. Postgres / Redis / Docker
+
+Postgres shared_buffers / work_mem — low defaults in docker-compose for dev (e.g. small shared_buffers).
+Redis maxmemory + eviction — explicit in compose.
+Compose profiles — minimal = db + redis + engine API only (no HA, no WebUI).
+Healthcheck lightness — avoid expensive checks that pile up under load.
+
+
+F. WebUI
+
+Don’t start WebUI by default on low-spec docs path.
+Next.js — production build only in image; no dev server in prod compose.
+API polling — backoff; don’t open huge payloads on dashboard home.
+
+
+G. Data-plane behavior (footprint under real ML files)
+
+Checkout/smudge — no whole-blob duplicate when chunked (you already care; keep tests).
+GC — bounded batch size; don’t load all object IDs at once if possible.
+Export/restore — streaming; temp files on disk not RAM.
+
+
+H. Packaging & docs
+
+av doctor --resources — print RSS, daemon on/off, recommended compose profile.
+README “low-memory mode” — one page: AV_NO_DAEMON, single worker, no WebUI, Postgres tunables.
+CHANGELOG 1.6.3 — footprint numbers before/after on your machine.
+
+
+
+Suggested phase order (1.6.3)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+StepWorkEffect1RSS scoreboard + budgetsKnow the truth2Daemon idle-trim + cache capsSteady-state laptop3Engine slim profile + worker=1 + stream uploadsCompose fits RAM4Postgres/Redis memory caps in composeBiggest multi-process win5Rate-limiter prune + list paginationLong-run server6C++ buffer/thread capsPeak during add/commit7av doctor --resources + low-mem docsUsable by humans
+
+Explicit non-goals for 1.6.3
+
+Full rewrite in Rust
+Packfiles (big design)
+Killing features to “save RAM” without a profile flag
+Chasing Git’s RSS on cold start without native launcher (that’s 1.6+/1.7)
+
+
+One-line definition of done
+On your machine: minimal compose + daemon idle + av status on a medium repo stay under documented RSS budgets; one large safetensors add/commit peaks under a stated limit; no functional regression on hash/CDC tests.
+That’s a coherent v1.6.3 footprint phase: measure → daemon/CLI → engine/compose → DB/Redis → polish.
+-----
+
 ## Blocked by environment, not by choice
 
 - [ ] **`tests/test_server.py`'s remaining tests, re-attempted 2026-09-13 (2nd session,

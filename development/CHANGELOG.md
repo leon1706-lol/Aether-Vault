@@ -559,3 +559,11 @@ The owner pushed the previous round's fixes (`5a5b34e`) and asked to keep monito
 - **`test-linux`/`test` (3.10 and 3.14) residual failures**: all `test_launcher_native.py` tests failing with "shim fallback" symptoms, matching the plan `test`/`test-linux` don't set `AV_REQUIRE_LAUNCHER` so a native-compile failure silently falls back — expected to resolve as a direct consequence of the `environ` fix above, not a separate bug.
 
 Not yet re-pushed to confirm.
+
+### 2026-09-13, same day: round three — down to one failure, and it's a genuinely different class of bug
+
+The owner pushed round two's fixes (`4e8104c`) and asked to keep monitoring. Confirmed: `environ` fix worked (`launcher-native-posix` both OSes green) and the clock-tie fix worked (`test (3.10)` green) — every job passed except one.
+
+- **Probleme.md #178**: `test (3.14)`'s dedicated `scripts/check_readme_test_freshness.py` step failed — README's hardcoded test-count badge/prose (1824/1916, already stale before this session) didn't match this job's real count (1622, on its `.[dev,watch]`-only install). Never surfaced before now because every prior run of this job failed on a real test failure first, before ever reaching this step. Fixed by updating README.md/tests/README.md to the real number, verified by running the actual check script against the failing run's own saved log.
+
+Every other job (`security`, `Docker Edge Build`, `CodeQL`, `test-linux` both versions, `test (3.10)`, both `launcher-native-posix` legs, and everything else in `Tests`) is green. Not yet re-pushed.
