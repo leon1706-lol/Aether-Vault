@@ -93,6 +93,29 @@ def test_canonical_form_golden_fixture():
     )
 
 
+def test_canonical_commit_bytes_matches_the_pre_hash_json_dumps_form():
+    """V1.6.0 (WS2.6): `_finalize_commit` now hashes via `canonical_commit_bytes` instead
+    of a second, ad-hoc `json.dumps(commit_data, sort_keys=True)` -- byte-identical for the
+    pre-hash/pre-signature state that call exists in (no `hash`/`signature` keys yet, so
+    `exclude=("signature",)` is a no-op), which is the whole safety argument for reusing it.
+    A UTC isoformat timestamp (what `_finalize_commit` always sets) round-trips unchanged
+    through the timestamp normalization too."""
+    import hashlib
+
+    commit_data = {
+        "parents": [], "author": "anonymous",
+        "timestamp": "2026-09-13T10:30:45.123456+00:00",
+        "message": "epoch 12", "tree": {"a.py": {"hash": "h", "type": "code"}},
+        "tags": ["run:abc"], "metrics": {"val_loss": 0.31},
+        "project_id": "p1", "project_name": "proj",
+    }
+    old_way = hashlib.sha256(
+        json.dumps(commit_data, sort_keys=True).encode()
+    ).hexdigest()
+    new_way = hashlib.sha256(canonical_commit_bytes(commit_data)).hexdigest()
+    assert new_way == old_way
+
+
 def test_canonical_form_is_timezone_spelling_insensitive():
     """The registry echoes naive UTC; the authoring client writes '+00:00'. Both must
     canonicalize identically or every cloned verification would fail (manual wire find)."""

@@ -223,7 +223,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install Aether-Vault (builds aether_core AND the native av launcher via setup.py)
+        # AV_REQUIRE_LAUNCHER=1: this job's whole point is proving the native exe compiles
+        # on a platform that always ships a working compiler -- without this, a genuine
+        # C++ build failure here silently falls back to the pure-Python shim (setup.py's
+        # own documented fallback for a missing/broken toolchain) and only surfaces later,
+        # confusingly, as the shim itself failing to run rather than as the real compiler
+        # diagnostic. Same flag release.yml sets for the same reason.
         run: pip install -e .[dev]
+        env:
+          AV_REQUIRE_LAUNCHER: "1"
 
       - name: Confirm the native launcher actually compiled (not the pure-Python shim fallback)
         # A missing exe here means the C++ build genuinely failed on a platform that always

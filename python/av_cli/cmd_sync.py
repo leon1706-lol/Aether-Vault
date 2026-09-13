@@ -73,8 +73,11 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
         cfg["remote_api_token"] = api_token
     save_config(target, cfg)
 
+    # durable=False (WS4.8): a clone that's interrupted mid-write is simply redone -- the
+    # fsync `write_fetched_commit` normally does (~16 ms/file here, ~8 s for 500 commits)
+    # buys nothing a fresh clone attempt wouldn't already recover.
     for c in commits:
-        sync.write_fetched_commit(target, c)
+        sync.write_fetched_commit(target, c, durable=False)
 
     heads_dir = target / ".av" / "refs" / "heads"
     atomic_write_text(heads_dir / branch, tip_hash)
@@ -152,9 +155,36 @@ def pull(force: bool) -> None:
 
     # Walk the remote chain back until it joins history we already have, storing every new
     # commit locally as we go — so even a diverged pull leaves the full picture on disk.
+    # V1.6.0 (WS4.8): resolved via the paginated `include_layers=true` project listing
+    # (500/page, newest first -- the gap being walked is almost always near the top) instead
+    # of one `GET /api/commits/{hash}` per new commit; `_resolve` only fetches another page
+    # once the chain walks past what's already been paged in.
     fetched: list[dict] = []
     cursor: str | None = remote_tip
     join_found = False
+    known: dict[str, dict] = {}
+    _pull_offset = 0
+    _pull_exhausted = False
+
+    def _resolve(h: str) -> dict | None:
+        nonlocal _pull_offset, _pull_exhausted
+        while h not in known and not _pull_exhausted:
+            page = client.list_commits(cfg["project_id"], limit=500, offset=_pull_offset,
+                                        include_layers=True)
+            rows = (page or {}).get("commits", [])
+            if not rows:
+                _pull_exhausted = True
+                break
+            for row in rows:
+                data = sync.normalize_commit_row(row)
+                known[data["hash"]] = data
+            next_offset = page.get("next_offset")
+            if next_offset is None:
+                _pull_exhausted = True
+            else:
+                _pull_offset = next_offset
+        return known.get(h)
+
     while cursor:
         if cursor == local_tip:
             join_found = True
@@ -163,12 +193,11 @@ def pull(force: bool) -> None:
         if existing is not None:
             join_found = True
             break
-        row = client.get_commit(cursor)
-        if not row:
+        data = _resolve(cursor)
+        if data is None:
             fail(ctx, "validation",
                  f"Remote history is broken — commit {cursor[:7]}… is referenced but "
                  "missing from the registry.")
-        data = sync.normalize_commit_row(row)
         sync.write_fetched_commit(repo_root, data)
         fetched.append(data)
         parents = data["parents"]
@@ -460,7 +489,11 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
         resolved_conflicts = len(conflicts)
 
     sync.ensure_objects_local(repo_root, client, merged)
-    _materialize_tree(repo_root, client, merged, Index(repo_root))
+    # V1.6.0 (WS2.7): reuse the `idx` already loaded above instead of re-reading `.av/index`
+    # from disk twice more -- nothing in this function writes to it between that load and
+    # here, and `_materialize_tree` replaces `idx.entries` wholesale anyway, so a fresh
+    # re-read would just discard what it loads.
+    _materialize_tree(repo_root, client, merged, idx)
 
     head_path = repo_root / ".av" / "HEAD"
     commit_data: dict = {
@@ -478,7 +511,7 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
     merge_hash = _finalize_commit(
         repo_root, cfg, client,
         commit_data=commit_data, tree=merged, ref_path=our_ref_path,
-        head_path=head_path, idx=Index(repo_root),
+        head_path=head_path, idx=idx,
         # In JSON mode, suppress _finalize_commit's own human echo — this command emits
         # ONE envelope covering both the merge and the resulting commit's queue outcome.
         result_sink=(finalize_result.update if output_is_json(ctx) else None),

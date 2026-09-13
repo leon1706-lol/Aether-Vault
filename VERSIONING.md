@@ -480,6 +480,31 @@ caching/batching) is an internal speed change with no altered contract.
   layer-split or CDC-chunked entry — this only affects local disk usage after a restore,
   never the working-tree content or the index/tree format.
 
+## v1.6.1 additive surfaces (see development/CHANGELOG.md Phase 70)
+
+A closure release for v1.6.0's own flagged gaps plus CI hardening — PATCH: no behavior
+change any existing caller would observe (every addition below is either internal or a
+purely additive status/JSON field).
+
+- **`av daemon status` gained additive fields**: `rss_mb`, `uptime_s`, `requests_served`,
+  `trimmed` — a client reading `pid`/`cli_version`/`protocol`/`repo_root`/`endpoint` only is
+  unaffected. The status file is now refreshed after every served request and every idle
+  trim, not written once at startup only.
+- **New env var**: `AV_DAEMON_TRIM_SECS` (default 30) — idle-trim threshold for the
+  daemon's memory-release watchdog (`release_pool()`/`gc.collect()`/`malloc_trim`).
+- **New env var (build-time only)**: `AV_REQUIRE_LAUNCHER` — makes a native-launcher
+  compile failure a hard build error instead of a silent shim fallback; set in
+  `release.yml`/`launcher-native-posix` CI only, never relevant to an installed package.
+- **New internal parameter, not user-facing**: `fsutil.atomic_write_text/json(...,
+  durable=False)` and `sync.write_fetched_commit(..., durable=True)` — `av clone`'s own
+  commit-file writes opt into the non-durable fast path; every other caller (including `av
+  pull`/`av merge`) keeps the durable default unchanged. No CLI/SDK/HTTP surface exposes
+  this — a clone's on-disk result is identical either way, just written faster.
+- **Not a contract change**: the commit hash/signature computation was refactored to reuse
+  one shared canonicalization function instead of two independently-maintained ones —
+  verified byte-identical output (`tests/test_signing.py`), so no existing commit hash or
+  signature is affected.
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades

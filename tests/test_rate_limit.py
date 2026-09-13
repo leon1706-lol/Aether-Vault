@@ -136,6 +136,58 @@ def test_reset_clears_recorded_windows():
 
 
 # ---------------------------------------------------------------------------
+# WS5.8: periodic pruning of stale buckets — unbounded growth under long uptime
+# with many distinct rate-limit keys, otherwise nothing ever removes an entry.
+# ---------------------------------------------------------------------------
+
+def test_prune_removes_a_bucket_whose_window_has_long_expired():
+    clock = FakeClock()
+    limiter = _limiter(max_requests=5, window=60, clock=clock)
+    limiter.check("stale-client", "gc")
+    assert ("stale-client", "gc") in limiter._buckets
+
+    # Past both the rate limit's own window AND the prune interval.
+    clock.now += limiter._PRUNE_INTERVAL_SECONDS + 61
+    limiter.check("other-client", "gc")  # any call piggybacks the sweep
+
+    assert ("stale-client", "gc") not in limiter._buckets
+    assert ("other-client", "gc") in limiter._buckets  # the fresh one survives
+
+
+def test_prune_leaves_a_bucket_whose_window_is_still_active():
+    clock = FakeClock()
+    limiter = _limiter(max_requests=5, window=600, clock=clock)  # long window
+    limiter.check("active-client", "gc")
+
+    clock.now += limiter._PRUNE_INTERVAL_SECONDS + 1  # sweep runs...
+    limiter.check("other-client", "gc")  # ...but active-client's 600s window hasn't expired
+
+    assert ("active-client", "gc") in limiter._buckets
+
+
+def test_prune_does_not_run_more_often_than_the_interval():
+    clock = FakeClock()
+    limiter = _limiter(max_requests=5, window=1, clock=clock)
+    limiter.check("a", "gc")
+    clock.now += 2  # a's 1s window is now expired, but the prune interval isn't
+    limiter.check("b", "gc")
+    assert ("a", "gc") in limiter._buckets  # not swept yet -- too soon since last prune
+
+
+def test_prune_is_a_pure_memory_optimization_never_changes_limiting_behavior():
+    """A key pruned mid-window (impossible in practice, since pruning only ever targets
+    already-expired windows) would just start a fresh window on its next hit -- identical
+    to a key that was never seen before. Prune interacting with `reset()` shouldn't leave
+    the limiter in a state where an old prune clock confuses a later check either."""
+    clock = FakeClock()
+    limiter = _limiter(max_requests=1, window=60, clock=clock)
+    limiter.check("ip", "gc")
+    clock.now += limiter._PRUNE_INTERVAL_SECONDS + 61
+    limiter.reset()
+    assert limiter.check("ip", "gc") is None  # fresh window post-reset, not blocked
+
+
+# ---------------------------------------------------------------------------
 # env wiring
 # ---------------------------------------------------------------------------
 

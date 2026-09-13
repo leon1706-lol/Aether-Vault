@@ -1,0 +1,122 @@
+name: Benchmarks
+
+# Cross-tool comparison against Git LFS/DVC/MLflow (see benchmarks/README.md) — a
+# performance MEASUREMENT, not a correctness gate, and needs those three tools installed
+# plus a live registry stack up: too slow/noisy to run on every push, and its numbers are
+# meant to be compared across captures, not pass/failed against a fixed threshold on every
+# commit. Scheduled weekly + workflow_dispatch, the same posture as nightly.yml (never
+# produces a check-run for a specific commit — excluded from the release gate for the same
+# reason nightly.yml's jobs are, see .github/required-checks.txt's own note).
+#
+# Never commits anything itself: the captured BENCHMARKS.md/BENCHMARKS-cold.md + JSON
+# snapshots are uploaded as a run artifact for the owner to review and copy in by hand —
+# same posture as append_perf_history.py's own CI step in tests.yml. This exists so these
+# benchmarks still get run somewhere real on a schedule, without depending on a
+# memory-constrained dev box ever having enough free RAM (+ Docker up) at the same time.
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"   # weekly, Monday 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
+        env:
+          POSTGRES_USER: av_user
+          POSTGRES_PASSWORD: av_password
+          POSTGRES_DB: aether_vault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis/redis-stack-server:latest@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      AV_TEST_DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_test
+      AV_TEST_REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0 # setuptools-scm needs tags for a real (non-dev0) version string
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      # GitHub-hosted ubuntu-latest ships git-lfs already; this is a no-op there and only
+      # does real work on a runner image that doesn't (kept for that reason, not removed).
+      - name: Ensure git-lfs is available
+        run: |
+          command -v git-lfs || (sudo apt-get update && sudo apt-get install -y git-lfs)
+          git lfs install --skip-repo
+
+      - name: Install Aether-Vault + benchmark comparison tools (DVC, MLflow)
+        # [sign] so a signed-commit path isn't silently different from what a real user's
+        # install would exercise; [benchmarks] is DVC+MLflow, the two competitor tools
+        # that aren't already covered by the git-lfs step above.
+        run: pip install -e .[dev,benchmarks,sign]
+
+      - name: Start aether-vault-server (bare-metal, for the live-registry benchmark rows)
+        env:
+          DATABASE_URL: ${{ env.AV_TEST_DATABASE_URL }}
+          REDIS_URL: ${{ env.AV_TEST_REDIS_URL }}
+          AV_DATA_DIR: ${{ runner.temp }}/av-data
+        run: |
+          nohup python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/api/health && break
+            sleep 1
+          done
+          curl -sf http://localhost:8000/api/health > /dev/null || {
+            echo "::error::aether-vault-server did not become healthy in 30s"
+            exit 1
+          }
+
+      - name: Capture warm benchmarks (product default — native launcher + auto-spawned daemon)
+        run: av benchmark --markdown development/BENCHMARKS.md --save-json bench-warm.json
+
+      - name: Capture cold benchmarks (--no-daemon)
+        run: av benchmark --no-daemon --markdown development/BENCHMARKS-cold.md --save-json bench-cold.json
+
+      - name: Stop the daemon this run may have spawned
+        if: always()
+        run: av daemon stop || true
+
+      - name: Upload captured reports (never committed automatically — for manual review)
+        # Download from this run's own page: Actions tab -> Benchmarks -> this run ->
+        # "Artifacts" at the bottom -- or `gh run download <run-id> -n benchmark-capture`.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: benchmark-capture
+          path: |
+            development/BENCHMARKS.md
+            development/BENCHMARKS-cold.md
+            bench-warm.json
+            bench-cold.json
+          if-no-files-found: warn
+          retention-days: 90

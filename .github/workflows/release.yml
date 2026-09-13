@@ -75,6 +75,11 @@ jobs:
       - uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
         env:
           CIBW_BUILD_VERBOSITY: 1
+          # A released wheel must never silently ship the pure-Python `#!python` shim in
+          # place of the real native launcher -- setup.py's `AV_REQUIRE_LAUNCHER=1` turns a
+          # native-compile failure into a hard build failure instead of a shim fallback
+          # nobody would notice until a user's `av --version` was mysteriously slow.
+          CIBW_ENVIRONMENT: AV_REQUIRE_LAUNCHER=1
 
       # cibuildwheel can silently skip a CPython tag it doesn't recognize rather than
       # failing the build, so this asserts every supported tag actually got built.

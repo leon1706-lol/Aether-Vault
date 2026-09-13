@@ -264,6 +264,29 @@ def test_merge_creates_two_parent_commit_and_merges_trees(forked_repo):
     assert "Merge feature into main" in log_result.output
 
 
+def test_merge_constructs_index_only_once(forked_repo, monkeypatch):
+    """V1.6.0 (WS2.7): `merge()` used to build a fresh `Index(repo_root)` three separate
+    times in one call (the dirty-check, `_materialize_tree`, and `_finalize_commit` each
+    re-read `.av/index` from disk) -- it now loads once and threads the same object
+    through all three, since nothing in between touches the index file on disk."""
+    from python.av_cli import cmd_sync as cmd_sync_module
+
+    real_index_cls = cmd_sync_module.Index
+    construction_count = 0
+
+    class CountingIndex(real_index_cls):
+        def __init__(self, *a, **k):
+            nonlocal construction_count
+            construction_count += 1
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(cmd_sync_module, "Index", CountingIndex)
+
+    result = invoke("merge", "feature")
+    assert result.exit_code == 0, result.output
+    assert construction_count == 1
+
+
 def test_merge_conflict_aborts_without_touching_anything(forked_repo):
     repo = forked_repo["repo"]
 

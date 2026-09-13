@@ -72,7 +72,12 @@ LABEL org.opencontainers.image.title="aether-vault-engine" \
 # procps (pkill/ps/etc.) is NOT in python:3.12-slim by default — needed both for
 # `docker exec <container> pkill ...` in e2e-engine-smoke's CI check and for real
 # operational debugging.
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg procps libxml2 libxmlsec1-openssl \
+# `apt-get upgrade` picks up Debian security-repo patches to packages already baked into
+# the base image (e.g. libpcre2-8-0's CVE-2026-86145/89161, HIGH — the base tag itself
+# isn't rebuilt often enough to always carry these) — every apt-get RUN in this file that
+# produces a shipped image does this, not just at initial install time.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg procps libxml2 libxmlsec1-openssl \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get purge -y gnupg \
@@ -135,7 +140,8 @@ LABEL org.opencontainers.image.title="aether-vault-engine-server" \
       org.opencontainers.image.created="$BUILD_DATE" \
       org.opencontainers.image.source="https://github.com/leon1706-lol/Aether-Vault" \
       org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates procps libxml2 libxmlsec1-openssl \
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends curl ca-certificates procps libxml2 libxmlsec1-openssl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=py-builder /wheels /wheels
 # Same reasoning as the engine stage above — installs the full `.[sso,saml,sign]`
@@ -166,7 +172,8 @@ LABEL org.opencontainers.image.title="aether-vault-engine-webui" \
       org.opencontainers.image.created="$BUILD_DATE" \
       org.opencontainers.image.source="https://github.com/leon1706-lol/Aether-Vault" \
       org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
-RUN apt-get update && apt-get install -y --no-install-recommends curl procps \
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends curl procps \
     && rm -rf /var/lib/apt/lists/* \
     # Same npm-removal reasoning as the engine stage above, at this base image's own
     # /usr/local path convention. Best-effort, never a build break.

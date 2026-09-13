@@ -9,64 +9,51 @@ are for — see `AGENTS.md`).
 
 -----
 
-**v1.6.0 "Performance Closure" — in progress.** Full plan (still the source of truth for
-scope): `C:\Users\Blackhead\.claude\plans\please-now-make-an-velvety-clarke.md`. What's
-already shipped: `development/CHANGELOG.md` Phase 69 + `development/Probleme.md` #153-167,
-`VERSIONING.md`'s v1.6.0 section, the Obsidian vault regen (`Project-Map.md`/folder
-indexes/`HANDOFF.MD`), and a real manual scratch-repo session covering every local-only
-checklist item from the original plan (native launcher `--version` parity, daemon
-auto-spawn, byte-identical daemon vs `AV_NO_DAEMON=1` JSON, fused-vs-legacy CDC staging
-byte-identical, `AV_THREADS` ∈ {1,4,8} determinism, `AV_SHA256_BACKEND=scalar` matches auto
-(no SHA-NI on this CPU either way), CDC-chunked `stash push`/`pop` round-trip, `checkout`
-writing no whole-blob duplicate for a chunked entry, non-ASCII filename staging, clean
-`daemon stop`) — the network-dependent half (`push`/`pull`/`clone`/`fetch`/`gc`/`registry
-export` against the live registry) was NOT exercised this pass: Docker's own API was
-independently returning 500s and a bare health-check curl took 120s+ under this box's
-sustained strain, confirmed unrelated to `av` itself. Uncommitted on `master` — nothing
-pushed/committed yet, the owner does that.
-
-## Missing / still to do
-
-Real gaps in the original plan, found by checking the code directly (not by memory) —
-none of these are exercised or caught by any existing CI job, since CI only tests what
-exists; these are missing features/optimizations, not missing test coverage.
-
-- [ ] **WS2.6 — commit path still does 3 separate `json.dumps` calls** (hash, signature,
-      file write each re-serialize `commit_data` independently) instead of the planned
-      single canonical-bytes reuse. `python/av_cli/core.py`'s `commit_staged()`.
-- [ ] **WS2.7 — `Index.remove_entry()` still saves unconditionally on every call** (no
-      `auto_save=False` batching option exists), and `cmd_sync.py::merge()` still
-      constructs `Index(repo_root)` three separate times within one call, exactly what the
-      plan flagged as the thing to fix.
-- [ ] **WS4.8 — clone/pull round-trip optimizations never implemented**: no page
-      pipelining in `sync.fetch_project_commits`, no `durable=False` fast path for clone's
-      commit-file writes, `av pull` still does one `GET /api/commits/{hash}` per new commit
-      instead of the planned paginated `include_layers=true` listing.
-- [ ] **WS5.8 — `WindowRateLimiter._buckets` (python/av_server/rate_limit.py) has no
-      periodic pruning** of stale entries — only a full `.clear()` exists. Unbounded growth
-      under long server uptime with many distinct rate-limit keys.
-- [ ] **WS6.1 — the daemon idle-trim watchdog was never implemented at all**, not even a
-      stub: no `release_pool()`/`gc.collect()`/`malloc_trim` call anywhere in
-      `python/av_cli/daemon.py`, no `AV_DAEMON_TRIM_SECS` anywhere in the codebase (checked
-      via a full-repo grep — zero matches). A long-lived auto-spawned daemon's memory only
-      ever grows, never gives anything back while idle.
-
 ## Blocked by environment, not by choice
 
-- [ ] **`tests/test_server.py`'s remaining 131 tests** and the **full
-      `development/BENCHMARKS.md` re-capture** — this box's free RAM held at 0.2-0.5GB (of
-      3.9GB) throughout the 2026-09-13 attempt, with Docker's own WSL VM growing from
-      ~370MB to 500MB+ under the sustained DB-backed test load. Genuinely retried many ways
-      (batch-of-50, batch-of-15, one-test-per-subprocess restarted ~25 times) — 62/193
-      server tests did get individually verified passing with zero real failures found; see
-      `development/CHANGELOG.md`'s 2026-09-13 entry for the full account. Re-run once there
-      is real headroom; the resumable driver script's design means a future attempt resumes
-      rather than restarts.
-- [ ] **`development/architecture.md`'s memory-envelope section (WS6.6) was never
-      written** — directly downstream of WS6.1 above not existing yet; there is no idle-trim
-      behavior to document. Write this once WS6.1 is implemented, not before (documenting a
-      memory envelope for a trim mechanism that doesn't exist would be describing something
-      that isn't true).
+- [ ] **`tests/test_server.py`'s remaining tests, re-attempted 2026-09-13 (2nd session,
+      Docker up)**: a one-test-per-subprocess resumable driver got through **79/193** (56
+      passed, 23 failed) before the *harness itself* killed the whole background process
+      for low system memory — not the driver's own safety check, which had been passing.
+      Re-ran one failure alone right after (`test_alembic_brings_schema_to_head`) and it
+      **passed clean** — strong evidence the 23 are the same documented class of false
+      failure as Probleme.md #167 (a DB fixture's teardown timing out under memory
+      pressure, not a real bug), but a retry batch for the other 22 couldn't even start a
+      single test before being killed again, so only that one is actually *confirmed* a
+      flake. The 22 still-unconfirmed names (all `test_server.py::`, mostly clustered
+      around `push_commit`/`list_commits`/`get_ref`/`gc`):
+      `test_protected_mode_gates_writes_too_not_just_reads`,
+      `test_push_commit_stamps_authenticated_username_as_author`,
+      `test_push_commit_respects_explicit_author_from_authenticated_user`,
+      `test_owner_shared_secret_stamps_owner_as_author`,
+      `test_anonymous_mode_keeps_author_untouched`,
+      `test_push_commit_then_get_commit_roundtrip`,
+      `test_list_commits_omits_tree_by_default`,
+      `test_list_commits_include_layers_matches_get_commit`,
+      `test_list_commits_include_layers_handles_a_commit_with_no_tree`,
+      `test_list_commits_include_layers_resolves_all_roots_in_one_shared_call`,
+      `test_push_commit_duplicate_returns_409`, `test_push_commit_rejects_oversized_tree`,
+      `test_push_commit_rejects_too_many_tags`, `test_push_commit_rejects_oversized_tag`,
+      `test_push_commit_rejects_too_many_metrics`,
+      `test_push_commit_rejects_oversized_message`, `test_update_ref_then_get_ref_roundtrip`,
+      `test_list_refs_filters_by_project_id`, `test_dashboard_summary_and_projects_endpoints`,
+      `test_gc_respects_grace_period_then_sweeps_when_aged`,
+      `test_merge_commit_round_trips_both_parents`,
+      `test_single_parent_commit_reports_one_parent`. Re-run these 22 specifically first on
+      a future attempt (fastest path to confirming they're all flakes too) before touching
+      the other 114 never-yet-reached tests. Root cause unchanged from before: this box's
+      free RAM sat at 0.3-0.5GB throughout, mostly consumed by Docker's own `vmmem` WSL VM
+      (~490-520MB) plus this session's own `claude` process(es) (up to ~625MB combined) —
+      not something a smaller test batch works around, since even a single subprocess
+      couldn't get a safe memory floor on the second retry attempt.
+- [ ] **The full `development/BENCHMARKS.md` re-capture (still `a73ebde`/v1.4.0.2-era, now
+      badly stale)** — attempted same session as above; a memory-checking driver correctly
+      refused to even start the *cheapest* of the 9 named benchmarks (`hashing_throughput`,
+      no server/subprocess tools needed), measuring 308MB free against its own 400MB safety
+      floor. Never actually ran anything, so no data to salvage or resume from — a clean
+      re-attempt from scratch once there's real headroom. git-lfs 3.7.1/dvc/mlflow are all
+      confirmed present on PATH and the live registry stack is confirmed up+healthy, so
+      nothing else blocks this besides free memory.
 
 ### Future testing not in scope for current plans
 

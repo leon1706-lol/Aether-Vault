@@ -19,7 +19,7 @@ INFRASTRUCTURE_MD = REPO_ROOT / "development" / "infrastructure.md"
 CI_BUDGETS = REPO_ROOT / ".github" / "ci-budgets.yml"
 
 _WORKFLOW_FILES = ["tests.yml", "security.yml", "codeql.yml", "nightly.yml",
-                   "release.yml", "docker-edge.yml"]
+                   "release.yml", "docker-edge.yml", "benchmarks.yml"]
 
 
 def _load_workflow(name: str) -> dict:

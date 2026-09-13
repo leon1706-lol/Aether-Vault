@@ -44,11 +44,19 @@ def get_version() -> str:
         return "dev"
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str, *, durable: bool = True) -> None:
     """Write text to `path` atomically (write to a temp file in the same dir, then replace).
 
     Prevents a crash mid-write from leaving a truncated/corrupt file: readers always see
     either the old or the new complete content. os.replace is atomic on POSIX and Windows.
+
+    `durable=False` (V1.6.0, WS4.8) skips the `fsync` -- still atomic (a crash mid-write
+    never leaves a truncated/corrupt file, since `os.replace` only ever sees a fully-written
+    temp file), just not guaranteed to survive a power loss between the write and the next
+    fsync of *something* in this directory. Only for data a crash can always regenerate by
+    redoing the operation, e.g. `av clone`'s commit-file writes (measured ~16 ms/file here,
+    ~8 s for 500 commits) -- never for a local commit, whose fsync is the durability
+    guarantee the whole product promises.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # Short random suffix (not pid + full uuid4 hex): commit filenames are already a 64-char
@@ -59,16 +67,17 @@ def atomic_write_text(path: Path, text: str) -> None:
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
         if tmp.exists():
             tmp.unlink()
 
 
-def atomic_write_json(path: Path, data) -> None:
-    atomic_write_text(path, json.dumps(data, indent=2))
+def atomic_write_json(path: Path, data, *, durable: bool = True) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2), durable=durable)
 
 
 def atomic_write_json_compact(path: Path, data) -> None:

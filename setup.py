@@ -2,7 +2,9 @@ import base64
 import csv
 import hashlib
 import io
+import os
 import shutil
+import stat
 import sys
 import sysconfig
 import zipfile
@@ -89,7 +91,12 @@ class BuildExtWithLauncher(_pybind11_build_ext):
 
     Best-effort and NEVER fatal to the overall build -- `aether_core` (the extension every
     test in this repo depends on) must always build even if the launcher's own compiler
-    toolchain probe fails for some reason.
+    toolchain probe fails for some reason -- UNLESS `AV_REQUIRE_LAUNCHER=1` is set (release
+    builds, and any CI job whose whole point is proving the native exe actually compiles):
+    then a build failure re-raises instead of silently falling back, so it fails loudly with
+    the real compiler diagnostic instead of shipping (or, worse in CI, quietly testing) a
+    shim nobody asked for. Never set for an ordinary dev `pip install -e .` -- a broken/
+    missing toolchain there must still leave a working `av-py`.
     """
 
     def run(self):
@@ -97,6 +104,8 @@ class BuildExtWithLauncher(_pybind11_build_ext):
         try:
             self._build_launcher()
         except Exception as exc:  # pragma: no cover - best-effort, see class docstring
+            if os.environ.get("AV_REQUIRE_LAUNCHER", "").strip().lower() in ("1", "true", "yes"):
+                raise
             print(f"warning: native av launcher build failed, av will be the pure-Python "
                   f"shim: {exc}", file=sys.stderr)
             self._record_shim_artifact()
@@ -188,8 +197,24 @@ class BuildExtWithLauncher(_pybind11_build_ext):
                 scripts_dir.mkdir(parents=True, exist_ok=True)
                 dest_native = scripts_dir / av_native_name
                 dest_av = scripts_dir / exe_name
-                shutil.copy2(artifact_path, dest_native)
-                shutil.copy2(artifact_path, dest_av)
+                if is_binary:
+                    shutil.copy2(artifact_path, dest_native)
+                    shutil.copy2(artifact_path, dest_av)
+                else:
+                    # The shim's `#!python` first line is a placeholder a real wheel
+                    # install rewrites via pip's own `fix_script()` (see `_PY_SHIM`'s
+                    # comment) -- a raw `shutil.copy2` here never goes through that, so an
+                    # editable install whose native build fell back to this shim left a
+                    # `#!python` literal on disk. The kernel's shebang parser takes that as
+                    # a path relative to cwd, not a PATH lookup -- when run from a checkout
+                    # that happens to contain a `python/` directory (this one does), exec
+                    # hits that directory and fails with "bad interpreter: Permission
+                    # denied" instead of running at all (found live: `launcher-native-posix`
+                    # CI, both POSIX runners, whenever the native compile doesn't succeed).
+                    # Rewriting to the real interpreter path here matches what pip would
+                    # have done, so the shim is actually invokable the same way `av-py` is.
+                    self._write_shim(artifact_path, dest_native)
+                    self._write_shim(artifact_path, dest_av)
                 if not _IS_MSVC:
                     # Executable bit -- needed regardless of `is_binary`: a POSIX shebang
                     # text script must be +x to be directly invokable exactly like a real
@@ -203,6 +228,17 @@ class BuildExtWithLauncher(_pybind11_build_ext):
                 last_exc = exc
         print(f"native av launcher: could not copy to any interpreter scripts dir "
               f"({last_exc}) -- av-native/av unavailable this build", file=sys.stderr)
+
+    @staticmethod
+    def _write_shim(src: Path, dest: Path) -> None:
+        """Copies the `#!python` text shim, rewriting that first line to this build's real
+        interpreter path -- see the call site's comment for why a plain `shutil.copy2`
+        leaves it non-invokable outside a real wheel install."""
+        text = src.read_text(encoding="utf-8")
+        first, _, rest = text.partition("\n")
+        if first.strip() == "#!python":
+            text = f"#!{sys.executable}\n{rest}"
+        dest.write_text(text, encoding="utf-8", newline="\n")
 
     def _record_shim_artifact(self):
         # Windows specifically: a bare `.py` text file named `av` (no `.exe`) is not
@@ -316,10 +352,13 @@ class WheelWithNativeLauncher(_bdist_wheel or object):
 
             new_info = zipfile.ZipInfo(data_arcname, date_time=fallback_date)
             new_info.compress_type = zipfile.ZIP_DEFLATED
-            # Executable bit for owner/group/other -- matches what pip's own installer
-            # (zip_item_is_executable / set_extracted_file_to_default_mode_plus_executable)
-            # expects to find on a script-scheme entry it should mark +x after extracting.
-            new_info.external_attr = (0o755 if is_binary else 0o755) << 16
+            # Real bug (found live via `smoke-wheel-linux`'s "Permission denied", not a
+            # shebang problem): pip's `zip_item_is_executable()` requires the upper 16 bits
+            # of `external_attr` to be a full Unix `st_mode` -- `stat.S_ISREG(mode)` on just
+            # `0o755` is False (no S_IFREG file-type bits set at all), so pip's installer
+            # silently skipped the post-extract chmod +x and every installed wheel's `av`
+            # came out non-executable. Must OR in `stat.S_IFREG`, not just the permission bits.
+            new_info.external_attr = (stat.S_IFREG | 0o755) << 16
             dst.writestr(new_info, payload)
             record_rows.append(self._record_row(data_arcname, payload))
 

@@ -74,7 +74,12 @@ docker = ["PyYAML>=6.0"]
 # (envelope/event/run/webhook-payload/semdiff/.avh) instead of the hand-rolled structural
 # checks — runtime code still falls back to those when jsonschema isn't importable, so the
 # installed package stays dependency-free; CI (this extra) always exercises the strict path.
-dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0", "httpx>=0.24.0", "jsonschema>=4.0", "PyYAML>=6.0"]
+# `build` (PEP 517 frontend): tests/test_wheel_packaging.py shells out to `python -m
+# build --wheel` to inspect the real artifact (native launcher injection, no `av`
+# console-script stub, RECORD hashes) -- V1.6.0 added those tests but never added the
+# dependency they need, so the "test" CI job passed `[dev]` without it and every one
+# failed with "No module named build" (found live, this pass).
+dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0", "httpx>=0.24.0", "jsonschema>=4.0", "PyYAML>=6.0", "build>=1.0.0"]
 benchmarks = ["dvc>=3.55,<4", "mlflow>=2.16"]
 # v1.3.3: SSO (OIDC) — authlib does the OAuth2/OIDC protocol work (PKCE, JWKS-based ID
 # token verification); pyjwt[crypto] is used directly for the device-code flow's own

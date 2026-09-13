@@ -41,6 +41,12 @@ from .daemon_protocol import (
 
 IDLE_TIMEOUT_SECONDS = 900
 MAX_CONSECUTIVE_INTERNAL_ERRORS = 3
+# V1.6.0 (WS6.1): seconds of inactivity before the idle-trim watchdog releases what it can
+# back to the OS -- separate from IDLE_TIMEOUT_SECONDS (which exits the process entirely).
+# A long-lived auto-spawned daemon's memory only ever grew before this; a modest default
+# means most real idle gaps between commands (a human reading output, a training epoch)
+# actually trigger it, not just the eventual full shutdown.
+DEFAULT_TRIM_AFTER_SECONDS = 30.0
 # The real allowlist filtering happens client-side now (daemon_client.call_daemon, before a
 # single byte goes on the wire) -- see daemon_common.allowlisted_env's docstring for why.
 # Re-exported here, and re-applied in _execute() below, purely as defense in depth: never
@@ -68,6 +74,14 @@ class DaemonServer:
         self._stop = threading.Event()
         self.requests_served = 0
         self.started_at = time.time()
+        # V1.6.0 (WS6.1): idle-trim state. `_trim_after_secs` reads the env once at daemon
+        # startup (not per-check) -- a daemon's env doesn't change over its own lifetime.
+        try:
+            self._trim_after_secs = float(os.environ.get("AV_DAEMON_TRIM_SECS", "") or DEFAULT_TRIM_AFTER_SECONDS)
+        except ValueError:
+            self._trim_after_secs = DEFAULT_TRIM_AFTER_SECONDS
+        self._trimmed_at: float | None = None
+        self.trim_count = 0
 
     # -- self-check / staleness -------------------------------------------------
 
@@ -133,6 +147,7 @@ class DaemonServer:
                 return build_error_response(f"internal: {exc}")
         finally:
             self._exec_lock.release()
+            self.refresh_state_file()  # requests_served/uptime_s/rss_mb for `daemon status`
 
     def _execute(self, request: dict) -> dict:
         from .main import cli  # heavy import -- fine here, the daemon pays it once at startup
@@ -192,9 +207,11 @@ class DaemonServer:
         return False
 
     def write_state_file(self, endpoint: str) -> None:
+        self._endpoint = endpoint
         state = {
             "pid": os.getpid(), "started_at": self.started_at, "protocol": PROTOCOL_VERSION,
             "cli_version": self.cli_version, "repo_root": str(self.repo_root), "endpoint": endpoint,
+            **self._live_status_fields(),
         }
         path = daemon_common.state_file(self.repo_root, PROTOCOL_VERSION, self.cli_version)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -216,11 +233,133 @@ class DaemonServer:
         tmp.write_text(json.dumps(state), encoding="utf-8")
         os.replace(tmp, path)
 
+    def refresh_state_file(self) -> None:
+        """Re-writes the state file with current `_live_status_fields()` -- called after
+        each served request and after each idle trim, so `av daemon status` (which just
+        reads this file, never talks to the running daemon) reflects something more recent
+        than "whatever was true at startup". Best-effort: a daemon mid-shutdown racing its
+        own `cleanup_state_files()` just means this recreates a file about to be removed
+        anyway, not a correctness issue."""
+        with contextlib.suppress(OSError, AttributeError):
+            self.write_state_file(self._endpoint)
+
+    def _live_status_fields(self) -> dict:
+        fields: dict = {
+            "uptime_s": round(time.time() - self.started_at, 3),
+            "requests_served": self.requests_served,
+            "trimmed": self.trim_count > 0,
+        }
+        rss_mb = _process_rss_mb()
+        if rss_mb is not None:
+            fields["rss_mb"] = rss_mb
+        return fields
+
+    # -- idle trim --------------------------------------------------------------
+
+    def maybe_trim_idle(self) -> bool:
+        """Best-effort memory trim once per idle period, armed again only by the next
+        served request. Never contends with a real command: a non-blocking lock acquire
+        means a request that arrives mid-trim just finds nothing to skip (the trim either
+        already finished or backed off), and a trim that can't get the lock simply retries
+        on the watchdog's next tick."""
+        if self.idle_seconds() < self._trim_after_secs:
+            return False
+        if self._trimmed_at is not None and self._trimmed_at >= self._last_activity:
+            return False  # already trimmed during this idle stretch
+        if not self._exec_lock.acquire(timeout=0):
+            return False
+        try:
+            with contextlib.suppress(ImportError):
+                import aether_core
+
+                aether_core.release_pool()
+            import gc
+
+            gc.collect()
+            _malloc_trim()
+            self._trimmed_at = time.monotonic()
+            self.trim_count += 1
+        finally:
+            self._exec_lock.release()
+        self.refresh_state_file()
+        return True
+
     def cleanup_state_files(self) -> None:
         path = daemon_common.state_file(self.repo_root, PROTOCOL_VERSION, self.cli_version)
         for p in (path, path.with_suffix(".key")):
             with contextlib.suppress(OSError):
                 p.unlink()
+
+
+def _malloc_trim() -> None:
+    """Hands freed heap pages back to the OS on glibc Linux -- the piece `gc.collect()`
+    alone can't do, since CPython's own allocator (and glibc's under it) is free to keep
+    memory it once used mapped for reuse. A no-op everywhere else (musl, macOS, Windows):
+    best-effort, never a reason to fail the trim."""
+    if not sys.platform.startswith("linux"):
+        return
+    with contextlib.suppress(OSError, AttributeError):
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+
+
+def _process_rss_mb() -> float | None:
+    """This process' resident set size in MiB, or None when it can't be determined --
+    `av daemon status`'s `rss_mb` field, and the number the idle trim exists to shrink."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            class _ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            # Real bug (found live, manual scratch-repo pass): without explicit
+            # argtypes/restype, ctypes marshals `GetCurrentProcess()`'s pseudo-handle
+            # (conceptually -1, i.e. all bits set) as a 32-bit int and zero-extends it to
+            # 64 bits instead of sign-extending -- `GetProcessMemoryInfo` then rejects that
+            # truncated value with ERROR_INVALID_HANDLE and this returned None on every
+            # single call. `wintypes.HANDLE` makes both calls marshal pointer-sized values.
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.GetCurrentProcess.argtypes = []
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(_ProcessMemoryCounters), wintypes.DWORD,
+            ]
+
+            counters = _ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
+            handle = kernel32.GetCurrentProcess()
+            if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                return None
+            return round(counters.WorkingSetSize / (1024 * 1024), 1)
+        if sys.platform == "darwin":
+            import resource
+
+            # macOS reports ru_maxrss in bytes (Linux reports KiB -- irrelevant here since
+            # Linux takes the /proc/self/statm path below instead).
+            return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024), 1)
+        # Linux: resident set = field 2 (0-indexed 1) of /proc/self/statm, in pages.
+        with open("/proc/self/statm", encoding="ascii") as f:
+            resident_pages = int(f.read().split()[1])
+        page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        return round(resident_pages * page_size / (1024 * 1024), 1)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -241,10 +380,14 @@ def _start_should_stop_watchdog(server: DaemonServer, check_interval: float = 2.
     `os._exit()` (not `sys.exit()`) because the main thread may be blocked in a C-level
     blocking call it cannot be interrupted out of -- cleanup runs here, in the watchdog,
     since the main thread's own `finally` block will never get a chance to.
+
+    V1.6.0 (WS6.1): the same 2s tick also drives `maybe_trim_idle()` -- one thread, one
+    cadence, for both "should this process exit" and "should this process shrink" checks.
     """
     def _watch():
         while not server.should_stop():
             time.sleep(check_interval)
+            server.maybe_trim_idle()
         server.cleanup_state_files()
         os._exit(0)
 

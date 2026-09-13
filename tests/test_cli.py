@@ -1992,10 +1992,22 @@ def test_auth_doctor_flags_rejected_token(repo, monkeypatch):
 # auto-update check at process exit.
 # ---------------------------------------------------------------------------
 
-def test_run_calls_maybe_auto_update_exactly_once_after_cli_exits(monkeypatch):
+def _enable_auto_update_on_disk(monkeypatch, tmp_path) -> None:
+    """`run()`'s finally now decides whether to even import `update_check` via a cheap raw
+    read of the user config (V1.6.0, WS2.1) instead of always calling `maybe_auto_update()`
+    and letting IT decide -- these tests exercise that call, so the on-disk flag it gates on
+    must say yes first."""
+    import python.av_cli.fsutil as fsutil_module
+
+    monkeypatch.setattr(fsutil_module, "USER_CONFIG_DIR", tmp_path)
+    (tmp_path / "config.json").write_text('{"auto_update": true}', encoding="utf-8")
+
+
+def test_run_calls_maybe_auto_update_exactly_once_after_cli_exits(monkeypatch, tmp_path):
     import python.av_cli.main as main_module
     import python.av_cli.update_check as update_check_module
 
+    _enable_auto_update_on_disk(monkeypatch, tmp_path)
     calls = []
 
     def fake_cli(*a, **k):
@@ -2010,9 +2022,33 @@ def test_run_calls_maybe_auto_update_exactly_once_after_cli_exits(monkeypatch):
     assert calls == [1]
 
 
-def test_run_swallows_a_failing_auto_update_check_without_changing_exit_code(monkeypatch):
+def test_run_skips_maybe_auto_update_when_not_opted_in_on_disk(monkeypatch, tmp_path):
+    """The common case: no user config at all (or `auto_update` false/absent) -- `run()`
+    never even imports `update_check`, let alone calls into it."""
+    import python.av_cli.fsutil as fsutil_module
     import python.av_cli.main as main_module
     import python.av_cli.update_check as update_check_module
+
+    monkeypatch.setattr(fsutil_module, "USER_CONFIG_DIR", tmp_path)  # no config.json at all
+
+    def fake_cli(*a, **k):
+        raise SystemExit(0)
+
+    calls = []
+    monkeypatch.setattr(main_module, "cli", fake_cli)
+    monkeypatch.setattr(update_check_module, "maybe_auto_update", lambda: calls.append(1))
+
+    with pytest.raises(SystemExit):
+        main_module.run()
+
+    assert calls == []
+
+
+def test_run_swallows_a_failing_auto_update_check_without_changing_exit_code(monkeypatch, tmp_path):
+    import python.av_cli.main as main_module
+    import python.av_cli.update_check as update_check_module
+
+    _enable_auto_update_on_disk(monkeypatch, tmp_path)
 
     def fake_cli(*a, **k):
         raise SystemExit(3)

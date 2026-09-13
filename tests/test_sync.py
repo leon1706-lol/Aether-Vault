@@ -494,6 +494,31 @@ def test_pull_fast_forwards_a_cloned_repo(fake_registry, tmp_path, monkeypatch):
     assert "Already up to date" in again.output
 
 
+def test_pull_never_calls_get_commit_uses_paginated_listing_instead(fake_registry, tmp_path, monkeypatch):
+    """V1.6.0 (WS4.8): `av pull` resolves new commits via the paginated `include_layers=true`
+    project listing now, not one `GET /api/commits/{hash}` per commit -- `get_commit` must
+    never be called at all for an ordinary (single-page) pull."""
+    source, fake = fake_registry["source"], fake_registry["fake"]
+    monkeypatch.chdir(tmp_path)
+    assert invoke("clone", "source", "workcopy").exit_code == 0
+    work = tmp_path / "workcopy"
+
+    monkeypatch.chdir(source)
+    (source / "train.py").write_text("print('v3')")
+    invoke("add", "train.py")
+    assert invoke("commit", "-m", "c3").exit_code == 0
+
+    calls = []
+    orig_get_commit = fake.get_commit
+    monkeypatch.setattr(fake, "get_commit", lambda *a, **k: calls.append(1) or orig_get_commit(*a, **k))
+
+    monkeypatch.chdir(work)
+    result = invoke("pull")
+    assert result.exit_code == 0, result.output
+    assert (work / "train.py").read_text() == "print('v3')"
+    assert calls == []
+
+
 def test_pull_refuses_dirty_tree_without_force(fake_registry, tmp_path, monkeypatch):
     source = fake_registry["source"]
     monkeypatch.chdir(tmp_path)
@@ -547,6 +572,53 @@ def test_pull_diverged_when_local_has_unpushed_commits(fake_registry, tmp_path, 
     # ref untouched; the fetched remote tip is available locally for av merge
     assert (work / ".av" / "refs" / "heads" / "main").read_text().strip() == diverged_tip
     assert (work / "train.py").read_text() == "print('local-only')"
+
+
+def test_clone_writes_commit_files_non_durably(fake_registry, tmp_path, monkeypatch):
+    """V1.6.0 (WS4.8): a clone can always be redone, so its commit-file writes skip the
+    fsync `write_fetched_commit` normally does -- `av pull`/`av merge` still get the
+    durable default (see the `sync.write_fetched_commit` calls in those two commands)."""
+    from python.av_cli import sync as sync_module
+
+    durables = []
+    orig = sync_module.write_fetched_commit
+
+    def _spy(repo_root, commit_data, *, durable=True):
+        durables.append(durable)
+        return orig(repo_root, commit_data, durable=durable)
+
+    monkeypatch.setattr(sync_module, "write_fetched_commit", _spy)
+    monkeypatch.chdir(tmp_path)
+    assert invoke("clone", "source", "workcopy").exit_code == 0
+
+    assert durables  # at least the seed commit was written
+    assert all(d is False for d in durables)
+
+
+def test_fetch_project_commits_pipelines_pages_and_preserves_order():
+    """V1.6.0 (WS4.8): page N+1 is requested before page N's rows are normalized -- a fake
+    client keyed purely on `offset` (ignoring `limit`) proves the pipelining doesn't
+    reorder or drop rows, and that pagination terminates on `next_offset: None`."""
+    from python.av_cli import sync as sync_module
+
+    h = lambda c: c * 64
+    pages = {
+        0: {"commits": [{"hash": h("a"), "parents": [], "timestamp": "3"},
+                        {"hash": h("b"), "parents": [], "timestamp": "2"}],
+            "next_offset": 2},
+        2: {"commits": [{"hash": h("c"), "parents": [], "timestamp": "1"}],
+            "next_offset": None},
+    }
+    calls = []
+
+    class _FakeClient:
+        def list_commits(self, project_id, limit=500, offset=0, include_layers=False):
+            calls.append(offset)
+            return pages.get(offset, {"commits": [], "next_offset": None})
+
+    commits = sync_module.fetch_project_commits(_FakeClient(), "proj")
+    assert [c["hash"] for c in commits] == [h("a"), h("b"), h("c")]
+    assert calls == [0, 2]
 
 
 def test_pull_detached_head_and_unreachable_server(fake_registry, tmp_path, monkeypatch):

@@ -89,19 +89,31 @@ def normalize_commit_row(row: dict) -> dict:
 
 
 def fetch_project_commits(client, project_id: str) -> list[dict]:
-    """Every commit of a project (metadata + resolved trees), newest first."""
+    """Every commit of a project (metadata + resolved trees), newest first.
+
+    V1.6.0 (WS4.8): page N+1's request is submitted before page N's rows are normalized, so
+    the network round trip for the next page overlaps with this page's (pure-CPU)
+    `normalize_commit_row` work instead of happening strictly after it -- at most one page
+    in flight ahead of the one being processed (two total), since the server is
+    single-worker and a deeper pipeline would just queue without helping.
+    """
     commits: list[dict] = []
-    offset = 0
-    while True:
-        page = client.list_commits(project_id, limit=500, offset=offset, include_layers=True)
-        if not page:
-            break
-        rows = page.get("commits", [])
-        commits.extend(normalize_commit_row(r) for r in rows)
-        next_offset = page.get("next_offset")
-        if next_offset is None or not rows:
-            break
-        offset = next_offset
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        next_future = pool.submit(client.list_commits, project_id, limit=500, offset=0,
+                                   include_layers=True)
+        while next_future is not None:
+            page = next_future.result()
+            next_future = None
+            if not page:
+                break
+            rows = page.get("commits", [])
+            next_offset = page.get("next_offset")
+            if next_offset is not None and rows:
+                next_future = pool.submit(client.list_commits, project_id, limit=500,
+                                           offset=next_offset, include_layers=True)
+            commits.extend(normalize_commit_row(r) for r in rows)
+            if next_offset is None or not rows:
+                break
     return commits
 
 
@@ -320,10 +332,15 @@ def is_ancestor(load_commit, ancestor_hash: str, descendant_hash: str) -> bool:
     return False
 
 
-def write_fetched_commit(repo_root: Path, commit_data: dict) -> None:
+def write_fetched_commit(repo_root: Path, commit_data: dict, *, durable: bool = True) -> None:
+    """Persists a commit fetched from the registry. `durable=False` (V1.6.0, WS4.8) skips
+    the fsync -- for `av clone`, where every commit file can always be re-fetched by
+    redoing the clone, unlike `av pull`/`av merge`'s writes (kept durable: those integrate
+    into a repo whose OWN un-pushed commits already made stronger promises)."""
     from .fsutil import atomic_write_json
 
-    atomic_write_json(repo_root / ".av" / "commits" / f"{commit_data['hash']}.json", commit_data)
+    atomic_write_json(repo_root / ".av" / "commits" / f"{commit_data['hash']}.json", commit_data,
+                       durable=durable)
 
 
 def load_local_commit(repo_root: Path, commit_hash: str) -> dict | None:

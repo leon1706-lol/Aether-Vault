@@ -62,3 +62,6 @@ workflows:
   docker-edge.yml:
     build-and-push-edge: 35       # estimated
     staging-smoke: 8              # estimated
+
+  benchmarks.yml:
+    capture: 45                   # estimated (9 benchmarks x repeat=3, warm + cold capture, + DVC/MLflow subprocess overhead)

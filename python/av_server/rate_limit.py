@@ -72,10 +72,16 @@ def bucket_class_for(path: str) -> str | None:
 class WindowRateLimiter:
     """Fixed-window counter keyed by (client_key, bucket_class)."""
 
+    # V1.6.0 (WS5.8): how often `check()` piggybacks a sweep of expired buckets, in
+    # wall-clock seconds of `_now_fn` time -- not every call, so the sweep's own O(n) cost
+    # stays amortized rather than paid on every single request.
+    _PRUNE_INTERVAL_SECONDS = 300.0
+
     def __init__(self, limits: dict[str, Limit | None], now_fn=time.monotonic):
         self._limits = limits
         self._now_fn = now_fn
         self._buckets: dict[tuple[str, str], tuple[int, float]] = {}
+        self._last_prune = now_fn()
 
     def check(self, client_key: str, bucket_class: str) -> int | None:
         """Records one hit. Returns retry-after seconds when over the limit, else None."""
@@ -83,8 +89,10 @@ class WindowRateLimiter:
         if limit is None:
             return None  # disabled class — pass through, record nothing
 
-        key = (client_key, bucket_class)
         now = self._now_fn()
+        self._maybe_prune(now)
+
+        key = (client_key, bucket_class)
         count, window_start = self._buckets.get(key, (0, now))
         if now - window_start >= limit.window_seconds:
             count, window_start = 0, now  # new window
@@ -99,9 +107,27 @@ class WindowRateLimiter:
             return max(1, math.ceil(remaining))
         return None
 
+    def _maybe_prune(self, now: float) -> None:
+        """Drops buckets whose window has already expired -- otherwise `_buckets` only ever
+        grows over a long server uptime with many distinct rate-limit keys (e.g. a widening
+        set of client hosts), since nothing else ever removes an entry. Safe at any time: an
+        expired-window entry pruned early is indistinguishable from one that was never
+        created yet -- the next hit for that key just starts a fresh window, identical to
+        today's behavior."""
+        if now - self._last_prune < self._PRUNE_INTERVAL_SECONDS:
+            return
+        self._last_prune = now
+        stale = [
+            key for key, (_, window_start) in self._buckets.items()
+            if now - window_start >= self._limits[key[1]].window_seconds
+        ]
+        for key in stale:
+            del self._buckets[key]
+
     def reset(self) -> None:
         """Test hook: clears all recorded windows."""
         self._buckets.clear()
+        self._last_prune = self._now_fn()
 
 
 def build_limiter_from_env(env: dict[str, str] | None = None) -> WindowRateLimiter:

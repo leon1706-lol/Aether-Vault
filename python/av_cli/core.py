@@ -1478,16 +1478,23 @@ def _finalize_commit(
     metrics = metrics or {}
     message = commit_data.get("message", "")
 
-    commit_str = json.dumps(commit_data, sort_keys=True)
-    commit_hash = hashlib.sha256(commit_str.encode()).hexdigest()
+    # V1.6.0 (WS2.6): hash over the SAME canonicalization `sign_payload`/`verify_signature`
+    # use (`signing.canonical_commit_bytes` -> `casobj.canonical_bytes`), instead of a second,
+    # ad-hoc `json.dumps(commit_data, sort_keys=True)` reimplementation of the identical
+    # sorted-keys rule -- one canonicalization implementation, not two that could drift (the
+    # same reasoning as WS4.1's single `CdcCutter`). Byte-identical to the old inline call:
+    # `commit_data` has neither `hash` nor `signature` yet, so `exclude=("signature",)` is a
+    # no-op here, and this commit's own `timestamp` (just set, always tz-aware UTC isoformat)
+    # round-trips unchanged through `canonical_commit_bytes`'s normalization.
+    from .signing import canonical_commit_bytes, sign_payload
+
+    commit_hash = hashlib.sha256(canonical_commit_bytes(commit_data)).hexdigest()
     commit_data["hash"] = commit_hash
 
     # --- Signed commits: auto-sign when an ed25519 key is configured ---
     # Signature covers the canonical sorted-keys JSON including the hash just computed,
     # excluding the signature itself. Best-effort: never blocks or fails a commit.
     try:
-        from .signing import sign_payload
-
         signature = sign_payload(commit_data, repo_root)
         if signature:
             commit_data["signature"] = signature

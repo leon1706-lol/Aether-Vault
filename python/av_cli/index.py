@@ -43,10 +43,11 @@ class Index:
         if auto_save:
             self.save()
 
-    def remove_entry(self, rel_path: str) -> None:
+    def remove_entry(self, rel_path: str, auto_save: bool = True) -> None:
         if rel_path in self.entries:
             del self.entries[rel_path]
-            self.save()
+            if auto_save:
+                self.save()
 
     def get_entry(self, rel_path: str) -> dict | None:
         return self.entries.get(rel_path)

@@ -205,6 +205,13 @@ AV_DAEMON  (unset = per-repo default; CLI-side)
 AV_DAEMON_DEBUG  (unset = silent; CLI-side, daemon_client.py)
                Non-empty, non-"0" → prints `[av daemon] ...` diagnostics to stderr for every
                daemon-path decision (state file missing, connect failed, MAC mismatch, ...).
+AV_DAEMON_TRIM_SECS  30  (default seconds; daemon-side, daemon.py, V1.6.1)
+               Idle threshold (separate from the 900s idle-timeout shutdown) after which the
+               daemon's own watchdog releases what it can back to the OS
+               (aether_core.release_pool()/gc.collect()/malloc_trim on glibc Linux) — once
+               per idle stretch, re-armed only by the next served request. Malformed values
+               fall back to the default rather than erroring. See architecture.md's Daemon
+               Contract "Idle trim" paragraph.
 AV_TEST_LAUNCHER  (unset = shutil.which("av-native"); test-only)
                Explicit path to a built native launcher exe, for `tests/test_launcher_native.py`
                (and anyone poking at it manually) when it isn't on PATH under the default name.
@@ -219,6 +226,14 @@ AV_LAUNCHER_EXE / AV_LAUNCHER_REPO / AV_LAUNCHER_DAEMON_RESULT  (internal — se
 AV_PYTHON  (unset = normal interpreter search; native launcher only)
                Explicit interpreter path the native launcher's fallback exec should use
                instead of searching for `av-py.exe`/`python.exe` next to itself.
+AV_REQUIRE_LAUNCHER  (unset = best-effort; build-time only, setup.py, V1.6.1)
+               1/true/yes → a native-launcher compile failure re-raises instead of silently
+               falling back to the pure-Python `#!python` shim, so the build fails loudly
+               with the real compiler diagnostic. Set in release.yml's CIBW_ENVIRONMENT and
+               tests.yml's launcher-native-posix job — never set for an ordinary dev
+               `pip install -e .`, where a broken/missing toolchain must still leave a
+               working `av-py`. See Probleme.md #168 for the bug this exists to catch loudly
+               instead of silently.
 AV_STAGE_FUSED  1  (default; CLI-side, core.py's _compute_stage_result)
                0/false/no → both fused single-read staging paths revert to their legacy
                multi-pass equivalents: CDC-chunked artifacts (av add) use
@@ -417,7 +432,7 @@ below for the automated proof of this.
 
 ## CI Job Map
 
-Every job across all 5 workflow files, grouped by which file defines it. `tests/test_ci_map.py`
+Every job across all 7 workflow files, grouped by which file defines it. `tests/test_ci_map.py`
 parses every workflow's real job ids AND this table's "Job(s)" column and fails if
 they ever disagree in either direction — a job added here with no doc row, or a doc row
 naming a job that no longer exists, both fail CI. Keep this table's job-id backticks exact.
@@ -499,6 +514,21 @@ from the release gate):
 |---|---|
 | `:edge`/`:server-edge`/`:webui-edge` images: scan-before-push gate, SBOM+provenance | `build-and-push-edge` |
 | Staging smoke: just-pushed `:edge` image, by digest, via `scripts/release_smoke.sh` | `staging-smoke` |
+
+**`benchmarks.yml`** — schedule (weekly) + `workflow_dispatch` only (same posture as
+`nightly.yml` — never produces a check-run for a specific commit, excluded from the
+release gate for the same reason):
+
+| Surface | Job(s) |
+|---|---|
+| Cross-tool benchmark capture (Git LFS/DVC/MLflow) against a live bare-metal registry stack, warm + `--no-daemon` cold; uploads `development/BENCHMARKS{,-cold}.md` + JSON snapshots as artifacts, never commits | `capture` |
+
+V1.6.1: added so the nine `av benchmark` rows still get run somewhere real on a schedule,
+independent of whether the maintainer's own dev box has enough free RAM (+ Docker up) at
+any given moment — see `todo.md`'s "Blocked by environment" history for why this needed
+solving. Re-capturing `development/BENCHMARKS.md` for a real release is still a manual
+step (download the artifact, review, commit) — this workflow only ever produces the raw
+numbers.
 
 Known residuals (deliberate): no Docker-daemon-dependent `av update --docker` flow test.
 Dependabot has been removed (config deleted, all open PRs closed); dependency freshness

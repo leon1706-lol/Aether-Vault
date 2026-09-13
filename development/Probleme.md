@@ -2027,3 +2027,47 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** added `unreachable_client` to the test's fixture list, matching the established pattern already used correctly elsewhere (e.g. `test_improver.py::test_register_without_server_queues`).
 
 **Verification:** `tests/test_canary.py` (9 tests) passes with the live Docker stack up; the specific test now deterministically exercises the offline path regardless of what's actually reachable on localhost:8000.
+
+
+### 168. The native-launcher fallback shim's `#!python` shebang was never rewritten for an editable install — broke every POSIX CI job that hit it
+
+**Severity:** 6/10 (silently non-functional `av`/`av-native` on any POSIX toolchain that can't build the native launcher — `launcher-native-posix`, `chaos-drills`, `e2e-suite` all failed on the v1.6.0 push) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `_PY_SHIM`'s first line (`#!python`) is a placeholder pip's own wheel installer rewrites to the real interpreter path at install time — but `_copy_to_interpreter_scripts_dir()`'s editable-install convenience path does a raw `shutil.copy2`, which never goes through pip's installer at all. The kernel's shebang parser then treats the literal string "python" as a path relative to cwd; from this repo's own root that resolves to the `python/` source directory, failing with "bad interpreter: Permission denied" or "cannot execute: required file not found".
+
+**Fix:** new `BuildExtWithLauncher._write_shim()` rewrites the shebang to `sys.executable` at copy time, mirroring what pip's `fix_script()` does for a real wheel install.
+
+**Verification:** `tests/test_setup_launcher_fallback.py` (new) unit-tests the rewrite directly against `setup.py`'s own helper (module loaded with `setuptools.setup` patched to a no-op, no real build needed).
+
+
+### 169. Wheel-injected `av`/`av.exe` was never actually executable — `external_attr` encoded permission bits without the file-type bits pip's installer checks for
+
+**Severity:** 6/10 (every wheel built by `WheelWithNativeLauncher` shipped a non-executable `av`; caught `smoke-wheel-linux` on the v1.6.0 push) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `_rewrite_wheel_with_extra_script()` set `new_info.external_attr = 0o755 << 16` for the injected script entry. Pip's own `zip_item_is_executable()` requires `stat.S_ISREG(mode)` to be true before it will `chmod +x` the extracted file — `0o755` alone carries no `S_IFREG` file-type bits, so that check silently failed and pip left the extracted `av` at its default (non-executable) mode. Installing the wheel and running `av` directly failed with a plain "Permission denied", not a shebang problem.
+
+**Fix:** `new_info.external_attr = (stat.S_IFREG | 0o755) << 16`.
+
+**Verification:** `tests/test_setup_launcher_fallback.py::test_injected_script_entry_is_recognized_as_executable_by_pip` builds a minimal fake wheel, runs the real injection code, and asserts pip's own `zip_item_is_executable()` (imported directly) accepts the result — confirmed the test fails without the fix by reverting it locally and re-running.
+
+
+### 170. `av daemon status`'s new `rss_mb` field silently never appeared on Windows — a ctypes handle got truncated, not sign-extended
+
+**Severity:** 4/10 (a new, purely observational field failing open to "absent" rather than crashing anything — found in the WS6.1 manual verification pass, not by a unit test) · **Status:** 🟢 `fixed` (2026-09-13).
+
+**Problem:** `_process_rss_mb()`'s Windows branch called `ctypes.windll.kernel32.GetCurrentProcess()`/`psapi.GetProcessMemoryInfo()` with no `argtypes`/`restype` declared. `GetCurrentProcess()`'s pseudo-handle is conceptually `-1` (every bit set); without an explicit `wintypes.HANDLE` return type, ctypes' default int marshaling zero-extended it to a 64-bit value with only the low 32 bits set instead of sign-extending it, and `GetProcessMemoryInfo` rejected that as `ERROR_INVALID_HANDLE` on every single call — silently swallowed by the function's blanket `except Exception: return None`.
+
+**Fix:** declared `wintypes.HANDLE`/`wintypes.BOOL`/`wintypes.DWORD` argtypes and restype on both calls.
+
+**Verification:** `tests/test_daemon.py::test_process_rss_mb_returns_a_real_positive_value_on_windows`; real manual scratch-repo session (`AV_DAEMON_TRIM_SECS=2`, real daemon, `av --output json daemon status` showing a real `rss_mb` before and after an idle trim).
+
+
+### 171. `run()`'s finally block always imported `update_check` on every single command, regardless of whether auto-update was ever opted into
+
+**Severity:** 3/10 (a real, unconditional cost on every `av` invocation for the overwhelming majority of users who never opt in; also the direct mechanism behind an intermittent `urllib.parse`-loaded CI failure in `test_import_graph.py`, though the exact trigger for that leak was not conclusively identified — see `development/CHANGELOG.md` Phase 70) · **Status:** 🟡 `partially fixed` (2026-09-13) — the unconditional-import cost is closed; the CI leak's root trigger remains open.
+
+**Problem:** the V1.5.0/V1.6.0 plan called for gating `update_check`'s import behind a cheap on-disk check for `auto_update: true`, but `main.py::run()`'s finally block always did `from . import update_check` (pulling in `packaging` unconditionally) and called `maybe_auto_update()` regardless — that function's own internal `cfg.get("auto_update", False)` check came too late to avoid the import cost, and when `auto_update` genuinely is `true`, `maybe_auto_update()` unconditionally force-fetches from PyPI (`check_for_update(force=True)`, skipping its own 12-hour cache) on every single command exit, not just periodically.
+
+**Fix:** `run()` now does a raw `USER_CONFIG_DIR/config.json` read (no `update_check` import at all) and only imports/calls into `update_check` when that file says `auto_update: true`.
+
+**Verification:** `tests/test_cli.py` (`test_run_skips_maybe_auto_update_when_not_opted_in_on_disk` new, the two existing `run()` tests updated to opt in on disk first); `tests/test_import_graph.py` still green. The force-fetch-every-command behavior for an opted-in user was not changed this pass — noted, not silently dropped.

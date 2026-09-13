@@ -522,12 +522,29 @@ def run() -> None:
     try:
         cli()
     finally:
-        from . import update_check
+        # V1.6.0 (WS2.1): a cheap raw read of the user config -- not a real `import
+        # update_check` -- decides whether there's anything to do at all. `update_check`'s
+        # own module scope imports `packaging`, and an opted-in `maybe_auto_update()` goes
+        # on to import `requests` (-> `urllib3`/`urllib.parse`) every single time: real cost
+        # this `finally` block used to pay on EVERY command, even a no-op `status`/`add`,
+        # regardless of whether the user ever opted in (the overwhelming common case is
+        # they haven't -- `auto_update` defaults False and nothing here sets it without an
+        # explicit `av update --enable-auto-update`).
+        from .fsutil import USER_CONFIG_DIR
 
         try:
-            update_check.maybe_auto_update()
-        except Exception:
-            pass
+            cfg_text = (USER_CONFIG_DIR / "config.json").read_text(encoding="utf-8")
+            auto_update_on = json.loads(cfg_text).get("auto_update", False)
+        except (OSError, ValueError):
+            auto_update_on = False
+
+        if auto_update_on:
+            from . import update_check
+
+            try:
+                update_check.maybe_auto_update()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

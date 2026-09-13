@@ -169,6 +169,17 @@ def daemon_status() -> None:
     click.echo(f"  protocol     : {status.get('protocol')}")
     click.echo(f"  repo_root    : {status.get('repo_root')}")
     click.echo(f"  endpoint     : {status.get('endpoint')}")
+    # V1.6.0 (WS6.1): populated once the daemon has served/refreshed its state file at
+    # least once; absent (not blank) on an older state file left by a not-yet-restarted
+    # daemon from before this field existed.
+    if "uptime_s" in status:
+        click.echo(f"  uptime_s     : {status['uptime_s']}")
+    if "requests_served" in status:
+        click.echo(f"  requests     : {status['requests_served']}")
+    if "rss_mb" in status:
+        click.echo(f"  rss_mb       : {status['rss_mb']}")
+    if "trimmed" in status:
+        click.echo(f"  trimmed      : {status['trimmed']}")
 
 
 @daemon.command("restart")

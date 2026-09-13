@@ -31,6 +31,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 ## Known Limitations
 
 - **Perf #4 (no-op status/add)** — ~7x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
+- **The benchmark suite can't currently be run on this project's own dev box** — it needs the live Docker registry stack up, git-lfs/DVC/MLflow all installed, and enough free RAM for the `av` subprocesses `av benchmark` itself spawns, and this box's memory has repeatedly not covered that combination even with Docker running and nothing else in flight. `.github/workflows/benchmarks.yml` runs it on a GitHub-hosted runner instead (weekly schedule + on-demand `workflow_dispatch`) — see [`benchmarks/README.md`](benchmarks/README.md#where-a-real-capture-actually-runs-v161) for where to download a capture.
 
 ## Table of Contents
 
@@ -207,7 +208,7 @@ and how it's wired in, this table is the index.
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
 | `python/av_plugins/` | Lightning / Transformers / MLflow / vanilla PyTorch auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
-| `tests/` | 1,916-test suite across 82 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
+| `tests/` | 1,916-test suite across 83 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
@@ -308,13 +309,13 @@ av import-pytorch path/to/epoch12.pt --tag backfill
 | 8 | Concurrent Push Throughput | Aether-only (7.6s / 8 pushes) | no competitor has a comparable concurrent-server primitive |
 | 9 | Garbage Collection Throughput | Aether-only (13.7s / 20 objects) | no competitor has a comparable server-side GC primitive |
 
-For full methodology, every raw number, and the rating legend, see [`development/BENCHMARKS.md`](development/BENCHMARKS.md).
+For full methodology, every raw number, and the rating legend, see [`development/BENCHMARKS.md`](development/BENCHMARKS.md) (product default: native launcher + auto-spawned daemon) and its cold-path counterpart, [`development/BENCHMARKS-cold.md`](development/BENCHMARKS-cold.md) (`--no-daemon`). Both are captured by `.github/workflows/benchmarks.yml` on a weekly schedule (also runnable on demand) rather than committed from a maintainer's own machine — see [`benchmarks/README.md`](benchmarks/README.md#where-a-real-capture-actually-runs-v161) for where to download a fresh capture.
 
 ---
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs 1,916 tests across 82 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
+The full suite (`av test` or `pytest tests/ -q`) runs 1,916 tests across 83 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
 
 ```bash
 av test                  # full suite

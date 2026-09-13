@@ -554,6 +554,99 @@ def test_should_stop_on_idle_timeout(repo):
     assert server.should_stop() is True
 
 
+# ---------------------------------------------------------------------------
+# WS6.1: idle-trim watchdog -- release_pool()/gc.collect()/malloc_trim after
+# AV_DAEMON_TRIM_SECS (default 30) idle, once per idle stretch.
+# ---------------------------------------------------------------------------
+
+def test_trim_after_secs_defaults_to_30(repo):
+    server = daemon_module.DaemonServer(repo, "test-version")
+    assert server._trim_after_secs == daemon_module.DEFAULT_TRIM_AFTER_SECONDS == 30.0
+
+
+def test_av_daemon_trim_secs_env_overrides_default(repo, monkeypatch):
+    monkeypatch.setenv("AV_DAEMON_TRIM_SECS", "5")
+    server = daemon_module.DaemonServer(repo, "test-version")
+    assert server._trim_after_secs == 5.0
+
+
+def test_av_daemon_trim_secs_malformed_falls_back_to_default(repo, monkeypatch):
+    monkeypatch.setenv("AV_DAEMON_TRIM_SECS", "not-a-number")
+    server = daemon_module.DaemonServer(repo, "test-version")
+    assert server._trim_after_secs == daemon_module.DEFAULT_TRIM_AFTER_SECONDS
+
+
+def test_maybe_trim_idle_does_nothing_before_the_threshold(repo):
+    server = daemon_module.DaemonServer(repo, "test-version")
+    server._trim_after_secs = 60.0
+    assert server.maybe_trim_idle() is False
+    assert server.trim_count == 0
+
+
+def test_watchdog_trims_after_idle(repo):
+    """The plan's own test name for this behavior: past the threshold, `maybe_trim_idle()`
+    actually trims -- once, not on every subsequent tick while still idle."""
+    server = daemon_module.DaemonServer(repo, "test-version")
+    server._trim_after_secs = 0.01
+    server._last_activity = time.monotonic() - 1.0  # well past the threshold
+
+    assert server.maybe_trim_idle() is True
+    assert server.trim_count == 1
+
+    # Still idle, no new activity -- must not trim again.
+    assert server.maybe_trim_idle() is False
+    assert server.trim_count == 1
+
+
+def test_maybe_trim_idle_rearms_after_new_activity(repo):
+    server = daemon_module.DaemonServer(repo, "test-version")
+    server._trim_after_secs = 0.01
+    server._last_activity = time.monotonic() - 1.0
+    assert server.maybe_trim_idle() is True
+
+    server._last_activity = time.monotonic()  # a request just came in
+    assert server.maybe_trim_idle() is False  # not idle long enough yet
+    time.sleep(0.02)  # real time passes -- past the threshold again
+    assert server.maybe_trim_idle() is True  # idle again -> trims again
+    assert server.trim_count == 2
+
+
+def test_maybe_trim_idle_skips_while_a_request_is_in_flight(repo):
+    server = daemon_module.DaemonServer(repo, "test-version")
+    server._trim_after_secs = 0.01
+    server._last_activity = time.monotonic() - 1.0
+    server._exec_lock.acquire()  # simulate a command mid-execution
+    try:
+        assert server.maybe_trim_idle() is False
+        assert server.trim_count == 0
+    finally:
+        server._exec_lock.release()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises the win32 ctypes path specifically")
+def test_process_rss_mb_returns_a_real_positive_value_on_windows():
+    """Real bug (found live in a manual scratch-repo pass): without explicit
+    argtypes/restype, ctypes truncated `GetCurrentProcess()`'s pseudo-handle and
+    `GetProcessMemoryInfo` rejected it with ERROR_INVALID_HANDLE every single call --
+    `rss_mb` silently never appeared in `av daemon status` on Windows at all."""
+    rss = daemon_module._process_rss_mb()
+    assert rss is not None
+    assert rss > 0
+
+
+def test_maybe_trim_idle_updates_status_fields(repo):
+    server = daemon_module.DaemonServer(repo, "test-version")
+    server._trim_after_secs = 0.01
+    server._last_activity = time.monotonic() - 1.0
+    server.write_state_file("fake-endpoint")
+
+    server.maybe_trim_idle()
+
+    path = daemon_common.state_file(server.repo_root, daemon_module.PROTOCOL_VERSION, "test-version")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["trimmed"] is True
+
+
 def test_allowlisted_env_only_forwards_expected_keys():
     env = {
         "AV_THREADS": "4", "PATH": "/usr/bin", "HOME": "/home/x",

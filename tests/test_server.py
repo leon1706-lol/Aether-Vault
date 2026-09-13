@@ -982,7 +982,7 @@ def test_alembic_brings_schema_to_head(db):
             await conn.close()
 
     version, tables = asyncio.run(_probe())
-    assert version == "0016"  # current migration head — bump alongside new revisions
+    assert version == "0017"  # current migration head — bump alongside new revisions
     assert {"objects", "trees", "commits", "refs", "alembic_version"} <= tables
     assert {"extra_parents"} <= _pg_columns("commits")
     assert {"chunks"} <= _pg_columns("trees")
@@ -1120,7 +1120,7 @@ def test_legacy_database_is_healed_and_stamped(db):
         finally:
             await conn.close()
 
-    assert asyncio.run(_version()) == "0016"  # stamps to CURRENT head, not a hardcoded rev
+    assert asyncio.run(_version()) == "0017"  # stamps to CURRENT head, not a hardcoded rev
 
 
 def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
@@ -1162,7 +1162,7 @@ def test_migration_chain_downgrades_and_reupgrades_cleanly(db):
         command.upgrade(cfg, "head")
 
         version = asyncio.run(_version_after())
-        assert version == "0016"
+        assert version == "0017"
         tables_at_head = asyncio.run(_tables())
         assert {"objects", "trees", "commits", "refs", "runs", "webhooks",
                 "audit_log", "webhook_deliveries", "events",

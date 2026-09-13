@@ -56,6 +56,42 @@ def test_index_operations(tmp_path):
     idx.remove_entry("model.pt")
     assert "model.pt" not in idx.entries
 
+def test_index_remove_entry_auto_save_false_batches_the_save(tmp_path):
+    """V1.6.0 (WS2.7): `remove_entry` gained the same `auto_save` batching option
+    `add_entry` already had -- a caller removing several entries in one pass can defer the
+    disk write until the last one instead of saving on every single removal."""
+    idx = Index(tmp_path)
+    idx.add_entry("a.pt", "hash-a", 1, 1, "artifact", auto_save=False)
+    idx.add_entry("b.pt", "hash-b", 1, 1, "artifact", auto_save=False)
+    idx.save()
+
+    idx.remove_entry("a.pt", auto_save=False)
+    # In-memory state is updated immediately regardless of auto_save...
+    assert "a.pt" not in idx.entries
+    # ...but nothing was written to disk yet -- a fresh load still sees the old entry.
+    assert "a.pt" in Index(tmp_path).entries
+
+    idx.remove_entry("b.pt", auto_save=False)
+    idx.save()
+    reloaded = Index(tmp_path)
+    assert "a.pt" not in reloaded.entries
+    assert "b.pt" not in reloaded.entries
+
+
+def test_index_remove_entry_default_still_saves_immediately(tmp_path):
+    idx = Index(tmp_path)
+    idx.add_entry("a.pt", "hash-a", 1, 1, "artifact")
+    idx.remove_entry("a.pt")  # default auto_save=True, unchanged behavior
+    assert "a.pt" not in Index(tmp_path).entries
+
+
+def test_index_remove_entry_missing_key_is_a_no_op_and_never_saves(tmp_path, monkeypatch):
+    idx = Index(tmp_path)
+    calls = []
+    monkeypatch.setattr(idx, "save", lambda: calls.append(1))
+    idx.remove_entry("never-added.pt")
+    assert calls == []
+
 
 def test_classify_lineage():
     assert classify_lineage("weights/epoch_50.safetensors") == "model"

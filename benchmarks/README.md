@@ -44,4 +44,34 @@ Benchmarks #8/#9 need the Docker registry stack running; #5's `av` column needs 
 too and otherwise reports "registry unreachable". Every `av` number is captured with the
 product default (native launcher + auto-spawned daemon, once those land — see `todo.md`);
 `--no-daemon` (or `AV_NO_DAEMON` leaking in from the calling shell) is called out
-explicitly in the captured report rather than silently changing what was measured.
+explicitly in the captured report rather than silently changing what was measured. The
+`--no-daemon` capture's own report is `development/BENCHMARKS-cold.md` — a separate file,
+not a section of `development/BENCHMARKS.md`.
+
+## Where a real capture actually runs (V1.6.1)
+
+**Known limitation, not by design**: the full 9-benchmark suite currently cannot be run on
+this project's own dev box — it needs the live Docker registry stack up (Postgres+Redis+
+`av_server`) *and* git-lfs/DVC/MLflow all installed *and* enough free RAM for the `av`
+subprocesses `av benchmark` itself spawns, and this box's free memory has repeatedly not
+been enough for that combination even with Docker running and nothing else in flight (see
+`todo.md`'s "Blocked by environment" history for the specific numbers). `av doctor --speed`
+and `av test --speed` (synthetic, no external tools) still work locally regardless — it's
+specifically the cross-tool comparison suite that's blocked here.
+
+`.github/workflows/benchmarks.yml` exists so this still gets run somewhere real: a weekly
+scheduled job (also triggerable on demand via `workflow_dispatch`) that brings up its own
+live stack on a GitHub-hosted runner and captures both the warm and cold reports. It never
+commits `development/BENCHMARKS.md`/`BENCHMARKS-cold.md` back to the repo — download the
+result from the run itself:
+
+- **Web UI**: repo → **Actions** tab → **Benchmarks** (left sidebar) → the run you want →
+  scroll to **Artifacts** at the bottom of that run's page → `benchmark-capture` (a zip
+  containing both Markdown reports and both JSON snapshots). Kept 90 days.
+- **`gh` CLI**: `gh run list --workflow=benchmarks.yml` to find a run id, then
+  `gh run download <run-id> -n benchmark-capture` (or omit `-n` to grab every artifact on
+  that run).
+
+Review the download, then copy whichever files you want to keep into
+`development/BENCHMARKS.md`/`BENCHMARKS-cold.md` and commit by hand — same posture as
+`scripts/append_perf_history.py`'s own CI capture, which also never commits for you.
