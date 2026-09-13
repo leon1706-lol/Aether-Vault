@@ -277,7 +277,7 @@ def _fake_registry_client(monkeypatch, get_response=None, post_response=None):
         def get(self, url, params=None, timeout=None):
             return _FakeResponse(*get_response) if get_response else _FakeResponse(200, {})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             return _FakeResponse(*post_response) if post_response else _FakeResponse(200, {})
 
     class _FakeClient(client_module.VaultClient):

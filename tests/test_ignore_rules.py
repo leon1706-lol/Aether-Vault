@@ -50,6 +50,68 @@ def test_explicitly_avignore_negated_dir_inside_default_ignored_still_pruned_by_
     assert found == set()
 
 
+def test_explicit_repo_root_is_used_instead_of_cwd_based_resolution(tmp_path, monkeypatch):
+    """V1.6.0 (Probleme.md real bug): `iter_working_files()` used to always resolve the
+    ignore-rule context via `find_repo_root()` walking up from the *process's* CWD, never
+    from its own `root` argument -- exactly what happened to `speedcheck.py`'s synthetic
+    benchmarks (CWD = wherever the benchmark was invoked from, `root` = a disposable fixture
+    directory). Note this is NOT a *correctness* bug when `root` sits outside the CWD-found
+    repo (`_rel_posix()` catches the resulting `ValueError` and simply skips gitignore
+    matching for that path) -- it's a *cost* bug: `find_repo_root()` runs at all, and every
+    single walked entry pays a `Path.relative_to()` call that raises and is caught, instead
+    of the whole ignore-context resolution being skipped outright. That per-file exception
+    overhead, multiplied over a couple thousand files, is what inflated a measured "9x
+    regression" that had nothing to do with the walk algorithm itself. This test pins down
+    the actual mechanism of the fix: `find_repo_root()` must not even be called when the
+    caller supplies `repo_root=` explicitly."""
+    cwd_repo = tmp_path / "cwd-repo"
+    (cwd_repo / ".av").mkdir(parents=True)  # find_repo_root() only recognizes an .av marker
+    (cwd_repo / ".gitignore").write_text("*.secret\n")
+    monkeypatch.chdir(cwd_repo)
+
+    target_root = tmp_path / "target-repo"
+    _touch(target_root / "model.secret")
+
+    import python.av_cli.core as core_module
+
+    calls = []
+    real_find_repo_root = core_module.find_repo_root
+
+    def _spy():
+        calls.append(1)
+        return real_find_repo_root()
+
+    monkeypatch.setattr(core_module, "find_repo_root", _spy)
+
+    # Without repo_root=: falls back to find_repo_root() from CWD.
+    list(iter_working_files(target_root))
+    assert calls == [1], "find_repo_root() must be called exactly once when repo_root is omitted"
+
+    calls.clear()
+
+    # With repo_root=target_root: find_repo_root() must not run at all -- the explicit
+    # value is used as-is, avoiding both the CWD walk-up and the per-file relative_to()
+    # exception cost for paths outside whatever it would have found.
+    found_explicit = {str(p.relative_to(target_root)).replace("\\", "/")
+                      for p in iter_working_files(target_root, repo_root=target_root)}
+    assert calls == [], "find_repo_root() must not be called when repo_root is given explicitly"
+    assert "model.secret" in found_explicit  # target_root has no .gitignore of its own
+
+
+def test_explicit_repo_root_is_used_for_avignore_too(tmp_path, monkeypatch):
+    cwd_repo = tmp_path / "cwd-repo"
+    cwd_repo.mkdir()
+    (cwd_repo / ".avignore").write_text("*.dat\n")
+    monkeypatch.chdir(cwd_repo)
+
+    target_root = tmp_path / "target-repo"
+    _touch(target_root / "weights.dat")
+
+    found = {str(p.relative_to(target_root)).replace("\\", "/")
+             for p in iter_working_files(target_root, repo_root=target_root)}
+    assert "weights.dat" in found
+
+
 def test_gitignore_simple_pattern_matches_at_any_depth(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".gitignore").write_text("*.log\n")

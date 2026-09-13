@@ -193,6 +193,40 @@ class Repo:
                 "still_queued": len(still),
                 "reachable": True}
 
+    # -- fetch ------------------------------------------------------------------
+
+    def fetch(self, paths: list[str] | tuple = (), *, layers: list[str] | None = None,
+              fetch_all: bool = False) -> dict:
+        """Downloads the objects `paths` need at HEAD into `.av/objects`, without touching
+        the working tree. `layers` restricts a single layer-split path to just those named
+        layers; `fetch_all=True` prefetches everything HEAD's tree references, ignoring
+        `paths`. Mirrors `av fetch`'s CLI data payload exactly (both call the same
+        `av_cli.sync` primitives) -- `{"fetched": [{"path","hash","bytes"}],
+        "already_local": n, "bytes": n}`.
+        """
+        from av_cli.core import resolve_head_tree
+        from av_cli.exceptions import NetworkError
+        from av_cli import sync
+
+        rel_paths = []
+        for p in paths:
+            po = Path(p)
+            if not po.is_absolute():
+                po = self.path / po
+            rel_paths.append(str(po.resolve().relative_to(self.path)).replace(os.sep, "/"))
+
+        tree = resolve_head_tree(self.path)
+        try:
+            selected = sync.resolve_fetch_targets(
+                tree, rel_paths, fetch_all=fetch_all, layer_names=list(layers or []),
+            )
+            client = self._client()
+            return sync.download_selected_objects(self.path, client, selected)
+        except NetworkError as exc:
+            raise SDKError("unreachable_queued", str(exc)) from None
+        except AetherVaultException as exc:
+            raise SDKError("validation", str(exc)) from None
+
     # -- log ------------------------------------------------------------------
 
     def log(self, limit: int = 30, branch: str | None = None) -> list[dict]:

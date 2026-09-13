@@ -5,6 +5,7 @@ downloaded and hash-re-verified, so an archive is self-validating. Attestation
 anyone without the key, not asymmetric crypto or a trust network.
 """
 
+import datetime  # V1.6.0 (WS2.1): core.py no longer re-exports this via `import *`.
 import hashlib
 import hmac as hmac_mod
 import json
@@ -66,6 +67,35 @@ def _save_state(out_path, kind: str, state: dict) -> None:
     atomic_write_json(_state_path(out_path, kind), state)
 
 
+def _collect_exportable_object_hashes(commits: list[dict]) -> set[str]:
+    """Every object hash export should actually request from the server, across every
+    commit's tree.
+
+    V1.6.0 (Probleme.md real bug): a layer-split/CDC-chunked entry's *whole-file* hash is
+    never uploaded to the server at all (`push_objects` deliberately skips it, matching
+    `add()`'s storage-saving intent -- see core.py) -- requesting it here always 404'd,
+    silently inflating every export's "failed" object count for any project with split
+    artifacts even though nothing was actually wrong. A standalone, module-level function
+    (not a closure inside `export()`) specifically so this can be unit-tested against a
+    plain list of tree dicts, without a live registry.
+    """
+    hashes: set[str] = set()
+    for commit in commits:
+        for info in (commit.get("tree") or {}).values():
+            layers = info.get("layers") or []
+            chunks = info.get("chunks") or []
+            if layers or chunks:
+                for layer in layers:
+                    hashes.add(layer["hash"])
+                for chunk in chunks:
+                    hashes.add(chunk["hash"])
+            else:
+                h = info.get("hash")
+                if h:
+                    hashes.add(h)
+    return hashes
+
+
 @registry.command()
 @click.argument("out_dir")
 @click.option("--project", "project_id", default=None, help="Scope to one project.")
@@ -119,21 +149,7 @@ def export(out_dir: str, project_id: str | None, resume: bool) -> None:
     except Exception:
         manifest["runs"] = []
 
-    # unique object hashes referenced anywhere in the trees (+ layers/chunks):
-    hashes: set[str] = set()
-
-    def _walk(entry: dict):
-        for info in entry.values():
-            h = info.get("hash")
-            if h:
-                hashes.add(h)
-            for layer in info.get("layers") or []:
-                hashes.add(layer["hash"])
-            for chunk in info.get("chunks") or []:
-                hashes.add(chunk["hash"])
-
-    for c in manifest["commits"]:
-        _walk(c.get("tree") or {})
+    hashes = _collect_exportable_object_hashes(manifest["commits"])
 
     ok = failed = skipped = 0
     sorted_hashes = sorted(hashes)

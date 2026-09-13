@@ -85,7 +85,7 @@ def _install_fake(monkeypatch, reg: _FakeRegistry):
                 return _FakeResponse(200, {"matches": []})
             return _FakeResponse(404, {})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             body = json or {}
             if url.endswith("/api/improvers"):
                 iid = body.get("id") or reg._id("improver")

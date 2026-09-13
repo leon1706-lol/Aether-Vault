@@ -39,7 +39,7 @@ def _fake_client(monkeypatch, get_map=None, post_map=None):
                     return _FakeResponse(status, body)
             return _FakeResponse(404, {})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             for suffix, (status, body) in (post_map or {}).items():
                 if url.endswith(suffix):
                     return _FakeResponse(status, body)

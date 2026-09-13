@@ -80,26 +80,46 @@ def add(paths: tuple, threads: int | None) -> None:
         if path_obj.is_file():
             files_to_process.append(path_obj)
         elif path_obj.is_dir():
-            files_to_process.extend(iter_working_files(path_obj))
+            files_to_process.extend(iter_working_files(path_obj, repo_root=repo_root))
 
     from . import attributes
 
     attr_rules = attributes.load_attributes(repo_root)
 
-    # (rel_path, fpath, file_type, existing_entry, attr_flags) for every path actually
-    # worth considering -- pointer files never get staged. Built once, in the exact
+    # V1.6.0 (Probleme.md): two-phase split. Phase A below is a pure os.stat() comparison
+    # against the index for every candidate path -- the same short-circuit
+    # _compute_stage_result() would reach anyway, just moved earlier so a stat-unchanged
+    # file never pays for is_pointer_file()'s own exists()+is_file()+open()+read() (a real,
+    # per-file cost on every no-op `av add` before this change). Safe to skip the pointer
+    # check for a stat-unchanged file: content can't have been replaced by a pointer stub
+    # in the interim without also touching mtime, the same trust model compare_meta_safe
+    # already relies on everywhere else in this codebase (compute_status, this function's
+    # own downstream short-circuit). (rel_path, fpath, file_type, existing_entry,
+    # attr_flags) for every path that's new or genuinely changed, in the exact
     # deterministic order files_to_process already has (user's arg order, sorted within
     # each expanded directory -- see iter_working_files), so applying results in this same
     # order later is independent of how many threads computed them or which finished first.
     work: list[tuple[str, Path, str, dict | None, set]] = []
     for fpath in files_to_process:
+        rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
+        existing_entry = idx.get_entry(rel_path)
+        if existing_entry and compare_meta_safe(
+            str(fpath), existing_entry["size"], existing_entry["mtime_ns"]
+        ):
+            continue
         if is_pointer_file(fpath):
             continue
-        rel_path = str(fpath.relative_to(repo_root)).replace("\\", "/")
         work.append((
-            rel_path, fpath, idx.classify_file(rel_path), idx.get_entry(rel_path),
+            rel_path, fpath, idx.classify_file(rel_path), existing_entry,
             attributes.flags_for(attr_rules, rel_path),
         ))
+
+    if not work:
+        # Nothing to hash/split/chunk at all -- skip configure_native_threads() too, so a
+        # genuine no-op `av add` never pays for loading the aether_core extension either.
+        if current_output_mode() == "json":
+            emit_json(None, "add", data={"staged": [], "count": 0})
+        return
 
     resolved_threads = configure_native_threads(repo_root, threads)
     pool_size = python_pool_size(resolved_threads)
@@ -118,7 +138,13 @@ def add(paths: tuple, threads: int | None) -> None:
         # order -- exactly what makes the apply loop below deterministic across thread
         # counts and runs. Workers only do _compute_stage_result's pure per-file work
         # (hash/split/chunk/CAS-write); nothing here touches `idx` or prints until the
-        # serial apply loop below.
+        # serial apply loop below. Imported locally (V1.6.0, WS2.1): core.py no longer
+        # re-exports this via `import *`, and a module-level import here would cost every
+        # `status`/no-op-`add` invocation of this same file the real weight
+        # `concurrent.futures.__init__` pulls in (it imports both `.thread` and
+        # `.process`, the latter dragging in `multiprocessing`) for a code path only a
+        # genuinely multi-file threaded `add` ever reaches.
+        from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=pool_size) as pool:
             results = list(pool.map(
                 lambda item: _compute_stage_result(

@@ -11,7 +11,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .exceptions import ValidationError
+from .exceptions import NetworkError, ValidationError
 
 DEFAULT_BRANCH_CANDIDATES = ("main", "master")
 _FETCH_WORKERS = 8
@@ -177,6 +177,122 @@ def ensure_objects_local(repo_root: Path, client, tree: dict) -> int:
             f"(e.g. {shown}) — refusing to materialize a partial tree."
         )
     return downloaded
+
+
+def resolve_fetch_targets(
+    tree: dict,
+    rel_paths: list[str] | None = None,
+    *,
+    fetch_all: bool = False,
+    layer_names: list[str] | None = None,
+) -> dict:
+    """Pure resolution logic behind `av fetch`/`Repo.fetch()`: which entries of a flat HEAD
+    tree the caller actually wants, applying `--layer`'s narrowing when given. Shared by
+    the CLI (cmd_sync.py) and the SDK (av_sdk/repo.py) so path validation/layer-filtering
+    logic exists exactly once. Raises ValidationError for bad input (an untracked path, an
+    unknown layer name, or `--layer` combined with more than one path) rather than
+    returning a sentinel -- both callers already have a ValidationError -> clean failure
+    path (`fail()`/`SDKError`)."""
+    if not fetch_all and not rel_paths:
+        raise ValidationError("Specify one or more paths, or fetch_all=True.")
+    if layer_names and (fetch_all or (rel_paths and len(rel_paths) != 1)):
+        raise ValidationError(
+            "layer_names requires exactly one path (not fetch_all, not multiple paths)."
+        )
+
+    if fetch_all:
+        selected = dict(tree)
+    else:
+        selected = {}
+        not_tracked = []
+        for rel in rel_paths:
+            if rel not in tree:
+                not_tracked.append(rel)
+                continue
+            selected[rel] = tree[rel]
+        if not_tracked:
+            raise ValidationError(f"Not tracked at HEAD: {', '.join(not_tracked)}")
+
+    if layer_names:
+        (rel, info), = selected.items()
+        available = {layer["name"] for layer in (info.get("layers") or [])}
+        wanted = set(layer_names)
+        unknown = wanted - available
+        if unknown:
+            raise ValidationError(
+                f"Unknown layer name(s) for {rel}: {', '.join(sorted(unknown))}. "
+                f"Available: {', '.join(sorted(available)) or '(none — not layer-split)'}"
+            )
+        restricted = dict(info)
+        restricted["layers"] = [l for l in info.get("layers") or [] if l["name"] in wanted]
+        selected = {rel: restricted}
+
+    return selected
+
+
+def download_selected_objects(repo_root: Path, client, selected: dict, pool_size: int = 8) -> dict:
+    """Downloads whatever `resolve_fetch_targets()` selected into `.av/objects`, without
+    touching the working tree. One batch-check round trip for every part across every
+    selected path, then parallel downloads of only what's genuinely missing -- the same
+    shape as `ensure_objects_local()`, but returning per-(path, object) detail
+    (`{"fetched": [{"path","hash","bytes"}], "already_local": n, "bytes": n}`) instead of
+    just a count, since `av fetch`'s whole point is reporting exactly what moved. Raises
+    ValidationError if something is missing both locally and on the server, or if a
+    download that batch-check promised was available fails anyway."""
+    wanted_parts: list[tuple[str, str, int]] = []  # (rel_path, hash, size)
+    for rel, info in selected.items():
+        parts = list(info.get("layers") or []) + list(info.get("chunks") or [])
+        if parts:
+            for part in parts:
+                wanted_parts.append((rel, part["hash"], part.get("size", 0)))
+        else:
+            wanted_parts.append((rel, info["hash"], info.get("size", 0)))
+
+    already_local = 0
+    to_download: list[tuple[str, str, int]] = []
+    for rel, h, size in wanted_parts:
+        obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
+        if obj_path.exists():
+            already_local += 1
+        else:
+            to_download.append((rel, h, size))
+
+    fetched: list[dict] = []
+    total_bytes = 0
+    if to_download:
+        if not client.server_available():
+            # NetworkError, not ValidationError: this maps to unreachable_queued (exit 13,
+            # "safe, retry later") in both the CLI (fail()) and the SDK (error_from_code()),
+            # distinct from a genuine validation failure (exit 15/20) -- nothing is actually
+            # wrong with the request, the registry is just not reachable right now.
+            raise NetworkError(
+                f"Registry unreachable at {client.server_url} — nothing to fetch from."
+            )
+
+        missing_hashes = list(dict.fromkeys(h for _, h, _ in to_download))
+        found = client.batch_check_objects(missing_hashes)
+        unrecoverable = sorted(set(missing_hashes) - found)
+        if unrecoverable:
+            raise ValidationError(
+                f"{len(unrecoverable)} object(s) neither local nor on the server "
+                f"(e.g. {unrecoverable[0][:12]}…) — repo state may be corrupt; try `av doctor`."
+            )
+
+        with ThreadPoolExecutor(max_workers=min(pool_size, len(to_download))) as pool:
+            futures = {
+                pool.submit(client.download_object, h,
+                           repo_root / ".av" / "objects" / h[:2] / h[2:]): (rel, h, size)
+                for rel, h, size in to_download
+            }
+            for future in futures:
+                rel, h, size = futures[future]
+                if future.result():
+                    fetched.append({"path": rel, "hash": h, "bytes": size})
+                    total_bytes += size
+                else:
+                    raise ValidationError(f"Failed to download object {h[:12]}… for {rel}.")
+
+    return {"fetched": fetched, "already_local": already_local, "bytes": total_bytes}
 
 
 def is_ancestor(load_commit, ancestor_hash: str, descendant_hash: str) -> bool:

@@ -1,8 +1,28 @@
+import hashlib
 import os
 import time
 import uuid
+import click
 import requests
 from pathlib import Path
+
+
+def _default_timeout() -> tuple[float, float]:
+    """(connect, read) timeout in seconds for every request except server_available()
+    (which keeps its own short, fixed 2s probe timeout). V1.6.0 (Probleme.md): no request
+    in this module had a timeout at all before except that one probe -- a stalled upload or
+    download blocked its worker thread forever, with no way to recover short of killing the
+    process. AV_HTTP_TIMEOUT overrides the read half only; connect stays a fixed 5s -- a
+    hung DNS/TCP handshake should fail fast regardless of how long the caller expects the
+    transfer itself to take."""
+    read = 120.0
+    override = os.environ.get("AV_HTTP_TIMEOUT", "").strip()
+    if override:
+        try:
+            read = float(override)
+        except ValueError:
+            pass
+    return (5.0, read)
 
 
 class AuthenticationError(Exception):
@@ -27,12 +47,20 @@ class RefRaceError(Exception):
         )
 
 
+class ObjectIntegrityError(Exception):
+    """Raised internally by download_object() when the downloaded bytes' SHA-256 doesn't
+    match the hash they were fetched by -- never propagated to a caller (download_object
+    catches it and returns False, same contract as any other download failure), just gives
+    the log line a precise reason instead of a bare False."""
+
+
 class VaultClient:
     def __init__(self, server_url: str = 'http://localhost:8000', api_token: str | None = None):
         self.server_url = server_url.rstrip('/')
         self.session = requests.Session()
         if api_token:
             self.session.headers["Authorization"] = f"Bearer {api_token}"
+        self._timeout = _default_timeout()
 
     def _raise_for_auth(self, resp: "requests.Response") -> None:
         if resp.status_code == 401:
@@ -65,36 +93,50 @@ class VaultClient:
         url = f"{self.server_url}/api/objects/{sha256_hash}"
         try:
             if not known_missing:
-                head_resp = self.session.head(url)
+                head_resp = self.session.head(url, timeout=self._timeout)
                 self._raise_for_auth(head_resp)
                 if head_resp.status_code == 200:
                     return True # Already exists
 
             with open(file_path, 'rb') as f:
-                resp = self.session.post(url, data=f)
+                resp = self.session.post(url, data=f, timeout=self._timeout)
             self._raise_for_auth(resp)
             return resp.status_code == 201
         except requests.exceptions.RequestException as e:
-            print(f"Error uploading object: {e}")
+            click.echo(f"Error uploading object: {e}", err=True)
             return False
 
     def download_object(self, sha256_hash: str, dest_path: Path) -> bool:
+        """Downloads `sha256_hash` to `dest_path` via a temp-file + atomic rename, verifying
+        the received bytes' own SHA-256 against `sha256_hash` before publishing (V1.6.0,
+        Probleme.md: previously unverified -- a truncated transfer or a compromised/buggy
+        server could hand back wrong bytes under a name the caller would then trust as
+        content-addressed forever). Verification is streamed (hashlib updated per chunk
+        alongside the write), so it costs no extra pass over the data."""
         url = f"{self.server_url}/api/objects/{sha256_hash}"
         tmp_path = None
         try:
-            with self.session.get(url, stream=True) as resp:
+            with self.session.get(url, stream=True, timeout=self._timeout) as resp:
                 self._raise_for_auth(resp)
                 if resp.status_code == 200:
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp_path = dest_path.with_name(dest_path.name + f".tmp.{uuid.uuid4().hex}")
+                    digest = hashlib.sha256()
                     with open(tmp_path, 'wb') as f:
                         for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
                             f.write(chunk)
+                            digest.update(chunk)
+                    if digest.hexdigest() != sha256_hash:
+                        raise ObjectIntegrityError(
+                            f"downloaded content for {sha256_hash[:12]}… hashes to "
+                            f"{digest.hexdigest()[:12]}… -- discarding, not publishing a "
+                            "corrupt/mismatched object"
+                        )
                     tmp_path.replace(dest_path)
                     return True
                 return False
-        except requests.exceptions.RequestException as e:
-            print(f"Error downloading object: {e}")
+        except (requests.exceptions.RequestException, ObjectIntegrityError) as e:
+            click.echo(f"Error downloading object: {e}", err=True)
             return False
         finally:
             if tmp_path and tmp_path.exists():
@@ -103,7 +145,7 @@ class VaultClient:
     def object_exists(self, sha256_hash: str) -> bool:
         url = f"{self.server_url}/api/objects/{sha256_hash}"
         try:
-            resp = self.session.head(url)
+            resp = self.session.head(url, timeout=self._timeout)
             self._raise_for_auth(resp)
             return resp.status_code == 200
         except requests.exceptions.RequestException:
@@ -116,28 +158,28 @@ class VaultClient:
             return set()
         url = f"{self.server_url}/api/sync/batch-objects"
         try:
-            resp = self.session.post(url, json=sha256_hashes)
+            resp = self.session.post(url, json=sha256_hashes, timeout=self._timeout)
             self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return set(resp.json().get("found", []))
         except requests.exceptions.RequestException as e:
-            print(f"Error checking object batch: {e}")
+            click.echo(f"Error checking object batch: {e}", err=True)
         return set()
 
     def push_commit(self, commit_data: dict) -> bool:
         url = f"{self.server_url}/api/commits"
         try:
-            resp = self.session.post(url, json=commit_data)
+            resp = self.session.post(url, json=commit_data, timeout=self._timeout)
             self._raise_for_auth(resp)
             return resp.status_code in (201, 409)  # 409 = commit already exists, idempotent success
         except requests.exceptions.RequestException as e:
-            print(f"Error pushing commit: {e}")
+            click.echo(f"Error pushing commit: {e}", err=True)
             return False
 
     def get_commit(self, commit_hash: str) -> dict | None:
         url = f"{self.server_url}/api/commits/{commit_hash}"
         try:
-            resp = self.session.get(url)
+            resp = self.session.get(url, timeout=self._timeout)
             self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json()
@@ -154,7 +196,7 @@ class VaultClient:
         if expected_hash is not None:
             payload["expected_hash"] = expected_hash
         try:
-            resp = self.session.put(url, json=payload)
+            resp = self.session.put(url, json=payload, timeout=self._timeout)
             self._raise_for_auth(resp)
             if resp.status_code == 409:
                 detail = {}
@@ -170,7 +212,7 @@ class VaultClient:
     def get_ref(self, ref_name: str) -> str | None:
         url = f"{self.server_url}/api/refs/{ref_name}"
         try:
-            resp = self.session.get(url)
+            resp = self.session.get(url, timeout=self._timeout)
             self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json().get("commit_hash")
@@ -183,13 +225,13 @@ class VaultClient:
         url = f"{self.server_url}/api/refs"
         params = {"project_id": project_id} if project_id else None
         try:
-            resp = self.session.get(url, params=params)
+            resp = self.session.get(url, params=params, timeout=self._timeout)
             self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json()
             return {}
         except requests.exceptions.RequestException as e:
-            print(f"Error listing refs: {e}")
+            click.echo(f"Error listing refs: {e}", err=True)
             return {}
 
     # V1.5.0: several real call sequences (a commit's own flush-then-check, and
@@ -208,7 +250,8 @@ class VaultClient:
                 return value
         # /api/health is always exempt from auth, deliberately — this probe must keep
         # working with zero credentials so callers can ask "is the server up" before
-        # anyone has a token configured.
+        # anyone has a token configured. Timeout deliberately stays a short fixed 2s
+        # (not self._timeout/AV_HTTP_TIMEOUT) -- this is a liveness probe, not a transfer.
         url = f"{self.server_url}/api/health"
         try:
             resp = self.session.get(url, timeout=2)
@@ -224,22 +267,24 @@ class VaultClient:
         promotion/merge itself."""
         url = f"{self.server_url}/api/runs/{run_id}/policy-outcome"
         try:
-            resp = self.session.post(url, json={"decision": decision, "rule": rule})
+            resp = self.session.post(url, json={"decision": decision, "rule": rule}, timeout=self._timeout)
             return resp.status_code == 200
         except requests.exceptions.RequestException:
             return False
 
     def run_gc(self) -> dict | None:
-        """Trigger garbage collection on the remote server."""
+        """Trigger garbage collection on the remote server. Known to run slow (a full
+        mark-and-sweep over the whole registry) -- a longer read timeout than the module
+        default, not affected by AV_HTTP_TIMEOUT."""
         url = f"{self.server_url}/api/admin/gc"
         try:
-            resp = self.session.post(url)
+            resp = self.session.post(url, timeout=(self._timeout[0], 300.0))
             self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json()
             return None
         except requests.exceptions.RequestException as e:
-            print(f"Error running GC: {e}")
+            click.echo(f"Error running GC: {e}", err=True)
             return None
 
     def fetch_all_refs(self) -> dict:
@@ -249,7 +294,7 @@ class VaultClient:
         limit = 1000
         while True:
             try:
-                resp = self.session.get(url, params={"limit": limit, "offset": offset})
+                resp = self.session.get(url, params={"limit": limit, "offset": offset}, timeout=self._timeout)
                 self._raise_for_auth(resp)
                 if resp.status_code == 200:
                     data = resp.json()
@@ -261,7 +306,7 @@ class VaultClient:
                 else:
                     break
             except requests.exceptions.RequestException as e:
-                print(f"Error syncing refs: {e}")
+                click.echo(f"Error syncing refs: {e}", err=True)
                 break
         return refs
 
@@ -270,13 +315,13 @@ class VaultClient:
         commit_count, last_push} rows. Empty list on any failure."""
         url = f"{self.server_url}/api/projects"
         try:
-            resp = self.session.get(url)
+            resp = self.session.get(url, timeout=self._timeout)
             self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json().get("projects", [])
             return []
         except requests.exceptions.RequestException as e:
-            print(f"Error listing projects: {e}")
+            click.echo(f"Error listing projects: {e}", err=True)
             return []
 
     def list_commits(self, project_id: str, limit: int = 500, offset: int = 0,
@@ -290,11 +335,11 @@ class VaultClient:
                 "limit": limit,
                 "offset": offset,
                 "include_layers": "true" if include_layers else "false",
-            })
+            }, timeout=self._timeout)
             self._raise_for_auth(resp)
             if resp.status_code == 200:
                 return resp.json()
             return None
         except requests.exceptions.RequestException as e:
-            print(f"Error listing commits: {e}")
+            click.echo(f"Error listing commits: {e}", err=True)
             return None

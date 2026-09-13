@@ -429,6 +429,57 @@ contract.
   JSON, just not pretty-printed — nothing reads these files by hand); this is purely a
   storage-format compaction of files nothing outside `av` itself parses.
 
+## v1.6.0 additive surfaces (see development/CHANGELOG.md Phase 69)
+
+A performance-closure release, MINOR because of one default-behavior change and several
+new surfaces; every other change (fused staging, hardware-dispatched SHA-256, server-side
+caching/batching) is an internal speed change with no altered contract.
+
+- **Default-behavior change, called out first**: the daemon (`av daemon`, opt-in since
+  v1.5.0) now **auto-spawns by default** — a first `av add`/`status`/`commit`/... in a repo
+  warms a background daemon for later invocations automatically, rather than requiring
+  `av daemon start` or an opt-in env var. `AV_NO_DAEMON=1` is the unconditional escape
+  hatch; `AV_DAEMON=0` or `.av/config`'s `"daemon":{"enabled":false}` are scoped opt-outs
+  that still let an already-running daemon serve requests. Output is guaranteed
+  byte-identical to the in-process path regardless of which one actually ran (same
+  underlying click command objects) — this changes latency and process lifetime only.
+- **Daemon allowlist grew**: from v1.5.0's `{add, status, commit}` to
+  `{add, status, commit, push, fetch, unstage, log, diff, context, run}` — every module
+  backing an allowlisted command is statically verified to never prompt.
+- **New CLI command**: `av fetch [PATH...] [--layer NAME]... [--all]` (+ `Repo.fetch()` in
+  the SDK) — downloads the objects a tracked path needs at HEAD into `.av/objects` without
+  touching the working tree, including fetching a single named layer of a layer-split
+  checkpoint.
+- **New native `av` launcher** (Windows and POSIX, the latter written to the same protocol
+  but CI-verified rather than locally-verified on this project's Windows-only dev box): a
+  small compiled executable that speaks the daemon's wire protocol directly for an
+  allowlisted command against a warm daemon, with zero Python startup cost, falling back
+  transparently to the real Python CLI (`av-py`, `python -m av_cli.launcher`, or
+  `AV_PYTHON`) for anything it can't handle. `av` itself IS this binary now on a successful
+  build — `av-py` remains the permanent, guaranteed, always-present pure-Python entry
+  point regardless of platform or build outcome.
+- **New/changed env vars** (all additive, all optional): `AV_SHA256_BACKEND`
+  (`auto`/`scalar`/`sha-ni`/`arm-sha2`) forces a hashing backend; `AV_STAGE_FUSED` (default
+  on) and `AV_STAGE_BUFFER_MB` (default 32) control the fused single-read staging paths for
+  CDC-chunked and safetensors artifacts; `AV_HTTP_TIMEOUT` overrides the client's read
+  timeout; `AV_PYTHON` names an explicit interpreter for the native launcher's fallback;
+  `AV_NO_UPDATE_CHECK` skips the PyPI version probe; `AV_UVICORN_WORKERS`,
+  `AV_DB_POOL_SIZE`, `AV_DB_MAX_OVERFLOW` size the server process.
+- **New C++ bindings** (`aether_core`): `hash_backend()`/`set_hash_backend()`,
+  `release_pool()`, `stage_cdc()`, `stage_safetensors()` — all additive; every existing
+  binding (`hash_file`, `split_and_hash_safetensors`, `chunk_and_hash_file`, ...) keeps its
+  exact prior signature and output.
+- **GC response gained an additive field**: `bloom_rebuilt: bool` — whether the sweep
+  actually triggered a Bloom Filter rebuild (skipped when nothing was deleted, since an
+  unchanged alive set is already correctly represented incrementally).
+- **`/api/objects/{hash}` gained real `Range`/`ETag`/caching support** — a client that
+  already handled 200 responses is unaffected; one that wants resumable/partial downloads
+  can now use standard HTTP `Range` requests.
+- **Not a contract change**: split-artifact restore (`checkout`/`stash`/`clone`/`pull`/
+  `merge`) no longer also writes the reassembled whole-file blob into `.av/objects` for a
+  layer-split or CDC-chunked entry — this only affects local disk usage after a restore,
+  never the working-tree content or the index/tree format.
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades

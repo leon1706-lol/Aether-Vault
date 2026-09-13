@@ -183,3 +183,40 @@ def test_stash_push_pop_roundtrip_preserves_safetensors_layers(repo):
     entry = idx.get_entry("model.safetensors")
     assert entry["staged"] is True
     assert entry["layers"], "expected layer-splitting to have survived the stash round-trip"
+
+
+def test_stash_push_pop_roundtrip_preserves_cdc_chunked_artifact(repo):
+    """V1.6.0 (Probleme.md real bug): a CDC-chunked artifact (e.g. a `.pt` checkpoint --
+    distinct from a layer-split `.safetensors`) was never restorable from a stash at all --
+    only `layers` was ever recorded in the stash record and passed to `materialize_file`,
+    so popping a stash holding a chunked file silently produced an empty or missing file
+    with no error."""
+    import random
+
+    pytest.importorskip("aether_core")
+    invoke("config", "1")  # 1 MB LFS threshold
+    rng = random.Random(202)
+
+    # 12 MB, not smaller: forces >= 2 chunks deterministically past the CDC hard cap
+    # (max_chunk=8MB), same reasoning as test_cli.py's _chunk_roundtrip_repo fixture.
+    blob_v1 = rng.randbytes(12 * 1024 * 1024)
+    (repo / "checkpoint.pt").write_bytes(blob_v1)
+    invoke("add", "checkpoint.pt")
+    invoke("commit", "-m", "v1")
+
+    blob_v2 = rng.randbytes(12 * 1024 * 1024)
+    (repo / "checkpoint.pt").write_bytes(blob_v2)
+    invoke("add", "checkpoint.pt")  # staged, CDC-chunked
+
+    result = invoke("stash")
+    assert result.exit_code == 0
+    assert (repo / "checkpoint.pt").read_bytes() == blob_v1  # reverted to HEAD's version
+
+    pop_result = invoke("stash", "pop")
+    assert pop_result.exit_code == 0, pop_result.output
+    assert (repo / "checkpoint.pt").read_bytes() == blob_v2  # dirty version restored intact
+
+    idx = Index(repo)
+    entry = idx.get_entry("checkpoint.pt")
+    assert entry["staged"] is True
+    assert entry.get("chunks"), "expected CDC chunking to have survived the stash round-trip"

@@ -87,8 +87,15 @@ start_webui() {
 }
 
 start_server() {
-  echo "[engine] starting server (uvicorn av_server.server:app) on :8000"
-  python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 &
+  # V1.6.0: AV_UVICORN_WORKERS (default 1, unchanged behavior) -- see infrastructure.md
+  # before raising this above 1. Each worker is a SEPARATE process with its own in-memory
+  # state (the default WindowRateLimiter's buckets, the webhook queue-depth metric, ...);
+  # AV_RATE_LIMIT_BACKEND=redis/AV_AUTH_SPIKE_BACKEND=redis exist specifically to make that
+  # state correct across replicas/workers, same as the documented HA Contract for N>1
+  # container replicas -- N>1 workers in ONE container has the identical failure mode.
+  local workers="${AV_UVICORN_WORKERS:-1}"
+  echo "[engine] starting server (uvicorn av_server.server:app) on :8000, workers=${workers}"
+  python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 --workers "${workers}" &
   SERVER_PID=$!
 }
 

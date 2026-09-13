@@ -21,6 +21,7 @@ from benchmarks.tool_runner import (  # noqa: E402
     Row,
     ToolStatus,
     detect_tools,
+    repeat_median,
     time_subprocess,
 )
 
@@ -34,10 +35,20 @@ def _bench_av() -> dict[str, float | None] | None:
         return None
     with tempfile.TemporaryDirectory(prefix="bench-push-av-", ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
-        probes = speedcheck.run_av_cli_probes(av_path, root)
-        result = {"init": probes[0][1], "add": probes[1][1], "commit": probes[2][1]}
+        # commit_upload=False: the commit row is a pure local finalize, like git-lfs's and
+        # dvc's own `git commit` (neither ever touches a network on commit) -- the real
+        # upload is what the push row measures, matching `dvc push`.
+        probes = speedcheck.run_av_cli_probes(
+            av_path, root, commit_upload=False, env={"AV_NO_UPDATE_CHECK": "1"}, warm_daemon=True,
+        )
+        result = {
+            "init": speedcheck.probe_ms(probes, "av init"),
+            "add": speedcheck.probe_ms(probes, "av add ."),
+            "commit": speedcheck.probe_ms(probes, "av commit"),
+        }
         push_ms = time_subprocess([av_path, "push"], root)
         result["push"] = push_ms
+        subprocess.run([av_path, "daemon", "stop"], cwd=root)
         return result
 
 
@@ -118,13 +129,13 @@ def _bench_mlflow() -> dict[str, float | None] | None:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def run(tool_order: list[str] | None = None) -> BenchmarkResult:
+def run(tool_order: list[str] | None = None, repeat: int = 1) -> BenchmarkResult:
     tool_order = tool_order or ["av", "git-lfs", "dvc", "mlflow"]
     results = {
-        "av": _bench_av(),
-        "git-lfs": _bench_git_lfs(),
-        "dvc": _bench_dvc(),
-        "mlflow": _bench_mlflow(),
+        "av": repeat_median(_bench_av, repeat),
+        "git-lfs": repeat_median(_bench_git_lfs, repeat),
+        "dvc": repeat_median(_bench_dvc, repeat),
+        "mlflow": repeat_median(_bench_mlflow, repeat),
     }
     tools = detect_tools()
 

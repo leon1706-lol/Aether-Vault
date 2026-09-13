@@ -448,6 +448,47 @@ def test_upload_then_download_object_roundtrip(db):
     assert resp.headers["content-length"] == str(len(content))
 
 
+def test_upload_object_larger_than_buffer_cap_hashes_and_stores_correctly(db):
+    """V1.6.0: store_object() now buffers stream chunks up to 4 MiB and flushes each
+    buffer's write+hash via asyncio.to_thread instead of writing every chunk directly on
+    the event loop. This object is larger than that cap, so a correct round trip here
+    proves the buffer-boundary flush (and the final partial-buffer flush) both work --
+    not just the common case of a small upload that never crosses the cap at all."""
+    content = os.urandom(5 * 1024 * 1024 + 137)  # > 4 MiB cap, plus an odd remainder
+    h = hashlib.sha256(content).hexdigest()
+
+    resp = db.post(f"/api/objects/{h}", content=content)
+    assert resp.status_code == 201
+
+    resp = db.get(f"/api/objects/{h}")
+    assert resp.status_code == 200
+    assert resp.content == content
+
+    resp = db.head(f"/api/objects/{h}")
+    assert resp.status_code == 200
+    assert resp.headers["content-length"] == str(len(content))
+
+
+def test_download_object_supports_range_and_immutable_caching(db):
+    """V1.6.0: download_object() switched from a hand-rolled StreamingResponse (no Range,
+    no caching headers at all) to FileResponse -- an object's hash IS its content address,
+    so an immutable Cache-Control + a hash-derived ETag are exact, never approximations."""
+    content = b"0123456789" * 1000  # 10000 bytes, enough for a real mid-file range
+    h = hashlib.sha256(content).hexdigest()
+    assert db.post(f"/api/objects/{h}", content=content).status_code == 201
+
+    full = db.get(f"/api/objects/{h}")
+    assert full.status_code == 200
+    assert full.headers["etag"] == f'"{h}"'
+    assert full.headers["cache-control"] == "public, max-age=31536000, immutable"
+    assert full.headers["accept-ranges"] == "bytes"
+
+    ranged = db.get(f"/api/objects/{h}", headers={"Range": "bytes=100-199"})
+    assert ranged.status_code == 206
+    assert ranged.content == content[100:200]
+    assert ranged.headers["content-range"] == f"bytes 100-199/{len(content)}"
+
+
 def test_upload_object_rejects_hash_mismatch(db):
     content = b"some bytes"
     wrong_hash = hashlib.sha256(b"different bytes").hexdigest()
@@ -514,6 +555,43 @@ def test_list_commits_include_layers_handles_a_commit_with_no_tree(db):
     assert resp.status_code == 200
     found = next(c for c in resp.json()["commits"] if c["hash"] == commit["hash"])
     assert found["tree"] == {}
+
+
+def test_list_commits_include_layers_resolves_all_roots_in_one_shared_call(db, monkeypatch):
+    """V1.6.0 (WS5.7): list_commits(include_layers=true) used to call the single-root
+    resolve_tree() once per commit on the page -- N independent tree walks for a page of N
+    commits. It now resolves every root on the page through one shared resolve_trees()
+    call. Proven by spying on resolve_trees itself (not resolve_tree, which still exists
+    only as resolve_trees's own single-root wrapper -- see that function's docstring) and
+    counting invocations, not just checking the output is still correct (a separate,
+    already-existing test already covers correctness)."""
+    calls = []
+    real_resolve_trees = server_module.resolve_trees
+
+    async def _spy(db_, root_hashes):
+        calls.append(list(root_hashes))
+        return await real_resolve_trees(db_, root_hashes)
+
+    monkeypatch.setattr(server_module, "resolve_trees", _spy)
+
+    commits = [_make_commit(f"batch-roots-{i}", tree={f"f{i}.txt": "a" * 64}) for i in range(4)]
+    for c in commits:
+        assert db.post("/api/commits", json=c).status_code == 201
+
+    resp = db.get("/api/commits", params={"include_layers": "true", "limit": 50})
+    assert resp.status_code == 200
+
+    assert len(calls) == 1, f"expected exactly one shared resolve_trees() call, got {len(calls)}"
+
+    # Every commit on the page still has its own correct, non-cross-contaminated tree --
+    # each one's distinguishing filename present, and no OTHER commit's filename leaking in.
+    by_hash = {c["hash"]: c for c in resp.json()["commits"]}
+    for i, c in enumerate(commits):
+        tree = by_hash[c["hash"]]["tree"]
+        assert f"f{i}.txt" in tree
+        for j in range(len(commits)):
+            if j != i:
+                assert f"f{j}.txt" not in tree
 
 
 def test_push_commit_duplicate_returns_409(db):
@@ -605,6 +683,9 @@ def test_gc_respects_grace_period_then_sweeps_when_aged(db, monkeypatch):
     resp = db.post("/api/admin/gc")
     assert resp.status_code == 200
     assert resp.json()["deleted_objects"] == 0
+    # V1.6.0: a sweep that deletes nothing must skip the Bloom Filter rebuild entirely --
+    # the alive set is unchanged, and every upload already keeps it in sync incrementally.
+    assert resp.json()["bloom_rebuilt"] is False
     assert db.head(f"/api/objects/{h}").status_code == 200
 
     # Zero the grace period so the same object is now "aged" relative to the new cutoff.
@@ -612,6 +693,7 @@ def test_gc_respects_grace_period_then_sweeps_when_aged(db, monkeypatch):
     resp = db.post("/api/admin/gc")
     assert resp.status_code == 200
     assert resp.json()["deleted_objects"] == 1
+    assert resp.json()["bloom_rebuilt"] is True
     assert db.head(f"/api/objects/{h}").status_code == 404
 
 
@@ -3189,6 +3271,43 @@ class TestAnomalyDetection:
 
         events = self._anomaly_events(db, "p-anom-nomass")
         assert not [e for e in events if e["payload"]["type"] == "mass_rewrite"]
+
+    def test_anomaly_detector_reuses_a_tree_already_resolved_by_the_parents_own_push(self, db, monkeypatch):
+        """V1.6.0 (WS5.5): a normal sequential push history resolves the SAME tree twice --
+        once as the "new tree" when a commit is pushed, again as the "old (parent) tree"
+        when its child is pushed next. `_resolve_tree_cached`'s per-process LRU means the
+        second lookup is a cache hit, not a second round trip through `resolve_tree`'s own
+        level-order DB traversal. Proven by counting real `resolve_tree` calls per distinct
+        tree hash across a 3-commit chain (root -> mid -> child): `mid`'s tree must be
+        resolved exactly once overall, not once per push that touches it."""
+        server_module._tree_cache.clear()  # isolate from whatever earlier tests cached
+        calls: list[str] = []
+        real_resolve_tree = server_module.resolve_tree
+
+        async def _spy(db_, root_hash):
+            calls.append(root_hash)
+            return await real_resolve_tree(db_, root_hash)
+
+        monkeypatch.setattr(server_module, "resolve_tree", _spy)
+
+        root = _make_commit("cache-root", tree={"a.txt": "a" * 64}, project_id="p-tree-cache")
+        assert db.post("/api/commits", json=root).status_code == 201
+        mid = _make_commit("cache-mid", tree={"a.txt": "a" * 64, "b.txt": "b" * 64},
+                            parents=[root["hash"]], project_id="p-tree-cache")
+        assert db.post("/api/commits", json=mid).status_code == 201
+        child = _make_commit("cache-child", tree={"a.txt": "a" * 64, "b.txt": "b" * 64, "c.txt": "c" * 64},
+                              parents=[mid["hash"]], project_id="p-tree-cache")
+        assert db.post("/api/commits", json=child).status_code == 201
+
+        # mid's tree was resolved once as the "new tree" during mid's own push (root is its
+        # parent), and should be a pure cache hit as child's "old (parent) tree" -- so
+        # whatever hash that was, it must appear in `calls` at most once.
+        from collections import Counter
+        counts = Counter(calls)
+        assert all(n == 1 for n in counts.values()), (
+            f"a tree hash was resolved more than once despite the cache: {counts}"
+        )
+        assert len(calls) >= 2  # root's tree (mid's push) + mid's tree (mid's push) at minimum
 
     def test_policy_pack_publish_emits_anomaly_event(self, db):
         obj = _upload_object(db, b'{"main":{}}')

@@ -85,11 +85,98 @@ def test_running_version_does_not_load_ui_questionary_rich_or_requests():
     assert result.returncode == 0, result.stderr
 
 
+def _run_av(args: list[str], cwd) -> subprocess.CompletedProcess:
+    """Runs one `av` invocation as a real, fresh subprocess (own interpreter, own
+    sys.modules) via `av_cli.main.run()` -- `AV_NO_DAEMON=1` so a real `av status`/`add`
+    can't be served by an auto-spawned background daemon instead (which would make the
+    checking process's own sys.modules reflect only the tiny daemon-client transport, not
+    the in-process import graph these tests exist to guard). encoding/errors explicit, not
+    text=True: `av init`'s banner prints non-ASCII box-drawing characters the default
+    locale codepage (cp1252 on this dev box) can't decode."""
+    code = (
+        "import os\n"
+        "os.environ['AV_NO_DAEMON'] = '1'\n"
+        "import sys\n"
+        f"sys.argv = {args!r}\n"
+        "from av_cli.main import run\n"
+        "try:\n"
+        "    run()\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "heavy = ('tempfile', 'urllib.parse', 'concurrent.futures', 'shutil', 'subprocess', 'uuid', 'datetime')\n"
+        "print('HEAVY_LOADED=' + ','.join(sorted(m for m in heavy if m in sys.modules)))\n"
+    )
+    return subprocess.run([sys.executable, "-c", code], cwd=cwd, capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=60)
+
+
+def _heavy_loaded(result: subprocess.CompletedProcess) -> list[str]:
+    for line in result.stdout.splitlines():
+        if line.startswith("HEAVY_LOADED="):
+            rest = line[len("HEAVY_LOADED="):]
+            return rest.split(",") if rest else []
+    raise AssertionError(f"marker line missing -- process failed?\n{result.stderr}")
+
+
+# V1.6.0 (WS2.1): `core.py`'s own module scope no longer imports `datetime`/`shutil`/
+# `subprocess`/`tempfile`/`uuid`/`concurrent.futures.ThreadPoolExecutor` -- `tempfile` and
+# `urllib.parse` had ZERO internal use in core.py even before this change (pure re-export
+# dead weight for other modules); the rest are genuinely used, just deferred to their
+# actual point of use (a real commit, a real upload, a restore, a one-time config backfill,
+# `av init`, or a genuinely multi-file threaded `add`), since core.py is reached by every
+# command via `from .core import *`. `urllib.parse`/`concurrent.futures` are the only two
+# of those names an end-to-end `status`/no-op-`add` run can actually be asserted empty on
+# today, though: `main.py` itself still imports `datetime`/`shutil`/`subprocess`/
+# `tempfile`/`uuid` at module scope regardless of anything core.py does (its own
+# top-of-file comment explains why -- removing them broke `test_cli.py`'s patch-anchor
+# dependencies on `main_module.subprocess`/`main_module.shutil` specifically, a real,
+# already-diagnosed constraint from earlier in this same phase, not an oversight here).
+_ACHIEVABLE_HEAVY = ("urllib.parse", "concurrent.futures")
+
+
+def test_status_in_a_real_repo_does_not_load_heavy_stdlib_modules(tmp_path):
+    """`av init` itself runs in its OWN separate subprocess here, deliberately not
+    measured -- it legitimately touches more (uuid for project_id, and more besides) and
+    isn't part of this phase's `status`/no-op-`add` speed claim; conflating its cost with
+    `status`'s in one process previously made this test fail for a reason that had nothing
+    to do with `status` itself.
+
+    `AV_NO_DAEMON=1` (via `_run_av`) is required -- otherwise a real `av status` could be
+    served by an auto-spawned background daemon, and the checking process's own
+    `sys.modules` would reflect only the tiny daemon-client transport, not the in-process
+    import graph this test actually exists to guard."""
+    init_result = _run_av(["av", "init", "--mode", "local", "--yes", "--no-repl"], tmp_path)
+    assert init_result.returncode == 0, init_result.stderr
+
+    status_result = _run_av(["av", "status"], tmp_path)
+    assert status_result.returncode == 0, status_result.stderr
+    loaded = [m for m in _heavy_loaded(status_result) if m in _ACHIEVABLE_HEAVY]
+    assert loaded == []
+
+
+def test_noop_add_does_not_load_heavy_stdlib_modules(tmp_path):
+    """Counterpart to the status test above for `add .` of an already-staged, unchanged
+    file -- the other half of the "no-op" hot path this phase's benchmark work targets. The
+    first `add` (a genuinely new file) runs in its own subprocess and legitimately needs
+    uuid/shutil (see core.py's own comments on those call sites) -- only the SECOND,
+    unchanged-file `add`, in a fresh process of its own, is the actual no-op under test."""
+    init_result = _run_av(["av", "init", "--mode", "local", "--yes", "--no-repl"], tmp_path)
+    assert init_result.returncode == 0, init_result.stderr
+    (tmp_path / "a.py").write_text("print('hi')\n")
+    first_add = _run_av(["av", "add", "."], tmp_path)
+    assert first_add.returncode == 0, first_add.stderr
+
+    noop_add = _run_av(["av", "add", "."], tmp_path)
+    assert noop_add.returncode == 0, noop_add.stderr
+    loaded = [m for m in _heavy_loaded(noop_add) if m in _ACHIEVABLE_HEAVY]
+    assert loaded == []
+
+
 def test_list_commands_matches_full_expected_surface_without_importing_anything():
     expected = sorted([
         "add", "add-user", "admin", "audit", "auth", "benchmark", "blackboard", "branch",
         "budget", "canary", "checkout", "clone", "commit", "config", "context", "critique",
-        "daemon", "diff", "doctor", "env", "eval", "file", "freeze", "gc", "graph", "handoff", "idp",
+        "daemon", "diff", "doctor", "env", "eval", "fetch", "file", "freeze", "gc", "graph", "handoff", "idp",
         "import-lightning", "import-mlflow", "import-pytorch", "import-transformers",
         "improver", "incident", "init", "lessons", "lineage", "list-meta", "list-users",
         "log", "login", "logout", "merge", "plan", "policy", "promote", "pull", "push",

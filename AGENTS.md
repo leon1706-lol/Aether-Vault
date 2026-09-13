@@ -100,12 +100,14 @@ credential). Full table: `docs/for-agents.md`.
 
 Every CLI command supports `--output json` except `watch` (NDJSON — one envelope per
 auto-commit, not per invocation) and the dev-only `test`/`benchmark`/`webui` (see
-`docs/contracts.md`'s exemption list). Core: status · add · commit · push · diff · run
+`docs/contracts.md`'s exemption list). Core: status · add · commit · push · fetch · diff · run
 start/finish/list/show · context note/show/validate/export/search · env snapshot/replay ·
 policy set/list/remove/promote --dry-run · registry export/keygen/attest/verify · auth
 doctor/rotate · audit list/export/prune --dry-run · daemon start/stop/status/restart
-(V1.5.0, opt-in — see `development/architecture.md`'s Daemon Contract; transparently
-accelerates add/status/commit, changes no output/exit-code shape). **RSI control plane** (see
+(V1.5.0, **auto-spawns by default since V1.6.0** — `AV_NO_DAEMON=1` to disable; see
+`development/architecture.md`'s Daemon Contract; transparently accelerates
+add/status/commit/push/fetch/unstage/log/diff/context/run, changes no output/exit-code
+shape). **RSI control plane** (see
 `docs/rsi-operator-guide.md`): improver register/propose/review/apply/rollback/promote/
 lineage · canary register/run/status · freeze on/off/status · incident rollback · eval
 register/freeze/score/reveal/adapter · task propose/accept/reject · plan create/attach/
@@ -187,6 +189,7 @@ av promote <candidate> --into main     # exit 16 on DENY
 | stage | `av add p/` | `r.add("p/")` |
 | persist | `av --output json commit -m m [--no-upload]` | `r.commit(...)` |
 | drain | `av push` | `r.push()` |
+| prefetch | `av fetch p/ [--layer L] [--all]` | `r.fetch(["p/"], layers=[...])` |
 | what moved | `av diff v2` | `r.diff_semantic("v2")` |
 | group work | `av run start/finish` | `r.run_start/run_finish` |
 | remember | `av context note …` | `r.context_note(...)` |

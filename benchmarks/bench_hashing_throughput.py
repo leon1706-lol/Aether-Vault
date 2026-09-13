@@ -29,10 +29,18 @@ from benchmarks.tool_runner import (  # noqa: E402
 )
 
 
-def _time_av(path: Path) -> float:
-    start = time.perf_counter()
-    hash_file_safe(str(path))
-    return (time.perf_counter() - start) * 1000
+def _time_av(path: Path, repeat: int = 1) -> float:
+    # Hashing is read-only and idempotent, so av's own number is a clean median-of-N
+    # (WS0.3); git-lfs's `clean`/dvc's `add` below are NOT repeated the same way -- each
+    # mutates tool-local state (an object store / a tracked-file record) on the first call,
+    # so a second call on the same file no longer measures the same "add this file" primitive.
+    import statistics
+    samples = []
+    for _ in range(max(1, repeat)):
+        start = time.perf_counter()
+        hash_file_safe(str(path))
+        samples.append((time.perf_counter() - start) * 1000)
+    return statistics.median(samples)
 
 
 def _time_git_lfs(git_lfs_path: str, repo: Path, path: Path) -> float | None:
@@ -51,7 +59,7 @@ def _time_dvc(dvc_path: str, repo: Path, path: Path) -> float | None:
     return elapsed if result.returncode == 0 else None
 
 
-def run(tool_order: list[str] | None = None) -> BenchmarkResult:
+def run(tool_order: list[str] | None = None, repeat: int = 1) -> BenchmarkResult:
     tools = detect_tools()
     tool_order = tool_order or ["av", "git-lfs", "dvc", "mlflow"]
     rows: list[Row] = []
@@ -80,7 +88,7 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
 
             av_file = root / f"av_{size_mb}mb.bin"
             fixtures.make_large_file(av_file, size_mb)
-            values["av"] = _time_av(av_file)
+            values["av"] = _time_av(av_file, repeat)
             statuses["av"] = ToolStatus.AVAILABLE
 
             if tools["git-lfs"].status == ToolStatus.AVAILABLE:

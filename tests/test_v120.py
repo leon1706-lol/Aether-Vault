@@ -83,7 +83,7 @@ def test_run_start_registration_payload_includes_project_id(repo, monkeypatch):
             return {"status": "created", "id": captured["payload"]["id"]}
 
     class _FakeSession:
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             captured["url"] = url
             captured["payload"] = json
             return _FakeResponse()

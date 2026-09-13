@@ -1,5 +1,9 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm>=8", "pybind11>=3.0.0"]
+# setuptools>=70.1: setup.py's WheelWithNativeLauncher needs setuptools.command.bdist_wheel
+# built in (before that it only existed as the separate `wheel` package, which setup.py
+# still falls back to importing if present, but pinning here means CI/release builds never
+# depend on that fallback actually being installed).
+requires = ["setuptools>=70.1", "setuptools-scm>=8", "pybind11>=3.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -98,7 +102,22 @@ sso = ["authlib>=1.3", "pyjwt[crypto]>=2.8"]
 saml = ["pysaml2>=7.5"]
 
 [project.scripts]
-av = "av_cli.launcher:main"
+# V1.6.0: `av` is deliberately NOT a `[project.scripts]` entry here -- it is injected
+# directly into the built wheel's `.data/scripts/` by `setup.py`'s `WheelWithNativeLauncher`
+# (a real, tested wheel post-processing step, not the naive `scripts=` argument, which
+# hard-crashes setuptools' `build_scripts` command on a raw binary -- see setup.py's own
+# comment and src/launcher/README.md's Packaging section for the full account of both the
+# failed attempt and the working mechanism that replaced it). Confirmed via reading pip's
+# own installer (`pip._internal.operations.install.wheel`): a `.data/scripts/` file whose
+# name does NOT match any registered entry point installs verbatim (binary-safe -- its own
+# `fix_script()` opens in binary mode and only acts on a literal `#!python` first line,
+# never crashing on other content) and is EXCLUDED from that filtering specifically when a
+# same-named entry point exists -- which is why `av` must NOT also be an entry point here,
+# on any platform, ever, or pip silently prefers its own generated wrapper and the injected
+# binary/shim is dead weight. `av-py` is the permanent, guaranteed, always-present
+# pure-Python entry point regardless of platform, native-build success, or how `av` itself
+# resolves this build -- `AV_PYTHON`/native-launcher-fallback docs point here.
+av-py = "av_cli.launcher:main"
 
 [project.urls]
 # v1.3.4 (W0.2): these pointed at github.com/leon1706/aether-vault (no such repo/org) and

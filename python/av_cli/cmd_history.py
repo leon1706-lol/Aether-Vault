@@ -5,6 +5,9 @@ main.py (`_find_source_root`, `_update_readme_test_badge`) are accessed late-bou
 `_root.<name>` so test monkeypatching on the main namespace stays effective.
 """
 
+import datetime  # V1.6.0 (WS2.1): core.py no longer re-exports these via `import *` --
+import uuid       # this module's own stash-id generation needs them explicitly.
+
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from .core import _collect_dirty_paths, _finalize_commit, _materialize_tree
 
@@ -32,12 +35,14 @@ def commit(
     metric_drawdown: float | None,
 ) -> None:
     """Record staged changes to the repository with optional tags and metrics."""
-    from .client import VaultClient
-
+    # V1.6.0 (Probleme.md): this used to build a VaultClient here unconditionally -- dead
+    # code, never referenced again in this function (commit_staged() below builds its own,
+    # lazily, only when an upload is actually going to happen) -- so every `av commit`,
+    # including `--no-upload`, paid `requests`' import cost (~1.5s on the reference
+    # machine) for a client object that did nothing.
     repo_root = ensure_repo()
     idx = Index(repo_root)
     cfg = load_config(repo_root)
-    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
 
     staged = idx.get_staged_entries()
     if not staged:
@@ -380,13 +385,20 @@ def _stash_push(message: str | None) -> None:
             "size": entry["size"],
             "type": entry["type"],
             "layers": entry.get("layers", []),
+            # V1.6.0 (Probleme.md): CDC-chunked artifacts were never restorable from a
+            # stash at all -- only `layers` was ever recorded/passed to materialize_file,
+            # so a stashed .pt/.pth/.ckpt (chunked, not layer-split) popped as an empty or
+            # missing file with no error, since the whole-object branch found no local
+            # blob and the server was never asked for one under the right hash either.
+            "chunks": entry.get("chunks", []),
             "pointer": entry.get("pointer"),
             "was_staged": was_staged,
         })
 
         head_data = head_tree.get(rel_path)
         if head_data:
-            materialize_file(repo_root, client, rel_path, head_data["hash"], head_data.get("layers", []))
+            materialize_file(repo_root, client, rel_path, head_data["hash"],
+                             head_data.get("layers", []), head_data.get("chunks", []))
             new_entry = {
                 "hash": head_data["hash"],
                 "size": head_data["size"],
@@ -397,6 +409,8 @@ def _stash_push(message: str | None) -> None:
             }
             if head_data.get("layers"):
                 new_entry["layers"] = head_data["layers"]
+            if head_data.get("chunks"):
+                new_entry["chunks"] = head_data["chunks"]
             idx.entries[rel_path] = new_entry
             # Re-stat now that HEAD's content has actually been written to disk, so the index
             # matches the real (clean) file instead of the 0 placeholder above — otherwise
@@ -470,9 +484,10 @@ def _stash_apply_or_pop(stash_id: str | None, delete_after: bool) -> None:
     for entry in record["entries"]:
         rel_path = entry["rel_path"]
         layers = entry.get("layers", [])
+        chunks = entry.get("chunks", [])
         # v1 doesn't attempt conflict detection against a dirty tree — this overwrites
         # whatever's currently at rel_path, same caveat as the plan this was built from.
-        materialize_file(repo_root, client, rel_path, entry["hash"], layers)
+        materialize_file(repo_root, client, rel_path, entry["hash"], layers, chunks)
 
         if entry["was_staged"]:
             # Was staged before the stash: restore it staged again, with the real (dirty)
@@ -496,6 +511,8 @@ def _stash_apply_or_pop(stash_id: str | None, delete_after: bool) -> None:
             }
         if layers:
             new_entry["layers"] = layers
+        if chunks:
+            new_entry["chunks"] = chunks
         idx.entries[rel_path] = new_entry
 
     idx.save()

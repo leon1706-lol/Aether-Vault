@@ -121,9 +121,16 @@ def test_run_with_multiple_checks_requires_all_to_pass(repo):
     assert passed_by_name["acc_ok"] is False
 
 
-def test_run_offline_still_evaluates_but_does_not_report(repo):
+def test_run_offline_still_evaluates_but_does_not_report(repo, unreachable_client):
     """No server reachable in the test sandbox — the LOCAL evaluation must still work,
-    matching offline-resilience expectations for a read/evaluate-only operation."""
+    matching offline-resilience expectations for a read/evaluate-only operation.
+
+    `unreachable_client` is required here, not optional: a real dev stack (this project's
+    own `docker compose` engine, listening on localhost:8000 by default — the exact
+    `remote_url` `av init` writes) can genuinely be reachable while this suite runs, which
+    silently turns "offline" into "online" and this test's `reported is False` assertion
+    into a false failure that has nothing to do with a real regression (found running the
+    full suite with the project's own Docker stack up, V1.6.0 phase)."""
     suite_file = _write_suite(repo)
     invoke("canary", "register", "core", str(suite_file))
     (repo / "m.txt").write_text("v1")

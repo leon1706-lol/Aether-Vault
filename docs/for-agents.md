@@ -13,9 +13,9 @@ or as a direct Python import (`from av_sdk import Repo`). Pick whichever fits yo
 runtime — a shell-based agent and a Python-native one get the same payload shapes, the
 same error codes, and the same single-writer commit path underneath
 (`python/av_cli/core.py::commit_staged()`). `tests/test_av_sdk.py`'s parity tests pin
-this equivalence for `status`/`add`/`commit`/`push`/`log`/`diff_semantic`/`context_note`/
-`handoff_dict` — if a payload ever drifts between the two, that's a test failure there,
-not a spec you have to read case-by-case.
+this equivalence for `status`/`add`/`commit`/`push`/`fetch`/`log`/`diff_semantic`/
+`context_note`/`handoff_dict` — if a payload ever drifts between the two, that's a test
+failure there, not a spec you have to read case-by-case.
 
 ## Minimal recipe
 

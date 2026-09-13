@@ -11,11 +11,21 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
+
+# V1.6.0 note: none of the stdlib imports above are called directly by this file's own
+# ~500 lines anymore (the "Point-13 split" moved every command body into cmd_*.py) -- a
+# same-session attempt to remove them as dead code broke `tests/test_cli.py`'s benchmark
+# suite, which reaches `importlib.import_module` via `main_module.importlib` specifically
+# because this module is the documented, stable "patch anchor" other test files already
+# rely on for late-bound names (see cmd_auth.py/cmd_devtools.py/cmd_integrations.py/
+# cmd_maintenance.py/cmd_repo.py's own "`_root.<name>`" convention) -- removing an import
+# here isn't just a dead-code question, it can silently break a test's only handle on the
+# real module object. Left in place deliberately; `concurrent.futures.ThreadPoolExecutor`
+# was confirmed to have no such dependents (grepped, none found) and stays removed below.
 
 if TYPE_CHECKING:
     from .client import VaultClient
@@ -173,9 +183,9 @@ def _load_history(group: click.Group) -> None:
 
 
 def _load_sync(group: click.Group) -> None:
-    from .cmd_sync import clone, merge, pull
+    from .cmd_sync import clone, fetch, merge, pull
 
-    for cmd in (clone, pull, merge):
+    for cmd in (clone, pull, merge, fetch):
         group.add_command(cmd)
 
 
@@ -443,7 +453,7 @@ _LOADERS_BY_NAMES: list[tuple[tuple[str, ...], object]] = [
     (("init", "update"), _load_repo),
     (("config", "add", "file", "unstage", "status"), _load_staging),
     (("commit", "branch", "checkout", "log", "stash", "list-meta", "push"), _load_history),
-    (("clone", "pull", "merge"), _load_sync),
+    (("clone", "pull", "merge", "fetch"), _load_sync),
     (("auth", "add-user", "list-users", "remove-user"), _load_auth),
     (("token",), _load_token),
     (("tenant",), _load_tenant),

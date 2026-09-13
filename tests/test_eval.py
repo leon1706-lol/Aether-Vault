@@ -94,7 +94,7 @@ def _fake_client(monkeypatch, reg: _FakeEvalRegistry, forbidden_scopes=()):
                 return _FakeResponse(200, {"tasks": []})
             return _FakeResponse(404, {})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             body = json or {}
             if "eval:write" in forbidden_scopes and (url.endswith("/api/eval/suites")
                                                       or url.endswith("/freeze")):

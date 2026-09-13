@@ -54,6 +54,33 @@ def test_update_check_disabled_skips_network(monkeypatch):
     assert calls == []
 
 
+def test_av_no_update_check_env_skips_network_even_when_cache_is_stale(monkeypatch):
+    monkeypatch.setenv("AV_NO_UPDATE_CHECK", "1")
+    calls = []
+    monkeypatch.setattr(update_check, "_fetch_latest_version", lambda *a, **k: calls.append(1) or "9.9.9")
+    assert update_check.check_for_update() is None
+    assert calls == []
+
+
+def test_av_no_update_check_env_does_not_override_an_explicit_force(monkeypatch):
+    # force=True is an explicit `av update` invocation -- the env var only suppresses the
+    # implicit, routine-command checks (init's own check, the finally-block auto-update).
+    monkeypatch.setenv("AV_NO_UPDATE_CHECK", "1")
+    calls = []
+    monkeypatch.setattr(update_check, "_fetch_latest_version", lambda *a, **k: calls.append(1) or "9.9.9")
+    update_check.check_for_update(force=True)
+    assert calls == [1]
+
+
+def test_av_no_update_check_env_short_circuits_maybe_auto_update(monkeypatch):
+    monkeypatch.setenv("AV_NO_UPDATE_CHECK", "1")
+    _set_auto_update(True)
+    calls = []
+    monkeypatch.setattr(update_check, "check_for_update", lambda *a, **k: calls.append(1))
+    assert update_check.maybe_auto_update() is False
+    assert calls == []
+
+
 def test_list_versions_sorted_descending(monkeypatch):
     # V1.5.0: `requests` is imported lazily inside list_versions()/_fetch_latest_version()
     # now (was a module-level `update_check.requests` attribute) so importing update_check

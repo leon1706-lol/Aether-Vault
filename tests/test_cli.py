@@ -234,6 +234,11 @@ def test_checkout_reassembles_safetensors_from_layers(repo):
     assert result.exit_code == 0, result.output
     assert (repo / "model.safetensors").read_bytes() == blob
 
+    # V1.6.0 (Probleme.md): checkout of a layer-split artifact must not re-store the
+    # reassembled whole blob under its own hash in .av/objects.
+    whole_hash = Index(repo).get_entry("model.safetensors")["hash"]
+    assert not (repo / ".av" / "objects" / whole_hash[:2] / whole_hash[2:]).exists()
+
 
 def test_doctor_does_not_flag_layered_artifact_as_orphaned(repo):
     pytest.importorskip("aether_core")
@@ -675,6 +680,14 @@ def test_doctor_on_healthy_repo_reports_ok(repo):
     assert "No orphaned pointer entries" in result.output
     assert "No commits pending push" in result.output
     assert "No *.tmp.* leftover files" in result.output
+
+
+def test_doctor_reports_sha256_backend_when_native_core_loaded(repo):
+    pytest.importorskip("aether_core")
+    result = invoke("doctor")
+    assert result.exit_code == 0, result.output
+    assert "SHA-256 backend:" in result.output
+    assert any(name in result.output for name in ("scalar", "sha-ni", "arm-sha2"))
 
 
 def test_doctor_detects_orphaned_pointer(repo):
@@ -1253,7 +1266,7 @@ def test_sync_readme_perf_ratio_rewrites_from_a_real_capture(tmp_path, monkeypat
     capture in development/BENCHMARKS.md put it at ~63x — nothing had ever re-derived
     README's copy of that ratio from a real benchmark run."""
     import python.av_cli.main as main_module
-    from python.av_cli.cmd_devtools import _sync_readme_perf_ratio
+    from python.av_cli.cmd_devtools import _sync_readme_benchmark_table
 
     (tmp_path / "README.md").write_text(
         "- Perf #4 — ~15x slower than Git LFS at interpreter startup.\n"
@@ -1262,9 +1275,9 @@ def test_sync_readme_perf_ratio_rewrites_from_a_real_capture(tmp_path, monkeypat
     )
     monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
 
-    row = type("Row", (), {"values": {"av": 13023.1, "git-lfs": 206.0}})()
+    row = type("Row", (), {"operation": "re-add unchanged (60 files)", "values": {"av": 13023.1, "git-lfs": 206.0}})()
     result = type("Result", (), {"name": "noop_status_speed", "rows": [row]})()
-    _sync_readme_perf_ratio([result])
+    _sync_readme_benchmark_table([result])
 
     text = (tmp_path / "README.md").read_text(encoding="utf-8")
     assert text.count("~63x slower than Git LFS") == 2
@@ -1272,17 +1285,36 @@ def test_sync_readme_perf_ratio_rewrites_from_a_real_capture(tmp_path, monkeypat
 
 def test_sync_readme_perf_ratio_leaves_readme_alone_without_a_real_git_lfs_number(tmp_path, monkeypatch):
     import python.av_cli.main as main_module
-    from python.av_cli.cmd_devtools import _sync_readme_perf_ratio
+    from python.av_cli.cmd_devtools import _sync_readme_benchmark_table
 
     original = "- Perf #4 — ~15x slower than Git LFS at interpreter startup.\n"
     (tmp_path / "README.md").write_text(original, encoding="utf-8")
     monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
 
-    row = type("Row", (), {"values": {"av": 13023.1, "git-lfs": None}})()  # git-lfs not installed
+    row = type("Row", (), {"operation": "re-add unchanged (60 files)", "values": {"av": 13023.1, "git-lfs": None}})()  # git-lfs not installed
     result = type("Result", (), {"name": "noop_status_speed", "rows": [row]})()
-    _sync_readme_perf_ratio([result])
+    _sync_readme_benchmark_table([result])
 
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == original
+
+
+def test_sync_readme_perf_ratio_flips_to_faster_when_av_wins(tmp_path, monkeypatch):
+    """WS0.4: once av's no-op add beats Git LFS, the README sentence must flip from
+    "slower" to "faster" instead of keeping stale wording forever."""
+    import python.av_cli.main as main_module
+    from python.av_cli.cmd_devtools import _sync_readme_benchmark_table
+
+    (tmp_path / "README.md").write_text(
+        "- Perf #4 — ~15x slower than Git LFS at interpreter startup.\n", encoding="utf-8",
+    )
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+
+    row = type("Row", (), {"operation": "re-add unchanged (60 files)", "values": {"av": 50.0, "git-lfs": 150.0}})()
+    result = type("Result", (), {"name": "noop_status_speed", "rows": [row]})()
+    _sync_readme_benchmark_table([result])
+
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "~3x faster than Git LFS" in text
 
 
 def test_test_command_updates_readme_badge_from_pytest_summary(tmp_path, monkeypatch):
@@ -1337,9 +1369,11 @@ class _FakeBenchModule:
     def __init__(self, name):
         self.name = name
         self.calls = []
+        self.repeats = []
 
-    def run(self, tool_order):
+    def run(self, tool_order, repeat=1):
         self.calls.append(tool_order)
+        self.repeats.append(repeat)
         from benchmarks.tool_runner import BenchmarkResult, Row, ToolStatus
         return BenchmarkResult(
             name=self.name,
@@ -1454,7 +1488,7 @@ def test_benchmark_command_baseline_exits_nonzero_on_a_real_regression(repo, mon
     import python.av_cli.main as main_module
 
     class _RegressedBenchModule(_FakeBenchModule):
-        def run(self, tool_order):
+        def run(self, tool_order, repeat=1):
             self.calls.append(tool_order)
             from benchmarks.tool_runner import BenchmarkResult, Row, ToolStatus
             return BenchmarkResult(
@@ -1499,6 +1533,92 @@ def test_benchmark_command_accepts_gc_throughput_via_only(repo, monkeypatch):
     result = invoke("benchmark", "--only", "gc_throughput")
     assert result.exit_code == 0, result.output
     assert imported == ["benchmarks.bench_gc_throughput"]
+
+
+def test_benchmark_command_defaults_repeat_to_three(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    module = _FakeBenchModule("benchmarks.bench_hashing_throughput")
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: module)
+
+    result = invoke("benchmark", "--only", "hashing_throughput")
+    assert result.exit_code == 0, result.output
+    assert module.repeats == [3]
+
+
+def test_benchmark_command_repeat_flag_is_forwarded_to_every_benchmark_module(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    module = _FakeBenchModule("benchmarks.bench_hashing_throughput")
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: module)
+
+    result = invoke("benchmark", "--only", "hashing_throughput", "--repeat", "5")
+    assert result.exit_code == 0, result.output
+    assert module.repeats == [5]
+
+
+def test_benchmark_command_tolerates_a_run_that_predates_the_repeat_parameter(repo, monkeypatch):
+    """A benchmark module whose `run()` doesn't accept `repeat` (e.g. a storage-byte-count
+    benchmark with nothing to average, or one not yet updated) must still work -- the
+    TypeError from the mismatched call falls back to the old calling convention."""
+    import python.av_cli.main as main_module
+
+    class _OldStyleModule:
+        def run(self, tool_order):
+            from benchmarks.tool_runner import BenchmarkResult, Row, ToolStatus
+            return BenchmarkResult(
+                name="benchmarks.bench_hashing_throughput", title="Old", description="d",
+                tool_order=tool_order,
+                rows=[Row(operation="op", values={t: 1.0 for t in tool_order}, statuses={t: ToolStatus.AVAILABLE for t in tool_order})],
+            )
+
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _OldStyleModule())
+    result = invoke("benchmark", "--only", "hashing_throughput")
+    assert result.exit_code == 0, result.output
+
+
+def test_benchmark_command_no_daemon_flag_sets_av_no_daemon_env(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    monkeypatch.delenv("AV_NO_DAEMON", raising=False)
+    module = _FakeBenchModule("benchmarks.bench_hashing_throughput")
+
+    def fake_import(name):
+        assert os.environ.get("AV_NO_DAEMON") == "1"  # already set by the time run() executes
+        return module
+
+    monkeypatch.setattr(main_module.importlib, "import_module", fake_import)
+    try:
+        result = invoke("benchmark", "--only", "hashing_throughput", "--no-daemon")
+        assert result.exit_code == 0, result.output
+    finally:
+        os.environ.pop("AV_NO_DAEMON", None)
+
+
+def test_benchmark_command_warns_when_av_no_daemon_leaks_in_from_the_shell(repo, monkeypatch):
+    import python.av_cli.main as main_module
+
+    monkeypatch.setenv("AV_NO_DAEMON", "1")
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _FakeBenchModule(name))
+
+    result = invoke("benchmark", "--only", "hashing_throughput")
+    assert result.exit_code == 0, result.output
+    assert "not the product default" in result.output.lower() or "warning" in result.output.lower()
+
+
+def test_benchmark_command_markdown_includes_claim_summary(repo, monkeypatch, tmp_path):
+    import python.av_cli.main as main_module
+    import benchmarks.tool_runner as tool_runner_module
+
+    monkeypatch.setattr(main_module.importlib, "import_module", lambda name: _FakeBenchModule(name))
+    monkeypatch.setattr(tool_runner_module, "render_doc_header", lambda *a, **k: "# fake header\n\n")
+
+    out_path = tmp_path / "BENCHMARKS.md"
+    result = invoke("benchmark", "--only", "hashing_throughput", "--markdown", str(out_path))
+    assert result.exit_code == 0, result.output
+    text = out_path.read_text()
+    assert "## Claim status" in text
+    assert "Faster in every published domain:" in text
 
 
 # ---------------------------------------------------------------------------
@@ -1991,6 +2111,12 @@ def test_checkout_reassembles_chunked_checkpoint(repo):
     assert (repo / "checkpoint.pt").read_bytes() == blob
     status = invoke("status")
     assert "Nothing to commit" in status.output
+
+    # V1.6.0 (Probleme.md): checkout of a chunked artifact must not re-store the
+    # reassembled whole blob under its own hash in .av/objects -- that duplicated the full
+    # artifact's bytes on every restore, undoing the chunking's storage saving.
+    whole_hash = Index(repo).get_entry("checkpoint.pt")["hash"]
+    assert not (repo / ".av" / "objects" / whole_hash[:2] / whole_hash[2:]).exists()
 
 
 def test_doctor_chunked_artifact_not_orphaned_but_missing_chunk_detected(repo):

@@ -7,6 +7,7 @@ command), so normal commands (`av add`, `av status`, ...) never pay a network-ca
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,7 +88,16 @@ def _is_outdated(current: str, latest: str) -> bool:
         return current != latest
 
 
+def _no_update_check_env() -> bool:
+    """`AV_NO_UPDATE_CHECK=1` -- lets a benchmark/test time `av init` without a PyPI round
+    trip skewing the number (Git/DVC's own `init` never touches the network either)."""
+    return os.environ.get("AV_NO_UPDATE_CHECK", "").strip().lower() in ("1", "true", "yes")
+
+
 def check_for_update(force: bool = False, cache_hours: float = 12.0) -> UpdateCheckResult | None:
+    if not force and _no_update_check_env():
+        return None
+
     cfg = load_user_config()
 
     if not force and not cfg.get("update_check_enabled", True):
@@ -147,6 +157,9 @@ def maybe_auto_update() -> bool:
     """
     import subprocess
     import sys
+
+    if _no_update_check_env():
+        return False
 
     cfg = load_user_config()
     if not cfg.get("auto_update", False):

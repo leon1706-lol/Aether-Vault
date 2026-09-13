@@ -42,7 +42,7 @@ def _fake_client(monkeypatch, get_body=None, get_status=200, post_status=200, po
         def get(self, url, params=None, timeout=None):
             return _FakeResponse(get_status, get_body)
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             return _FakeResponse(post_status, post_body)
 
     class _FakeClient(client_module.VaultClient):

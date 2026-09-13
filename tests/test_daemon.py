@@ -111,14 +111,112 @@ def test_enabled_mode_auto_spawn(monkeypatch):
     assert daemon_common.enabled_mode() == "auto_spawn"
 
 
-def test_enabled_mode_default_is_use_only(monkeypatch):
+def test_enabled_mode_default_is_auto_spawn(monkeypatch):
+    """V1.6.0: the default flipped from "use_only" to "auto_spawn" -- a daemon now
+    auto-starts on first use per repo unless explicitly opted out (AV_NO_DAEMON=1,
+    AV_DAEMON=0/false/no, or `.av/config`'s `"daemon":{"enabled":false}`)."""
     monkeypatch.delenv("AV_NO_DAEMON", raising=False)
     monkeypatch.delenv("AV_DAEMON", raising=False)
+    assert daemon_common.enabled_mode() == "auto_spawn"
+
+
+def test_enabled_mode_av_daemon_zero_is_use_only(monkeypatch):
+    monkeypatch.delenv("AV_NO_DAEMON", raising=False)
+    monkeypatch.setenv("AV_DAEMON", "0")
     assert daemon_common.enabled_mode() == "use_only"
 
 
-def test_allowed_commands_is_exactly_the_documented_three():
-    assert daemon_common.ALLOWED_COMMANDS == {"add", "status", "commit"}
+def test_enabled_mode_config_false_is_use_only(repo, monkeypatch):
+    monkeypatch.delenv("AV_NO_DAEMON", raising=False)
+    monkeypatch.delenv("AV_DAEMON", raising=False)
+    (repo / ".av" / "config").write_text(json.dumps({"daemon": {"enabled": False}}))
+    assert daemon_common.enabled_mode(repo) == "use_only"
+
+
+def test_allowed_commands_matches_v160_set():
+    assert daemon_common.ALLOWED_COMMANDS == {
+        "add", "status", "commit", "push", "fetch", "unstage", "log", "diff", "context", "run",
+    }
+
+
+# ---------------------------------------------------------------------------
+# first_subcommand -- must resolve exactly what click's own parser would for main.py's global
+# options (--verbose/--silent/--version are bare flags, --output takes one value). V1.6.0:
+# moved here from test_launcher.py when the implementation itself moved from being a private
+# copy in launcher.py to the one shared home every daemon-path layer uses -- see
+# test_handle_request_allows_allowlisted_command_with_leading_global_options and
+# test_call_daemon_reaches_state_lookup_with_leading_global_options for why a single shared
+# implementation matters here, not just launcher.py's own entry gate.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("argv,expected", [
+    (["status"], "status"),
+    (["add", "f.py"], "add"),
+    ([], None),
+    (["--verbose", "status"], "status"),
+    (["--silent", "add", "f.py"], "add"),
+    (["--output", "json", "status"], "status"),  # the exact bug this fixes
+    (["--output=json", "status"], "status"),
+    (["--verbose", "--output", "json", "commit", "-m", "x"], "commit"),
+    (["--output", "json", "--verbose", "push"], "push"),
+    (["--version"], None),
+    (["--help"], "--help"),  # not a global option in this module's list
+    (["--output", "json"], None),  # global option consumes its value, nothing left
+])
+def test_first_subcommand_skips_global_options(argv, expected):
+    assert daemon_common.first_subcommand(argv) == expected
+
+
+def test_first_subcommand_does_not_mistake_a_command_named_like_a_flag_value_for_a_flag():
+    # "--output" always consumes exactly the next token as its value, even if that token
+    # happens to look like it could be a command -- matches click's own real parsing.
+    assert daemon_common.first_subcommand(["--output", "status"]) is None
+
+
+def test_allowlisted_command_modules_never_prompt():
+    """Static verification, not just an assertion of trust: every module backing an
+    allowlisted command must be free of anything that could block waiting on a real
+    terminal -- questionary/prompt_toolkit imports, or click's own prompt/confirm helpers,
+    or a bare `input(`. Growing ALLOWED_COMMANDS later without also passing this check is
+    exactly the mistake this guards against."""
+    import ast
+    from pathlib import Path
+
+    command_modules = {
+        "add": "cmd_staging.py", "status": "cmd_staging.py", "unstage": "cmd_staging.py",
+        "commit": "cmd_history.py", "push": "cmd_history.py", "log": "cmd_history.py",
+        "fetch": "cmd_sync.py", "diff": "cmd_diff.py", "context": "cmd_context.py",
+        "run": "cmd_run.py",
+    }
+    assert set(command_modules) == daemon_common.ALLOWED_COMMANDS, (
+        "this test's own module map is out of sync with ALLOWED_COMMANDS -- update both"
+    )
+    src_dir = Path(daemon_common.__file__).resolve().parent
+    forbidden_imports = {"questionary", "prompt_toolkit"}
+    forbidden_calls = {"input"}  # click.prompt/click.confirm are attribute calls, caught below
+    for module_file in set(command_modules.values()):
+        tree = ast.parse((src_dir / module_file).read_text(encoding="utf-8"), filename=module_file)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name.split(".")[0] not in forbidden_imports, (
+                        f"{module_file} imports {alias.name} -- not safe for the daemon allowlist"
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                assert (node.module or "").split(".")[0] not in forbidden_imports, (
+                    f"{module_file} imports from {node.module} -- not safe for the daemon allowlist"
+                )
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                assert name not in forbidden_calls, (
+                    f"{module_file} calls {name}() -- not safe for the daemon allowlist"
+                )
+                if isinstance(func, ast.Attribute) and func.attr in ("prompt", "confirm"):
+                    owner = func.value.id if isinstance(func.value, ast.Name) else None
+                    assert owner != "click", (
+                        f"{module_file} calls click.{func.attr}() -- not safe for the daemon allowlist"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +260,21 @@ def test_handle_request_rejects_disallowed_command(repo):
     assert resp["error"] == "not_allowed"
 
 
+def test_handle_request_allows_allowlisted_command_with_leading_global_options(repo):
+    """V1.6.0 real bug (found building the native launcher's own test coverage): this
+    server-side re-check used to be a plain `argv[0] not in ALLOWED_COMMANDS`, so a request
+    carrying `["--output", "json", "status"]` -- exactly what a real client actually sends,
+    since the daemon protocol forwards the client's whole original argv, globals included --
+    was rejected with `not_allowed` even though `status` is allowlisted and the CLIENT'S OWN
+    gate (`daemon_client.call_daemon`, `launcher.py`) had already validated it. See
+    `daemon_common.first_subcommand`'s docstring for the full account."""
+    server = daemon_module.DaemonServer(repo, "test-version")
+    req = _base_request(token=server.token, argv=["--output", "json", "status"], cwd=str(repo))
+    resp = server.handle_request(req)
+    assert "error" not in resp
+    assert resp["exit_code"] == 0
+
+
 def test_handle_request_rejects_cli_version_mismatch(repo):
     server = daemon_module.DaemonServer(repo, "test-version")
     resp = server.handle_request(_base_request(token=server.token, cli_version="other-version"))
@@ -189,6 +302,31 @@ def test_handle_request_add_actually_stages_the_file(repo):
     assert resp["exit_code"] == 0
     idx_text = (repo / ".av" / "index").read_text()
     assert "f.py" in idx_text
+
+
+def test_auth_failure_via_daemon_returns_clean_exit_not_a_hang(repo, monkeypatch):
+    """The daemon's stdin is DEVNULL (daemon_client.spawn_detached) and its stdout is
+    redirected to an io.StringIO (daemon.py::_execute) for the duration of every request --
+    both make `ui.is_interactive()` (stdin AND stdout must both be a real tty) false by
+    construction, so `_AuthRetryGroup`'s 401-retry prompt (core.py) can never actually try
+    to block waiting on a real terminal inside the daemon. No separate "needs_interactive"
+    protocol concept is needed -- proven end-to-end here: a `status` call that hits
+    AuthenticationError deep inside must return a clean auth_failed exit, not hang the
+    request or crash the daemon."""
+    import python.av_cli.cmd_staging as cmd_staging_module
+    from python.av_cli.client import AuthenticationError
+
+    def _raise(*a, **k):
+        raise AuthenticationError("nope")
+
+    monkeypatch.setattr(cmd_staging_module, "compute_status", _raise)
+
+    server = daemon_module.DaemonServer(repo, "test-version")
+    req = _base_request(token=server.token, argv=["status"], cwd=str(repo))
+    resp = server.handle_request(req)
+    assert "error" not in resp  # a completed response, not a protocol-level refusal
+    assert resp["exit_code"] == 12  # auth_failed -- never a hang, never a crash
+    assert "protected" in (resp["stdout"] + resp["stderr"]).lower()
 
 
 def test_handle_request_serializes_concurrent_calls(repo):
@@ -251,6 +389,34 @@ def test_end_to_end_status_and_add_over_real_transport(repo):
         time.sleep(0.3)
 
 
+def test_zero_byte_disconnect_does_not_kill_the_daemon_thread(repo):
+    """V1.6.0 real bug (found by the native launcher's own test suite -- see
+    `daemon.py::_serve_connection`'s comment for the full account): `read_status()`
+    deliberately connects and disconnects WITHOUT sending anything, to check reachability --
+    exactly what `av daemon status` and `maybe_auto_spawn` (in turn called from every
+    `launcher.py` invocation whenever `call_daemon` returns None) do on a real daemon in
+    normal use. No existing test drove that real path against a real live daemon (every
+    `maybe_auto_spawn` test mocks `read_status`), so this uncaught-`OSError`-kills-the-
+    thread bug shipped unnoticed. Proven here: `read_status` for real, then a REAL
+    subsequent request must still be served -- the thread must not have died."""
+    cli_version = "e2e-zero-byte-test"
+    server = daemon_module.DaemonServer(repo, cli_version, idle_timeout=30)
+    _run_daemon_in_thread(server)
+    try:
+        _wait_for_state_file(repo, cli_version)
+
+        status = daemon_client.read_status(repo, cli_version)
+        assert status is not None  # the zero-op connect itself must report "reachable"
+
+        resp = daemon_client.call_daemon(repo, cli_version, ["status"])
+        assert resp is not None and resp["exit_code"] == 0, (
+            "the daemon thread must survive a zero-byte reachability probe and keep serving"
+        )
+    finally:
+        server._stop.set()
+        time.sleep(0.3)
+
+
 def test_end_to_end_output_matches_in_process_cli(repo, monkeypatch):
     """The core promise: a command run through the daemon produces the same observable
     result as running it in-process. Compares actual index/commit state, not just stdout
@@ -293,6 +459,29 @@ def test_call_daemon_returns_none_when_no_daemon_running(repo):
 def test_call_daemon_returns_none_for_disallowed_command(repo):
     resp = daemon_client.call_daemon(repo, "any-version", ["login"])
     assert resp is None
+
+
+def test_call_daemon_reaches_state_lookup_with_leading_global_options(repo, monkeypatch):
+    """V1.6.0 real bug (found building the native launcher's own test coverage):
+    `call_daemon`'s own allowlist guard used to check `argv[0]` positionally, so
+    `["--output", "json", "status"]` was rejected right here -- before ever consulting the
+    state file -- indistinguishable from "no daemon running" to the caller. `launcher.py`'s
+    own gate had already correctly resolved "status" and called this function anyway, so the
+    net effect was: `av --output json status` silently never reached a daemon even when one
+    was running. Proven here by observing the state-file lookup is actually attempted (it
+    still returns None -- no daemon is actually running in this test -- but for the RIGHT
+    reason, not because the guard rejected it)."""
+    calls = []
+    real_read_state = daemon_client._read_state
+
+    def _spy(repo_root, cli_version):
+        calls.append(1)
+        return real_read_state(repo_root, cli_version)
+
+    monkeypatch.setattr(daemon_client, "_read_state", _spy)
+    resp = daemon_client.call_daemon(repo, "any-version", ["--output", "json", "status"])
+    assert resp is None
+    assert calls, "the allowlist guard must resolve 'status' and proceed to the state lookup"
 
 
 def test_call_daemon_respects_av_no_daemon(repo, monkeypatch):
@@ -406,10 +595,13 @@ def test_enabled_mode_with_repo_root_honors_config_opt_in(repo, monkeypatch):
 
 def test_enabled_mode_without_repo_root_ignores_config(repo, monkeypatch):
     """The cheap env-only call (no repo_root) must never touch the filesystem for this --
-    that's the whole point of the two-tier check in launcher.py."""
+    that's the whole point of the two-tier check in launcher.py. Config here says
+    enabled:true (would resolve to "auto_spawn" if read), but the point of this test is
+    that it's never read at all -- the assertion is on the V1.6.0 *default* precisely
+    because that's what a repo_root-less call falls through to without ever looking."""
     monkeypatch.delenv("AV_DAEMON", raising=False)
     (repo / ".av" / "config").write_text(json.dumps({"daemon": {"enabled": True}}))
-    assert daemon_common.enabled_mode() == "use_only"
+    assert daemon_common.enabled_mode() == "auto_spawn"
 
 
 def test_enabled_mode_env_var_wins_over_config(repo, monkeypatch):

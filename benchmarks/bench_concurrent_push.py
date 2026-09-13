@@ -3,7 +3,8 @@
 Aether has a real multi-tenant FastAPI server that N clients can push to concurrently
 against one shared endpoint; DVC/Git LFS/MLflow have no equivalent concurrent-server
 primitive, so this is scoped Aether-only (see BENCHMARKS.md methodology) with the other
-three columns N/A.
+three columns N/A, and the whole benchmark is excluded from the "faster in every published
+domain" claim (`claim_scope="internal"`) rather than silently counted as a pass.
 
 Drives `VaultClient.push_commit()` directly (no subprocess) from a thread pool against
 whichever real `av_server` is reachable.
@@ -11,6 +12,7 @@ whichever real `av_server` is reachable.
 
 import concurrent.futures
 import hashlib
+import statistics
 import sys
 import time
 import uuid
@@ -47,7 +49,21 @@ def _push_one(_: int) -> bool:
         return client.push_commit(_fake_commit())
 
 
-def run(tool_order: list[str] | None = None) -> BenchmarkResult:
+def _one_round() -> tuple[float, bool, Exception | None]:
+    """One batch of CONCURRENT_PUSHES simultaneous pushes. Returns (elapsed_ms, ok, exc) --
+    a reset/failure under concurrency can raise out of push_commit() rather than return
+    False, so any exception is captured and reported rather than propagated (a
+    server-was-up-the-whole-time failure, never "not installed")."""
+    start = time.perf_counter()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENT_PUSHES) as pool:
+            results = list(pool.map(_push_one, range(CONCURRENT_PUSHES)))
+        return (time.perf_counter() - start) * 1000, all(results), None
+    except Exception as exc:  # noqa: BLE001 -- reported to the caller, never silently swallowed
+        return (time.perf_counter() - start) * 1000, False, exc
+
+
+def run(tool_order: list[str] | None = None, repeat: int = 1) -> BenchmarkResult:
     tool_order = tool_order or ["av", "git-lfs", "dvc", "mlflow"]
     client = VaultClient()
     server_up = client.server_available()
@@ -58,22 +74,17 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
     notes: dict[str, str] = {}
 
     if server_up:
-        start = time.perf_counter()
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENT_PUSHES) as pool:
-                results = list(pool.map(_push_one, range(CONCURRENT_PUSHES)))
-            ok = all(results)
-        except Exception as exc:
-            # A reset/failure under concurrency can raise out of push_commit() rather
-            # than return False -- a server-was-up-the-whole-time failure, never "not installed".
-            results = []
-            ok = False
-            notes["av"] = f"server reachable but the operation failed: {exc}"
-        elapsed_ms = (time.perf_counter() - start) * 1000
+        rounds = [_one_round() for _ in range(max(1, repeat))]
+        ok = all(r[1] for r in rounds)
+        elapsed_ms = statistics.median(r[0] for r in rounds)
+        first_exc = next((r[2] for r in rounds if r[2] is not None), None)
         values["av"] = elapsed_ms if ok else None
         statuses["av"] = ToolStatus.AVAILABLE if ok else ToolStatus.FAILED
-        if not ok and "av" not in notes:
-            notes["av"] = "server was reachable but one or more of the concurrent pushes failed"
+        if not ok:
+            notes["av"] = (
+                f"server reachable but the operation failed: {first_exc}" if first_exc else
+                "server was reachable but one or more of the concurrent pushes failed"
+            )
     else:
         values["av"] = None
         statuses["av"] = ToolStatus.NOT_INSTALLED
@@ -101,6 +112,7 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
         ),
         tool_order=tool_order,
         rows=[row],
+        claim_scope="internal",
     )
 
 

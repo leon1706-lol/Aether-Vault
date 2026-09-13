@@ -1825,6 +1825,8 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 **Verification:** The raw-stdlib isolation script above reproduces the same ~16-17ms/file cost with zero av_cli code in the loop, proving the regression (if it were one) can't be in this codebase. `AV_PERF_BUDGET_MULTIPLIER` exists exactly for this class of noise (documented in `test_perf_gate.py`'s own docstring); CI and any real user's machine (no comparable per-file AV-scan tax) are expected to hit the un-multiplied budget normally.
 
+**2026-09-12 re-confirmation (v1.6.0 phase, unrelated to any change this phase made):** re-ran the gate at its DEFAULT multiplier (no override) with this dev box's Docker stack (Postgres+Redis+engine) up and under 0.4GB free RAM out of 3.9GB total — `log() (150 commits): median 6181ms > 4.5x300ms (disk, 4/4 samples over)`. Re-ran the exact same raw-stdlib isolation script (zero av_cli code) fresh: **39.71ms/file** this time, roughly 2.4x worse than the ~16.5ms/file measured when this entry was first written — consistent with today's added Docker/RAM pressure, not a code-side regression (nothing touched this phase sits anywhere near `cmd_history.py`'s `log()`/`find_commit_file()`). Confirms this is the same closed, environmental issue, now simply more pronounced under heavier concurrent load on the same box, not a new or worsening product-side problem. No action taken; re-check remains "on a quieter box" as originally concluded.
+
 ---
 
 ### 152. `test_should_stop_watchdog_does_not_fire_while_active` had a real race that silently killed pytest's own process, real GitHub Actions CI included — #149 wrongly blamed the local sandbox
@@ -1836,3 +1838,192 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** The test now waits on the same `exited` event *after* setting `_stop`, mirroring the pattern the companion test (`test_should_stop_watchdog_fires_on_idle_timeout`) already used correctly — guaranteeing the mocked `os._exit` fires, and is observed, while the monkeypatch is still active, before the test function returns and teardown restores the real one.
 
 **Verification:** `pytest tests/test_daemon.py` (all 53 tests, one process, no `-k` splitting) run 3 times in a row after the fix, each producing a complete, clean summary line (`52 passed, 1 skipped`) — the exact invocation that never once completed cleanly all session before this fix, including on real CI. #149's entry above is left in place as the historical record of the incorrect investigation; its status line now points here.
+
+---
+
+### 153. Benchmark `commit`/`add`/`init` rows were reading the wrong timing after a probe was inserted at index 0 — the published "commit ~4.4x slower than DVC" number was never a commit measurement
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-12), found during a V1.6.0 benchmark-methodology audit.
+
+**Problem:** `speedcheck.run_av_cli_probes()` gained a new `av --version` probe at index 0 in V1.5.0, but `benchmarks/bench_commit_push_latency.py` and `scripts/run_benchmark_comparison.py` still read `probes[0]`/`probes[1]`/`probes[2]` positionally — silently shifting every label one slot. The published "commit" row was actually `av add .`'s timing, and the real `av commit` number was discarded entirely; no test asserted the mapping.
+
+**Fix:** New `speedcheck.probe_ms(probes, label_prefix)` looks a probe up by its label instead of a position; both consumers switched to it. `tests/test_benchmark_mapping.py` pins the exact regression (a probe inserted at the front must not change what any existing label resolves to) plus an end-to-end check against `run_av_cli_probes` itself.
+
+**Verification:** `pytest tests/test_benchmark_mapping.py tests/test_tool_runner.py -q` — 55 passed. Also fixed alongside: the commit row now times `av commit --no-upload` (a fair comparison to DVC/Git LFS's own network-free commit) while the push row measures the real upload, matching `dvc push`.
+
+---
+
+### 154. Non-ASCII file paths silently failed in the C++ core on Windows — `hash_file` reported "File not found" for a real, existing file
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-09-12), reproduced live while adding SHA-256 backend tests (`tests/test_core.py::test_hash_file_non_ascii_path`), not a hypothetical.
+
+**Problem:** Every path-taking call in `src/core.cpp` (`fs::exists`, `fs::file_size`, `fs::last_write_time`, `std::ifstream`, `std::ofstream`) passed the UTF-8 `std::string` pybind11 hands over straight into `fs::path`'s `std::string` constructor. On Windows that constructor decodes via the process's ANSI code page, not UTF-8 — a file named e.g. `модель_ü.bin` genuinely exists on disk but `aether_core.hash_file()` threw `RuntimeError: File not found`, and `av add`'s Python-side `hashlib` fallback (which never triggers here, since the *stat* call fails first) doesn't cover it either.
+
+**Fix:** New file-local `to_path(utf8: std::string) -> fs::path` helper (`fs::u8path`, always correct regardless of platform); every one of the ~21 path-taking calls in `core.cpp` now goes through it, never the bare string.
+
+**Verification:** `tests/test_core.py::test_hash_file_non_ascii_path` (new) reproduces the exact failure pre-fix and passes post-fix; full `pytest tests/test_core.py -q` — 41 passed, no regressions.
+
+---
+
+### 155. `checkout`/`stash pop`/`merge`/`clone`/`pull` re-stored the whole reassembled blob for every layer-split or CDC-chunked artifact, undoing the storage saving `add()` deliberately avoids
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-12), found during a V1.6.0 restore-path audit; the double-store itself dates to the original layer/CDC restore code.
+
+**Problem:** `materialize_file()` reassembled a layer-split or chunked artifact from its shards into the working tree, then ALSO `shutil.copy2`'d the reassembled bytes into `.av/objects/<whole-hash>` — duplicating the full artifact's bytes on disk (shards *and* a complete second copy) on every single restore, the exact inverse of what layer-splitting/CDC-chunking exist to save (Probleme #47 fixed the same mistake in `add()`; restore never got the equivalent fix).
+
+**Fix:** Removed both `shutil.copy2(dest, obj_path)` calls and their `and not obj_path.exists()` short-circuits; layered/chunked entries now reassemble straight into the working tree and stop there. Trade-off, accepted: a repeat checkout of the same split entry always re-reassembles from shards rather than short-circuiting off a cached whole blob — correct either way, just not free the second time. No consumer relied on that whole blob existing for a split entry (`push_objects` already skips it; `doctor`'s orphan checks are shard-aware).
+
+**Verification:** `tests/test_cli.py::test_checkout_reassembles_safetensors_from_layers` and `test_checkout_reassembles_chunked_checkpoint` both extended to assert the whole-hash object is absent after checkout; `tests/test_sync.py::test_materialize_tree_prefetches_missing_parts_in_one_batch` asserts it directly for a fresh restore. Also manually verified end-to-end against a real live registry in a scratch repo: push → delete `.av/objects` → `av fetch` → `av checkout main` → confirmed byte-identical restore with no whole-blob object written.
+
+---
+
+### 156. `av stash` silently produced an empty or missing file for any CDC-chunked artifact — only layer-split safetensors ever survived a stash round-trip
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-09-12), a real bug reproduced live, not a hypothetical.
+
+**Problem:** `stash push`/`pop`/`apply` in `cmd_history.py` recorded and restored an entry's `layers` field but never its `chunks` field — a CDC-chunked artifact (e.g. a `.pt`/`.ckpt` checkpoint, distinct from a layer-split `.safetensors`) has no `layers`, so `materialize_file()` fell through to the whole-object branch, found no local blob under a hash the server never had either, and silently produced nothing, with no error surfaced.
+
+**Fix:** `chunks` is now recorded in the stash entry and threaded through every `materialize_file()` call in `cmd_history.py`'s stash push/pop/apply paths, alongside `layers`.
+
+**Verification:** New `tests/test_stash.py::test_stash_push_pop_roundtrip_preserves_cdc_chunked_artifact` (12MB random checkpoint, forces ≥2 chunks past the CDC hard cap) — fails on the pre-fix code, passes after. Also manually reproduced and verified fixed end-to-end with the real `av` binary in a scratch repo (dirty checkpoint → `av stash` → `av stash pop` → byte-identical restore, confirmed via SHA-256).
+
+---
+
+### 157. `av registry export` always counted every layer-split/CDC-chunked artifact's whole-file object as "failed" — a false negative on every project with split artifacts
+
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-09-12).
+
+**Problem:** The export walk collected `info["hash"]` unconditionally for every tree entry, including ones with `layers`/`chunks` — but a split entry's whole-file hash is deliberately never uploaded to the server (`push_objects` skips it, matching `add()`'s storage intent), so requesting it during export always 404'd and inflated the reported failure count for a project that was actually exported correctly.
+
+**Fix:** Extracted the walk into a standalone, unit-testable `_collect_exportable_object_hashes()`; a split entry now contributes only its layer/chunk shard hashes, never its own whole-file hash.
+
+**Verification:** `tests/test_registry.py` — 5 new unit tests (whole-file entry, layer-split entry, chunked entry, cross-commit dedup, missing-tree-key) directly exercising the extracted function, no live registry needed.
+
+---
+
+### 158. `VaultClient` had no request timeout anywhere except the health probe, never verified a downloaded object's hash, and `av commit` built an unused second client paying `requests`' import cost for nothing
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-12).
+
+**Problem:** Every `requests.Session` call in `client.py` except `server_available()` had no timeout at all — a stalled upload/download blocked its worker thread forever with no recovery short of killing the process. `download_object()` also never checked the received bytes' SHA-256 against the hash it was fetched by, so a truncated transfer or a bad server response would be trusted and published into the CAS under a name it didn't actually hash to. Separately, `cmd_history.py`'s `commit()` constructed a `VaultClient` (forcing `requests`' import, ~1.5s on the reference machine) that was never referenced again in the function — `commit_staged()` builds and uses its own.
+
+**Fix:** A module-level `(connect=5s, read=120s)` default timeout (`AV_HTTP_TIMEOUT` overrides the read half), applied to every request except the health probe (kept at its own short fixed 2s) and `run_gc` (kept at a longer 300s read, since a full mark-and-sweep is known-slow). `download_object()` now streams a SHA-256 alongside the write and discards + fails on mismatch instead of silently publishing. Every bare `print()` of an error moved to `click.echo(err=True)` (a latent `--output json` stdout-leak). The dead client construction in `commit()` was removed outright.
+
+**Verification:** `pytest tests/test_client.py tests/test_registry.py tests/test_sync.py tests/test_stash.py -q` — 55 passed. `pytest tests/test_cli.py -q` (full, 129 tests) — no regressions from the timeout/error-channel changes.
+
+---
+
+### 159. The published "single-layer fetch: 38ms" benchmark number was measuring the safetensors header pseudo-layer, not a real tensor layer
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-09-12), found while wiring `bench_partial_checkpoint_fetch.py` over to the new `av fetch --layer` CLI.
+
+**Problem:** `split_and_hash_safetensors_core` (`src/core.cpp`) always inserts a `__header__` pseudo-layer (the 8-byte length prefix + JSON header, a few hundred bytes) at absolute offset 0, and the layer list is sorted by offset — so `entry["layers"][0]` is *always* `__header__`, never real tensor data, regardless of which named layer actually comes first in the file. `bench_partial_checkpoint_fetch.py`'s "fetch single layer" row indexed `layers[0]` (both before and after this session's switch to `av fetch`), so the "unique capability" showcase number in `development/BENCHMARKS.md`/README (38ms) measured fetching ~343 bytes of JSON header, not one of the four real 5MB tensor layers the benchmark's own fixture creates.
+
+**Fix:** The benchmark now explicitly picks `next(l for l in layers if l["name"] != "__header__")` before timing the single-layer fetch.
+
+**Verification:** Manually re-ran the benchmark against a real live registry; the untimed setup log now shows `Fetched 1 object(s), <real layer size> bytes` for a genuine data layer instead of 343 bytes. Not (yet) a regression test, since it needs the live-registry path this benchmark already requires — tracked as a follow-up if this benchmark ever gains a mocked-registry unit test.
+
+---
+
+### 160. `iter_working_files()`'s "9× regression" was never an algorithmic slowdown — it was a CWD-resolution bug in how synthetic benchmarks measured it
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-09-12), corrects the project's own perf-history record.
+
+**Problem:** `iter_working_files(root)` always resolved its `.avignore`/`.gitignore` context via `find_repo_root() or root` — and `find_repo_root()` walks up from `Path.cwd()`, the *process's* current directory, never from the function's own `root` argument. `speedcheck.py`'s synthetic benchmarks build a disposable fixture tree as `root` but never `chdir` into it, so on this dev box `find_repo_root()` resolved to whatever real project the benchmark happened to be invoked from — this very checkout, with a genuine multi-hundred-line `.gitignore`. Since `root` (a tmp fixture) is never actually a subdirectory of that unrelated repo root, every single walked entry's `p.relative_to(repo_root)` raised `ValueError` (caught, so gitignore matching correctly never fired — this was never a *correctness* bug, nothing was ever wrongly filtered), but paying for a raised-and-caught exception on every one of ~2000 walked entries is real, measurable overhead. This is what the perf-history table recorded as `iter_working_files()`: 72ms → 661ms, a "9× regression" nobody had actually root-caused — profiling attempts kept reproducing it because they *also* never `chdir`'d into the isolated fixture, so they inherited the exact same confound as the benchmark they were trying to explain.
+
+**Fix:** `iter_working_files()` gained an optional `repo_root` parameter, used AS-IS (never re-derived via `find_repo_root()`) when the caller supplies it. Every internal call site inside `core.py` (`compute_status()`, `commit_scoped_paths`) and `cmd_staging.py`'s `add()` now passes its own already-known `repo_root` explicitly — a no-op for them (their own CWD was always inside the target repo anyway) — and both of `speedcheck.py`'s benchmark drivers (`run_real_repo_probes`, `run_synthetic_probes`) now pass the fixture root explicitly too, closing the actual confound at its source.
+
+**Verification:** A corrected, `chdir`-isolated profiling run showed the walk itself was already fine (~130ms for 2000 files, well under budget) once the confound was removed — the "regression" was 100% measurement artifact. `tests/test_ignore_rules.py::test_explicit_repo_root_is_used_instead_of_cwd_based_resolution` pins the actual mechanism of the fix (asserts `find_repo_root()` is called exactly once when `repo_root` is omitted, zero times when supplied — a direct spy, not an indirect behavioral proxy, after an earlier draft of this same test's own premise — "the wrong repo's `.gitignore` incorrectly hides a file" — turned out to be false per the code above and had to be corrected before it could pass for the right reason). Re-measured end-to-end via `speedcheck`: 887ms → 56ms (15.8×) on the probe that had shown the original "9×" number.
+
+---
+
+### 161. Building the native launcher's own test suite found two real, previously-latent daemon bugs no mocked test had ever exercised
+
+**Severity:** 7/10 (the second) / 3/10 (the first — client-only, this session's own new code) · **Status:** 🟢 `fixed` (2026-09-12).
+
+**Problem A — `call_daemon()`/`handle_request()` each re-checked the allowlist positionally, undoing `launcher.py`'s own fix for the same bug.** V1.6.0 already fixed `launcher.py`'s top-level gate so `av --output json status` (global options before the subcommand) correctly resolves "status" instead of stopping at "--output" — but `daemon_client.call_daemon()` and `daemon.py`'s server-side `handle_request()` each had their OWN separate, cruder check (`argv[0] not in ALLOWED_COMMANDS`), never updated to match. `launcher.py`'s gate would correctly let `["--output", "json", "status"]` through, `call_daemon` would then reject it anyway (indistinguishable from "no daemon running" to the caller — `call_daemon` returning `None` means exactly that either way), and even if the client-side check had been fixed alone, the SERVER's own `handle_request` would have rejected the exact same request on the wire with `not_allowed`. Found while writing the native launcher's C++ client (which naturally sends the full original argv, globals included, exactly like the real protocol always intended) and its own round-trip test immediately failed for a reason that had nothing to do with the new C++ code.
+
+**Fix A:** `first_subcommand()` — the token-skipping logic that already existed, correctly, only in `launcher.py` — moved to `daemon_common.py` as the one shared implementation, used identically by `launcher.py`, `daemon_client.call_daemon()`, and `daemon.py::handle_request()`. One implementation used everywhere makes this specific class of drift structurally impossible instead of merely fixed today.
+
+**Problem B — a zero-byte reachability probe could kill the entire daemon thread.** `daemon_client.read_status()` (used by `av daemon status` and by every `maybe_auto_spawn()` call whenever `call_daemon` returns `None`) deliberately connects and immediately disconnects without sending anything, just to check whether a daemon is listening. `daemon.py::_serve_connection` only caught `ProtocolError` around its request-decode call — a zero-byte disconnect instead makes the blocking read raise `BrokenPipeError`/`ConnectionResetError` (both plain `OSError`, not `ProtocolError`), which propagated all the way out of the `run_windows`/`run_posix` accept loop and terminated the daemon's ONLY thread — not just that one connection, every subsequent client too. No existing test caught this because every unit test exercising `maybe_auto_spawn` monkeypatches `read_status` outright rather than driving a real one against a real live daemon; this only surfaced because the native launcher's "busy daemon falls back" test genuinely triggers the real `call_daemon` → `None` → `maybe_auto_spawn` → `read_status` chain against an in-thread `DaemonServer`.
+
+**Fix B:** `_serve_connection` now catches `(ProtocolError, OSError)` around the decode step — a zero-byte or malformed connection is closed and the server keeps serving, exactly the intended behavior.
+
+**Verification:** `tests/test_daemon.py::test_handle_request_allows_allowlisted_command_with_leading_global_options`, `test_call_daemon_reaches_state_lookup_with_leading_global_options`, and `test_zero_byte_disconnect_does_not_kill_the_daemon_thread` (all three fail on the pre-fix code); `tests/test_launcher_native.py` (8 tests) drives the real compiled Windows exe as a subprocess against a real in-thread daemon and only passed cleanly once both fixes landed — before Fix B, two of its multi-call tests intermittently killed the daemon thread mid-test (visible as `PytestUnhandledThreadExceptionWarning: BrokenPipeError` in the run, not a clean assertion failure).
+
+---
+
+### 162. Server-side hot paths: per-hash Bloom Filter round trips, a full rebuild after a no-op GC sweep, and a blocking disk write on the event loop
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-09-12), verified against a live Postgres+Redis stack (this dev box's own Docker containers), not mocked.
+
+**Problem A — `/api/sync/batch-objects` awaited one `BF.EXISTS` round trip per hash, sequentially.** Every `av push`/`av fetch`'s "does the remote already have these objects" check looped `for h in hashes: await cache.check_hash_exists(h, ...)` — a real push's object list paid that serially, one Redis round trip per object, before the batch ever reached Postgres.
+
+**Problem B — GC always did a full Bloom Filter reset+rebuild, even when nothing was deleted.** `run_gc` unconditionally called `cache.reset_filter()` + `cache.init_filter()` + one `BF.ADD` round trip per surviving hash, regardless of `deleted_count`. A Redis Bloom Filter can't remove individual entries (only a full rebuild shrinks it) — but every upload already keeps the filter in sync incrementally via `cache.add_hash()` at upload time, so a sweep that deletes nothing leaves the alive set exactly as it already was, and the "rebuild" was pure waste on every single GC run, not just the ones that actually needed it.
+
+**Problem C — `CASStorage.store_object()` wrote every upload chunk synchronously on the event loop.** `async def store_object` called `f.write(chunk)` directly inside the coroutine for every chunk received off the network stream — a blocking disk-write syscall on the SAME event loop this single-worker uvicorn process uses to serve every other concurrent request. A large or slow upload could stall the whole server, not just its own connection.
+
+**Fix:** `RedisCache.check_hashes_exist()` (A) and `RedisCache.add_hashes()` (B) batch via `BF.MEXISTS`/`BF.MADD` in 1000-hash chunks, preserving the existing per-hash short-circuit semantics for isolated-tenant mode (a tenant-filter hit never needs the global filter checked). GC now only rebuilds when `deleted_count > 0`, and the response gained an additive `bloom_rebuilt: bool` field so this is externally observable, not just an internal optimization. `store_object()` (C) now buffers stream chunks up to 4 MiB and flushes each buffer's write+hash via `asyncio.to_thread` instead of writing every chunk directly in the coroutine.
+
+**Verification:** `tests/test_redis_cache.py` (12 new unit tests against a fake async Redis client — chunking, isolated-mode short-circuiting, fail-open on error, no real Redis needed); `tests/test_server.py::test_gc_respects_grace_period_then_sweeps_when_aged` extended to assert `bloom_rebuilt` is `False` on a no-op sweep and `True` on a real one; `tests/test_server.py::test_download_object_supports_range_and_immutable_caching` and `test_upload_object_larger_than_buffer_cap_hashes_and_stores_correctly` (a real >5MB upload, past the 4MB buffer cap, hash-verified round trip) — all run against this dev box's real, live Docker Postgres+Redis stack, not a mock.
+
+---
+
+### 163. `/api/objects/{hash}` had no Range/ETag/caching support at all
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-09-12).
+
+**Problem:** `download_object()` was a hand-rolled 8MB-chunked `StreamingResponse` — no `Range` support (a resumed/partial download always restarted from byte 0), no `ETag`, no `Cache-Control`. An object's hash IS its content address under this project's CAS invariant (never mutated in place once written), so an immutable cache header and a hash-derived ETag are exact facts, not approximations that could ever go stale.
+
+**Fix:** Switched to Starlette's `FileResponse` with `Cache-Control: public, max-age=31536000, immutable` and `ETag: "<hash>"` — `FileResponse` honors `Range` requests (206 Partial Content) and sets `Content-Length`/`Accept-Ranges` automatically from the real file stat, without overriding the explicit ETag (verified via reading Starlette 1.2.1's own source: `set_stat_headers()` uses `setdefault`, never clobbering a caller-supplied header).
+
+**Verification:** `tests/test_server.py::test_download_object_supports_range_and_immutable_caching` — full download headers, plus a real mid-file `Range: bytes=100-199` request returning 206 with the exact expected byte slice and a correct `Content-Range` header, against the live server.
+
+---
+
+### 164. `setuptools`' `scripts=` mechanism hard-crashes on a raw binary executable — found while wiring the native `av` launcher into the real `av` command
+
+**Severity:** 2/10 (packaging-only, never shipped) · **Status:** 🟢 `fixed` (2026-09-12) with a different mechanism entirely, not a patch to the failing one.
+
+**Problem:** The obvious way to ship a prebuilt binary as a console command via `setuptools` is its classic `scripts=` argument. Doing exactly that here (`scripts=[<path to the compiled av.exe>]`, with `av` removed from `[project.scripts]` so nothing else claims the name) turned out to be a hard build break, not just a theoretical risk: this setuptools version's vendored `build_scripts` command calls `tokenize.open()` unconditionally on every `scripts=` entry to sniff a `#!`-shebang line, and `tokenize`'s encoding detection raises `SyntaxError: source code cannot contain null bytes` the moment it hits a raw PE binary's byte content. `python -m build --wheel` failed outright — confirmed live, not reasoned about in the abstract.
+
+**Fix:** `WheelWithNativeLauncher` (a `bdist_wheel` subclass in `setup.py`) never touches `scripts=`/`build_scripts` at all. It lets the wheel build completely normally, then re-writes the already-finished `.whl` (a zip archive) directly via `zipfile`: read every existing entry except `RECORD`, write them all into a new zip unchanged, append the compiled exe at `<namever>.data/scripts/av.exe` (`namever` read off the wheel's own `.dist-info/RECORD` path, not re-derived from the wheel filename's stricter normalization — those can differ), and regenerate `RECORD` with a real sha256+size for every entry including the new one. Confirmed safe on the *install* side too by reading pip's own installer (`pip._internal.operations.install.wheel`) directly: a `.data/scripts/` file installs byte-for-byte via `fix_script()`, which opens in binary mode and only acts on a literal `#!python` first line — safe on any binary — **except** when the file's name (minus `.exe`) matches a registered entry point, in which case pip silently drops it in favor of its own generated wrapper (`is_entrypoint_wrapper()`). That's why `av` must never be a `[project.scripts]` entry at all, on any platform.
+
+**Verification:** `tests/test_wheel_packaging.py` (4 tests) drives a real `python -m build --wheel` and inspects the resulting wheel: the injected `av.exe` is present, correctly sized (not a ~4KB console-script stub), starts with the real PE magic bytes (`MZ`), carries the executable bit, has a correct RECORD hash, and `av` is absent from `entry_points.txt`. Manually verified end-to-end beyond that: built a real wheel, installed it into a genuinely fresh, empty venv, and confirmed `av --version`/`av --av-launcher-info` answer from the real 206KB compiled exe (not the ~108KB Python wrapper) — including the full daemon-fallback/discovery-file behavior working identically to every other native-launcher test in the suite.
+
+
+### 165. `setup.py`'s native-build-failure fallback recorded an artifact for wheel injection but never copied it into the interpreter's own Scripts directory — a fresh editable install with a broken toolchain would have shipped no working `av` at all
+
+**Severity:** 6/10 (would have shipped a genuinely broken `av` command on the one platform/scenario it's meant to cover — Windows, editable install, native build failing — with no automated test able to see it) · **Status:** 🟢 `fixed` (2026-09-12).
+
+**Problem:** `BuildExtWithLauncher` has two outcomes for the native launcher: a successful build, which copies the compiled exe directly into the interpreter's `sysconfig.get_path("scripts")` directory (so `pip install -e .` gets a working `av` immediately, since `bdist_wheel`/its injection logic never runs for editable installs); and a failed build, handled by `_record_shim_artifact()`, which only set `self.distribution.av_launcher_artifact` — the field `WheelWithNativeLauncher` reads to inject a fallback into a *built wheel*. Nothing in the failure path ever copied anything into the Scripts directory. An editable install where the native build fails would therefore leave whatever `av` a *previous* successful build had put there completely untouched — including nothing at all, on a genuinely fresh checkout.
+
+**How it was found:** not by reading the code and reasoning about it — by deliberately breaking the build (renaming `av_launcher.cpp` out of the way) and re-running `pip install -e .` to exercise the failure path for real, the same way the daemon/launcher protocol bugs earlier this phase were found. The first pass at this test gave a **false positive**: `av --version` after the broken build still answered correctly, which looked like success. Comparing the Scripts-directory `av.exe`'s modification timestamp (`19:57:02`, from the last successful build, well before the test at `20:01+`) against the precompiled shim's own timestamp proved it was silently serving a stale binary from a prior build, not anything the (intentionally broken) current build had produced — the exact "looks fine, isn't" failure mode this codebase's own testing discipline exists to catch.
+
+**Fix:** extracted the Scripts-directory-copy logic (previously living only inside the successful-build path) into one shared `_copy_to_interpreter_scripts_dir(artifact_path, exe_name, is_binary)` helper, called from *both* the successful-build path and `_record_shim_artifact()`. The failure path now copies the precompiled shim (`src/launcher/precompiled/av_shim_win32.exe`, see entry above) into Scripts as both `av-native.exe` and `av.exe`, exactly like a successful build would have copied the real compiled launcher.
+
+**Verification:** re-ran the same deliberately-broken-build scenario; confirmed via MD5 checksum that the Scripts-directory `av.exe` now matches the committed precompiled shim exactly (no stale-binary ambiguity this time), and functionally confirmed `av --version` and `av --output json status` both work correctly running through the shim → `av_cli.launcher` → the real Python CLI. Restored `av_launcher.cpp` and rebuilt successfully afterward to return to the normal, real-native-launcher state (this also surfaced and required cleaning up two stray leftover `av daemon` processes from earlier manual testing that were holding the `.pyd` file locked — unrelated to this bug, noted here only because it blocked the rebuild).
+
+
+### 166. `stage_safetensors`'s fused single-read path hashed the WRONG bytes for the `__header__` pseudo-layer — the header parse already consumed them from the stream
+
+**Severity:** 8/10 (would have silently corrupted every safetensors checkpoint's `__header__` object hash — a real dedup/integrity break, not a crash — had it shipped without the cross-check tests) · **Status:** 🟢 `fixed` (2026-09-12), caught before ever reaching a real repo.
+
+**Problem:** `stage_safetensors_core_parts_only()`'s header-parsing step reads the file's first `8 + header_size` bytes (the length prefix + JSON header) directly off the `ifstream` to parse the tensor layout, which necessarily advances the stream's read position to `base_offset`. The first draft then treated the `__header__` pseudo-layer (declared as covering `[0, base_offset)`, matching `split_and_hash_safetensors`'s own convention) exactly like every other layer: read `layer.size` bytes forward from the file's CURRENT position and hash them. But the stream was no longer at position 0 — it was already at `base_offset`, having just consumed the header for parsing. The function ended up reading past the header entirely, into whatever came after it (the first tensor's data, or past EOF on a small file), and hashing those bytes as if they were the header.
+
+**How it was found:** immediately, by the simplest possible test rather than an elaborate one. `test_stage_safetensors_header_only_no_tensors` (a safetensors file with zero tensors — just a header) failed with `RuntimeError: Truncated read for layer '__header__'` the very first time the new code ran against real test data, because a header-only file has no bytes at all past `base_offset` for the buggy re-read to consume. Every other new test (single layer, multiple layers, buffer-cap variations) failed the identical way for the identical reason, just with a less obvious symptom (reading into real tensor data rather than immediately hitting EOF) — the header-only case is what turned a subtle wrong-hash bug into a loud, immediate crash on the very first test run, before any output could be silently wrong. Had this shipped, it would not have crashed in production nearly as clearly: a normal safetensors file has plenty of bytes after its header, so the function would have returned successfully with a `__header__` hash computed over the wrong byte range — a real correctness bug (wrong dedup class, and a hash that wouldn't match anything a legacy-path client computed for the same file) that no crash would have flagged.
+
+**Fix:** the `__header__` layer's bytes (the 8-byte length prefix + the JSON header) are now hashed and published directly from the buffers already read into memory for header parsing (`header_size`'s raw bytes + `header_buf`), never re-read from the file. The main per-layer walk loop starts at the sorted layer list's index 1 (guaranteed to be the first real tensor layer, since `__header__`'s `abs_start == 0` is always the unique minimum) with its cursor initialized to `base_offset`, not 0.
+
+**Verification:** all 13 new `tests/test_core.py::test_stage_safetensors_*` tests pass, including the header-only case that caught this; cross-checked byte-for-byte against `split_and_hash_safetensors` (the legacy oracle) for every case, not just the ones that happened to trigger the bug. See `src/README.md`'s invariant 8, added specifically to flag this exact failure mode for future edits to either function.
+
+
+### 167. `test_canary.py::test_run_offline_still_evaluates_but_does_not_report` assumed no server was reachable, without requesting the fixture that guarantees it
+
+**Severity:** 2/10 (test-only, no product code involved) · **Status:** 🟢 `fixed` (2026-09-13), found running the full test suite end-to-end with this project's own Docker stack up.
+
+**Problem:** The test's own docstring says "No server reachable in the test sandbox" and asserts `env["data"]["reported"] is False` on that assumption, but it only requested the plain `repo` fixture — not `unreachable_client` (`tests/conftest.py`), the fixture this project's own test infrastructure already provides specifically for this class of false assumption ("a real dev stack can genuinely be up on localhost:8000, in which case a test's 'no server configured' assumption silently becomes false"). With this dev box's own `docker compose` engine up and healthy on port 8000 (the exact `remote_url` `av init` writes by default), `av canary run` actually reached the live server and reported successfully, making `reported` `True` instead of the expected `False` — a false failure entirely dependent on whether Docker happened to be running when the suite was invoked, not a real product regression.
+
+**Fix:** added `unreachable_client` to the test's fixture list, matching the established pattern already used correctly elsewhere (e.g. `test_improver.py::test_register_without_server_queues`).
+
+**Verification:** `tests/test_canary.py` (9 tests) passes with the live Docker stack up; the specific test now deterministically exercises the offline path regardless of what's actually reachable on localhost:8000.

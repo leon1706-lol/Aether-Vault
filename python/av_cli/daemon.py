@@ -113,7 +113,7 @@ class DaemonServer:
             return build_error_response("version_skew")
 
         argv = request.get("argv") or []
-        if not argv or argv[0] not in daemon_common.ALLOWED_COMMANDS:
+        if not argv or daemon_common.first_subcommand(argv) not in daemon_common.ALLOWED_COMMANDS:
             return build_error_response("not_allowed")
 
         acquired = self._exec_lock.acquire(timeout=0.25)
@@ -254,7 +254,19 @@ def _start_should_stop_watchdog(server: DaemonServer, check_interval: float = 2.
 def _serve_connection(server: DaemonServer, recv, send, close) -> None:
     try:
         request = decode_frame(recv)
-    except ProtocolError:
+    except (ProtocolError, OSError):
+        # V1.6.0 real bug (found by the native launcher's own test suite, driving a REAL
+        # `read_status()` zero-op "is this reachable" connect against a REAL live daemon --
+        # every existing test mocked `read_status` and so never actually exercised this):
+        # a client that connects and disconnects without ever sending anything (exactly
+        # what `read_status()` -- used by both `av daemon status` and `maybe_auto_spawn` --
+        # deliberately does) makes the blocking read inside `decode_frame` raise
+        # `BrokenPipeError`/`ConnectionResetError` (both `OSError`), not `ProtocolError`.
+        # That was uncaught here, so it propagated out of `_serve_connection`, out of the
+        # `run_windows`/`run_posix` accept loop, and killed the ENTIRE daemon thread --
+        # meaning a single `av daemon status` (or ANY auto-spawn check) against a running
+        # daemon could take it down for every other client. Same treatment as a malformed
+        # frame: just close this one connection and keep serving.
         close()
         return
     try:

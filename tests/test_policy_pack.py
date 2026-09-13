@@ -76,7 +76,7 @@ def _fake_client(monkeypatch, reg: _FakePackRegistry):
                 return _FakeResponse(200, {"policy_packs": rows[:params.get("limit", 50)]})
             return _FakeResponse(404, {})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             if url.endswith("/api/policy-packs"):
                 status, row = reg.create(json)
                 return _FakeResponse(status, row)

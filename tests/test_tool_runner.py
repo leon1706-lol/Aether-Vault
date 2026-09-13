@@ -15,10 +15,15 @@ from benchmarks.tool_runner import (  # noqa: E402
     ToolStatus,
     VERDICT_THRESHOLD,
     compare_to_baseline,
+    daemon_mode_label,
     format_value,
     rate,
+    render_claim_summary,
+    repeat_median,
     result_to_markdown,
     results_to_json,
+    time_call,
+    time_subprocess,
 )
 
 
@@ -141,3 +146,146 @@ def test_compare_to_baseline_skips_rows_missing_from_either_side():
 
     current2 = [_make_result(name="bench_x", op="op1", av_value=100.0)]
     assert compare_to_baseline(current2, {}) == []
+
+
+# --- WS0.3: median-of-N ----------------------------------------------------------------
+
+def test_repeat_median_returns_the_single_call_when_repeat_is_one():
+    calls = iter([42.0])
+    assert repeat_median(lambda: next(calls), repeat=1) == 42.0
+
+
+def test_repeat_median_of_floats_is_the_median_across_calls():
+    calls = iter([10.0, 30.0, 20.0])
+    assert repeat_median(lambda: next(calls), repeat=3) == 20.0
+
+
+def test_repeat_median_of_dicts_takes_the_median_per_key_independently():
+    calls = iter([
+        {"init": 10.0, "add": 100.0},
+        {"init": 30.0, "add": 300.0},
+        {"init": 20.0, "add": 200.0},
+    ])
+    result = repeat_median(lambda: next(calls), repeat=3)
+    assert result == {"init": 20.0, "add": 200.0}
+
+
+def test_repeat_median_stops_after_one_call_when_the_tool_is_not_installed():
+    calls = []
+
+    def fn():
+        calls.append(1)
+        return None
+
+    assert repeat_median(fn, repeat=5) is None
+    assert len(calls) == 1  # never retried a tool that isn't there
+
+
+def test_repeat_median_ignores_a_none_among_otherwise_real_samples():
+    calls = iter([10.0, None, 20.0])
+    assert repeat_median(lambda: next(calls), repeat=3) == 15.0
+
+
+def test_time_call_returns_median_of_repeat_in_process_calls(monkeypatch):
+    ticks = iter([0.0, 1.0, 1.0, 4.0, 4.0, 6.0])  # elapsed seconds: 1, 3, 2 -> 1000/3000/2000 ms
+    monkeypatch.setattr("benchmarks.tool_runner.time.perf_counter", lambda: next(ticks))
+    assert time_call(lambda: None, repeat=3) == 2000.0  # median of [1000, 3000, 2000]
+
+
+def test_time_subprocess_returns_median_of_repeat_runs(monkeypatch):
+    calls = []
+    monkeypatch.setattr("benchmarks.tool_runner.subprocess.run", lambda *a, **k: calls.append(k))
+    ticks = iter([0.0, 1.0, 1.0, 5.0, 5.0, 6.0])  # elapsed seconds: 1, 4, 1 -> 1000/4000/1000 ms
+    monkeypatch.setattr("benchmarks.tool_runner.time.perf_counter", lambda: next(ticks))
+    result = time_subprocess(["av", "status"], Path("."), repeat=3, env={"X": "1"})
+    assert result == 1000.0  # median of [1000, 4000, 1000]
+    assert len(calls) == 3
+    assert calls[0]["env"]["X"] == "1"
+
+
+# --- WS0.5: daemon-mode labeling ---------------------------------------------------------
+
+def test_daemon_mode_label_reports_warm_by_default(monkeypatch):
+    monkeypatch.delenv("AV_NO_DAEMON", raising=False)
+    assert daemon_mode_label() == "warm (default)"
+
+
+def test_daemon_mode_label_reports_off_when_env_set(monkeypatch):
+    monkeypatch.setenv("AV_NO_DAEMON", "1")
+    assert "off" in daemon_mode_label()
+
+
+# --- WS0.7: claim summary ----------------------------------------------------------------
+
+def _speed_result(name, av_value, competitor_value, claim_scope="speed"):
+    return BenchmarkResult(
+        name=name, title=name, description="d", tool_order=["av", "git-lfs"],
+        rows=[Row(operation="op", values={"av": av_value, "git-lfs": competitor_value},
+                  statuses={"av": ToolStatus.AVAILABLE, "git-lfs": ToolStatus.AVAILABLE})],
+        claim_scope=claim_scope,
+    )
+
+
+def test_claim_summary_passes_when_every_speed_row_is_good_or_ok():
+    results = [_speed_result("a", av_value=10.0, competitor_value=10.0)]
+    summary = render_claim_summary(results)
+    assert "| 1 | a | speed | PASS |" in summary
+    assert "Faster in every published domain: YES" in summary
+
+
+def test_claim_summary_fails_when_a_speed_row_is_bad():
+    results = [_speed_result("a", av_value=100.0, competitor_value=10.0)]
+    summary = render_claim_summary(results)
+    assert "| 1 | a | speed | FAIL |" in summary
+    assert "Faster in every published domain: NO" in summary
+
+
+def test_claim_summary_excludes_internal_benchmarks_from_the_verdict():
+    bad = _speed_result("internal-one", av_value=100.0, competitor_value=10.0, claim_scope="internal")
+    good = _speed_result("real-one", av_value=10.0, competitor_value=10.0)
+    summary = render_claim_summary([bad, good])
+    assert "Faster in every published domain: YES" in summary
+    assert "Internal-only (excluded from the claim): internal-one." in summary
+    assert "internal-one" not in summary.split("Internal-only")[0]
+
+
+def test_claim_summary_unique_scope_passes_on_a_real_number_alone():
+    result = BenchmarkResult(
+        name="u", title="u", description="d", tool_order=["av"],
+        rows=[Row(operation="op", values={"av": 5.0}, statuses={"av": ToolStatus.AVAILABLE})],
+        claim_scope="unique",
+    )
+    assert "PASS" in render_claim_summary([result])
+
+
+def test_claim_summary_unique_scope_fails_with_no_real_av_number():
+    result = BenchmarkResult(
+        name="u", title="u", description="d", tool_order=["av"],
+        rows=[Row(operation="op", values={"av": None}, statuses={"av": ToolStatus.NOT_INSTALLED})],
+        claim_scope="unique",
+    )
+    assert "FAIL" in render_claim_summary([result])
+    assert "Faster in every published domain: NO" in render_claim_summary([result])
+
+
+def test_claim_summary_row_level_scope_overrides_the_result_default():
+    # partial_checkpoint_fetch's real shape: one "unique" row, one ordinary "speed" row.
+    result = BenchmarkResult(
+        name="fetch", title="Fetch", description="d", tool_order=["av", "git-lfs"],
+        rows=[
+            Row(operation="single layer", values={"av": 5.0}, statuses={"av": ToolStatus.AVAILABLE},
+                claim_scope="unique"),
+            Row(operation="whole checkpoint", values={"av": 100.0, "git-lfs": 10.0},
+                statuses={"av": ToolStatus.AVAILABLE, "git-lfs": ToolStatus.AVAILABLE}),
+        ],
+        claim_scope="speed",
+    )
+    summary = render_claim_summary([result])
+    assert "| 1 | Fetch | mixed | FAIL |" in summary  # the whole-checkpoint row is BAD
+    assert "Faster in every published domain: NO" in summary
+
+
+def test_result_to_markdown_marks_internal_benchmarks():
+    result = _speed_result("a", av_value=10.0, competitor_value=10.0, claim_scope="internal")
+    md = result_to_markdown(result)
+    assert "internal-only" in md.lower()

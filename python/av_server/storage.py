@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import shutil
@@ -42,23 +43,41 @@ class CASStorage:
         target_path = self._object_path(sha256_hash, tenant_id)
         if target_path.exists():
             return target_path
-            
+
         target_path.parent.mkdir(parents=True, exist_ok=True)
         import uuid
         temp_path = target_path.with_name(target_path.name + f".tmp.{uuid.uuid4().hex}")
-        
+
         sha256 = hashlib.sha256()
+        # V1.6.0 (Probleme.md real bug): this used to call `f.write(chunk)` directly inside
+        # this coroutine for every chunk off the network -- a synchronous, blocking disk
+        # write on the SAME event loop this single-worker uvicorn process uses to serve
+        # every other concurrent request. A large/slow upload could stall the whole server,
+        # not just its own connection. Chunks are now buffered up to 4 MiB and flushed via
+        # `asyncio.to_thread`, so the actual write (and its hash update, done in the same
+        # offloaded call rather than adding a second thread-hop) never blocks the loop.
+        BUFFER_CAP = 4 * 1024 * 1024
+        buf = bytearray()
+
+        def _write_and_hash(data: bytes) -> None:
+            f.write(data)
+            sha256.update(data)
+
         try:
             with open(temp_path, 'wb') as f:
                 async for chunk in data_stream:
-                    f.write(chunk)
-                    sha256.update(chunk)
-                    
+                    buf.extend(chunk)
+                    if len(buf) >= BUFFER_CAP:
+                        await asyncio.to_thread(_write_and_hash, bytes(buf))
+                        buf.clear()
+                if buf:
+                    await asyncio.to_thread(_write_and_hash, bytes(buf))
+
             actual_hash = sha256.hexdigest()
             if actual_hash != sha256_hash:
                 raise ValueError(f"Hash mismatch. Expected {sha256_hash}, got {actual_hash}")
-                
-            shutil.move(temp_path, target_path)
+
+            await asyncio.to_thread(shutil.move, temp_path, target_path)
             return target_path
         except Exception:
             # Clean up temp file only on error — never after successful move

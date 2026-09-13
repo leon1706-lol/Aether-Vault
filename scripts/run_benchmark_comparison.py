@@ -39,8 +39,14 @@ def bench_av() -> dict[str, float] | None:
     if av_path is None:
         return None
     with tempfile.TemporaryDirectory(prefix="bench-av-") as tmp:
-        probes = speedcheck.run_av_cli_probes(av_path, Path(tmp))
-        return {"init": probes[0][1], "add": probes[1][1], "commit": probes[2][1]}
+        probes = speedcheck.run_av_cli_probes(
+            av_path, Path(tmp), commit_upload=False, env={"AV_NO_UPDATE_CHECK": "1"},
+        )
+        return {
+            "init": speedcheck.probe_ms(probes, "av init"),
+            "add": speedcheck.probe_ms(probes, "av add ."),
+            "commit": speedcheck.probe_ms(probes, "av commit"),
+        }
 
 
 def bench_git_lfs() -> dict[str, float] | None:

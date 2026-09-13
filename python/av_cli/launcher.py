@@ -5,14 +5,25 @@ point) costs ~450-600ms to import even after V1.5.0's lazy-command-registration 
 because click, `core.py`'s prelude, and whatever the target command needs all still have to
 load. A daemon can only ever help if the CLIENT'S OWN entry point avoids that cost for the
 commands it can serve -- so this module imports only `sys` at module scope, decides
-daemon-vs-fallback, and only reaches into `av_cli.daemon_client` (itself os/socket/json only
-until a connection actually succeeds) on the daemon path. `av_cli.main:run` is untouched and
-still directly invocable (tests, CI, anyone with an older console-script shim from before an
-upgrade) -- this module is purely an optional fast path in front of it, never a replacement.
+daemon-vs-fallback, and only reaches into `av_cli.daemon_client`/`daemon_common` (all
+os/socket/json/hashlib only until a connection actually succeeds) on the daemon path.
+`av_cli.main:run` is untouched and still directly invocable (tests, CI, anyone with an
+older console-script shim from before an upgrade) -- this module is purely an optional fast
+path in front of it, never a replacement.
 """
 from __future__ import annotations
 
 import sys
+
+# `_first_subcommand` used to be a private copy living only here (mirroring main.py's global
+# options so `av --output json status` resolves to the daemon-eligible "status" instead of
+# stopping at "--output" -- Probleme.md, a real confirmed gap). V1.6.0: `daemon_client.
+# call_daemon()` and `daemon.py`'s own `handle_request()` each had a SEPARATE, cruder
+# positional check (`argv[0] not in ALLOWED_COMMANDS`) that silently reintroduced the exact
+# same bug one layer deeper -- this module's own gate passed, then the request got rejected
+# anyway further in, indistinguishable from "no daemon running" (Probleme.md). Now one
+# shared implementation, `daemon_common.first_subcommand` -- see its docstring for the full
+# account -- imported lazily below so a bare `--help` still costs nothing extra.
 
 
 def _repo_root_or_none():
@@ -31,21 +42,22 @@ def _repo_root_or_none():
 def _try_daemon(argv: list[str]) -> int | None:
     """Returns an exit code if the daemon handled the command, else None (any reason at
     all -- caller must fall back in-process). When no daemon is reachable but this repo/env
-    has opted into auto-spawn (AV_DAEMON=1, or `.av/config`'s `"daemon": {"enabled": true}`),
-    fires one off in the background for NEXT time -- this invocation still always falls back
-    in-process rather than waiting on a cold daemon's warm-up."""
+    has opted into auto-spawn (the V1.6.0 default, or AV_DAEMON=1, or `.av/config`'s
+    `"daemon": {"enabled": true}`), fires one off in the background for NEXT time -- this
+    invocation still always falls back in-process rather than waiting on a cold daemon's
+    warm-up."""
     from . import daemon_common
 
     mode = daemon_common.enabled_mode()  # cheap env-only check first
     if mode == "never":
         return None
-    if not argv or argv[0] not in daemon_common.ALLOWED_COMMANDS:
+    if not argv or daemon_common.first_subcommand(argv) not in daemon_common.ALLOWED_COMMANDS:
         return None
     repo_root = _repo_root_or_none()
     if repo_root is None:
         return None
     if mode == "use_only":
-        mode = daemon_common.enabled_mode(repo_root)  # also honors .av/config's opt-in
+        mode = daemon_common.enabled_mode(repo_root)  # also honors .av/config's opt-in/opt-out
 
     from . import __version__ as cli_version
     from .daemon_client import call_daemon
@@ -60,6 +72,13 @@ def _try_daemon(argv: list[str]) -> int | None:
             except Exception:
                 pass  # never let a spawn attempt turn into a failed command
         return None
+    # No "needs_interactive" concept: _AuthRetryGroup's own 401-retry prompt already
+    # checks `ui.is_interactive()` (stdin AND stdout both a real tty), which is false by
+    # construction inside the daemon -- its stdin is DEVNULL (daemon_client.spawn_detached)
+    # and stdout is redirected to an io.StringIO (daemon.py::_execute) whenever this code
+    # runs. A protected-registry command served by the daemon cleanly returns exit 12
+    # (auth_failed) instead of hanging on a prompt no one could ever answer -- verified in
+    # tests/test_daemon.py::test_auth_failure_via_daemon_returns_clean_exit_not_a_hang.
     sys.stdout.write(response.get("stdout", ""))
     sys.stderr.write(response.get("stderr", ""))
     return int(response.get("exit_code", 1))
@@ -67,16 +86,20 @@ def _try_daemon(argv: list[str]) -> int | None:
 
 def main() -> None:
     argv = sys.argv[1:]
-    # --help/--version and anything not a bare allowlisted-command invocation always takes
-    # the normal path without even trying the daemon -- keeps the decision cheap (no state
-    # file read) for the majority of invocations that could never qualify anyway.
-    if argv and argv[0] in ("add", "status", "commit") and "--help" not in argv:
-        try:
-            exit_code = _try_daemon(argv)
-        except Exception:
-            exit_code = None  # any daemon-path failure at all -> fall back, never raise here
-        if exit_code is not None:
-            sys.exit(exit_code)
+    # --help and anything not a bare allowlisted-command invocation always takes the
+    # normal path without even trying the daemon.
+    if "--help" not in argv:
+        from . import daemon_common
+
+        first = daemon_common.first_subcommand(argv)
+        if first is not None:
+            if first in daemon_common.ALLOWED_COMMANDS:
+                try:
+                    exit_code = _try_daemon(argv)
+                except Exception:
+                    exit_code = None  # any daemon-path failure at all -> fall back, never raise here
+                if exit_code is not None:
+                    sys.exit(exit_code)
 
     from .main import run
 

@@ -1,6 +1,9 @@
 """`av daemon start/stop/status/restart` -- lifecycle management for V1.5.0's opt-in
 background command executor. See `daemon.py`'s module docstring for the design invariants.
 """
+import subprocess  # V1.6.0 (WS2.1): core.py no longer re-exports this via `import *`; this
+                    # module's own `taskkill` call needs it explicitly.
+
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from .core import current_output_mode, emit_json  # noqa: E402
 

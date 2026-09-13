@@ -7,24 +7,48 @@ compat shell (cli group construction, registration order, patch-target owners, r
 Import-hub note: this module intentionally re-exports the stdlib/third-party names the
 command bodies rely on (json/os/click/Path/Index/...), because cmd modules start with
 `from .core import *` — keeps per-module headers tiny without eager heavy imports.
+
+V1.6.0 (WS2.1): `datetime`, `shutil`, `subprocess`, `tempfile`, `uuid`, and
+`urllib.parse`/`concurrent.futures.ThreadPoolExecutor` are deliberately NOT imported here
+at module scope anymore, even though several functions below still use them -- every one
+of those uses sits behind a code path `status`/a no-op `add` never reaches (a real commit,
+a real upload, a restore, a one-time config backfill, `av init`, ...), so each has its own
+local `import` right at first use instead. This module is loaded by EVERY command via
+`from .core import *`, so a module-level import here is a cost every single invocation
+pays regardless of which command actually runs -- unlike a local import, which only costs
+the invocations that reach that line. `tempfile` and `urllib.parse` in particular had ZERO
+internal use in this file even before this change; they existed purely to re-export to
+`cmd_devtools.py`/`cmd_integrations.py`, which now import them directly instead.
+
+Stated plainly rather than overclaimed: for a real end-to-end `av status`/`av add`
+invocation through the actual CLI, `main.py` itself still imports `datetime`, `shutil`,
+`subprocess`, `tempfile`, and `uuid` at ITS OWN module scope regardless of anything this
+file does (see its own top-of-file comment -- a same-session attempt to remove those broke
+`test_cli.py`'s patch-anchor dependencies on `main_module.subprocess`/`main_module.shutil`
+specifically, a real, already-diagnosed constraint, not an oversight). So the practical,
+verified win for the full CLI path today is `urllib.parse` and
+`concurrent.futures.ThreadPoolExecutor` only (`tests/test_import_graph.py`'s
+`test_status_in_a_real_repo_does_not_load_heavy_stdlib_modules` /
+`test_noop_add_does_not_load_heavy_stdlib_modules` assert exactly that, honestly, not the
+full list). The rest of this trim is still worth doing regardless: it's correct either way,
+it's what makes the two names above actually reach zero, and it fully benefits any caller
+of these functions that doesn't route through `main.py`'s CLI group at all (e.g. a daemon
+process past its own one-time `main.py` import, or a script importing `av_cli.core`
+directly) — the cost just isn't paid twice by every request once it's the daemon that's
+warm rather than a fresh process. See `src/launcher/README.md`/`architecture.md`'s Daemon
+Contract section for that path.
 """
 
 from __future__ import annotations
 
-import datetime
+import copy
 import hashlib
 import fnmatch
 import json
 import logging
 import os
 import re as _re
-import shutil
-import subprocess
 import sys
-import tempfile
-import uuid
-import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import click
@@ -213,6 +237,42 @@ def _default_ignores_enabled() -> bool:
     return os.environ.get("AV_NO_DEFAULT_IGNORES", "").strip().lower() not in ("1", "true", "yes")
 
 
+def _fused_staging_enabled() -> bool:
+    """V1.6.0 (WS4.1/WS4.2): one switch for both fused single-read staging paths --
+    `aether_core.stage_cdc()` (cut-detection + per-chunk hashing + whole-file hashing + the
+    CAS write, one sequential pass) and `aether_core.stage_safetensors()` (header parse +
+    per-layer hashing + whole-file hashing + the CAS write, one sequential pass) -- each
+    replacing what used to be two-or-three separate full-file read passes (see each
+    function's own C++ docstring/comment for the exact before/after). Default on: both are
+    pure algorithm, verified byte-for-byte against their legacy counterparts + `hashlib` as
+    independent oracles across many file shapes/sizes (tests/test_core.py), unlike the
+    SHA-NI/ARM hashing backends (hardware-dependent, can't be verified on every machine this
+    ships to) -- this escape hatch exists for diagnosis, not open correctness doubt. Each
+    call site still falls back to its own legacy implementation on any exception from the
+    fused path (e.g. `stage_safetensors` throws on overlapping layer ranges, which its
+    single-pass design cannot represent but the legacy fully-parallel per-layer re-read
+    handles fine), so flipping this off never removes correctness, only the read-count win."""
+    return os.environ.get("AV_STAGE_FUSED", "").strip().lower() not in ("0", "false", "no")
+
+
+def _stage_buffer_cap_bytes() -> int:
+    """V1.6.0 (WS4.1): `AV_STAGE_BUFFER_MB` bounds how large a single safetensors layer's
+    bytes are held in memory during fused staging before falling back to streaming straight
+    to a temp file on disk (`aether_core.stage_safetensors`'s own `buffer_cap_bytes` param) --
+    without this, an 8-worker `av add` staging several multi-GB tensors from the same
+    checkpoint concurrently could each buffer an entire layer in RAM at once. Default 32 MiB
+    per in-flight layer (documented in architecture.md's memory envelope alongside the CDC
+    fused path's per-file buffers); invalid/non-numeric values fall back to the default
+    rather than raising, matching this project's other env-var parsing convention."""
+    try:
+        mb = int(os.environ.get("AV_STAGE_BUFFER_MB", "32").strip())
+        if mb <= 0:
+            return 32 * 1024 * 1024
+        return mb * 1024 * 1024
+    except ValueError:
+        return 32 * 1024 * 1024
+
+
 def load_avignore_patterns(repo_root: Path) -> list[str]:
     """Reads `.avignore` from the repo root, if present.
 
@@ -313,7 +373,7 @@ def _is_gitignored(rel_posix: str, name: str, is_dir: bool, rules: list[_Gitigno
     return ignored
 
 
-def iter_working_files(root: Path):
+def iter_working_files(root: Path, repo_root: Path | None = None):
     """Yield every working-tree file path under `root`, skipping ignored dirs/noise,
     anything matching a `.avignore` pattern or the repo's `.gitignore`, and (V1.5.0) a
     built-in default ignore list of common heavy directories (`venv`, `node_modules`, ...) --
@@ -322,8 +382,20 @@ def iter_working_files(root: Path):
     Prunes ignored/ignored-by-pattern directories in-place so the CAS object store (and e.g. a
     `.avignore`'d `venv/`) is never traversed in the first place, not just filtered after a full
     walk.
+
+    `repo_root`, if given, is used AS-IS instead of `find_repo_root() or root`. Every real
+    CLI call site omits it (its own CWD is already inside the target repo, so the default
+    resolution is correct and this is a no-op for them) -- it exists for callers that walk a
+    directory unrelated to the *process's* CWD, most notably `speedcheck.py`'s synthetic
+    benchmarks: without it, `find_repo_root()` walks up from wherever the benchmark happens
+    to be invoked FROM (e.g. this very checkout) rather than the disposable fixture
+    directory actually being measured, and picks up THAT real project's own `.gitignore` by
+    accident -- a genuine, confirmed measurement bug (Probleme.md), not a real regression in
+    this function's own algorithm: profiled at ~130ms for 2000 files once isolated correctly
+    (well under budget), vs. ~900ms when a real multi-hundred-line `.gitignore` from an
+    unrelated ancestor directory gets accidentally walked into the comparison for every file.
     """
-    repo_root = find_repo_root() or root
+    repo_root = repo_root if repo_root is not None else (find_repo_root() or root)
     avignore_patterns = load_avignore_patterns(repo_root)
     gitignore_rules = load_gitignore_rules(repo_root)
     default_ignores = _default_ignores_enabled()
@@ -394,10 +466,31 @@ def ensure_repo() -> Path:
     return repo_root
 
 
+# V1.6.0: a single `av commit`/`av add` invocation calls load_config() 2-3 times (once
+# directly, once inside resolve_threads(), once inside commit_staged(), ...) -- each a full
+# file open + json.loads() of the same unchanged bytes. Keyed by the resolved config path,
+# validated against (mtime_ns, size) on every call (the same cheap heuristic
+# compare_meta_safe already uses for staging change-detection) so an external edit (a
+# second `av` process, a hand-edited config, the daemon's own save_config() call) is always
+# seen fresh, never trusted stale -- consistent with the daemon's "no write-back cache,
+# state re-validated on every request" invariant (architecture.md's Daemon Contract): this
+# cache re-validates via stat on every single call, it just skips the parse when unchanged.
+# Every return is a deepcopy, never the cached dict itself -- a caller doing
+# `cfg = load_config(...); cfg["x"] = "y"` (common; not every call site immediately
+# save_config()s afterward) must never corrupt what a later, unrelated load_config() call
+# for the same repo sees.
+_config_cache: dict[str, tuple[int, int, dict]] = {}
+
+
 def load_config(repo_root: Path) -> dict:
     config_path = repo_root / ".av" / "config"
     if config_path.exists():
         try:
+            st = config_path.stat()
+            cache_key = str(config_path)
+            cached = _config_cache.get(cache_key)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                return copy.deepcopy(cached[2])
             with open(config_path, "r") as f:
                 cfg = json.load(f)
             # Repos initialized before per-project separation was added have no
@@ -406,12 +499,18 @@ def load_config(repo_root: Path) -> dict:
             # repo a different identity on each command invocation (every push would look
             # like a new project).
             if "project_id" not in cfg or "project_name" not in cfg:
+                import uuid  # V1.6.0 (WS2.1): one-time backfill branch only -- the common
+                              # case (an already-migrated repo's config) never pays for this.
                 cfg.setdefault("project_id", uuid.uuid4().hex)
                 cfg.setdefault("project_name", repo_root.name)
-                save_config(repo_root, cfg)
+                save_config(repo_root, cfg)  # also refreshes the cache entry, see below
+                return copy.deepcopy(cfg)
+            _config_cache[cache_key] = (st.st_mtime_ns, st.st_size, copy.deepcopy(cfg))
             return cfg
         except (json.JSONDecodeError, OSError) as exc:
             print(f"Warning: Failed to load config, using defaults: {exc}", file=sys.stderr)
+    import uuid  # V1.6.0 (WS2.1): only reached when .av/config doesn't exist yet (no repo
+                  # to speak of) or failed to parse -- never on a normal status/add call.
     return {
         "lfs_threshold_mb": 50,
         "remote_url": "http://localhost:8000",
@@ -424,6 +523,17 @@ def save_config(repo_root: Path, config: dict) -> None:
     config_path = repo_root / ".av" / "config"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(config_path, json.dumps(config, indent=2))
+    # Refresh the cache with exactly what was just written, so a load_config() call right
+    # after a save_config() call (a very common pattern: `cfg = load_config(...);
+    # cfg["x"] = y; save_config(repo_root, cfg)`) sees the new value immediately rather than
+    # only on the NEXT call once the stat check notices the file changed. On any stat
+    # failure, drop the entry rather than risk it going stale -- the next load_config() then
+    # just re-reads from disk, the safe default.
+    try:
+        st = config_path.stat()
+        _config_cache[str(config_path)] = (st.st_mtime_ns, st.st_size, copy.deepcopy(config))
+    except OSError:
+        _config_cache.pop(str(config_path), None)
 
 
 class _AuthRetryGroup(click.Group):
@@ -689,6 +799,9 @@ def upload_commit_objects(
     if not missing:
         return True
 
+    # V1.6.0 (WS2.1): imported locally -- only a real commit/push with actual missing
+    # objects reaches this line; core.py's own module scope is paid by every status/add.
+    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
         futures = [
             pool.submit(client.upload_object, path, h, known_missing=True)
@@ -785,6 +898,9 @@ def hash_and_publish_whole_file(repo_root: Path, fpath: Path) -> str:
     write it immediately discards. Bounded, and never slower than the old always-two-reads
     path for the common case.
     """
+    import uuid  # V1.6.0 (WS2.1): only a genuinely new/changed file reaches this function
+                  # at all (the mtime/size no-op check already returned before this call) --
+                  # never worth core.py's own module scope, which every status/add pays for.
     aether_core = _get_aether_core()
     if aether_core is not None and hasattr(aether_core, "hash_and_copy"):
         if not _native_threads_configured:
@@ -875,14 +991,28 @@ def materialize_file(
     """Writes a tracked path's content to the working tree from the CAS -- whole-object,
     reassembled from safetensors layers, or reassembled from CDC chunks, downloading
     missing pieces from the remote. Shared by `checkout`, `av stash pop`/`apply`,
-    clone/pull, and merge, so all of them restore a file identically."""
+    clone/pull, and merge, so all of them restore a file identically.
+
+    V1.6.0 (Probleme.md): layered/chunked entries reassemble straight into the working
+    tree and stop there -- they no longer also `shutil.copy2` the reassembled bytes into
+    `.av/objects/<whole-hash>`. That extra write duplicated the whole artifact on disk
+    (shards *and* a full second copy) on every restore, undoing the storage saving
+    `add()` deliberately avoids for split artifacts (Probleme #47) and roughly doubling
+    the I/O for a large checkpoint's checkout. The trade-off: a repeat checkout of the
+    same layered/chunked entry (e.g. `checkout` back onto the same commit) now always
+    re-reassembles from shards rather than short-circuiting off a cached whole blob --
+    correct either way, just not free the second time. No consumer relies on that whole
+    blob existing for a split entry: `push_objects`/`upload_commit_objects` already skip
+    it (it was never uploaded), and `doctor`'s orphan/missing checks are shard-aware."""
     layers = layers or []
+    import shutil  # V1.6.0 (WS2.1): restore-only (checkout/stash/clone/pull/merge) -- never
+                    # reached by status/add, so never worth core.py's own module scope.
     chunks = chunks or []
     obj_path = repo_root / ".av" / "objects" / h[:2] / h[2:]
     dest = repo_root / rel_path
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    if layers and not obj_path.exists():
+    if layers:
         click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
         try:
             with open(dest, "wb") as f_out:
@@ -900,10 +1030,7 @@ def materialize_file(
         except click.ClickException:
             dest.unlink(missing_ok=True)
             raise
-
-        obj_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(dest, obj_path)
-    elif chunks and not obj_path.exists():
+    elif chunks:
         ordered = sorted(chunks, key=lambda c: c.get("offset", 0))
         click.echo(f"Reassembling {rel_path} from {len(ordered)} chunks...")
         try:
@@ -922,9 +1049,6 @@ def materialize_file(
         except click.ClickException:
             dest.unlink(missing_ok=True)
             raise
-
-        obj_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(dest, obj_path)
     else:
         if obj_path.exists():
             shutil.copy2(obj_path, dest)
@@ -1021,6 +1145,8 @@ def _atomic_publish_object(obj_path: Path, write_fn) -> None:
     """
     if obj_path.exists():
         return
+    import uuid  # V1.6.0 (WS2.1): only reached for a genuinely new/changed object -- never
+                  # worth core.py's own module scope, which every status/add pays for.
     obj_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = obj_path.with_name(f"{obj_path.name}.tmp.{uuid.uuid4().hex[:8]}")
     try:
@@ -1066,12 +1192,16 @@ def _compute_stage_result(
         return None
 
     if file_type == "artifact" and meta["size"] > threshold_bytes:
-        # Needed regardless of whether layer-split/chunking below actually fires -- kept as
-        # a separate read here (unlike the plain-file branch at the bottom of this
-        # function) because a successful split reads the file again anyway for its own
-        # per-layer/per-chunk hashing; folding the whole-file hash into that pass too is a
-        # real further optimization, just a separate/riskier one than this function takes on.
-        file_hash = hash_file_safe(str(fpath))
+        # `file_hash` (the WHOLE-FILE hash) is needed regardless of whether layer-split/
+        # chunking below actually fires. For safetensors it's still a genuinely separate
+        # read (that split reads the file again anyway for its own per-layer hashing --
+        # folding the whole-file hash into that pass too is a real further optimization,
+        # just a riskier one this function doesn't take on this session -- see WS4.1's own
+        # CHANGELOG entry). For CDC-chunked files, `stage_cdc()` below computes the exact
+        # same whole-file hash AS PART OF its single fused pass, so `file_hash` is left
+        # unset here and only falls back to a separate `hash_file_safe()` call at the
+        # bottom of this branch if nothing already produced one.
+        file_hash: str | None = None
         layers: list[dict] = []
         chunks: list[dict] = []
 
@@ -1080,45 +1210,83 @@ def _compute_stage_result(
             rel_path.endswith(".safetensors")
             and "no-layer-split" not in attr_flags
             and aether_core
-            and hasattr(aether_core, "split_and_hash_safetensors")
         ):
-            logger.info(f"Splitting safetensors layers for {rel_path}...")
-            try:
-                layer_results = aether_core.split_and_hash_safetensors(str(fpath))
-                for lr in layer_results:
-                    l_hash = lr["hash"]
-                    l_size = lr["size"]
-                    l_offset = lr["offset"]
-                    l_obj_path = repo_root / ".av" / "objects" / l_hash[:2] / l_hash[2:]
+            if _fused_staging_enabled() and hasattr(aether_core, "stage_safetensors"):
+                logger.info(f"Splitting safetensors layers (fused) for {rel_path}...")
+                try:
+                    objects_dir = repo_root / ".av" / "objects"
+                    stage_result = aether_core.stage_safetensors(
+                        str(fpath), str(objects_dir), _stage_buffer_cap_bytes()
+                    )
+                    file_hash = stage_result["whole_hash"]
+                    layers = [
+                        {"name": p["name"], "hash": p["hash"], "size": p["size"]}
+                        for p in stage_result["parts"]
+                    ]
+                except Exception as exc:
+                    logger.warning(f"Fused layer splitting failed for {rel_path}, falling "
+                                    f"back to legacy layer splitting: {exc}")
+                    layers = []
+                    file_hash = None  # must fall through to hash_file_safe() below
 
-                    def _write_layer(tmp_path, _offset=l_offset, _size=l_size):
-                        with open(fpath, "rb") as src_f:
-                            src_f.seek(_offset)
-                            with open(tmp_path, "wb") as dst_f:
-                                remaining = _size
-                                while remaining > 0:
-                                    chunk = src_f.read(min(8 * 1024 * 1024, remaining))
-                                    if not chunk:
-                                        break
-                                    dst_f.write(chunk)
-                                    remaining -= len(chunk)
+            if not layers and hasattr(aether_core, "split_and_hash_safetensors"):
+                logger.info(f"Splitting safetensors layers for {rel_path}...")
+                try:
+                    layer_results = aether_core.split_and_hash_safetensors(str(fpath))
+                    for lr in layer_results:
+                        l_hash = lr["hash"]
+                        l_size = lr["size"]
+                        l_offset = lr["offset"]
+                        l_obj_path = repo_root / ".av" / "objects" / l_hash[:2] / l_hash[2:]
 
-                    _atomic_publish_object(l_obj_path, _write_layer)
-                    layers.append({"name": lr["name"], "hash": l_hash, "size": l_size})
-            except Exception as exc:
-                logger.warning(f"Layer splitting failed for {rel_path}, falling back to whole-file: {exc}")
+                        def _write_layer(tmp_path, _offset=l_offset, _size=l_size):
+                            with open(fpath, "rb") as src_f:
+                                src_f.seek(_offset)
+                                with open(tmp_path, "wb") as dst_f:
+                                    remaining = _size
+                                    while remaining > 0:
+                                        chunk = src_f.read(min(8 * 1024 * 1024, remaining))
+                                        if not chunk:
+                                            break
+                                        dst_f.write(chunk)
+                                        remaining -= len(chunk)
+
+                        _atomic_publish_object(l_obj_path, _write_layer)
+                        layers.append({"name": lr["name"], "hash": l_hash, "size": l_size})
+                except Exception as exc:
+                    logger.warning(f"Layer splitting failed for {rel_path}, falling back to whole-file: {exc}")
 
         if not layers:
             suffix = Path(rel_path).suffix.lower()
             core_cdc = _get_aether_core()
             # `chunk` in .avattributes force-enables CDC for a glob regardless of extension;
             # `no-chunk` still wins when both are set -- safety over the opt-in.
-            if (
+            cdc_eligible = (
                 (suffix in CHUNKABLE_EXTS or "chunk" in attr_flags)
                 and "no-chunk" not in attr_flags
                 and core_cdc is not None
-                and hasattr(core_cdc, "chunk_and_hash_file")
+            )
+            if (
+                cdc_eligible
+                and _fused_staging_enabled()
+                and hasattr(core_cdc, "stage_cdc")
             ):
+                logger.info(f"Content-defined chunking (fused) for {rel_path}...")
+                try:
+                    objects_dir = repo_root / ".av" / "objects"
+                    stage_result = core_cdc.stage_cdc(str(fpath), str(objects_dir))
+                    file_hash = stage_result["whole_hash"]
+                    chunks = [
+                        {"hash": p["hash"], "size": p["size"], "offset": p["offset"]}
+                        for p in stage_result["parts"]
+                    ]
+                except Exception as exc:
+                    logger.warning(f"Fused chunking failed for {rel_path}, falling back to "
+                                    f"legacy chunking: {exc}")
+                    chunks = []
+                    file_hash = None  # must fall through to hash_file_safe() below
+
+            if cdc_eligible and not chunks and hasattr(core_cdc, "chunk_and_hash_file"):
                 logger.info(f"Content-defined chunking for {rel_path}...")
                 try:
                     chunk_results = core_cdc.chunk_and_hash_file(str(fpath))
@@ -1146,7 +1314,13 @@ def _compute_stage_result(
                     logger.warning(f"Chunking failed for {rel_path}, falling back to whole-file: {exc}")
                     chunks = []
 
+        if file_hash is None:
+            file_hash = hash_file_safe(str(fpath))
+
         if not layers and not chunks:
+            import shutil  # V1.6.0 (WS2.1): only a large artifact that didn't layer-split
+                            # or CDC-chunk reaches this -- never worth core.py's own module
+                            # scope, which every status/add pays for.
             obj_path = repo_root / ".av" / "objects" / file_hash[:2] / file_hash[2:]
             _atomic_publish_object(obj_path, lambda tmp: shutil.copy2(fpath, tmp))
 
@@ -1220,6 +1394,7 @@ def stage_one_file(
 
 def _init_repo_structure(repo_root: Path) -> None:
     """Bootstrap the .av/ directory layout. Behavior-preserving extraction from `init`."""
+    import uuid  # V1.6.0 (WS2.1): `av init`-only -- never worth core.py's own module scope.
     av_dir = repo_root / ".av"
     (av_dir / "objects").mkdir(parents=True, exist_ok=True)
     (av_dir / "refs" / "heads").mkdir(parents=True, exist_ok=True)
@@ -1249,7 +1424,7 @@ def compute_status(repo_root: Path, idx: Index) -> tuple[list[str], list[str], l
     staged, modified, deleted, untracked = [], [], [], []
 
     disk_files: set[str] = set()
-    for fpath in iter_working_files(repo_root):
+    for fpath in iter_working_files(repo_root, repo_root=repo_root):
         disk_files.add(str(fpath.relative_to(repo_root)).replace("\\", "/"))
 
     for rel_path, entry in idx.entries.items():
@@ -1720,7 +1895,7 @@ def commit_scoped_paths(
             if not p.is_absolute():
                 p = repo_root / p
             p = p.resolve()
-            targets = list(iter_working_files(p)) if p.is_dir() else [p]
+            targets = list(iter_working_files(p, repo_root=repo_root)) if p.is_dir() else [p]
             for fpath in targets:
                 if not fpath.exists():
                     continue
@@ -1789,6 +1964,7 @@ def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: I
     restore path behind `checkout`, `av clone`, and `av pull`: replaces idx.entries,
     deletes working files the tree no longer contains, then re-stats every entry and
     clears its staged flag so `av status` reads clean immediately after."""
+    import shutil  # V1.6.0 (WS2.1): checkout/clone/pull-only -- never status/add.
     old_entries = dict(idx.entries)
     idx.entries.clear()
 
@@ -1812,6 +1988,21 @@ def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: I
                         obj_path.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(dest, obj_path)
     else:
+        # V1.6.0: batch-check + parallel-download every object this tree references in one
+        # round trip before the per-file loop below reassembles anything, instead of each
+        # layer/chunk (or whole file) triggering its own serial download the first time
+        # materialize_file() hits a miss. `ensure_objects_local` already no-ops with zero
+        # round trips when everything is local (the common re-checkout/merge case), so this
+        # is never worse than before, only better on a real cold fetch (clone/pull already
+        # called this themselves earlier in their own flow -- here it's a no-op for them).
+        if client.server_available():
+            from . import sync as _sync
+
+            try:
+                _sync.ensure_objects_local(repo_root, client, tree)
+            except ValidationError as exc:
+                raise click.ClickException(str(exc))
+
         for rel_path, info in tree.items():
             h = info["hash"]
             size = info.get("size", 0)

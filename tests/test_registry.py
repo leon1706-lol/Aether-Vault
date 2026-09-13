@@ -1,3 +1,4 @@
+from python.av_cli.cmd_registry import _collect_exportable_object_hashes
 from python.av_cli.main import load_registry, update_registry, load_config, save_config
 
 
@@ -34,3 +35,47 @@ def test_save_config_atomic_no_tmp_file_left_behind(repo):
 
     leftovers = list((repo / ".av").glob("*.tmp.*"))
     assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# _collect_exportable_object_hashes — V1.6.0 real-bug fix (Probleme.md): a layer-split/
+# CDC-chunked entry's whole-file hash was never uploaded, so requesting it during export
+# always 404'd and inflated the "failed" count for every project with split artifacts.
+# ---------------------------------------------------------------------------
+
+def test_collect_exportable_object_hashes_whole_file_entry():
+    commits = [{"tree": {"a.py": {"hash": "deadbeef" * 8}}}]
+    assert _collect_exportable_object_hashes(commits) == {"deadbeef" * 8}
+
+
+def test_collect_exportable_object_hashes_excludes_whole_hash_for_layered_entry():
+    commits = [{"tree": {"model.safetensors": {
+        "hash": "wholehash" * 7 + "wh",  # never uploaded -- must not be requested
+        "layers": [{"hash": "layer1hash" * 6 + "l1"}, {"hash": "layer2hash" * 6 + "l2"}],
+    }}}]
+    hashes = _collect_exportable_object_hashes(commits)
+    assert "wholehash" * 7 + "wh" not in hashes
+    assert {"layer1hash" * 6 + "l1", "layer2hash" * 6 + "l2"} == hashes
+
+
+def test_collect_exportable_object_hashes_excludes_whole_hash_for_chunked_entry():
+    commits = [{"tree": {"checkpoint.pt": {
+        "hash": "wholehash" * 7 + "wh",  # never uploaded -- must not be requested
+        "chunks": [{"hash": "chunk1hash" * 6 + "c1"}, {"hash": "chunk2hash" * 6 + "c2"}],
+    }}}]
+    hashes = _collect_exportable_object_hashes(commits)
+    assert "wholehash" * 7 + "wh" not in hashes
+    assert {"chunk1hash" * 6 + "c1", "chunk2hash" * 6 + "c2"} == hashes
+
+
+def test_collect_exportable_object_hashes_across_multiple_commits_dedupes():
+    shared_hash = "shared0" * 9 + "sh"
+    commits = [
+        {"tree": {"a.py": {"hash": shared_hash}}},
+        {"tree": {"b.py": {"hash": shared_hash}}},
+    ]
+    assert _collect_exportable_object_hashes(commits) == {shared_hash}
+
+
+def test_collect_exportable_object_hashes_handles_missing_tree_key():
+    assert _collect_exportable_object_hashes([{"hash": "x"}, {}]) == set()

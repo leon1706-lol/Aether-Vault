@@ -58,7 +58,7 @@ def _fake_client(monkeypatch, reg: _FakeTaskRegistry):
                 rows = [t for t in rows if t["status"] == params["status"]]
             return _FakeResponse(200, {"tasks": rows})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             body = json or {}
             if url.endswith("/api/tasks"):
                 status, resp = reg.create(body)

@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC-0097E8?style=flat-square&labelColor=1A1A1A" alt="PolyForm Noncommercial">
-  <img src="https://img.shields.io/badge/tests-1402%2F1402%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="1402 of 1402 tests passing">
+  <img src="https://img.shields.io/badge/tests-1824%2F1824%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="1824 of 1824 tests passing">
   <img src="https://img.shields.io/pypi/v/aether-vault?style=flat-square&labelColor=1A1A1A&label=pypi&logo=pypi&logoColor=white" alt="PyPI">
   <img src="https://img.shields.io/badge/docker-aether--vault--engine-2496ED?style=flat-square&labelColor=1A1A1A&logo=docker&logoColor=white" alt="Docker">
 </p>
@@ -62,6 +62,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
   - [`av log`](#av-log)
   - [`av branch` / `av checkout`](#av-branch--av-checkout)
   - [`av merge`](#av-merge)
+  - [`av fetch`](#av-fetch)
   - [`av diff`](#av-diff)
   - [`av run`](#av-run)
   - [`av context`](#av-context)
@@ -133,7 +134,7 @@ Split into two focused diagrams — what happens on your machine, and how it tal
 ```mermaid
 graph TD
     Plugins("av_plugins<br>(Lightning · Transformers · vanilla PyTorch callbacks)")
-    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · daemon · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-pytorch · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit ·<br>improver · canary · freeze · incident · eval · task · plan · budget ·<br>scheduler · review · critique · lineage · search · strategy · lessons ·<br>blackboard · sandbox · replay-actions · tools)")
+    CLI("av_cli<br>(init · add · status · commit · branch · checkout · merge · log ·<br>clone · pull · fetch · push · gc · auth · webui · doctor · config · list-meta ·<br>graph · handoff · test · benchmark · daemon · update · file · unstage · stash ·<br>import-lightning · import-mlflow · import-pytorch · import-transformers · diff · context ·<br>run · env/replay · policy · promote · watch · registry · webhooks · audit ·<br>improver · canary · freeze · incident · eval · task · plan · budget ·<br>scheduler · review · critique · lineage · search · strategy · lessons ·<br>blackboard · sandbox · replay-actions · tools)")
     CPP("aether_core (C++)<br>(Splits Safetensors & CDC-Chunks Checkpoints,<br>Hashes & Chunks in Parallel — shared thread pool,<br>AV_THREADS/--threads)")
     LocalDAG(".av/<br>(Commits · Branch Refs · Merkle Index · LFS Pointers)")
     PendingQ("pending_push queue<br>(.av/pending_push — offline-resilient commits)")
@@ -176,6 +177,7 @@ graph TD
     CLI -- "Push: Uploads Objects, Trees & Refs<br>(+ Bearer Token if Protected)" --> FastAPI
     CLI -- "Checkout: Downloads Missing Objects" --> FastAPI
     CLI -- "Clone/Pull: Discovers Projects, Fetches<br>History & Materializes Working Copies" --> FastAPI
+    CLI -- "fetch: Downloads Objects/Layers for<br>One Path Without Touching the Working Tree" --> FastAPI
     CLI -- "gc: Triggers Remote Garbage Collection" --> FastAPI
     CLI -- "RSI Control Plane: Improver/Change-Set/Canary/Freeze/Eval/<br>Budget/Review/Sandbox/Policy-Pack — all server-authoritative,<br>scoped-token enforced" --> FastAPI
     PendingQ -- "Retried by av push" --> FastAPI
@@ -205,7 +207,7 @@ and how it's wired in, this table is the index.
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
 | `python/av_plugins/` | Lightning / Transformers / MLflow / vanilla PyTorch auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
-| `tests/` | 1,402-test suite across 75 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
+| `tests/` | 1,916-test suite across 82 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
@@ -312,7 +314,7 @@ For full methodology, every raw number, and the rating legend, see [`development
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs 1,402 tests across 75 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
+The full suite (`av test` or `pytest tests/ -q`) runs 1,916 tests across 82 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
 
 ```bash
 av test                  # full suite
@@ -570,6 +572,18 @@ av merge <target> --no-ff               # force a merge commit even when a fast-
 ```
 
 Successful merges create a real two-parent commit that syncs to the registry and shows up in `av log`. Content-level line merging is intentionally out of scope — versioned payloads are binary artifacts; an honest abort beats a corrupt merge. `--force` bypasses an armed branch policy for this one merge (see `av policy` below).
+
+#### `av fetch`
+
+Downloads the objects one or more tracked paths need at HEAD into `.av/objects`, without touching the working tree. `checkout`/`stash pop`/`merge` already prefetch what they need automatically — `fetch` is for warming the local object store ahead of time (before going offline, or before a large `checkout`), or for pulling down just one named layer of a large layer-split checkpoint, a capability no competitor in the benchmark suite has at all.
+
+```bash
+av fetch checkpoint.pt                       # download everything model.pt needs at HEAD
+av fetch --layer classifier_head model.safetensors   # just one named layer
+av fetch --all                               # prefetch every object HEAD's tree references
+```
+
+`av --output json fetch <path>` reports exactly what moved: `{"fetched": [{"path","hash","bytes"}], "already_local": n, "bytes": n}`. Available via the SDK too: `r.fetch(["model.pt"], layers=["classifier_head"])`.
 
 #### `av diff`
 

@@ -7,6 +7,9 @@ main.py (`_find_source_root`, `_update_readme_test_badge`) are accessed late-bou
 
 import importlib
 import re
+import shutil  # V1.6.0 (WS2.1): core.py no longer re-exports this via `import *`.
+import subprocess
+import tempfile
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from . import main as _root
 
@@ -114,15 +117,27 @@ def _update_readme_test_badge(passed: int, failed: int) -> None:
             click.secho(f"Updated tests/README.md test counts: {total_str} tests across {file_count} files", fg="cyan")
 
 
-def _sync_readme_perf_ratio(results: list) -> None:
-    """Keeps README.md's "~Nx slower than Git LFS" mentions in sync with the No-Op
+def _sync_readme_benchmark_table(results: list) -> None:
+    """Keeps README.md's "~Nx slower/faster than Git LFS" mention in sync with the No-Op
     status/add benchmark's own just-captured numbers, which drifted before since nothing
     re-derived README's hand-typed ratio from a real run. Only called with `--markdown`,
-    and only rewrites when the noop benchmark actually ran with a real Git LFS number."""
+    and only rewrites when the noop benchmark actually ran with a real Git LFS number.
+
+    Looks the row up by its operation label prefix ("re-add unchanged") rather than a
+    positional `rows[0]` -- the same class of bug the benchmark probe-index fix
+    (speedcheck.probe_ms) addresses, now that this benchmark has more than one row (WS0.4
+    added an explicit `status` row alongside it). Handles both directions: if av's own
+    speed work has flipped the ratio, the README sentence flips from "slower" to "faster"
+    instead of silently keeping stale wording. Rows 3/6/8/9 of the Benchmark Comparison
+    table are still hand-maintained prose (percentages, capability call-outs) -- rewritten
+    by hand alongside the doc pass each release, not auto-derived, since a regex can't
+    safely judge what those sentences should say."""
     noop = next((r for r in results if r.name == "noop_status_speed"), None)
     if noop is None or not noop.rows:
         return
-    row = noop.rows[0]
+    row = next((r for r in noop.rows if r.operation.startswith("re-add")), None)
+    if row is None:
+        return
     av_value, lfs_value = row.values.get("av"), row.values.get("git-lfs")
     if not av_value or not lfs_value:
         return
@@ -130,12 +145,17 @@ def _sync_readme_perf_ratio(results: list) -> None:
     readme_path = source_root / "README.md"
     if not readme_path.is_file():
         return
-    ratio = av_value / lfs_value
     text = readme_path.read_text(encoding="utf-8")
-    updated, n = re.subn(r"~[\d.]+x slower than Git LFS", f"~{ratio:.0f}x slower than Git LFS", text)
+    if av_value <= lfs_value:
+        ratio = lfs_value / av_value
+        phrase = f"~{ratio:.0f}x faster than Git LFS"
+    else:
+        ratio = av_value / lfs_value
+        phrase = f"~{ratio:.0f}x slower than Git LFS"
+    updated, n = re.subn(r"~[\d.]+x (?:slower|faster) than Git LFS", phrase, text)
     if n and updated != text:
         atomic_write_text(readme_path, updated)
-        click.secho(f"Updated README.md perf ratio: ~{ratio:.0f}x slower than Git LFS (no-op status/add)", fg="cyan")
+        click.secho(f"Updated README.md perf ratio: {phrase} (no-op status/add)", fg="cyan")
 
 
 @click.command(name="test")
@@ -284,7 +304,14 @@ BENCHMARK_NAMES = [
               help="Save this run's av-only numbers as a JSON snapshot, for a future --baseline comparison.")
 @click.option("--baseline", "baseline_path", type=click.Path(exists=True), default=None,
               help="Compare this run's av numbers against a prior --save-json snapshot and report any row that regressed past the 1.5x verdict threshold. Exits non-zero if any regression is found.")
-def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_out: str | None, baseline_path: str | None) -> None:
+@click.option("--repeat", "repeat", type=int, default=3, show_default=True,
+              help="Run each benchmark this many times (each a fully independent run) and report the median -- lower per-benchmark noise than a single-shot timing.")
+@click.option("--no-daemon", "no_daemon", is_flag=True, default=False,
+              help="Force AV_NO_DAEMON=1 for every av subprocess this run spawns, capturing the cold (no background daemon) numbers instead of the product default. Not the default methodology -- see METHODOLOGY_NOTES.")
+def benchmark(
+    only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_out: str | None,
+    baseline_path: str | None, repeat: int, no_daemon: bool,
+) -> None:
     """(Development only) Run cross-tool benchmark comparisons against DVC, Git LFS, and MLflow.
 
     Requires an editable/dev install (`pip install -e .[dev,benchmarks]`) — see benchmarks/README.md
@@ -292,6 +319,15 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_
     labeled "not installed" in the output, never given a fabricated number.
     """
     json_mode = current_output_mode() == "json"
+    if no_daemon:
+        os.environ["AV_NO_DAEMON"] = "1"
+    elif os.environ.get("AV_NO_DAEMON") and not json_mode:
+        click.secho(
+            "WARNING: AV_NO_DAEMON is set in this shell -- av numbers will NOT reflect the "
+            "product default (native launcher + auto-spawned daemon). Unset it, or pass "
+            "--no-daemon explicitly so the captured report says so honestly.",
+            fg="yellow",
+        )
     source_root = _root._find_source_root()
     benchmarks_dir = source_root / "benchmarks"
     if not benchmarks_dir.is_dir():
@@ -314,8 +350,10 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_
         sys.path.insert(0, str(source_root))
     from benchmarks.tool_runner import (
         compare_to_baseline,
+        daemon_mode_label,
         print_regression_report,
         print_table,
+        render_claim_summary,
         render_doc_header,
         result_to_markdown,
         results_to_json,
@@ -336,18 +374,27 @@ def benchmark(only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_
     markdown_chunks = []
     for name in names:
         module = importlib.import_module(f"benchmarks.bench_{name}")
-        result = module.run(tool_order=tool_order)
+        try:
+            result = module.run(tool_order=tool_order, repeat=repeat)
+        except TypeError:
+            # A benchmark whose run() predates the `repeat` parameter (e.g. a
+            # storage-byte-count benchmark with nothing to average) -- call it the old way.
+            result = module.run(tool_order=tool_order)
         if not json_mode:
             print_table(result)
         results.append(result)
         markdown_chunks.append(result_to_markdown(result))
 
     if markdown_out:
-        doc = render_doc_header(source_root) + METHODOLOGY_NOTES + "\n".join(markdown_chunks)
+        doc = (
+            render_doc_header(source_root, repeat=repeat, daemon_mode=daemon_mode_label())
+            + render_claim_summary(results) + "\n"
+            + METHODOLOGY_NOTES + "\n".join(markdown_chunks)
+        )
         Path(markdown_out).write_text(doc, encoding="utf-8")
         if not json_mode:
             click.echo(f"\nWrote {markdown_out}")
-        _sync_readme_perf_ratio(results)
+        _sync_readme_benchmark_table(results)
 
     if save_json_out:
         Path(save_json_out).write_text(json.dumps(results_to_json(results), indent=2), encoding="utf-8")

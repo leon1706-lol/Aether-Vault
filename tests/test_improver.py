@@ -122,7 +122,7 @@ def _fake_client(monkeypatch, reg: _FakeRegistry):
                 return _FakeResponse(200, {"canary_results": rows[:params.get("limit", 50)]})
             return _FakeResponse(404, {})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             body = json or {}
             if url.endswith("/api/improvers"):
                 status, resp = reg.create_improver(body)

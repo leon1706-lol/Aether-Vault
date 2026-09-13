@@ -70,7 +70,7 @@ def _fake_client(monkeypatch, run_metrics=None, eval_rows=None, report_status=20
                 return _FakeResponse(200, {"id": "r1", "metrics_summary": run_metrics or {}})
             return _FakeResponse(404, {})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             return _FakeResponse(report_status, {"status": "recorded"})
 
     class _FakeClient(client_module.VaultClient):

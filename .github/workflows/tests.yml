@@ -202,6 +202,43 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://av_user:av_password@localhost:5432/aether_vault_migrations_drill
         run: python scripts/migrations_drill.py
 
+  # The native `av` launcher's POSIX (Linux/macOS) code paths (src/launcher/av_launcher.cpp)
+  # -- this project's own dev box is Windows-only with no toolchain to build or execute
+  # either platform, so this matrix is the ONLY place those code paths are ever actually
+  # compiled and run, not just written. Windows itself is already exercised by the `test`
+  # matrix above (which builds the same launcher via the same setup.py path and runs the
+  # same tests/test_launcher_native.py) and `smoke-sdist-windows` below.
+  launcher-native-posix:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Aether-Vault (builds aether_core AND the native av launcher via setup.py)
+        run: pip install -e .[dev]
+
+      - name: Confirm the native launcher actually compiled (not the pure-Python shim fallback)
+        # A missing exe here means the C++ build genuinely failed on a platform that always
+        # ships a working compiler (ubuntu-latest/macos-latest both do) -- a real bug to
+        # catch, not a legitimate "no toolchain" case the shim fallback exists for.
+        run: |
+          command -v av-native
+          av-native --av-launcher-info
+
+      - name: Run the native launcher test suite (real subprocess against a real in-thread daemon)
+        run: pytest tests/test_launcher_native.py -v
+
+      - name: Build a real wheel and verify av is injected as the real binary, not an entry point
+        run: pytest tests/test_wheel_packaging.py -v
+
   # Lints .github/workflows/*.yml and every shell script this repo ships -- no
   # services, no build, runs on every push in well under a minute.
   lint-workflows:
@@ -1139,6 +1176,7 @@ jobs:
       - flaky-quarantine
       - contract-matrix
       - migrations-drill
+      - launcher-native-posix
       - lint-workflows
       - plugin-tests
       - webui-tests

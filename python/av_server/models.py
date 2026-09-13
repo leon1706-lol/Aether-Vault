@@ -97,6 +97,17 @@ class DBCommit(Base):
     project_id = Column(String, nullable=False, index=True)
     project_name = Column(String, nullable=False)
 
+    # V1.6.0 (WS5.7): list_commits' primary query is exactly this shape --
+    # `WHERE project_id = ... ORDER BY timestamp DESC LIMIT ... OFFSET ...`. The lone
+    # single-column `project_id` index (above) lets Postgres filter but not avoid a
+    # separate sort step over every matching row before LIMIT/OFFSET can apply; this
+    # composite index (with DESC baked into the index itself, matching the query's own
+    # ORDER BY direction) lets that query satisfy both the filter and the ordering from one
+    # index scan on a project with a large commit history.
+    __table_args__ = (
+        Index("ix_commits_project_timestamp", "project_id", timestamp.desc()),
+    )
+
 
 class DBRef(Base):
     """Branch / tag reference pointing to a commit hash."""

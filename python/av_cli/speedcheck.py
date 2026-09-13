@@ -122,7 +122,7 @@ def run_real_repo_probes(
     return [
         (f"Index.load() (.av/index, {entry_count} entries)", _time_ms(lambda: Index(repo_root))),
         ("load_config()", _time_ms(lambda: load_config(repo_root))),
-        ("iter_working_files() (real tree)", _time_ms(lambda: list(iter_working_files(repo_root)))),
+        ("iter_working_files() (real tree)", _time_ms(lambda: list(iter_working_files(repo_root, repo_root=repo_root)))),
         ("Storage stats (.av/objects)", _time_ms(lambda: storage_stats(av_dir))),
     ]
 
@@ -167,7 +167,14 @@ def run_synthetic_probes(
     for i in range(SYNTHETIC_FILE_COUNT):
         (work_dir / f"f_{i}.txt").write_text("x")
     label = f"iter_working_files() ({SYNTHETIC_FILE_COUNT} files)"
-    results.append((label, _time_ms(lambda: list(iter_working_files(tmp_root))), _budget_for(label)))
+    # repo_root=tmp_root explicitly: without it, iter_working_files() falls back to
+    # find_repo_root() walking up from the PROCESS's real CWD (wherever this benchmark
+    # happens to be invoked from -- e.g. this very checkout) rather than this disposable
+    # fixture directory, and picks up that unrelated real project's own .gitignore by
+    # accident. This was a real, confirmed measurement bug (Probleme.md) behind the
+    # "iter_working_files() 9x regression" the perf-history table showed after V1.5.0 added
+    # .gitignore support -- not a real regression in the function's own algorithm.
+    results.append((label, _time_ms(lambda: list(iter_working_files(tmp_root, repo_root=tmp_root))), _budget_for(label)))
 
     objects_dir = av_dir / "objects"
     for i in range(SYNTHETIC_OBJECT_COUNT):
@@ -371,24 +378,93 @@ def populate_cli_fixture(root: Path) -> None:
         (root / f"model_{i}.bin").write_bytes(b"x" * CLI_LARGE_FILE_SIZE)
 
 
-def run_av_cli_probes(av_path: str, tmp_root: Path) -> list[Probe]:
+def await_daemon(av_path: str, repo_root: Path, timeout_s: float = 15.0) -> bool:
+    """Polls `av daemon status --output json` (untimed) until it reports a running daemon
+    for `repo_root`, or `timeout_s` elapses. Called after a benchmark's untimed setup commit
+    so the *timed* add/status/commit that follows hits an already-warm daemon -- the product
+    default (WS1b) -- rather than paying a cold auto-spawn mid-measurement. A no-op (returns
+    False immediately) when `AV_NO_DAEMON` is set in the environment these subprocesses will
+    inherit, since no daemon will ever come up in that mode. Never raises: any subprocess or
+    parse failure is treated as "not running yet" and the poll simply continues."""
+    if os.environ.get("AV_NO_DAEMON", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [av_path, "--output", "json", "daemon", "status"],
+                cwd=repo_root, capture_output=True, text=True, timeout=5,
+            )
+            data = json.loads(result.stdout)
+            if data.get("data", {}).get("running"):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def probe_ms(probes: list[Probe], label_prefix: str) -> float | None:
+    """Looks a probe up by its label's prefix instead of a positional index into the list
+    `run_av_cli_probes` returns -- the exact bug this replaces (Probleme.md): a new probe
+    inserted at the front of that list silently shifted every positional consumer's labels
+    without either of them making a sound. Returns None if no label matches."""
+    for label, value in probes:
+        if label.startswith(label_prefix):
+            return value
+    return None
+
+
+def run_av_cli_probes(
+    av_path: str,
+    tmp_root: Path,
+    *,
+    commit_upload: bool = True,
+    env: dict | None = None,
+    warm_daemon: bool = False,
+) -> list[Probe]:
     """Times the real `av` binary (init/add/commit) as subprocesses against the shared
     CLI fixture. Caller resolves/checks `av_path` (e.g. via `shutil.which`) and provides
     a disposable `tmp_root` — this never touches a real repo.
+
+    `commit_upload=False` appends `--no-upload` to the commit step, so its timing is a pure
+    local finalize -- the same semantics as `git commit`/`dvc commit` (neither ever touches
+    a network), rather than including a synchronous registry round trip DVC/Git LFS's own
+    commit numbers never pay. `env` is merged over the current process environment for every
+    subprocess (e.g. `AV_NO_UPDATE_CHECK=1` so `av init` doesn't make a PyPI call that Git's
+    and DVC's own `init` never would). `warm_daemon=True` inserts one untimed `av status`
+    right after `init` and waits (`await_daemon`) for the daemon it triggers to come up
+    before the *timed* `add` step -- the product default (WS1b) is an auto-spawned daemon,
+    and a real user's second command in a session hits it warm, not cold; without this, the
+    very first allowlisted probe in this list would pay the one-time spawn cost that no
+    later real invocation in the same repo ever would.
     """
     populate_cli_fixture(tmp_root)
     file_count = CLI_CODE_FILE_COUNT + CLI_LARGE_FILE_COUNT
+    commit_args = [av_path, "commit", "-m", "speedcheck"]
+    if not commit_upload:
+        commit_args.append("--no-upload")
     steps = [
         # Pure interpreter/import-startup floor, isolated from any real work below --
         # the scoreboard metric for import-graph regressions (V1.5.0 perf work).
         ("av --version", [av_path, "--version"]),
         ("av init", [av_path, "init", "--mode", "local", "--yes", "--no-repl"]),
         (f"av add . ({file_count} files)", [av_path, "add", "."]),
-        ("av commit", [av_path, "commit", "-m", "speedcheck"]),
+        ("av commit", commit_args),
     ]
+    # `env` only added to the subprocess.run() kwargs when actually given -- some callers
+    # (and their test doubles, e.g. tests/test_cli.py's `av test --speed` fakes) don't
+    # expect an `env=` keyword at all, and plain omission is equivalent to `env=None` for a
+    # real subprocess anyway (both mean "inherit the current environment").
+    run_kwargs: dict = {"cwd": tmp_root}
+    if env:
+        run_kwargs["env"] = {**os.environ, **env}
     results: list[Probe] = []
     for label, args in steps:
+        if warm_daemon and label.startswith("av add"):
+            subprocess.run([av_path, "status"], **run_kwargs)  # untimed: triggers auto-spawn
+            await_daemon(av_path, tmp_root)
         start = time.perf_counter()
-        subprocess.run(args, cwd=tmp_root)
+        subprocess.run(args, **run_kwargs)
         results.append((label, (time.perf_counter() - start) * 1000))
     return results

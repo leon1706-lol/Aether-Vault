@@ -5,6 +5,8 @@ main.py (`_find_source_root`, `_update_readme_test_badge`) are accessed late-bou
 `_root.<name>` so test monkeypatching on the main namespace stays effective.
 """
 
+import datetime  # V1.6.0 (WS2.1): core.py no longer re-exports this via `import *`.
+
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from .core import (
     _collect_dirty_paths,
@@ -500,4 +502,56 @@ def merge(target: str, message: str | None, policy_ours: bool, policy_theirs: bo
         f"Merged {target} into {branch}: +{added} -{removed} ~{changed} file(s)"
         f"{note} [{merge_hash[:7]}]",
         fg="green",
+    )
+
+
+@click.command("fetch")
+@click.argument("paths", nargs=-1)
+@click.option("--layer", "layer_names", multiple=True, metavar="NAME",
+              help="Restrict a layer-split entry to just these named layers (repeatable). "
+                   "Requires exactly one PATH — the single-layer partial-fetch capability "
+                   "no other tool in the benchmark suite has (see benchmarks/README.md).")
+@click.option("--all", "fetch_all", is_flag=True, default=False,
+              help="Prefetch every object HEAD's tree references, ignoring PATHS.")
+def fetch(paths: tuple, layer_names: tuple, fetch_all: bool) -> None:
+    """Download the objects one or more tracked paths need at HEAD into `.av/objects`,
+    without touching the working tree. Warms the local object store before an offline
+    session, or fetches just one named layer of a large layer-split checkpoint --
+    `checkout`/`stash pop`/`merge` already do this transparently as needed, so `fetch` is
+    for pre-staging bytes ahead of time, not a prerequisite for them.
+    """
+    from .client import VaultClient
+    from . import sync
+
+    ctx = click.get_current_context(silent=True)
+    repo_root = ensure_repo()
+    json_mode = output_is_json(ctx)
+
+    rel_paths = [str(Path(p).resolve().relative_to(repo_root)).replace("\\", "/") for p in paths]
+    tree = resolve_head_tree(repo_root)
+    try:
+        selected = sync.resolve_fetch_targets(
+            tree, rel_paths, fetch_all=fetch_all, layer_names=list(layer_names),
+        )
+        client = VaultClient(*resolve_remote(repo_root))
+        pool_size = python_pool_size(resolve_threads(repo_root))
+        result = sync.download_selected_objects(repo_root, client, selected, pool_size)
+    except NetworkError as exc:
+        fail(ctx, "unreachable_queued", f"{exc} Safe to retry once it's back.", command="fetch")
+    except ValidationError as exc:
+        fail(ctx, "validation", str(exc), command="fetch")
+
+    fetched, already_local, total_bytes = result["fetched"], result["already_local"], result["bytes"]
+
+    if json_mode:
+        emit_json(ctx, "fetch", data={
+            "fetched": fetched, "already_local": already_local, "bytes": total_bytes,
+        })
+        return
+    if not fetched:
+        click.secho(f"Nothing to fetch — {already_local} object(s) already local.", fg="green")
+        return
+    click.secho(
+        f"Fetched {len(fetched)} object(s), {total_bytes:,} bytes "
+        f"({already_local} already local).", fg="green",
     )

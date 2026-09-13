@@ -176,6 +176,92 @@ AV_AUDIT_SIGNING_KEY_PATH  (empty/unset = chain-hashing only, no signing)
                keypair. Once set, every NEW audit row is additionally signed;
                pre-existing rows and any row written while unset simply have
                signature=NULL, which never blocks chain verification.
+AV_SHA256_BACKEND  auto   (default; CLI-side, aether_core)
+               Forces the SHA-256 compression backend: auto | scalar | sha-ni | arm-sha2.
+               An unsupported/failing choice is silently ignored (falls back to normal
+               auto-detection) — a hashing path this central must never hard-fail on a
+               bad diagnostic request. `aether_core.hash_backend()` / `av doctor` report
+               which one is actually active. See src/README.md.
+AV_HTTP_TIMEOUT  120  (default seconds; CLI-side, VaultClient)
+               Read timeout for every registry request except the health probe (fixed 2s)
+               and `av gc` (fixed 300s, GC is known-slow) — both untouched by this var.
+               Connect timeout is a fixed 5s, not overridable.
+AV_NO_UPDATE_CHECK  (unset = normal caching behavior)
+               1 → `check_for_update()`/`maybe_auto_update()` return immediately, no PyPI
+               call, regardless of the user config's cache state. For `av init`/`av
+               benchmark`'s init row — a routine command's own update check shouldn't
+               skew a timing meant to compare against tools that never make one.
+AV_NO_DAEMON  (unset = normal; CLI-side)
+               1/true/yes → the daemon path is never even considered, this invocation and
+               every spawn decision (`enabled_mode()` returns "never" unconditionally,
+               overriding everything below). The one hard, unconditional escape hatch.
+AV_DAEMON  (unset = per-repo default; CLI-side)
+               0/false/no → "use_only" (use an already-running daemon for this repo, but
+               never auto-spawn one). 1/true/yes → "auto_spawn" this invocation regardless
+               of `.av/config`. Unset falls through to `.av/config`'s `"daemon":{"enabled"}`
+               (true/false/absent), and absent means **auto_spawn — the default since
+               V1.6.0** (V1.5.0 defaulted to "use_only"). See daemon_common.enabled_mode()'s
+               own docstring for the full precedence order.
+AV_DAEMON_DEBUG  (unset = silent; CLI-side, daemon_client.py)
+               Non-empty, non-"0" → prints `[av daemon] ...` diagnostics to stderr for every
+               daemon-path decision (state file missing, connect failed, MAC mismatch, ...).
+AV_TEST_LAUNCHER  (unset = shutil.which("av-native"); test-only)
+               Explicit path to a built native launcher exe, for `tests/test_launcher_native.py`
+               (and anyone poking at it manually) when it isn't on PATH under the default name.
+AV_LAUNCHER_TRACE  (unset = silent; native launcher only, Windows exe)
+               1 → the native launcher prints one `[av-native] ...` line per decision point
+               to stderr (which fallback reason fired, connect/send/recv outcomes). Never
+               enabled by default; see src/launcher/README.md.
+AV_LAUNCHER_EXE / AV_LAUNCHER_REPO / AV_LAUNCHER_DAEMON_RESULT  (internal — set BY the
+               native launcher on its own fallback exec, read by daemon_client.py; not
+               meant to be set by a user or script). See src/launcher/README.md's
+               "discovery-file protocol" section for the full handshake these implement.
+AV_PYTHON  (unset = normal interpreter search; native launcher only)
+               Explicit interpreter path the native launcher's fallback exec should use
+               instead of searching for `av-py.exe`/`python.exe` next to itself.
+AV_STAGE_FUSED  1  (default; CLI-side, core.py's _compute_stage_result)
+               0/false/no → both fused single-read staging paths revert to their legacy
+               multi-pass equivalents: CDC-chunked artifacts (av add) use
+               chunk_and_hash_file (two read passes) + a third Python-side write pass
+               instead of aether_core.stage_cdc; .safetensors layer-splitting uses
+               split_and_hash_safetensors (fully parallel but still per-layer re-reads)
+               + a further Python-side per-layer write pass instead of
+               aether_core.stage_safetensors. An escape hatch for diagnosis, not because
+               of open correctness doubt -- each fused function shares its cut/boundary
+               logic with (stage_cdc/chunk_and_hash_file's CdcCutter) or is validated
+               against (stage_safetensors vs. split_and_hash_safetensors) its legacy
+               counterpart and is proven byte-identical per chunk/layer
+               (tests/test_core.py, tests/test_staging_internals.py). Each fused path also
+               falls back to its own legacy path automatically on any exception for that
+               one file (e.g. stage_safetensors on overlapping declared layer ranges,
+               which its single sequential pass can't represent but the legacy fully-
+               parallel per-layer re-read handles fine) -- this env var forces that same
+               fallback for every file, not just the ones that hit an exception.
+AV_STAGE_BUFFER_MB  32  (default; CLI-side, core.py's _stage_buffer_cap_bytes,
+               consumed by aether_core.stage_safetensors's buffer_cap_bytes param)
+               Bounds how large a single safetensors layer's bytes are held in memory
+               during fused staging before falling back to streaming straight to a temp
+               file on disk. A layer at or under this size accumulates in memory (like
+               stage_cdc's own chunk buffer) and is published once complete; a layer over
+               it streams to objects_dir/.stage-tmp.<n> as its bytes arrive (its final
+               content-addressed path isn't known until its hash completes) and is renamed
+               into place, or discarded on a dedup hit, only then. Invalid/non-numeric
+               values fall back to the default rather than raising.
+AV_DB_POOL_SIZE  10  (default; server-side, database.py)
+               SQLAlchemy async engine pool_size, applied to both `engine` and `app_engine`
+               (same physical database either way). SQLAlchemy's own default is 5 -- tight
+               for a single-worker uvicorn process serving many concurrent request sessions.
+AV_DB_MAX_OVERFLOW  20  (default; server-side, database.py)
+               SQLAlchemy async engine max_overflow, same two engines as above. SQLAlchemy's
+               own default is 10.
+AV_UVICORN_WORKERS  1  (default, unchanged behavior; docker/engine-entrypoint.sh)
+               Passed straight to `uvicorn --workers`. Each worker beyond the first is a
+               SEPARATE process with its own in-memory state (the default in-process
+               WindowRateLimiter's buckets, the webhook queue-depth metric, ...) -- the
+               identical failure mode the HA Contract already documents for N>1 container
+               replicas, just within one container. `AV_RATE_LIMIT_BACKEND=redis`/
+               `AV_AUTH_SPIKE_BACKEND=redis` exist specifically to make that state correct
+               across workers/replicas either way.
 ```
 
 **Caution:** `AV_DATA_DIR`'s `/data` default is container-oriented. Bare-metal uvicorn MUST point it at a writable directory, or every object upload fails with PermissionError while `/api/health` stays green — the most misleading failure mode in the project. This exact failure broke CI `webui-e2e` once: uploads 500ed, seed pushes queued offline, the dashboard rendered empty, Playwright failed on element-not-found. Documented in [CHANGELOG.md](CHANGELOG.md); the fix lives as explicit env vars on both uvicorn-starting CI jobs.
@@ -345,6 +431,7 @@ naming a job that no longer exists, both fail CI. Keep this table's job-id backt
 | Registered-flaky tests only (`tests/FLAKES.md`), non-gating | `flaky-quarantine` |
 | Contract matrix + exit codes + CI policy, as their own named check | `contract-matrix` |
 | Per-revision migration upgrade/downgrade/re-upgrade drill (live Postgres) | `migrations-drill` |
+| Native `av` launcher POSIX (Linux/macOS) build + real subprocess-vs-daemon tests + wheel-injection check — the only place those code paths are ever compiled/run, this project's own dev box being Windows-only | `launcher-native-posix` matrix |
 | `actionlint` + `shellcheck` over every workflow/script | `lint-workflows` |
 | Plugins incl. real Lightning + vanilla-PyTorch training loops + signed-commit gate (`[sign]` extra) | `plugin-tests` |
 | WebUI lint/typecheck/Vitest | `webui-tests` |

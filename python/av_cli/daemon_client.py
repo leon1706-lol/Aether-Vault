@@ -103,7 +103,7 @@ def call_daemon(repo_root, cli_version: str, argv: list[str]) -> dict | None:
     never as an error to surface. Never raises."""
     if daemon_common.enabled_mode() == "never":
         return None
-    if not argv or argv[0] not in daemon_common.ALLOWED_COMMANDS:
+    if not argv or daemon_common.first_subcommand(argv) not in daemon_common.ALLOWED_COMMANDS:
         return None
 
     state = _read_state(repo_root, cli_version)
@@ -143,12 +143,51 @@ def call_daemon(repo_root, cli_version: str, argv: list[str]) -> dict | None:
         if not hmac.compare_digest(str(response.get("server_nonce_mac", "")), expected_mac):
             _debug("server nonce MAC mismatch -- refusing response (impersonation attempt?)")
             return None
+        _maybe_write_launcher_discovery(repo_root, cli_version, state)
         return response
     except (ProtocolError, OSError, KeyError) as exc:
         _debug(f"request failed: {exc}")
         return None
     finally:
         conn.close()
+
+
+def _maybe_write_launcher_discovery(repo_root, cli_version: str, state: dict) -> None:
+    """V1.6.0: after a successful, MAC-verified daemon round trip, leave a breadcrumb for
+    the native `av` launcher (`src/launcher/av_launcher.cpp`) -- but ONLY when this process
+    was itself invoked by that launcher's own fallback-exec path (`AV_LAUNCHER_EXE`/
+    `AV_LAUNCHER_REPO` set), never speculatively. A plain `av-py`/`python -m av_cli.launcher`
+    invocation with no native launcher in the picture at all writes nothing here -- there
+    would be no exe on the other end to ever read it. Best-effort and silent: any failure
+    just means the exe falls back again next time, exactly as if this never ran."""
+    exe = os.environ.get("AV_LAUNCHER_EXE")
+    repo_s = os.environ.get("AV_LAUNCHER_REPO")
+    if not exe or not repo_s:
+        return
+    try:
+        import json
+
+        disc_path = daemon_common.launcher_discovery_file(exe, repo_s)
+        key_path = daemon_common.state_file(repo_root, PROTOCOL_VERSION, cli_version).with_suffix(".key")
+        content = {
+            "protocol": PROTOCOL_VERSION,
+            "cli_version": cli_version,
+            "endpoint": state["endpoint"],
+            "key_path": str(key_path),
+            "pid": state.get("pid"),
+        }
+        try:
+            existing = json.loads(disc_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = None
+        if existing == content:
+            return
+        disc_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = disc_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(content), encoding="utf-8")
+        os.replace(tmp_path, disc_path)
+    except (OSError, KeyError):
+        pass
 
 
 def _cleanup_stale_state(repo_root, cli_version: str) -> None:

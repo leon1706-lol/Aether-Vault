@@ -60,7 +60,7 @@ def test_sdk_run_start_registration_payload_includes_project_id(repo, monkeypatc
             return {"status": "created", "id": captured["payload"]["id"]}
 
     class _FakeSession:
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             captured["url"] = url
             captured["payload"] = json
             return _FakeResponse()
@@ -145,6 +145,60 @@ def test_log_parity_sdk_vs_cli(repo):
             assert sdk_entry[field] == cli_entry[field], (
                 f"log() parity broken on {field}: sdk={sdk_entry[field]} cli={cli_entry[field]}"
             )
+
+
+def test_fetch_parity_sdk_vs_cli_when_everything_already_local(repo):
+    (repo / "m.bin").write_bytes(b"x" * 100)
+    inv_cli(repo, "add", "m.bin")
+    inv_cli(repo, "commit", "-m", "v1")
+
+    with Repo(repo) as r:
+        sdk_fetch = r.fetch(["m.bin"])
+    cli_fetch = inv_cli_json(repo, "fetch", "m.bin")["data"]
+    assert sdk_fetch == cli_fetch == {"fetched": [], "already_local": 1, "bytes": 0}
+
+
+def test_fetch_via_sdk_downloads_missing_object(repo):
+    import av_cli.client as client_module
+    from av_cli.index import Index
+
+    (repo / "m.bin").write_bytes(b"x" * 500)
+    inv_cli(repo, "add", "m.bin")
+    inv_cli(repo, "commit", "-m", "v1")
+
+    h = Index(repo).get_entry("m.bin")["hash"]
+    obj_path = repo / ".av" / "objects" / h[:2] / h[2:]
+    original = obj_path.read_bytes()
+    obj_path.unlink()
+
+    class _FakeClient(client_module.VaultClient):
+        def server_available(self):
+            return True
+
+        def batch_check_objects(self, hashes):
+            return {h}
+
+        def download_object(self, sha256_hash, dest_path):
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_bytes(original)
+            return True
+
+    class _FakeRepo(Repo):
+        def _client(self):
+            return _FakeClient("http://fake")
+
+    with _FakeRepo(repo) as r:
+        result = r.fetch(["m.bin"])
+
+    assert result == {"fetched": [{"path": "m.bin", "hash": h, "bytes": 500}],
+                       "already_local": 0, "bytes": 500}
+    assert obj_path.read_bytes() == original
+
+
+def test_fetch_raises_validation_error_for_untracked_path(repo):
+    with Repo(repo) as r, pytest.raises(SDKError) as ei:
+        r.fetch(["nope.bin"])
+    assert ei.value.code == "validation"
 
 
 def test_push_parity_sdk_vs_cli_when_nothing_pending(repo):

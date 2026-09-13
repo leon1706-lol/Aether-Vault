@@ -115,7 +115,7 @@ def _fake_client(monkeypatch, reg: _FakeRegistry):
                        else _FakeResponse(404, {}))
             return _FakeResponse(404, {})
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             body = json or {}
             if url.endswith("/api/improvers"):
                 status, resp = reg.create_improver(body)
@@ -318,7 +318,7 @@ def test_freeze_status_and_set_via_sdk(repo, monkeypatch):
         def get(self, url, params=None, timeout=None):
             return _FakeResponse(dict(state))
 
-        def post(self, url, json=None):
+        def post(self, url, json=None, timeout=None):
             state["frozen"], state["reason"] = json["frozen"], json.get("reason")
             return _FakeResponse(dict(state))
 

@@ -23,6 +23,11 @@ wheels/
 # setuptools-scm generated version file (derived from git tags at build time)
 python/av_cli/_version.py
 
+# Native av launcher's version header -- setup.py's BuildExtWithLauncher regenerates this
+# from the same setuptools-scm version on every build (see src/launcher/av_launcher_version.h's
+# own comment); the committed copy is only a placeholder for a bare manual compile.
+src/launcher/av_launcher_version.h
+
 # Aether-Vault internal repository tracking data
 # We don't want to sync local Aether-Vault databases to Git!
 .av/

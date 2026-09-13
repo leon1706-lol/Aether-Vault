@@ -625,3 +625,263 @@ def test_clone_round_trips_chunked_checkpoint(fake_registry, tmp_path, monkeypat
     assert (cloned / "checkpoint.pt").read_bytes() == original
     cloned_chunks = Index(cloned).get_entry("checkpoint.pt")["chunks"]
     assert {c["hash"] for c in cloned_chunks} == {c["hash"] for c in chunks}
+
+
+# ---------------------------------------------------------------------------
+# _materialize_tree prefetch (V1.6.0): one batch-check + parallel download for every
+# object a tree references, before the per-file reassembly loop -- instead of each missing
+# layer/chunk triggering its own serial round trip the first time materialize_file() hits
+# it. `checkout`/`stash`/`merge` all go through _materialize_tree, so this benefits all of
+# them, not just clone/pull (which already called ensure_objects_local() themselves).
+# ---------------------------------------------------------------------------
+
+class _CountingFakeClient(client_module.VaultClient):
+    """Serves every object from an in-memory dict; counts batch_check_objects calls so a
+    test can assert the whole tree is checked in ONE round trip, not one per shard."""
+
+    def __init__(self, objects: dict[str, bytes]):
+        super().__init__("http://fake-registry")
+        self.objects = objects
+        self.batch_check_calls: list[list[str]] = []
+        self.download_calls: list[str] = []
+
+    def server_available(self) -> bool:
+        return True
+
+    def batch_check_objects(self, sha256_hashes: list[str]) -> set[str]:
+        self.batch_check_calls.append(list(sha256_hashes))
+        return {h for h in sha256_hashes if h in self.objects}
+
+    def download_object(self, sha256_hash: str, dest_path: Path) -> bool:
+        self.download_calls.append(sha256_hash)
+        data = self.objects.get(sha256_hash)
+        if data is None:
+            return False
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(data)
+        return True
+
+
+def test_materialize_tree_prefetches_missing_parts_in_one_batch(tmp_path):
+    from python.av_cli import core
+    from python.av_cli.index import Index
+
+    repo_root = tmp_path / "repo"
+    (repo_root / ".av").mkdir(parents=True)
+
+    def h(label: str) -> str:
+        import hashlib
+        return hashlib.sha256(label.encode()).hexdigest()
+
+    layer_a, layer_b, layer_c, layer_d = h("a"), h("b"), h("c"), h("d")
+    objects = {
+        layer_a: b"A" * 100, layer_b: b"B" * 100,
+        layer_c: b"C" * 100, layer_d: b"D" * 100,
+    }
+    tree = {
+        "model1.safetensors": {
+            "hash": h("whole1"), "size": 200, "type": "artifact",
+            "layers": [{"hash": layer_a, "size": 100, "offset": 0},
+                       {"hash": layer_b, "size": 100, "offset": 100}],
+        },
+        "model2.safetensors": {
+            "hash": h("whole2"), "size": 200, "type": "artifact",
+            "layers": [{"hash": layer_c, "size": 100, "offset": 0},
+                       {"hash": layer_d, "size": 100, "offset": 100}],
+        },
+    }
+
+    client = _CountingFakeClient(objects)
+    idx = Index(repo_root)
+    core._materialize_tree(repo_root, client, tree, idx)
+
+    # One batch-check for the whole tree (4 shards across 2 files), not 2 (one per file)
+    # or 4 (one per shard).
+    assert len(client.batch_check_calls) == 1
+    assert set(client.batch_check_calls[0]) == {layer_a, layer_b, layer_c, layer_d}
+
+    # Every shard was downloaded exactly once via the prefetch -- materialize_file's own
+    # per-part fallback finds them already local and never re-downloads.
+    assert sorted(client.download_calls) == sorted([layer_a, layer_b, layer_c, layer_d])
+
+    assert (repo_root / "model1.safetensors").read_bytes() == b"A" * 100 + b"B" * 100
+    assert (repo_root / "model2.safetensors").read_bytes() == b"C" * 100 + b"D" * 100
+
+    # And no whole-blob object was written for either split entry (V1.6.0 no-double-store).
+    for info in tree.values():
+        wh = info["hash"]
+        assert not (repo_root / ".av" / "objects" / wh[:2] / wh[2:]).exists()
+
+
+def test_materialize_tree_skips_batch_check_when_everything_is_already_local(tmp_path):
+    """ensure_objects_local() already no-ops with zero round trips when nothing is
+    missing -- the prefetch this test guards must never turn a warm, fully-local checkout
+    into an unnecessary network call."""
+    from python.av_cli import core
+    from python.av_cli.index import Index
+
+    repo_root = tmp_path / "repo"
+    (repo_root / ".av").mkdir(parents=True)
+
+    import hashlib
+    whole = hashlib.sha256(b"content").hexdigest()
+    obj_path = repo_root / ".av" / "objects" / whole[:2] / whole[2:]
+    obj_path.parent.mkdir(parents=True)
+    obj_path.write_bytes(b"content")
+
+    tree = {"f.py": {"hash": whole, "size": 7, "type": "code"}}
+
+    class _ExplodingClient(client_module.VaultClient):
+        def server_available(self) -> bool:
+            return True
+
+        def batch_check_objects(self, sha256_hashes):
+            raise AssertionError("must not be called when nothing is missing")
+
+    client = _ExplodingClient("http://fake-registry")
+    idx = Index(repo_root)
+    core._materialize_tree(repo_root, client, tree, idx)
+    assert (repo_root / "f.py").read_bytes() == b"content"
+
+
+# ---------------------------------------------------------------------------
+# av fetch (V1.6.0): downloads the objects a tracked path needs at HEAD into .av/objects,
+# without touching the working tree -- a real CLI surface for the "single-layer partial
+# fetch" capability the benchmark suite previously only exercised via a direct Python-API
+# call to VaultClient.download_object().
+# ---------------------------------------------------------------------------
+
+def test_fetch_downloads_missing_whole_file_object(repo, monkeypatch):
+    (repo / "model.bin").write_bytes(b"x" * 5000)
+    assert invoke("add", "model.bin").exit_code == 0
+    assert invoke("commit", "-m", "v1").exit_code == 0
+
+    from python.av_cli.index import Index
+    h = Index(repo).get_entry("model.bin")["hash"]
+    obj_path = repo / ".av" / "objects" / h[:2] / h[2:]
+    original_bytes = obj_path.read_bytes()
+    obj_path.unlink()
+
+    fake = _CountingFakeClient({h: original_bytes})
+    monkeypatch.setattr(client_module, "VaultClient", lambda *a, **k: fake)
+
+    result = invoke("--output", "json", "fetch", "model.bin")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)["data"]
+    assert data["already_local"] == 0
+    assert data["bytes"] == 5000
+    assert [f["path"] for f in data["fetched"]] == ["model.bin"]
+    assert obj_path.read_bytes() == original_bytes
+
+
+def test_fetch_reports_already_local_without_touching_the_network(repo, monkeypatch):
+    (repo / "model.bin").write_bytes(b"x" * 5000)
+    assert invoke("add", "model.bin").exit_code == 0
+    assert invoke("commit", "-m", "v1").exit_code == 0
+
+    class _ExplodingClient(client_module.VaultClient):
+        def server_available(self):
+            raise AssertionError("must not probe the network when everything is local")
+
+    monkeypatch.setattr(client_module, "VaultClient", lambda *a, **k: _ExplodingClient("http://fake"))
+
+    result = invoke("--output", "json", "fetch", "model.bin")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)["data"]
+    assert data["already_local"] == 1
+    assert data["fetched"] == []
+
+
+def test_fetch_single_layer_downloads_only_that_layer(repo, monkeypatch):
+    pytest.importorskip("aether_core")
+    invoke("config", "1")  # 1 MB LFS threshold, forces layer-splitting
+
+    import json as _json
+    import struct
+
+    header = {
+        "layer_a": {"dtype": "U8", "shape": [600 * 1024], "data_offsets": [0, 600 * 1024]},
+        "layer_b": {"dtype": "U8", "shape": [600 * 1024], "data_offsets": [600 * 1024, 1200 * 1024]},
+    }
+    header_bytes = _json.dumps(header).encode("utf-8")
+    blob = struct.pack("<Q", len(header_bytes)) + header_bytes + b"A" * (600 * 1024) + b"B" * (600 * 1024)
+    (repo / "model.safetensors").write_bytes(blob)
+    assert invoke("add", "model.safetensors").exit_code == 0
+    assert invoke("commit", "-m", "v1").exit_code == 0
+
+    from python.av_cli.index import Index
+    layers = Index(repo).get_entry("model.safetensors")["layers"]
+    layer_a = next(l for l in layers if l["name"] == "layer_a")
+    layer_b = next(l for l in layers if l["name"] == "layer_b")
+
+    # Remove both shards locally so `fetch --layer` has real network work to do.
+    objects = {}
+    for layer in (layer_a, layer_b):
+        p = repo / ".av" / "objects" / layer["hash"][:2] / layer["hash"][2:]
+        objects[layer["hash"]] = p.read_bytes()
+        p.unlink()
+
+    fake = _CountingFakeClient(objects)
+    monkeypatch.setattr(client_module, "VaultClient", lambda *a, **k: fake)
+
+    result = invoke("--output", "json", "fetch", "--layer", "layer_a", "model.safetensors")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)["data"]
+    assert [f["hash"] for f in data["fetched"]] == [layer_a["hash"]]
+
+    a_path = repo / ".av" / "objects" / layer_a["hash"][:2] / layer_a["hash"][2:]
+    b_path = repo / ".av" / "objects" / layer_b["hash"][:2] / layer_b["hash"][2:]
+    assert a_path.exists()
+    assert not b_path.exists()  # the unselected layer was never requested
+
+
+def test_fetch_rejects_untracked_path(repo):
+    result = invoke("--output", "json", "fetch", "nope.bin")
+    assert result.exit_code != 0
+    data = json.loads(result.output)
+    assert data["ok"] is False
+    assert data["error"]["code"] == "validation"
+
+
+def test_fetch_requires_paths_or_all(repo):
+    result = invoke("--output", "json", "fetch")
+    assert result.exit_code != 0
+    data = json.loads(result.output)
+    assert data["ok"] is False
+
+
+def test_fetch_layer_flag_rejects_multiple_paths(repo):
+    (repo / "a.bin").write_bytes(b"a" * 10)
+    (repo / "b.bin").write_bytes(b"b" * 10)
+    invoke("add", "a.bin", "b.bin")
+    invoke("commit", "-m", "v1")
+
+    result = invoke("--output", "json", "fetch", "--layer", "x", "a.bin", "b.bin")
+    assert result.exit_code != 0
+    data = json.loads(result.output)
+    assert data["ok"] is False
+
+
+def test_fetch_all_prefetches_every_object_in_head_tree(repo, monkeypatch):
+    (repo / "a.bin").write_bytes(b"a" * 5000)
+    (repo / "b.bin").write_bytes(b"b" * 5000)
+    invoke("add", "a.bin", "b.bin")
+    invoke("commit", "-m", "v1")
+
+    from python.av_cli.index import Index
+    idx = Index(repo)
+    ha, hb = idx.get_entry("a.bin")["hash"], idx.get_entry("b.bin")["hash"]
+    objects = {}
+    for h in (ha, hb):
+        p = repo / ".av" / "objects" / h[:2] / h[2:]
+        objects[h] = p.read_bytes()
+        p.unlink()
+
+    fake = _CountingFakeClient(objects)
+    monkeypatch.setattr(client_module, "VaultClient", lambda *a, **k: fake)
+
+    result = invoke("--output", "json", "fetch", "--all")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)["data"]
+    assert {f["hash"] for f in data["fetched"]} == {ha, hb}
+    assert len(fake.batch_check_calls) == 1  # one round trip for both objects

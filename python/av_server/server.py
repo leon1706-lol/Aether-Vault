@@ -1,5 +1,7 @@
 import asyncio
+import collections
 import contextlib
+import functools
 import hashlib
 import itertools
 import json
@@ -15,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -150,10 +152,18 @@ AV_API_TOKEN = os.environ.get("AV_API_TOKEN", "").strip()
 _AUTH_EXEMPT_PATHS = {"/api/health", "/api/ready", "/docs", "/openapi.json", "/redoc"}
 
 
+@functools.lru_cache(maxsize=1)
 def _installed_version() -> str:
     """The real installed package version, from ONE source (importlib.metadata) instead
     of a hardcoded literal that could drift from the actual release. Deliberately NOT
-    importing av_cli here -- the server package has never depended on it."""
+    importing av_cli here -- the server package has never depended on it.
+
+    V1.6.0 (Probleme.md): this ran `importlib.metadata.version()` -- a real filesystem
+    scan of installed-package metadata -- on EVERY `/api/health` call, and every client
+    (`VaultClient.server_available()`) probes health before every upload. The installed
+    version cannot change without restarting this process (a new deploy IS a new process),
+    so caching for the process's lifetime is exact, not an approximation -- unlike the
+    Bloom Filter's fail-open caching, there is no staleness case to worry about here."""
     try:
         from importlib.metadata import version as _pkg_version
 
@@ -738,19 +748,25 @@ async def upload_object(
 
 
 @app.get("/api/objects/{hash}")
-def download_object(hash: str, request: Request) -> StreamingResponse:
+def download_object(hash: str, request: Request) -> Response:
     if not re.match(r"^[a-f0-9]{64}$", hash):
         raise HTTPException(status_code=400, detail="Invalid hash format")
     obj_path = storage.get_object_path(hash, _cas_tenant_id(request))
     if not obj_path:
         raise HTTPException(status_code=404, detail="Object not found")
 
-    def iterfile():
-        with open(obj_path, mode="rb") as f:
-            while chunk := f.read(8 * 1024 * 1024):
-                yield chunk
-
-    return StreamingResponse(iterfile(), media_type="application/octet-stream")
+    # V1.6.0: was a hand-rolled 8MB-chunked StreamingResponse with no Range/ETag/caching
+    # support at all -- every partial-fetch/resume had to re-download the whole object, and
+    # nothing was ever cacheable. An object's hash IS its content address (immutable by the
+    # CAS invariant, never mutated in place), so `ETag: "<hash>"` and a permanent
+    # `Cache-Control` are exact, not approximations -- unlike an ETag on mutable content,
+    # this one can never go stale. Starlette's FileResponse sets Content-Length, honors
+    # `Range` requests (206 Partial Content, via os.stat + sendfile where available), and
+    # handles `If-None-Match`/conditional requests against the ETag automatically.
+    return FileResponse(
+        obj_path, media_type="application/octet-stream",
+        headers={"Cache-Control": "public, max-age=31536000, immutable", "ETag": f'"{hash}"'},
+    )
 
 
 @app.head("/api/objects/{hash}")
@@ -941,43 +957,87 @@ async def push_commit(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-async def resolve_tree(db: AsyncSession, root_hash: str) -> dict:
-    """Rebuilds a commit's full file tree from the DB Merkle Tree. Level-order traversal
-    with one batched query per depth level (was one query per node, i.e. N+1). Factored
-    out of `get_commit` so `list_commits`'s `include_layers` option can reuse it."""
-    tree_data: dict = {}
-    frontier: list[tuple[str, str]] = [(root_hash, "")]  # (tree_hash, path_prefix)
-    while frontier:
-        prefixes_by_hash: Dict[str, List[str]] = {}
-        for th, prefix in frontier:
-            prefixes_by_hash.setdefault(th, []).append(prefix)
+async def resolve_trees(db: AsyncSession, root_hashes: list) -> dict:
+    """Multi-root form of tree resolution -- one batched, per-depth-level query ACROSS all
+    roots at once, instead of a completely separate independent BFS per root. `resolve_tree`
+    below is the single-root convenience wrapper; this is the one real implementation both
+    it and `list_commits`'s `include_layers=true` share.
 
+    V1.6.0 (WS5.7): `list_commits(include_layers=true)` used to call the single-root
+    resolver once per commit on the page (up to `limit` -- default 50 -- fully independent
+    tree walks, each paying its own per-depth round trips), even though sibling commits on
+    the same branch overwhelmingly share large, unchanged interior subtrees by construction
+    (that's the whole point of a Merkle tree). This resolves every root on the page in one
+    shared traversal: a tree_hash reachable from more than one root is fetched from the DB
+    exactly once per depth level, attributed back to every root it's actually reachable
+    from, not re-fetched per root.
+
+    Returns `{root_hash: tree_data}` for every hash in `root_hashes` (an empty dict for a
+    falsy/duplicate/unresolvable entry).
+    """
+    results: dict = {rh: {} for rh in root_hashes}
+    # (root_id, tree_hash, path_prefix) -- root_id lets one shared BFS attribute each leaf
+    # back to every root that reaches it.
+    frontier: list = [(rh, rh, "") for rh in dict.fromkeys(root_hashes) if rh]
+    while frontier:
+        hashes_needed = {th for _, th, _ in frontier}
         rows = (
-            await db.execute(
-                select(DBTree).where(DBTree.tree_hash.in_(list(prefixes_by_hash.keys())))
-            )
+            await db.execute(select(DBTree).where(DBTree.tree_hash.in_(list(hashes_needed))))
         ).scalars().all()
         rows_by_hash: Dict[str, list] = {}
         for r in rows:
             rows_by_hash.setdefault(r.tree_hash, []).append(r)
 
-        next_frontier: list[tuple[str, str]] = []
-        for th, prefixes in prefixes_by_hash.items():
-            for prefix in prefixes:
-                for entry in rows_by_hash.get(th, []):
-                    full_path = f"{prefix}/{entry.path_name}" if prefix else entry.path_name
-                    if entry.child_tree_hash:
-                        next_frontier.append((entry.child_tree_hash, full_path))
-                    else:
-                        tree_data[full_path] = {
-                            "hash": entry.object_hash,
-                            "size": entry.size,
-                            "type": entry.type,
-                            "layers": entry.layers or [],
-                            "chunks": getattr(entry, "chunks", None) or [],
-                        }
+        next_frontier: list = []
+        for root_id, th, prefix in frontier:
+            for entry in rows_by_hash.get(th, []):
+                full_path = f"{prefix}/{entry.path_name}" if prefix else entry.path_name
+                if entry.child_tree_hash:
+                    next_frontier.append((root_id, entry.child_tree_hash, full_path))
+                else:
+                    results[root_id][full_path] = {
+                        "hash": entry.object_hash,
+                        "size": entry.size,
+                        "type": entry.type,
+                        "layers": entry.layers or [],
+                        "chunks": getattr(entry, "chunks", None) or [],
+                    }
         frontier = next_frontier
-    return tree_data
+    return results
+
+
+async def resolve_tree(db: AsyncSession, root_hash: str) -> dict:
+    """Single-root convenience wrapper around `resolve_trees` -- see that function's
+    docstring for the real (level-order, batched-per-depth) implementation both share."""
+    if not root_hash:
+        return {}
+    return (await resolve_trees(db, [root_hash])).get(root_hash, {})
+
+
+# V1.6.0 (WS5.5): every push's anomaly detector resolves BOTH the parent commit's tree and
+# the new commit's tree -- and on a normal sequential push history, "the parent's tree" is
+# almost always the exact same root_tree_hash that WAS "the new tree" one push ago. A
+# per-process, bounded LRU means that common case only ever resolves each tree once,
+# regardless of how many times it's looked up across a session of pushes. Content-addressed
+# by construction (a given root_tree_hash always resolves to the exact same dict, forever),
+# so there is no staleness case to invalidate against -- unlike the Bloom Filter's fail-open
+# caching, this is an exact cache, not an approximation. Keyed by hash alone (not per-tenant)
+# since DBTree rows themselves are never tenant-scoped even under AV_CAS_ISOLATION=isolated.
+_TREE_CACHE_MAX = 256
+_tree_cache: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+
+
+async def _resolve_tree_cached(db: AsyncSession, root_hash: str) -> dict:
+    cached = _tree_cache.get(root_hash)
+    if cached is not None:
+        _tree_cache.move_to_end(root_hash)
+        return cached
+    tree = await resolve_tree(db, root_hash)
+    _tree_cache[root_hash] = tree
+    _tree_cache.move_to_end(root_hash)
+    while len(_tree_cache) > _TREE_CACHE_MAX:
+        _tree_cache.popitem(last=False)
+    return tree
 
 
 def _full_parents(parent_hash: Optional[str], extra_parents_json: Optional[str]) -> List[str]:
@@ -1322,19 +1382,25 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
 
         deleted_count = await loop.run_in_executor(None, purge_orphans)
 
-        # Rebuild the Bloom Filter(s) from the surviving set(s). Shared mode: just the
-        # global filter. Isolated mode: the global filter too (legacy flat directory)
-        # plus each tenant's own filter.
-        await cache.reset_filter()
-        await cache.init_filter()
-        if CAS_ISOLATION == "isolated":
-            for tenant_id, tenant_alive in alive_by_tenant.items():
-                await cache.reset_filter(tenant_id)
-                await cache.init_filter(tenant_id)
-                for h in tenant_alive:
-                    await cache.add_hash(h, tenant_id)
-        for h in alive_hashes:
-            await cache.add_hash(h)
+        # Rebuild the Bloom Filter(s) from the surviving set(s) -- but ONLY when the sweep
+        # actually deleted something. A Redis Bloom Filter can't remove individual entries
+        # (only a full reset+rebuild shrinks it), which is the ONLY reason GC ever touches
+        # it at all: every upload already calls add_hash() incrementally, so an alive set
+        # that didn't shrink is already correctly represented and a full rebuild would be
+        # pure waste (V1.6.0, real measured cost on this project's own GC benchmark).
+        # Rebuilds that DO happen batch via add_hashes() (BF.MADD, chunked) instead of one
+        # BF.ADD round trip per surviving hash. Shared mode: just the global filter.
+        # Isolated mode: the global filter too (legacy flat directory) plus each tenant's.
+        bloom_rebuilt = deleted_count > 0
+        if bloom_rebuilt:
+            await cache.reset_filter()
+            await cache.init_filter()
+            if CAS_ISOLATION == "isolated":
+                for tenant_id, tenant_alive in alive_by_tenant.items():
+                    await cache.reset_filter(tenant_id)
+                    await cache.init_filter(tenant_id)
+                    await cache.add_hashes(list(tenant_alive), tenant_id)
+            await cache.add_hashes(list(alive_hashes))
 
         # Retention sweeps: events (30d default), audit_log (90d default). Terminal-status
         # webhook deliveries ride the event window; stuck pending/failed rows are never
@@ -1373,6 +1439,7 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
             "alive_objects": len(alive_hashes),
             "deleted_objects": deleted_count,
             "reused_trees": len(visited_trees),
+            "bloom_rebuilt": bloom_rebuilt,
         }
     except Exception as exc:
         await db.rollback()
@@ -1397,8 +1464,12 @@ async def check_objects_batch(hashes: List[str], request: Request, db: AsyncSess
     might_exist = []
     cas_tenant_id = _cas_tenant_id(request)
 
+    # V1.6.0 (Probleme.md): was one awaited BF.EXISTS round trip PER hash -- a real push's
+    # object list paid that serially before ever reaching Postgres. check_hashes_exist()
+    # batches via BF.MEXISTS (chunked internally), same fail-open semantics per hash.
+    existence = await cache.check_hashes_exist(hashes, cas_tenant_id)
     for h in hashes:
-        if await cache.check_hash_exists(h, cas_tenant_id):
+        if existence.get(h, True):
             might_exist.append(h)
         else:
             definitely_missing.append(h)
@@ -1484,9 +1555,15 @@ async def list_commits(
             "signature": _signature_out(c.signature),
             "env_snapshot_id": c.env_snapshot_id,
         }
-        if include_layers:
-            d["tree"] = await resolve_tree(db, c.root_tree_hash) if c.root_tree_hash else {}
         commit_dicts.append(d)
+
+    if include_layers:
+        # V1.6.0 (WS5.7): one shared multi-root resolution for the whole page instead of
+        # one independent tree walk per commit -- see resolve_trees()'s own docstring.
+        roots = [c.root_tree_hash for c in commits if c.root_tree_hash]
+        trees_by_root = await resolve_trees(db, roots) if roots else {}
+        for d, c in zip(commit_dicts, commits):
+            d["tree"] = trees_by_root.get(c.root_tree_hash, {}) if c.root_tree_hash else {}
 
     return {
         "commits": commit_dicts,
@@ -1716,8 +1793,8 @@ async def _detect_commit_anomalies(db: AsyncSession, project_id: str, commit_has
                 "parent_hash": parent_hash, **jump,
             })
         if parent.root_tree_hash and new_tree_hash:
-            old_tree = await resolve_tree(db, parent.root_tree_hash)
-            new_tree = await resolve_tree(db, new_tree_hash)
+            old_tree = await _resolve_tree_cached(db, parent.root_tree_hash)
+            new_tree = await _resolve_tree_cached(db, new_tree_hash)
             diff = _summarize_tree_diff(old_tree, new_tree)
             # _summarize_tree_diff() nests these three lists under "files", not top-level.
             diff_files = diff.get("files") or {}

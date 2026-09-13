@@ -13,7 +13,17 @@ DATABASE_URL: str = os.getenv(
     "postgresql+asyncpg://av_user:av_password@db:5432/aether_vault",
 )
 
-engine: AsyncEngine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+# V1.6.0: SQLAlchemy's own defaults (pool_size=5, max_overflow=10) were never overridden --
+# fine for the low-concurrency case, tight for a single-worker uvicorn process serving many
+# concurrent pushes/fetches, each holding a session for its request's duration. Both engines
+# share one pair of env vars since they point at the same physical database either way.
+DB_POOL_SIZE: int = int(os.environ.get("AV_DB_POOL_SIZE", "10"))
+DB_MAX_OVERFLOW: int = int(os.environ.get("AV_DB_MAX_OVERFLOW", "20"))
+
+engine: AsyncEngine = create_async_engine(
+    DATABASE_URL, echo=False, pool_pre_ping=True,
+    pool_size=DB_POOL_SIZE, max_overflow=DB_MAX_OVERFLOW,
+)
 
 # `engine`/`DATABASE_URL` above (today's `av_user`) MUST keep having DDL rights --
 # Alembic and `system_session_factory` both still use it unconditionally.
@@ -23,7 +33,10 @@ engine: AsyncEngine = create_async_engine(DATABASE_URL, echo=False, pool_pre_pin
 # `av_user` is). Unset means `async_session_factory` below keeps using the same `engine`.
 APP_DATABASE_URL: str | None = os.environ.get("AV_APP_DATABASE_URL") or None
 app_engine: AsyncEngine = (
-    create_async_engine(APP_DATABASE_URL, echo=False, pool_pre_ping=True)
+    create_async_engine(
+        APP_DATABASE_URL, echo=False, pool_pre_ping=True,
+        pool_size=DB_POOL_SIZE, max_overflow=DB_MAX_OVERFLOW,
+    )
     if APP_DATABASE_URL
     else engine
 )

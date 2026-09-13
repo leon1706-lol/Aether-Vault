@@ -226,8 +226,15 @@ def doctor(fix: bool, dry_run: bool, speed: bool, compose_path: str | None, writ
     else:
         ok(f"Repository found at {av_dir}")
 
-    if _get_aether_core():
+    aether_core = _get_aether_core()
+    if aether_core:
         ok("Native core (aether_core) loaded — hashing runs at full speed")
+        if hasattr(aether_core, "hash_backend"):
+            backend = aether_core.hash_backend()
+            label = {"sha-ni": "sha-ni (hardware-accelerated)",
+                      "arm-sha2": "arm-sha2 (hardware-accelerated)",
+                      "scalar": "scalar (no SHA extensions detected on this CPU)"}.get(backend, backend)
+            ok(f"SHA-256 backend: {label}")
     else:
         warn("Native core (aether_core) not loaded — falling back to slower Python hashing")
 
