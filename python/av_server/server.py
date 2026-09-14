@@ -4378,26 +4378,31 @@ async def verify_audit_chain(
     pub_key = audit_signing.public_key_hex()
     checked = 0
     last_id = None
-    async for row in result.scalars():
-        last_id = row.id
-        expected = compute_chain_hash(
-            prev_hash, row.ts, row.username, row.action, row.project_id,
-            row.status_code, row.details,
-        )
-        if expected != row.chain_hash:
-            return {
-                "ok": False, "broken_at_id": row.id, "checked": checked,
-                "signature_checks": signature_checks,
-            }
-        if row.signature:
-            if pub_key and audit_signing.verify(row.chain_hash, row.signature, pub_key):
-                signature_checks["verified"] += 1
+    try:
+        async for row in result.scalars():
+            last_id = row.id
+            expected = compute_chain_hash(
+                prev_hash, row.ts, row.username, row.action, row.project_id,
+                row.status_code, row.details,
+            )
+            if expected != row.chain_hash:
+                return {
+                    "ok": False, "broken_at_id": row.id, "checked": checked,
+                    "signature_checks": signature_checks,
+                }
+            if row.signature:
+                if pub_key and audit_signing.verify(row.chain_hash, row.signature, pub_key):
+                    signature_checks["verified"] += 1
+                else:
+                    signature_checks["failed"] += 1
             else:
-                signature_checks["failed"] += 1
-        else:
-            signature_checks["absent"] += 1
-        prev_hash = row.chain_hash
-        checked += 1
+                signature_checks["absent"] += 1
+            prev_hash = row.chain_hash
+            checked += 1
+    finally:
+        # The early return above would otherwise abandon the server-side cursor until the
+        # session closes; release it (and its connection) deterministically.
+        await result.close()
 
     return {
         "ok": True, "checked": checked,

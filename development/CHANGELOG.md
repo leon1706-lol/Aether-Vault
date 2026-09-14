@@ -569,6 +569,7 @@ The owner pushed round two's fixes (`4e8104c`) and asked to keep monitoring. Con
 Every other job (`security`, `Docker Edge Build`, `CodeQL`, `test-linux` both versions, `test (3.10)`, both `launcher-native-posix` legs, and everything else in `Tests`) is green. Not yet re-pushed.
 
 ## Phase 71 — V1.6.3 "Footprint": bounded memory everywhere, measured, and the suite/benchmarks runnable on a small box again
+- **2026-09-14 follow-up: a real hang found and fixed post-push** — `verify_audit_chain`'s streamed cursor leaked a connection on its early-return path, which blocked `server-tests-windows`'s session teardown for 20+ minutes on every run (Probleme.md #184); README/test-count/CI-timeout/nightly-drill fixes from the same push round are covered inline above.
 
 The owner's brief: same features, much smaller steady-state and peak memory, measure first, one owner per leak class, no hash/CDC/signing/tenancy regressions — and `av benchmark` plus the full `pytest` suite must run on the 3.9 GB dev box again. Every section A–H of `todo.md`'s list shipped; nothing deferred. Before/after: `development/memory-baseline-v1.6.2.json` vs `development/memory-scoreboard-v1.6.3.json`, table and derivation in `development/MEMORY.md`.
 

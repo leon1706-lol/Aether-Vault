@@ -9,23 +9,7 @@ are for — see `AGENTS.md`).
 
 -----
 
-## V1.6.3 — footprint / RAM phase — COMPLETE (2026-09-14), awaiting commit
-
-Everything shipped end to end (code, tests, measurements, docs, image rebuild, full suite
-through the low-memory runner, vault regen). The record is `development/CHANGELOG.md`
-Phase 71 + `development/Probleme.md` #179–#183; the numbers are in `development/MEMORY.md`.
-Honest caveats: `tests/test_perf_gate.py`'s `log()` probe fails on this box (cold-file AV
-scans of 150 just-written files under the running stack; the read path is unchanged,
-warm it is 6x under budget) — CI is the authority; `scripts/ha_drill.sh`'s new 5 MiB
-upload step is verified in CI, not locally (the HA stack doesn't fit this box).
-
-Owner's next steps:
-- [ ] Review + commit the working tree (~90 files). Nothing has been committed.
-- [ ] Push and watch CI — the README test badge is provisional (2005/2006, red: one
-      box-specific perf-gate timing failure kept honest; CI's `check_readme_test_freshness`
-      will assert its own count, as in Probleme #178).
-- [ ] Optional: `pytest tests/test_perf_gate.py` on a quiet box (its `log()` probe fails
-      here under the running stack because of cold-file AV scans; the read path is unchanged).
+# Main Objective: V1.#.#
 
 -----
 
