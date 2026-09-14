@@ -306,3 +306,114 @@ def test_add_still_calls_is_pointer_file_for_a_genuinely_modified_file(repo):
     assert result.exit_code == 0
     after = Index(repo).get_entry("f.py")["hash"]
     assert after != before
+
+
+# --- V1.6.3-adjacent: concurrent publish of the SAME content-addressed object -------------
+# Real bug found live via `av benchmark --lowmem` on Windows: two synthetic benchmark
+# fixture files with IDENTICAL content hash to the same object, and two parallel `av add`
+# staging workers raced to publish it. `os.replace()` onto an existing/being-created
+# destination is atomic-and-silent on POSIX, but Windows' MoveFileExW can instead raise
+# PermissionError ([WinError 5]) when two renames race the exact same destination path --
+# see Probleme.md #185 and `_replace_or_accept_concurrent_publish`'s own docstring.
+
+def test_atomic_publish_object_tolerates_a_concurrent_publish_race(tmp_path, monkeypatch):
+    """Reproduces the real race with genuine threads: both callers must pass the initial
+    `obj_path.exists()` check as False (via a barrier) BEFORE either writes -- calling this
+    twice sequentially would never hit the race at all, since the second call's own
+    exists() check short-circuits before ever reaching os.replace."""
+    import threading
+
+    from python.av_cli import core as core_module
+
+    obj_path = tmp_path / "ab" / "cdef"
+    real_replace = os.replace
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    calls = {"n": 0}
+    errors = []
+
+    def racy_replace(src, dst):
+        # Simulate the exact Windows failure mode: the FIRST rename to actually land wins
+        # for real (the destination now exists with correct content), any OTHER
+        # concurrent rename to the same destination raises PermissionError even though
+        # losing gracefully is the correct outcome. The real rename runs INSIDE the lock
+        # so it is guaranteed to have fully landed on disk before a losing thread's
+        # exception (and its dest.exists() recovery check) can run.
+        with lock:
+            calls["n"] += 1
+            first = calls["n"] == 1
+            if first:
+                real_replace(src, dst)
+        if not first:
+            raise PermissionError(5, "Zugriff verweigert")
+
+    monkeypatch.setattr(core_module.os, "replace", racy_replace)
+
+    def write_content(p):
+        # Synchronizing HERE (not before calling _atomic_publish_object) is what actually
+        # matters: write_fn runs AFTER the function's own `obj_path.exists()` fast-path
+        # check, so blocking both threads here proves both already passed that check as
+        # False before either proceeds to os.replace -- a bare pre-call barrier let one
+        # thread's write+replace finish entirely before the other was even scheduled.
+        p.write_bytes(b"identical content")
+        barrier.wait(timeout=10)
+
+    def worker():
+        try:
+            _atomic_publish_object(obj_path, write_content)
+        except Exception as exc:  # pragma: no cover -- assertion happens on the main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=10)
+
+    assert errors == [], errors  # neither thread's call raised
+    assert obj_path.read_bytes() == b"identical content"
+    assert calls["n"] == 2  # both threads genuinely raced os.replace
+
+
+def test_replace_or_accept_concurrent_publish_reraises_a_real_error(tmp_path, monkeypatch):
+    """The tolerance is specifically for "someone else already published this" -- a
+    genuine, unrelated OSError (dest never appears) must still propagate."""
+    from python.av_cli.core import _replace_or_accept_concurrent_publish
+
+    src = tmp_path / "src.tmp"
+    src.write_bytes(b"x")
+    dest = tmp_path / "never-appears" / "dest"  # parent dir doesn't exist -> real failure
+
+    with pytest.raises(OSError):
+        _replace_or_accept_concurrent_publish(src, dest)
+
+
+def test_hash_and_publish_whole_file_tolerates_concurrent_publish_race(tmp_path, monkeypatch, repo):
+    """The two call sites inside hash_and_publish_whole_file (native aether_core path and
+    the pure-Python fallback) must both survive the same Windows race, not just the shared
+    _atomic_publish_object helper other callers use."""
+    from python.av_cli import core as core_module
+
+    fpath = repo / "model.bin"
+    fpath.write_bytes(b"same content for both files")
+    other = repo / "model_dup.bin"
+    other.write_bytes(b"same content for both files")  # identical -> same object hash
+
+    real_replace = os.replace
+    state = {"first_done": False}
+
+    def racy_replace(src, dst):
+        if not state["first_done"]:
+            state["first_done"] = True
+            real_replace(src, dst)
+        else:
+            raise PermissionError(5, "Zugriff verweigert")
+
+    monkeypatch.setattr(core_module.os, "replace", racy_replace)
+    monkeypatch.setattr(core_module, "_get_aether_core", lambda: None)  # force the pure-Python fallback
+
+    h1 = hash_and_publish_whole_file(repo, fpath)
+    h2 = hash_and_publish_whole_file(repo, other)  # must not raise despite the simulated race
+    assert h1 == h2
+    obj_path = repo / ".av" / "objects" / h1[:2] / h1[2:]
+    assert obj_path.read_bytes() == b"same content for both files"

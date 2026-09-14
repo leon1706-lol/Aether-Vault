@@ -30,7 +30,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 
 ## Known Limitations
 
-- **Perf #4 (no-op status/add)** — ~7x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
+- **Perf #4 (no-op status/add)** — ~6x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
 - **Benchmarks and the full test suite on a small machine need the low-memory runners** — `av benchmark --lowmem` and `python scripts/run_tests_lowmem.py` (V1.6.3) run one benchmark / one test file per fresh subprocess with a free-RAM floor, which is what makes both runnable on this project's own 3.9 GB dev box again; a single combined `av benchmark` or `pytest tests/` process still gets OOM-killed there. `.github/workflows/benchmarks.yml` remains the source of published captures — see [`benchmarks/README.md`](benchmarks/README.md). See [Low-memory mode](#low-memory-mode) for every knob.
 
 ## Table of Contents
@@ -304,7 +304,7 @@ av import-pytorch path/to/epoch12.pt --tag backfill
 | 1 | Hashing Throughput at Scale | ~2–3x faster than Git LFS, up to 17x faster than DVC | fastest at every size tested (10–200 MB) |
 | 2 | Safetensors Layer-Dedup | **63% smaller** | 47 MB vs. 126 MB after 6 fine-tune commits |
 | 3 | Commit + Push Latency | push ~14% faster · commit ~4.4x slower vs. DVC (was ~10.5x pre-V1.5.0) | av uploads during commit; DVC defers to a separate push — V1.5.0 closed most of the gap (import-graph + threading fixes), not fully eliminated it |
-| 4 | No-Op `status`/`add` | ~7x slower than Git LFS | open finding — interpreter/import startup cost |
+| 4 | No-Op `status`/`add` | ~6x slower than Git LFS | open finding — interpreter/import startup cost |
 | 5 | Cold Clone / First Pull | ~3.6x faster than Git LFS, ~2.2x faster than DVC | fresh checkout of a project someone else already pushed |
 | 6 | Partial-Checkpoint Fetch | unique capability (38 ms) | only tool that can fetch a single layer instead of the whole file |
 | 7 | Storage Footprint Curve | **63% smaller**, gap widens every commit | same dedup advantage as #2, sustained over time |

@@ -7,10 +7,16 @@ calls to each tool — never fabricated. A tool that genuinely can't run a given
 (not installed, or the benchmark's primitive doesn't map onto it) is shown as such, not
 guessed at.
 
-**Captured:** 2026-09-11, on Windows. Aether-Vault @ `a73ebde`, git-lfs 3.7.1, dvc 3.67.1, mlflow unknown version, Python 3.14.7.
+**Captured:** 2026-09-14, on Windows. Aether-Vault @ `29aaa2a`, git-lfs 3.7.1, dvc 3.67.1, mlflow unknown version, Python 3.14.7.
+**av daemon:** warm (default). **Timing:** each number is the median of 3 runs.
+**Memory:** an `av peak RSS` column, where present, is the peak resident set of the timed
+`av` process tree (Windows: the kernel's exact PeakWorkingSet; POSIX: sampled every 20 ms),
+median across runs. With the daemon warm (the default) that tree is the launcher *client*
+(~4 MB) — the resident daemon's own RSS is `av daemon status`'s `rss_mb`; a `--no-daemon`
+capture measures the full in-process CLI instead. Budgets: `development/MEMORY.md`.
 
-**Caveat:** these are single-run, single-machine timings — disk/antivirus/OS-scheduler noise
-is real. Re-run before relying on any single number for a decision. Use `av benchmark --baseline`
+**Caveat:** these are single-machine timings — disk/antivirus/OS-scheduler noise is real.
+Re-run before relying on any single number for a decision. Use `av benchmark --baseline`
 to track regressions across captures rather than eyeballing two snapshots of this file by hand.
 
 ## Reference machine
@@ -33,8 +39,41 @@ to track regressions across captures rather than eyeballing two snapshots of thi
   (footnoted why); re-run before treating a "failed" cell as a real regression, since it
   usually means capture-machine contention rather than a code defect.
 
+## Claim status
+
+| # | Benchmark | Scope | Status |
+|---|---|---|---|
+| 1 | Hashing Throughput at Scale | speed | PASS |
+| 2 | Safetensors Layer-Dedup Storage Savings | speed | PASS |
+| 3 | Commit + Push Latency, End-to-End | speed | FAIL |
+| 4 | No-Op status/add Speed at Scale | speed | FAIL |
+| 5 | Cold Clone / First Pull Time | speed | PASS |
+| 6 | Partial-Checkpoint Fetch (Layer-Level Pull) | mixed | PASS |
+| 7 | Storage Footprint Over N Versions | speed | PASS |
+
+Internal-only (excluded from the claim): Concurrent Multi-User Push Throughput, Garbage Collection Throughput.
+
+**Faster in every published domain: NO**
+
 ## Methodology notes (resolved open questions)
 
+- **av numbers run with the product default: native launcher + auto-spawned daemon.** Each
+  av benchmark does an untimed warm-up `av` invocation as part of its setup and waits (up to
+  15s) for `av daemon status` to report running before timing anything — mirroring how a
+  user's *second* command in a session behaves, the same way Git LFS's own long-running
+  `filter-process` is already warm by the time `git add` is timed. `av benchmark
+  --no-daemon` (or `AV_NO_DAEMON=1` in the calling shell) captures the cold, no-daemon
+  numbers instead — published separately in `development/BENCHMARKS-cold.md` — and the
+  **av daemon:** line above states which mode produced this file. Git LFS and DVC have no
+  comparable warm-process primitive of their own to match against; each runs with its own
+  defaults.
+- **Commit + Push Latency, "commit" row is local-only; "push" row carries the real upload.**
+  `av commit`'s default behavior — uploading synchronously — is unchanged by this note; the
+  *benchmark* times `av commit --no-upload` for the commit row specifically so it measures
+  the same thing DVC's and Git LFS's own "commit" numbers do (neither ever touches a
+  network on commit — their upload is a separate `dvc push`/already happened in `git add`'s
+  LFS clean filter). The real upload — batch-check, parallel object upload, push_commit,
+  ref update — is what the "push" row measures, directly comparable to `dvc push`.
 - **Hashing throughput, MLflow column:** MLflow has no exposed file-hashing primitive
   comparable to `dvc add`/`git lfs clean`/`av`'s hasher — `log_artifact()` copies/uploads a
   file but doesn't expose a hash step a caller can time independently. Marked N/A rather than
@@ -54,11 +93,14 @@ to track regressions across captures rather than eyeballing two snapshots of thi
   a running registry (`benchmarks/bench_cold_clone.py`), timing exactly what Git LFS's
   `git clone` + `git lfs pull` and DVC's `git clone` + `dvc pull` measure for their own
   columns — a second machine materializing a fresh copy of a project someone else pushed.
-- **Partial-checkpoint fetch, "fetch whole checkpoint" row:** MLflow's number here is a
-  local-filesystem artifact store, not a network round trip like av/Git LFS's real HTTP
-  fetch or DVC's local-dir remote pull — faster for that reason, not because MLflow's actual
-  remote-artifact-store fetch path would be.
-
+- **Partial-checkpoint fetch, "fetch whole checkpoint" row:** MLflow's number now comes
+  from a real `mlflow server` over HTTP (`--serve-artifacts`), not its local-filesystem
+  artifact-store shortcut — `log_artifact`/`download_artifacts` are genuine network round
+  trips, the same fairness bar av (`av fetch`), Git LFS (`git lfs pull`), and DVC
+  (`dvc pull`) are already held to. av's own numbers go through the real `av fetch`/
+  `av fetch --layer` CLI, paying process startup like every competitor's own subprocess.
+  "fetch single layer" is scoped `claim_scope="unique"` (see `tool_runner.BenchmarkResult`)
+  since no competitor has sub-file granularity to compare against at all.
 
 ## Hashing Throughput at Scale
 
@@ -66,10 +108,10 @@ SHA-256 (or each tool's equivalent content hash) over a single file at increasin
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| hash 10MB file | 290.4 ms | 1,857.3 ms | 8,313.2 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 50MB file | 1,204.5 ms | 3,343.2 ms | 7,554.7 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 100MB file | 2,871.6 ms | 6,250.0 ms | 9,264.7 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 200MB file | 5,678.3 ms | 10,067.8 ms | 12,707.7 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 10MB file | 335.1 ms | 6,249.6 ms | 11,441.1 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 50MB file | 1,822.5 ms | 4,698.1 ms | 10,884.3 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 100MB file | 2,499.2 ms | 6,448.5 ms | 11,259.7 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 200MB file | 5,806.2 ms | 13,326.7 ms | 13,477.3 ms | N/A (no exposed file-hashing primitive) | GOOD |
 
 ## Safetensors Layer-Dedup Storage Savings
 
@@ -83,28 +125,29 @@ Total on-disk storage after 6 commits, each changing only a classifier-head laye
 
 init/add/commit/push on the same 60-file mixed fixture, across all four tools.
 
-| Operation | av | git-lfs | dvc | mlflow | Verdict |
-|---|---:|---:|---:|---:|---|
-| init | 1,135.9 ms | 5,855.2 ms | 5,845.7 ms | 10,220.8 ms | GOOD |
-| add (60 files) | 3,804.6 ms | 2,520.5 ms | 8,977.7 ms | 0.0 ms | OK |
-| commit | 2,139.1 ms | 2,026.9 ms | 485.7 ms | 1,702.4 ms | BAD |
-| push | 5,389.5 ms | 6,282.3 ms | 7,209.5 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | OK |
+| Operation | av | git-lfs | dvc | mlflow | Verdict | av peak RSS |
+|---|---:|---:|---:|---:|---|---:|
+| init | 2,543.0 ms | 4,882.7 ms | 4,700.6 ms | 5,157.3 ms | GOOD | — |
+| add (60 files) | 1,513.9 ms | 2,295.8 ms | 8,182.8 ms | 0.0 ms | OK | — |
+| commit | 1,022.4 ms | 2,074.7 ms | 440.5 ms | 357.3 ms | BAD | — |
+| push | 1,008.3 ms | 5,506.4 ms | 6,039.2 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | GOOD | 22 MB |
 
 ## No-Op status/add Speed at Scale
 
-Re-running the staging step a second time with nothing changed.
+Re-running the staging step, and a plain `status`, a second time with nothing changed.
 
-| Operation | av | git-lfs | dvc | mlflow | Verdict |
-|---|---:|---:|---:|---:|---|
-| re-add unchanged (60 files) | 851.6 ms | 127.7 ms | 7,078.8 ms | N/A (no incremental staging/status primitive) | BAD |
+| Operation | av | git-lfs | dvc | mlflow | Verdict | av peak RSS |
+|---|---:|---:|---:|---:|---|---:|
+| re-add unchanged (60 files) | 468.0 ms | 78.6 ms | 7,561.6 ms | N/A (no incremental staging/status primitive) | BAD | 22 MB |
+| status (clean tree, 60 files) | 566.7 ms | 91.7 ms | 4,452.8 ms | N/A (no incremental staging/status primitive) | BAD | 22 MB |
 
 ## Cold Clone / First Pull Time
 
 Fresh, empty-directory checkout of a project someone else already pushed.
 
-| Operation | av | git-lfs | dvc | mlflow | Verdict |
-|---|---:|---:|---:|---:|---|
-| clone + pull (fresh checkout) | 7,716.1 ms | 28,058.9 ms | 16,861.1 ms | N/A (no project-level clone/pull concept) | GOOD |
+| Operation | av | git-lfs | dvc | mlflow | Verdict | av peak RSS |
+|---|---:|---:|---:|---:|---|---:|
+| clone + pull (fresh checkout) | 2,803.0 ms | 7,602.0 ms | 6,336.5 ms | N/A (no project-level clone/pull concept) | GOOD | 42 MB |
 
 ## Partial-Checkpoint Fetch (Layer-Level Pull)
 
@@ -112,8 +155,8 @@ Fetching one 5MB layer of a 20MB checkpoint vs the whole thing, from a real remo
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| fetch single layer | 38.3 ms | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | OK |
-| fetch whole checkpoint | 892.0 ms | 4,087.5 ms | 12,240.1 ms | 210.1 ms | BAD |
+| fetch single layer | 862.8 ms | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | OK |
+| fetch whole checkpoint | 1,704.3 ms | 1,747.1 ms | 4,992.4 ms | available | OK |
 
 ## Storage Footprint Over N Versions
 
@@ -130,34 +173,16 @@ Cumulative on-disk storage after each of 6 fine-tune commits (same scenario as t
 
 ## Concurrent Multi-User Push Throughput
 
-8 simultaneous commit pushes against a real av_server. Aether-only for v1 — see methodology note for why the other three are N/A.
+8 simultaneous commit pushes against a real av_server. Aether-only for v1 — see methodology note for why the other three are N/A. **(internal-only — excluded from the every-domain claim.)**
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| 8 concurrent pushes | 7,617.7 ms | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | OK |
+| 8 concurrent pushes | 1,214.5 ms | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | N/A (no comparable concurrent-server primitive (see BENCHMARKS.md methodology)) | OK |
 
 ## Garbage Collection Throughput
 
-Time to run `av gc` on the remote CAS server after committing and pushing 20 small objects from a real fixture. Aether-only — see methodology note for why the other three are N/A.
+Time to run `av gc` on the remote CAS server after committing and pushing 20 small objects from a real fixture. Aether-only — see methodology note for why the other three are N/A. **(internal-only — excluded from the every-domain claim.)**
 
-| Operation | av | git-lfs | dvc | mlflow | Verdict |
-|---|---:|---:|---:|---:|---|
-| gc after 20 objects | 13,677.9 ms | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | OK |
-
-
-<!-- PERF-HISTORY:START (generated by scripts/append_perf_history.py — do not hand-edit between these markers) -->
-
-## Perf history trend
-
-| Date | Version | Index.save() | Index.load() | load_config() | iter_working_files() | Storage stats | semdiff.diff_trees() | commit_staged() | compute_status() | log() |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2026-09-02 | 1.2.5.dev6+g8ef634b58.d20260902 | 13.2 ms | 59.5 ms | 84.8 ms | 111.1 ms | 1436.3 ms | 43.8 ms | 224.4 ms | 1933.3 ms | 12392.8 ms |
-| 2026-09-02 | 1.2.5.dev6+g8ef634b58.d20260902 | 17.5 ms | 58.5 ms | 100.1 ms | 97.8 ms | 1380.1 ms | 36.8 ms | 173.8 ms | 1790.0 ms | 9504.0 ms |
-| 2026-09-07 | 1.3.6 | 9.0 ms | 17.1 ms | 16.7 ms | 45.6 ms | 535.3 ms | 8.1 ms | 97.7 ms | 695.7 ms | 2789.5 ms |
-| 2026-09-07 | 1.3.7 | 9.6 ms | 15.7 ms | 12.4 ms | 17.6 ms | 301.0 ms | 9.2 ms | 80.6 ms | 440.2 ms | 2069.8 ms |
-| 2026-09-07 | 1.4.0 | 14.8 ms | 29.5 ms | 16.2 ms | 72.0 ms | 970.2 ms | 18.9 ms | 135.0 ms | 1264.6 ms | 5314.9 ms |
-| 2026-09-11 | 1.4.1.dev0+ga73ebdeb2.d20260911 | 14.2 ms | 29.7 ms | 16.4 ms | 661.1 ms | 619.8 ms | 20.4 ms | 105.3 ms | 1311.2 ms | 4126.7 ms |
-
-6 capture(s) total, showing the most recent 6. Machine varies across captures (see each entry's `os`/`python` in `development/perf-history.json`) — read this as a rough trend, not an apples-to-apples benchmark; `av test --speed` / the perf gate (`tests/test_perf_gate.py`) are the authoritative regression check for a single machine.
-
-<!-- PERF-HISTORY:END -->
+| Operation | av | git-lfs | dvc | mlflow | Verdict | av peak RSS |
+|---|---:|---:|---:|---:|---|---:|
+| gc after 20 objects | 4,567.2 ms | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | N/A (no comparable server-side garbage-collection primitive (see BENCHMARKS.md methodology)) | OK | 39 MB |

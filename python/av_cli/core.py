@@ -980,11 +980,7 @@ def hash_and_publish_whole_file(repo_root: Path, fpath: Path) -> str:
                 scratch.unlink(missing_ok=True)
             else:
                 obj_path.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    os.replace(scratch, obj_path)
-                except OSError:
-                    scratch.unlink(missing_ok=True)
-                    raise
+                _replace_or_accept_concurrent_publish(scratch, obj_path)
             return file_hash
 
     # Pure-Python fallback (no aether_core, or it failed above): still one read, via
@@ -1004,7 +1000,7 @@ def hash_and_publish_whole_file(repo_root: Path, fpath: Path) -> str:
             scratch.unlink(missing_ok=True)
         else:
             obj_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(scratch, obj_path)
+            _replace_or_accept_concurrent_publish(scratch, obj_path)
         return file_hash
     finally:
         if scratch.exists():
@@ -1188,6 +1184,26 @@ CHUNKABLE_EXTS = {
 }
 
 
+def _replace_or_accept_concurrent_publish(src: Path, dest: Path) -> None:
+    """`os.replace(src, dest)`, tolerant of another thread/process concurrently publishing
+    the SAME content-addressed object under `dest`. On POSIX, renaming onto an existing
+    destination is atomic and the loser's rename simply overwrites with byte-identical
+    content -- harmless. On WINDOWS, the underlying `MoveFileExW` call can instead raise
+    `PermissionError` ([WinError 5], ERROR_ACCESS_DENIED) when two renames race the exact
+    same destination path, even though `dest` ends up with correct content either way --
+    a real bug, found live via `av benchmark`'s parallel staging of duplicate-content
+    fixture files (two synthetic files with identical bytes hash to the same object, and
+    two staging workers raced to publish it; Probleme.md #185). Only re-raises when `dest`
+    genuinely never appeared -- a real, unrelated I/O failure."""
+    try:
+        os.replace(src, dest)
+    except OSError:
+        if dest.exists():
+            src.unlink(missing_ok=True)
+        else:
+            raise
+
+
 def _atomic_publish_object(obj_path: Path, write_fn) -> None:
     """Publishes a CAS object at `obj_path` by writing to a temp file in the same shard
     directory first, then `os.replace` -- never write straight to the final content-
@@ -1210,9 +1226,11 @@ def _atomic_publish_object(obj_path: Path, write_fn) -> None:
     try:
         write_fn(tmp)
         # Another thread may have published the same content-addressed object while this
-        # one was writing its own temp copy -- that's fine, os.replace still lands
-        # atomically; the loser's temp file just becomes the (byte-identical) final file.
-        os.replace(tmp, obj_path)
+        # one was writing its own temp copy -- that's fine content-wise (the loser's temp
+        # file is byte-identical), but os.replace() is only guaranteed atomic-and-silent
+        # about it on POSIX; see _replace_or_accept_concurrent_publish for why Windows
+        # needs the extra check.
+        _replace_or_accept_concurrent_publish(tmp, obj_path)
     finally:
         if tmp.exists():
             try:

@@ -36,6 +36,11 @@ src/launcher/av_launcher_version.h
 # per-user token map here (next to docker-compose.yml) on a dev checkout. Never commit.
 .env
 
+# Ad-hoc `av benchmark --save-json <name>.json` snapshots (regression-tracking scratch
+# files meant for local `--baseline`/`--save-json` comparisons, not for the repo — the
+# durable record is `development/BENCHMARKS.md` + `development/perf-history.json`).
+/bench-*.json
+
 # CMake / C++ Builds
 CMakeCache.txt
 CMakeFiles/
