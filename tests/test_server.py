@@ -140,6 +140,45 @@ def _make_commit(seed: str, tree: dict | None = None, **overrides) -> dict:
     return payload
 
 
+def _watchdog_around(label: str, seconds: float, fn) -> None:
+    """Runs `fn()` on a background thread; if it hasn't returned within `seconds`, dumps
+    every thread's Python stack to stderr and re-arms itself, so a hang shows up as a real
+    traceback in the CI log instead of a silent multi-minute stall (V1.6.3, Probleme.md
+    #184-class bugs -- a leaked DB cursor blocking session-scope TestClient teardown).
+    Does NOT abort `fn()` itself (a partially-torn-down ASGI app is worse than a slow one);
+    it only makes a genuine hang immediately diagnosable on the first occurrence instead of
+    requiring another full CI round-trip to even see what's stuck."""
+    import faulthandler
+    import sys
+    import threading
+
+    done = threading.Event()
+
+    def watch():
+        tick = 0
+        while not done.wait(seconds):
+            tick += 1
+            elapsed = tick * seconds
+            if tick == 1:
+                print(f"\n##[warning]{label} has not returned after {elapsed:.0f}s -- "
+                      f"dumping all thread stacks:", file=sys.stderr, flush=True)
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            elif tick % 10 == 0:
+                # A full dump every tick would flood the log on a genuine multi-minute
+                # hang; the first dump already has every stack, so later ticks are just a
+                # heartbeat confirming it's still stuck (not making progress unseen).
+                print(f"##[warning]{label} still not returned after {elapsed:.0f}s "
+                      f"(see the first dump above for stacks)", file=sys.stderr, flush=True)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        fn()
+    finally:
+        done.set()
+        watcher.join(timeout=5)
+
+
 @pytest.fixture(scope="session")
 def client():
     if not (_tcp_reachable(AV_TEST_DATABASE_URL) and _tcp_reachable(AV_TEST_REDIS_URL)):
@@ -148,8 +187,16 @@ def client():
             f"(AV_TEST_DATABASE_URL={AV_TEST_DATABASE_URL}, AV_TEST_REDIS_URL={AV_TEST_REDIS_URL}). "
             "Run `docker compose up -d db redis` first."
         )
-    with TestClient(app) as c:  # triggers the FastAPI lifespan: init_db() + cache.init_filter()
-        yield c
+    tc = TestClient(app)  # triggers the FastAPI lifespan: init_db() + cache.init_filter()
+    _watchdog_around("TestClient startup (lifespan)", 30.0, tc.__enter__)
+    try:
+        yield tc
+    finally:
+        # This exact step (lifespan shutdown -> engine.dispose()) hung for 20+ minutes on
+        # CI's Windows runner twice in this phase (Probleme.md #184); a watchdog here
+        # turns any recurrence into an immediate, actionable stack trace.
+        _watchdog_around("TestClient teardown (lifespan shutdown)", 30.0,
+                         lambda: tc.__exit__(None, None, None))
 
 
 def _clear_storage_dirs() -> None:

@@ -452,10 +452,12 @@ jobs:
   # natively via Chocolatey instead.
   server-tests-windows:
     runs-on: windows-latest
-    # ~10min of that is chocolatey installing Postgres+Memurai; V1.6.3's six extra live
-    # tests pushed a run to 25:00 and the 25-minute cap cancelled it 4s after the last
-    # test PASSED. 40 leaves real headroom for a slow runner.
-    timeout-minutes: 40
+    # ~10min of that is chocolatey installing Postgres+Memurai; the actual test run is
+    # ~8-10min. 25 leaves real margin over that without wasting 40min of runner time on a
+    # genuine hang (Probleme.md #184) -- the watchdog in tests/test_server.py's `client`
+    # fixture dumps every thread's stack the moment lifespan startup/shutdown stalls, so a
+    # recurrence fails loud and fast here instead of silently running out the clock.
+    timeout-minutes: 25
 
     env:
       AV_TEST_DATABASE_URL: postgresql+asyncpg://postgres:av_password@localhost:5432/aether_vault_test
