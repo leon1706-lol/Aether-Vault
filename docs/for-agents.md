@@ -137,6 +137,25 @@ walkthrough, covering propose→apply→canary→dual-gate-promote→review→pr
 budget-stop end to end; `examples/rsi_loop/` is the same narrative as a deterministic,
 runnable reference agent with no LLM key.
 
+## Memory-related surfaces (V1.6.3)
+
+- `av --output json doctor --resources` adds a `resources` object to the doctor envelope
+  (`null` without the flag): `rss_mb`, `peak_rss_mb`, `total_ram_mb`, `available_mb`,
+  `daemon.{running,rss_mb,peak_rss_mb}`, `stage_workers_effective`, `stage_buffer_mb`,
+  `stage_worker_budget_mb`, `stage_peak_estimate_mb`, `recommended_profile`
+  (`lowmem`|`default`) and `recommendations[]` — an agent on a small box can read these
+  and export `AV_STAGE_WORKERS_MAX`/`AV_STAGE_BUFFER_MB` before a large `add`.
+- `av --output json daemon status` gained `peak_rss_mb` next to `rss_mb`.
+- `av --output json test --lowmem` gained a `lowmem` object (per-file counts and peak RSS).
+- Server: every `limit` query parameter has a maximum (`422` above it — commits 500, runs
+  1000, refs 5000, most lists 500 or 2000); the formerly whole-table lists (`/api/tasks`,
+  `/api/plans`, `/api/webhooks`, `/api/users`, …) page at 500 by default with `offset`;
+  `/api/refs` pages at 1000 (ordered by name) — the SDK/CLI walk pages for you.
+  `POST /api/objects/{hash}` returns `413` when the operator set `AV_MAX_UPLOAD_BYTES`
+  (default unlimited); `VaultClient.upload_object` reports it and returns `False`, and the
+  commit stays queued in `.av/pending_push` like any other failed push.
+- `GET /api/metrics` exposes `av_process_rss_bytes` and `av_process_peak_rss_bytes`.
+
 ## Where to go next
 
 - `docs/contracts.md` — every published JSON schema and the stability policy.

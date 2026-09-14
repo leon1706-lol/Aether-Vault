@@ -71,6 +71,10 @@ def env_principal(username: str, tenant_id: str, scopes: list[str]) -> Principal
 # ---------------------------------------------------------------------------
 
 AUTH_CACHE_TTL_SECS = float(os.environ.get("AV_AUTH_CACHE_TTL_SECS", "30"))
+# V1.6.3: bounded. Expired entries used to be evicted only when looked up again, so
+# every distinct bad token a spraying client sent stayed cached forever (as a `None`
+# principal). At the cap, expired entries go first, then the soonest-to-expire.
+AUTH_CACHE_MAX_ENTRIES = int(os.environ.get("AV_AUTH_CACHE_MAX_ENTRIES", "1024"))
 _principal_cache: dict[str, tuple[float, Principal | None]] = {}
 
 
@@ -86,7 +90,15 @@ def _cache_get(token_hash: str) -> tuple[bool, Principal | None]:
 
 
 def _cache_put(token_hash: str, principal: Principal | None) -> None:
-    _principal_cache[token_hash] = (time.monotonic() + AUTH_CACHE_TTL_SECS, principal)
+    now = time.monotonic()
+    if token_hash not in _principal_cache and len(_principal_cache) >= AUTH_CACHE_MAX_ENTRIES:
+        for k in [k for k, (exp, _) in _principal_cache.items() if now >= exp]:
+            _principal_cache.pop(k, None)
+        overflow = len(_principal_cache) - AUTH_CACHE_MAX_ENTRIES + 1
+        if overflow > 0:
+            for k, _ in sorted(_principal_cache.items(), key=lambda kv: kv[1][0])[:overflow]:
+                _principal_cache.pop(k, None)
+    _principal_cache[token_hash] = (now + AUTH_CACHE_TTL_SECS, principal)
 
 
 def invalidate_cached_token(raw_token: str) -> None:

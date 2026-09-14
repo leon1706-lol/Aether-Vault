@@ -110,6 +110,16 @@ pybind11 boundary lives in `python/`.
    overlapping declared layer ranges (structurally unrepresentable in a single sequential
    pass), while `split_and_hash_safetensors` handles them fine (each layer independently
    re-reads its own range) -- that's the documented fallback trigger, not a bug.
+9. **Memory envelope is bounded per in-flight call, never per file size (V1.6.3).** Read
+   buffers are 1 MiB; `stage_safetensors` holds one layer buffer of at most
+   `buffer_cap_bytes` (larger layers stream through a temp file) and the header exactly
+   ONCE (raw bytes parsed in place, DOM dropped after the layer table is built, raw bytes
+   dropped after `__header__` is published); `stage_cdc` holds one chunk (≤ `max_chunk`);
+   `hash_file_tree` keeps at most `min(pool, 4)` chunk tasks (and their `chunk_size`
+   buffers) in flight, consuming results oldest-first so its output is unchanged
+   (`tests/test_core.py::test_hash_file_tree_matches_python_oracle_*` is the oracle -- it
+   had none before). The numbers in `development/MEMORY.md` derive from these bounds; a
+   change that reads a whole file or layer into memory breaks them.
 
 ## Rebuild after editing
 

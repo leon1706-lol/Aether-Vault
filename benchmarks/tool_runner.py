@@ -48,12 +48,33 @@ def detect_tools(names: list[str] | None = None) -> dict[str, ToolHandle]:
     return {name: detect_tool(name) for name in names}
 
 
-def time_subprocess(args: list[str], cwd: Path, *, repeat: int = 1, env: dict | None = None) -> float:
+#: Peak-RSS samples recorded by `time_subprocess(..., rss_key=...)`, drained per key by
+#: `pop_rss_median()` when a benchmark fills its `Row.rss_mb`. Process-global on purpose:
+#: the `_bench_av()` helpers that time subprocesses return only floats, and threading a
+#: second return value through every one of them would touch every benchmark for no gain.
+_RSS_SAMPLES: dict[str, list[float]] = {}
+
+
+def record_rss(key: str, peak_mb: float | None) -> None:
+    if peak_mb is not None:
+        _RSS_SAMPLES.setdefault(key, []).append(peak_mb)
+
+
+def pop_rss_median(key: str) -> float | None:
+    samples = _RSS_SAMPLES.pop(key, [])
+    return round(statistics.median(samples), 1) if samples else None
+
+
+def time_subprocess(args: list[str], cwd: Path, *, repeat: int = 1, env: dict | None = None,
+                    rss_key: str | None = None) -> float:
     """Times a subprocess call in milliseconds, as the median of `repeat` runs (default 1 =
     a single timing, unchanged from before). Deliberately no `capture_output=True` -- matches
     speedcheck.run_av_cli_probes's calling convention, which a test mock depends on. `env`
     merges over the current process environment for every run (e.g. AV_NO_DAEMON=1 for a
-    `--no-daemon` capture)."""
+    `--no-daemon` capture). `rss_key` additionally records each run's peak RSS (whole
+    process tree, via `av_cli.sysres`) under that key for `pop_rss_median()` -- the timing
+    path and return value are unchanged when it is None, which is what the test doubles for
+    `subprocess.run` rely on."""
     # `env` only added to the subprocess.run() kwargs when actually given -- plain omission
     # is equivalent to `env=None` for a real subprocess (both mean "inherit the current
     # environment"), and some test doubles don't expect an `env=` keyword at all.
@@ -62,6 +83,13 @@ def time_subprocess(args: list[str], cwd: Path, *, repeat: int = 1, env: dict | 
         run_kwargs["env"] = {**os.environ, **env}
     samples = []
     for _ in range(max(1, repeat)):
+        if rss_key is not None:
+            from av_cli import sysres
+
+            measured = sysres.run_measured(args, **run_kwargs)
+            samples.append(measured.elapsed_ms)
+            record_rss(rss_key, measured.peak_rss_mb)
+            continue
         start = time.perf_counter()
         subprocess.run(args, **run_kwargs)
         samples.append((time.perf_counter() - start) * 1000)
@@ -116,6 +144,10 @@ class Row:
     # though "fetch whole checkpoint" in the same result is an ordinary speed domain. None
     # (the common case) means "inherit the result's own claim_scope".
     claim_scope: str | None = None
+    # tool name -> peak RSS (MB) of the timed subprocess tree, when a benchmark measured it
+    # (V1.6.3). Empty for tools/rows without a measurement; rendered as an extra column only
+    # when at least one row in the result carries a number.
+    rss_mb: dict[str, float | None] = field(default_factory=dict)
 
 
 #: A benchmark's place in the "faster in every published domain" claim (todo.md's V1.6.0
@@ -176,13 +208,24 @@ def _verdict_for_row(row: Row, tool_order: list[str]) -> str:
     return rate(av_value, competitors)
 
 
+def _has_rss(result: BenchmarkResult) -> bool:
+    return any(v is not None for row in result.rows for v in row.rss_mb.values())
+
+
+def format_rss(value: float | None) -> str:
+    return "—" if value is None else f"{value:,.0f} MB"
+
+
 def print_table(result: BenchmarkResult, echo=print) -> None:
     echo(f"\n=== {result.title} ===")
     echo(result.description)
     if result.claim_scope == "internal":
         echo("(internal-only — excluded from the every-domain claim; see METHODOLOGY_NOTES)")
     col_w = 16
+    with_rss = _has_rss(result)
     header = f"{'Operation':<28}" + "".join(f"{t:>{col_w}}" for t in result.tool_order) + f"{'Verdict':>10}"
+    if with_rss:
+        header += f"{'av peak RSS':>14}"
     echo(header)
     echo("-" * len(header))
     footnotes: dict[str, str] = {}
@@ -192,7 +235,8 @@ def print_table(result: BenchmarkResult, echo=print) -> None:
             f"{format_value(row.values.get(t), row.statuses.get(t, ToolStatus.NOT_INSTALLED), row.unit):>{col_w}}"
             for t in result.tool_order
         )
-        echo(f"{row.operation:<28}{cells}{verdict.upper():>10}")
+        rss = f"{format_rss(row.rss_mb.get('av')):>14}" if with_rss else ""
+        echo(f"{row.operation:<28}{cells}{verdict.upper():>10}{rss}")
         for t, note in row.notes.items():
             if note:
                 footnotes[t] = note
@@ -205,8 +249,9 @@ def result_to_markdown(result: BenchmarkResult) -> str:
     if result.claim_scope == "internal":
         description += " **(internal-only — excluded from the every-domain claim.)**"
     lines = [f"## {result.title}", "", description, ""]
-    header = "| Operation | " + " | ".join(result.tool_order) + " | Verdict |"
-    sep = "|---|" + "---:|" * len(result.tool_order) + "---|"
+    with_rss = _has_rss(result)
+    header = "| Operation | " + " | ".join(result.tool_order) + " | Verdict |" + (" av peak RSS |" if with_rss else "")
+    sep = "|---|" + "---:|" * len(result.tool_order) + "---|" + ("---:|" if with_rss else "")
     lines += [header, sep]
     for row in result.rows:
         verdict = _verdict_for_row(row, result.tool_order)
@@ -214,7 +259,8 @@ def result_to_markdown(result: BenchmarkResult) -> str:
             format_value(row.values.get(t), row.statuses.get(t, ToolStatus.NOT_INSTALLED), row.unit, row.notes.get(t), with_note=True)
             for t in result.tool_order
         )
-        lines.append(f"| {row.operation} | {cells} | {verdict.upper()} |")
+        rss = f" {format_rss(row.rss_mb.get('av'))} |" if with_rss else ""
+        lines.append(f"| {row.operation} | {cells} | {verdict.upper()} |{rss}")
     lines.append("")
     return "\n".join(lines)
 
@@ -369,6 +415,14 @@ def _total_ram_gb() -> str:
     """Best-effort, dependency-free (no psutil) total RAM. Returns "unknown" rather than
     a wrong guess when the platform-specific path isn't available."""
     try:
+        from av_cli import sysres
+
+        total_mb = sysres.total_ram_mb()
+        if total_mb:
+            return f"{total_mb / 1024:.0f} GB"
+    except Exception:
+        pass
+    try:
         if platform.system() == "Windows":
             import ctypes
 
@@ -452,6 +506,11 @@ guessed at.
 
 **Captured:** {today}, on {platform.system()}. Aether-Vault @ `{sha}`, {versions}, Python {platform.python_version()}.
 **av daemon:** {daemon_mode}. **Timing:** each number is {run_note}.
+**Memory:** an `av peak RSS` column, where present, is the peak resident set of the timed
+`av` process tree (Windows: the kernel's exact PeakWorkingSet; POSIX: sampled every 20 ms),
+median across runs. With the daemon warm (the default) that tree is the launcher *client*
+(~4 MB) — the resident daemon's own RSS is `av daemon status`'s `rss_mb`; a `--no-daemon`
+capture measures the full in-process CLI instead. Budgets: `development/MEMORY.md`.
 
 **Caveat:** these are single-machine timings — disk/antivirus/OS-scheduler noise is real.
 Re-run before relying on any single number for a decision. Use `av benchmark --baseline`
@@ -473,11 +532,64 @@ to track regressions across captures rather than eyeballing two snapshots of thi
 
 def results_to_json(results: list[BenchmarkResult]) -> dict:
     """{benchmark_name: {operation: av_value_or_None}} — a flat snapshot for --save-json,
-    consumed later by compare_to_baseline() in a future run."""
-    return {
+    consumed later by compare_to_baseline() in a future run. Peak RSS rides along under
+    the `_rss_mb` key only when some row measured it; `compare_to_baseline` walks this
+    run's results (never the baseline's keys), so the underscore key is inert there."""
+    doc = {
         result.name: {row.operation: row.values.get("av") for row in result.rows}
         for result in results
     }
+    rss = {
+        result.name: {row.operation: row.rss_mb.get("av") for row in result.rows if row.rss_mb.get("av") is not None}
+        for result in results if _has_rss(result)
+    }
+    if rss:
+        doc["_rss_mb"] = rss
+    return doc
+
+
+def results_to_json_full(results: list[BenchmarkResult]) -> dict:
+    """Lossless dataclass → dict form (every tool's value/status/note, claim scopes, RSS),
+    so `av benchmark --lowmem` can run each benchmark in its own subprocess and merge the
+    results through the normal print/markdown/baseline code path."""
+    return {
+        "schema": "benchmark-results-1.0",
+        "results": [
+            {
+                "name": r.name, "title": r.title, "description": r.description,
+                "tool_order": list(r.tool_order), "claim_scope": r.claim_scope,
+                "rows": [
+                    {
+                        "operation": row.operation, "unit": row.unit, "claim_scope": row.claim_scope,
+                        "values": dict(row.values),
+                        "statuses": {t: s.value for t, s in row.statuses.items()},
+                        "notes": dict(row.notes), "rss_mb": dict(row.rss_mb),
+                    }
+                    for row in r.rows
+                ],
+            }
+            for r in results
+        ],
+    }
+
+
+def results_from_json_full(doc: dict) -> list[BenchmarkResult]:
+    by_value = {s.value: s for s in ToolStatus}
+    out: list[BenchmarkResult] = []
+    for r in doc.get("results", []):
+        rows = [
+            Row(
+                operation=row["operation"], values=dict(row.get("values", {})),
+                statuses={t: by_value[s] for t, s in row.get("statuses", {}).items()},
+                unit=row.get("unit", "ms"), notes=dict(row.get("notes", {})),
+                claim_scope=row.get("claim_scope"), rss_mb=dict(row.get("rss_mb", {})),
+            )
+            for row in r.get("rows", [])
+        ]
+        out.append(BenchmarkResult(name=r["name"], title=r["title"], description=r["description"],
+                                   tool_order=list(r["tool_order"]), rows=rows,
+                                   claim_scope=r.get("claim_scope", "speed")))
+    return out
 
 
 def compare_to_baseline(results: list[BenchmarkResult], baseline: dict) -> list[dict]:

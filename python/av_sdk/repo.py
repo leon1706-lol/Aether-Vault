@@ -159,7 +159,7 @@ class Repo:
 
         head_hash = commit_staged(
             self.path, message, tags=all_tags, metrics=metrics or {},
-            run_id=run_id, defer_upload=no_upload, result_sink=sink_cb,
+            run_id=run_id, defer_upload=no_upload, result_sink=sink_cb, idx=idx,
         )
         return {
             "committed": True,

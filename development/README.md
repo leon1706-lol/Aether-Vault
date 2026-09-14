@@ -24,8 +24,10 @@ Kept separate from the root README so that file stays short and scannable.
   check that the version being tagged has a real capture.
 - `threat-model.md` - assets, actors, trust boundaries, and a threat -> mitigation ->
   residual-risk table, with an annual-review checklist. Linked from `SECURITY.md`.
-- `CONTINUATION-V1.2.0.md`, `CONTINUATION-V1.2.2.md` - milestone records: shipped
-  scope, decisions, verification snapshots.
+- `MEMORY.md` - the memory envelope: how to measure it, the budgets, the before/after
+  table (`memory-baseline-v1.6.2.json` / `memory-scoreboard-v1.6.3.json`), every knob.
+  Per-phase plan/continuation notes are deliberately NOT kept here: a phase's record is
+  its CHANGELOG entry plus Probleme.md; temporary planning files live in `todo.md`.
 - `logo.png` - used by the root README banner.
 
 More development-process documents can live here over time.

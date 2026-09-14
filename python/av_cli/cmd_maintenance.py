@@ -111,13 +111,18 @@ def _doctor_compose_migrate(path_str: str, write: bool) -> None:
 
     server_svc, webui_svc = services[server_name], services[webui_name]
     merged_env = {**_compose_env_dict(webui_svc), **_compose_env_dict(server_svc)}
-    merged_env["AV_ENGINE_ROLE"] = "all"
+    # Interpolated (V1.6.3) so `AV_ENGINE_ROLE=server` in the neighbouring .env yields an
+    # API-only container without editing the file again -- same form as the shipped
+    # compose files. Defaults to "all", exactly what this migration always produced.
+    merged_env["AV_ENGINE_ROLE"] = "${AV_ENGINE_ROLE:-all}"
 
     engine_service: dict = {
         "image": "ghcr.io/leon1706-lol/aether-vault-engine:latest",
         "ports": ["8000:8000", "3000:3000"],
         "environment": merged_env,
         "restart": server_svc.get("restart") or webui_svc.get("restart") or "unless-stopped",
+        # Footprint cap (V1.6.3), overridable from .env like the shipped compose files.
+        "deploy": {"resources": {"limits": {"memory": "${AV_ENGINE_MEM_LIMIT:-768M}"}}},
     }
     # Carry forward (or set) a 30s stop_grace_period so AV_ENGINE_STOP_GRACE_SECS' drain
     # window isn't cut short by Docker's 10s default.
@@ -172,7 +177,11 @@ def _doctor_compose_migrate(path_str: str, write: bool) -> None:
                    "See docs/migrate-engine-image.md.")
 @click.option("--write", "write_compose", is_flag=True, default=False,
               help="With --compose, apply the rewrite in place instead of only previewing it.")
-def doctor(fix: bool, dry_run: bool, speed: bool, compose_path: str | None, write_compose: bool) -> None:
+@click.option("--resources", "resources", is_flag=True, default=False,
+              help="Also report memory: this process' and the daemon's RSS, free RAM, the effective "
+                   "staging worker count, and which low-memory knobs to set on this machine.")
+def doctor(fix: bool, dry_run: bool, speed: bool, compose_path: str | None, write_compose: bool,
+           resources: bool) -> None:
     """Diagnose common repo and environment problems. Read-only by default; pass --fix to
     repair what's safely recoverable, or --fix --dry-run to preview. `--compose PATH` is a
     completely different mode (a compose-file migration tool, not a repo diagnostic)."""
@@ -422,10 +431,18 @@ def doctor(fix: bool, dry_run: bool, speed: bool, compose_path: str | None, writ
         else:
             _print_real_repo_speed_diagnostics(repo_root)
 
+    resources_report = None
+    if resources:
+        from .resources_report import build_resources_report, render_resources_report
+
+        resources_report = build_resources_report(repo_root)
+        if not json_mode:
+            render_resources_report(resources_report, click.echo)
+
     if json_mode:
         emit_json(None, "doctor", data={
             "checks": checks, "warning_count": warning_count, "fixed_count": fixed_count,
-            "dry_run": preview, "speed_probes": speed_probes,
+            "dry_run": preview, "speed_probes": speed_probes, "resources": resources_report,
         })
         return
 

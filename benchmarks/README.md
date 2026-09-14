@@ -50,14 +50,27 @@ not a section of `development/BENCHMARKS.md`.
 
 ## Where a real capture actually runs (V1.6.1)
 
-**Known limitation, not by design**: the full 9-benchmark suite currently cannot be run on
-this project's own dev box — it needs the live Docker registry stack up (Postgres+Redis+
-`av_server`) *and* git-lfs/DVC/MLflow all installed *and* enough free RAM for the `av`
-subprocesses `av benchmark` itself spawns, and this box's free memory has repeatedly not
-been enough for that combination even with Docker running and nothing else in flight (see
-`todo.md`'s "Blocked by environment" history for the specific numbers). `av doctor --speed`
-and `av test --speed` (synthetic, no external tools) still work locally regardless — it's
-specifically the cross-tool comparison suite that's blocked here.
+**On a small machine, use `--lowmem` (V1.6.3).** A single combined `av benchmark` process
+still cannot run all 9 benchmarks on this project's own 3.9 GB dev box (the live Docker
+stack alone takes ~500 MB of it, and the combined run's fixtures plus the `av`
+subprocesses it spawns pushed free RAM past what the box had, every time — see `todo.md`'s
+"Blocked by environment" history). `av benchmark --lowmem` runs each benchmark in its own
+fresh interpreter, sequentially, waiting for `--min-free-mb` (default 400) of free RAM
+before each, and merges the results through the same report/`--markdown`/`--baseline`
+path — verified on that box: `hashing_throughput` at a 115 MB child peak and
+`noop_status_speed` at 263 MB, both previously impossible here. A benchmark that never
+gets its free-RAM floor within 60 s comes back as a `failed` row with a footnote, never a
+silently missing one. Every `av` row also carries an `av peak RSS` column now (peak
+resident memory of the timed `av` process tree; with the daemon warm that is the launcher
+client — the daemon's own RSS is `av daemon status`'s `rss_mb`).
+
+```bash
+av benchmark --lowmem --markdown development/BENCHMARKS.md          # full capture, one process per benchmark
+av benchmark --lowmem --only hashing_throughput --min-free-mb 300    # one benchmark
+```
+
+`av doctor --speed` and `av test --speed` (synthetic, no external tools) work locally
+regardless, as before.
 
 `.github/workflows/benchmarks.yml` exists so this still gets run somewhere real: a weekly
 scheduled job (also triggerable on demand via `workflow_dispatch`) that brings up its own

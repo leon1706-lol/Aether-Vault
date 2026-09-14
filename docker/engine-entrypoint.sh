@@ -40,6 +40,10 @@ if [ -z "$ROLE" ]; then
   fi
 fi
 
+# The resolved role, for /engine-healthcheck.sh (which must not re-run the inference
+# above every tick). Best-effort: a read-only rootfs just falls back to AV_ENGINE_ROLE.
+printf '%s' "$ROLE" > /run/av-engine-role 2>/dev/null || true
+
 STOP_GRACE_SECS="${AV_ENGINE_STOP_GRACE_SECS:-25}"
 RESTART_SUBSERVICE="${AV_ENGINE_RESTART_SUBSERVICE:-1}"
 MAX_RESTARTS="${AV_ENGINE_MAX_RESTARTS:-5}"
@@ -78,7 +82,14 @@ shutdown() {
 trap shutdown TERM INT
 
 start_webui() {
-  echo "[engine] starting webui (node /webui/server.js) on :${WEBUI_PORT:-3000}"
+  # V1.6.3: bound V8's old-space heap. Next's standalone server idles well under 100 MB
+  # (measured, development/MEMORY.md); without a cap node sizes its heap to the HOST's
+  # RAM and only collects late. AV_WEBUI_NODE_HEAP_MB=0 leaves node's default.
+  local heap="${AV_WEBUI_NODE_HEAP_MB:-256}"
+  if [ "$heap" != "0" ]; then
+    export NODE_OPTIONS="--max-old-space-size=${heap}${NODE_OPTIONS:+ $NODE_OPTIONS}"
+  fi
+  echo "[engine] starting webui (node /webui/server.js) on :${WEBUI_PORT:-3000}, node heap cap=${heap}MB"
   (
     cd /webui || exit 1
     exec node server.js
@@ -94,8 +105,15 @@ start_server() {
   # state correct across replicas/workers, same as the documented HA Contract for N>1
   # container replicas -- N>1 workers in ONE container has the identical failure mode.
   local workers="${AV_UVICORN_WORKERS:-1}"
-  echo "[engine] starting server (uvicorn av_server.server:app) on :8000, workers=${workers}"
-  python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 --workers "${workers}" &
+  # V1.6.3: AV_UVICORN_LIMIT_CONCURRENCY (unset = uvicorn's unlimited) caps in-flight
+  # requests per worker -- 503 beyond it, instead of N concurrent uploads each holding
+  # their 4 MiB buffer plus a DB session. The low-memory .env sets it to 32.
+  local extra=()
+  if [ -n "${AV_UVICORN_LIMIT_CONCURRENCY:-}" ]; then
+    extra+=(--limit-concurrency "${AV_UVICORN_LIMIT_CONCURRENCY}")
+  fi
+  echo "[engine] starting server (uvicorn av_server.server:app) on :8000, workers=${workers}${AV_UVICORN_LIMIT_CONCURRENCY:+, limit-concurrency=${AV_UVICORN_LIMIT_CONCURRENCY}}"
+  python -m uvicorn av_server.server:app --host 0.0.0.0 --port 8000 --workers "${workers}" "${extra[@]}" &
   SERVER_PID=$!
 }
 

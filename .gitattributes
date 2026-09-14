@@ -1,0 +1,8 @@
+# Files that are executed or COPYed verbatim into Linux images must stay LF even on a
+# Windows checkout with core.autocrlf=true: a CRLF shebang makes the engine container
+# fail with "exec /engine-entrypoint.sh: no such file or directory" (V1.6.3, found live).
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.conf      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf

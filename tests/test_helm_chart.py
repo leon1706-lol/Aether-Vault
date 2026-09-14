@@ -57,3 +57,37 @@ def test_chart_yaml_is_valid_yaml_with_version_fields():
     chart = yaml.safe_load(CHART_PATH.read_text(encoding="utf-8"))
     assert chart.get("version"), "Chart.yaml is missing a chart 'version'"
     assert chart.get("appVersion"), "Chart.yaml is missing an 'appVersion'"
+
+
+# --- V1.6.3: per-role resource presets + footprint env knobs ----------------------------
+
+CHART_DIR = VALUES_PATH.parent
+
+
+def _values():
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load(VALUES_PATH.read_text(encoding="utf-8"))
+
+
+def test_values_have_per_role_resources_and_footprint_knobs():
+    values = _values()
+    assert values["resources"] == {}  # empty = use the preset for engine.role
+    presets = values["resourcesByRole"]
+    assert set(presets) == {"all", "server", "webui"}
+    for role, spec in presets.items():
+        assert spec["limits"]["memory"] and spec["requests"]["memory"], role
+    assert presets["server"]["limits"]["memory"] != presets["all"]["limits"]["memory"]
+    engine = values["engine"]
+    assert engine["uvicornWorkers"] == 1
+    assert engine["limitConcurrency"] == ""
+    assert engine["nodeHeapMb"] == 256
+    assert engine["maxUploadBytes"] == 0
+    assert engine["role"] in presets
+
+
+def test_deployment_template_wires_the_knobs_and_the_role_preset():
+    text = (CHART_DIR / "templates" / "deployment.yaml").read_text(encoding="utf-8")
+    for name in ("AV_UVICORN_WORKERS", "AV_UVICORN_LIMIT_CONCURRENCY", "AV_WEBUI_NODE_HEAP_MB", "AV_MAX_UPLOAD_BYTES"):
+        assert f"- name: {name}" in text, name
+    assert "index .Values.resourcesByRole .Values.engine.role" in text
+    assert "{{- if .Values.engine.limitConcurrency }}" in text  # unset stays unset, not ""

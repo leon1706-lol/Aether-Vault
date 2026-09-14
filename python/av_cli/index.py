@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from .fsutil import atomic_write_json_compact
+from .fsutil import atomic_write_chunks
 
 class Index:
     def __init__(self, repo_root: Path):
@@ -21,13 +21,25 @@ class Index:
         else:
             self.entries = {}
 
+    def iter_serialized(self):
+        """The on-disk index text as fragments: `{"entries":{...}}`, compact separators,
+        entries sorted by path (V1.5.0: byte-identical for a given working tree regardless
+        of staging order or AV_THREADS). Yielded entry by entry over a sorted view rather
+        than built through a second `dict(sorted(...))` copy plus one multi-MB string --
+        byte-for-byte the same bytes as
+        `json.dumps({"entries": dict(sorted(entries.items()))}, separators=(",", ":"))`."""
+        yield '{"entries":{'
+        first = True
+        for rel_path, entry in sorted(self.entries.items()):
+            yield f'{"" if first else ","}{json.dumps(rel_path)}:{json.dumps(entry, separators=(",", ":"))}'
+            first = False
+        yield "}}"
+
+    def serialize(self) -> str:
+        return "".join(self.iter_serialized())
+
     def save(self) -> None:
-        # V1.5.0: sorted by key -- makes the on-disk index byte-identical for a given
-        # working tree regardless of the order entries were added in (which, combined with
-        # `iter_working_files`'s now-sorted walk, is what makes "same repo -> byte-identical
-        # index, any machine, any AV_THREADS value" an actual guarantee rather than
-        # incidental). Not a format change: same JSON shape, just deterministic key order.
-        atomic_write_json_compact(self.index_path, {"entries": dict(sorted(self.entries.items()))})
+        atomic_write_chunks(self.index_path, self.iter_serialized())
 
     def add_entry(self, rel_path: str, hash: str, size: int, mtime_ns: int, file_type: str, pointer: str | None = None, auto_save: bool = True) -> None:
         existing = self.entries.get(rel_path)

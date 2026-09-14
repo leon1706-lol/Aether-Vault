@@ -883,3 +883,46 @@ def test_set_max_threads_caps_at_sixteen():
         assert aether_core.get_max_threads() == 16
     finally:
         aether_core.set_max_threads(0)
+
+
+# --- V1.6.3: hash_file_tree oracle (it had no test and no caller before its buffers were bounded) ---
+
+def _tree_oracle(data: bytes, chunk_size: int) -> str:
+    """The documented construction: sha256 over the concatenated hex digests of each
+    chunk_size-sized piece. Deliberately NOT the canonical whole-file hash."""
+    parts = "".join(hashlib.sha256(data[i:i + chunk_size]).hexdigest() for i in range(0, len(data), chunk_size))
+    return hashlib.sha256(parts.encode("ascii")).hexdigest()
+
+
+def test_hash_file_tree_matches_python_oracle_and_is_not_the_canonical_hash(tmp_path):
+    rng = __import__("random").Random(1234)
+    data = rng.randbytes(40 * 1024 * 1024 + 12345)  # 10+ chunks at 4 MiB: the parallel path
+    p = tmp_path / "tree.bin"
+    p.write_bytes(data)
+    chunk = 4 * 1024 * 1024
+    assert aether_core.hash_file_tree(str(p), chunk, 0) == _tree_oracle(data, chunk)
+    assert aether_core.hash_file_tree(str(p), chunk, 2) == _tree_oracle(data, chunk)
+    assert aether_core.hash_file_tree(str(p), chunk, 0) != aether_core.hash_file(str(p))
+
+
+def test_hash_file_tree_small_file_takes_the_sequential_path(tmp_path):
+    data = b"x" * 1000
+    p = tmp_path / "small.bin"
+    p.write_bytes(data)
+    # Below PARALLEL_MIN_CHUNKS * chunk_size the whole-file hash is returned by design.
+    assert aether_core.hash_file_tree(str(p), 4096, 0) == hashlib.sha256(data).hexdigest()
+
+
+def test_safetensors_split_header_parsed_from_the_read_buffer(tmp_path):
+    """C1: the legacy splitter parses the header in place (no std::string copy) -- the
+    layer table and `__header__` size must be unchanged for a header with unicode keys."""
+    header = {"wéight.α": {"dtype": "F16", "shape": [4], "data_offsets": [0, 8]},
+              "__metadata__": {"format": "pt"}}
+    hb = json.dumps(header, ensure_ascii=False).encode("utf-8")
+    payload = b"\x01" * 8
+    p = tmp_path / "u.safetensors"
+    p.write_bytes(struct.pack("<Q", len(hb)) + hb + payload)
+    layers = aether_core.split_and_hash_safetensors(str(p))
+    names = {l["name"]: l for l in layers}
+    assert "wéight.α" in names and names["wéight.α"]["size"] == 8
+    assert names["__header__"]["size"] == 8 + len(hb)

@@ -12,9 +12,14 @@ Usage:
                                                                    artifact) instead of running
                                                                    the probes locally
 
+    python scripts/append_perf_history.py --from-scoreboard PATH   # also fold peak-RSS rows
+                                                                   from a scripts/rss_scoreboard.py
+                                                                   JSON into the entry (V1.6.3)
+
 The captured JSON shape (also what `--save-speedcheck-json` below writes, and what the
 `test` CI job uploads as an artifact) is: {"date", "version", "os", "python", "probes":
-{label: median_ms}}.
+{label: median_ms}, "rss_mb": {scenario: peak_mb}}. Schema "perf-history-1.1" added the
+optional `rss_mb` map; 1.0 files are read unchanged and rewritten as 1.1.
 """
 import argparse
 import json
@@ -38,6 +43,12 @@ TRACKED_LABELS = [
     "Index.save()", "Index.load()", "load_config()", "iter_working_files()",
     "Storage stats", "semdiff.diff_trees()", "commit_staged()", "compute_status()", "log()",
 ]
+
+# Scoreboard rows (scripts/rss_scoreboard.py) tracked alongside the timings. Rendered as
+# extra columns only when at least one entry in the history carries them.
+TRACKED_RSS_LABELS = ["status_cold", "add_safetensors", "daemon_idle_trimmed"]
+SCHEMA = "perf-history-1.1"
+READABLE_SCHEMAS = {"perf-history-1.0", SCHEMA}
 
 
 def _project_version() -> str:
@@ -84,8 +95,28 @@ def capture_speedcheck_entry() -> dict:
 
 def load_history() -> dict:
     if PERF_HISTORY_PATH.exists():
-        return json.loads(PERF_HISTORY_PATH.read_text(encoding="utf-8"))
-    return {"schema": "perf-history-1.0", "entries": []}
+        history = json.loads(PERF_HISTORY_PATH.read_text(encoding="utf-8"))
+        if history.get("schema") not in READABLE_SCHEMAS:
+            raise SystemExit(f"unknown perf-history schema {history.get('schema')!r}")
+        history["schema"] = SCHEMA
+        return history
+    return {"schema": SCHEMA, "entries": []}
+
+
+def rss_from_scoreboard(path: Path) -> dict[str, float]:
+    """{scenario: peak_rss_mb} for the tracked rows of an rss-scoreboard-1.0 JSON."""
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if doc.get("schema") != "rss-scoreboard-1.0":
+        raise SystemExit(f"{path}: expected schema rss-scoreboard-1.0, got {doc.get('schema')!r}")
+    out: dict[str, float] = {}
+    for name, row in doc.get("scenarios", {}).items():
+        if name in TRACKED_RSS_LABELS and row.get("peak_rss_mb") is not None:
+            out[name] = row["peak_rss_mb"]
+    return out
+
+
+def _has_rss(entries: list[dict]) -> bool:
+    return any(e.get("rss_mb") for e in entries)
 
 
 def _probe_value(probes: dict, tracked_label: str) -> float | None:
@@ -105,8 +136,10 @@ def render_trend_table(history: dict) -> str:
 
     # Most recent N captures, oldest-first for a left-to-right reading of the trend.
     recent = entries[-10:]
-    header = "| Date | Version | " + " | ".join(TRACKED_LABELS) + " |"
-    sep = "|---|---|" + "---:|" * len(TRACKED_LABELS)
+    with_rss = _has_rss(recent)
+    rss_headers = [f"RSS {l}" for l in TRACKED_RSS_LABELS] if with_rss else []
+    header = "| Date | Version | " + " | ".join(TRACKED_LABELS + rss_headers) + " |"
+    sep = "|---|---|" + "---:|" * (len(TRACKED_LABELS) + len(rss_headers))
     rows = [header, sep]
     for e in recent:
         probes = e.get("probes", {})
@@ -114,6 +147,11 @@ def render_trend_table(history: dict) -> str:
         for l in TRACKED_LABELS:
             value = _probe_value(probes, l)
             cells.append(f"{value:.1f} ms" if value is not None else "—")
+        if with_rss:
+            rss = e.get("rss_mb") or {}
+            for l in TRACKED_RSS_LABELS:
+                value = rss.get(l)
+                cells.append(f"{value:.0f} MB" if value is not None else "—")
         rows.append(f"| {e.get('date', '?')} | {e.get('version', '?')} | " + " | ".join(cells) + " |")
     table = "\n".join(rows)
     note = (
@@ -147,9 +185,13 @@ def main() -> int:
     parser.add_argument("--save-speedcheck-json", type=Path, default=None,
                         help="Also save the freshly captured entry as its own JSON file "
                              "(the shape the 'test' CI job uploads as an artifact).")
+    parser.add_argument("--from-scoreboard", type=Path, default=None,
+                        help="Fold the tracked peak-RSS rows of a scripts/rss_scoreboard.py JSON into the entry.")
     args = parser.parse_args()
 
     entry = json.loads(args.from_json.read_text(encoding="utf-8")) if args.from_json else capture_speedcheck_entry()
+    if args.from_scoreboard:
+        entry["rss_mb"] = {**entry.get("rss_mb", {}), **rss_from_scoreboard(args.from_scoreboard)}
 
     # Honored even under --dry-run: writes a standalone capture file, not the tracked
     # files --dry-run protects. This is what CI uses to produce its uploaded artifact.
@@ -163,6 +205,8 @@ def main() -> int:
 
     print(f"Captured: {entry['date']} version={entry['version']} os={entry['os']} python={entry['python']}")
     print(f"Probes: {json.dumps(entry['probes'], indent=2)}")
+    if entry.get("rss_mb"):
+        print(f"Peak RSS: {json.dumps(entry['rss_mb'], indent=2)}")
 
     if args.dry_run:
         print(f"\n[DRY RUN] Would append to {PERF_HISTORY_PATH} and update {BENCHMARKS_PATH}.")

@@ -120,9 +120,14 @@ export async function fetchHealth(): Promise<HealthResponse> {
   return fetchJSON<HealthResponse>("/api/health");
 }
 
-export async function fetchRefs(projectId?: string | null): Promise<Ref> {
-  const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
-  return fetchJSON<Ref>(`/api/refs${qs}`);
+// `limit` (V1.6.3): the dashboard polls this endpoint, and the server pages it since
+// V1.6.3 (default 1000, max 5000) -- 200 is plenty for the branches panel and keeps the
+// steady-state poll small. Callers that need every ref page with `offset`.
+export async function fetchRefs(projectId?: string | null, limit = 200): Promise<Ref> {
+  const params = new URLSearchParams();
+  if (projectId) params.set("project_id", projectId);
+  params.set("limit", String(limit));
+  return fetchJSON<Ref>(`/api/refs?${params.toString()}`);
 }
 
 export async function fetchProjects(): Promise<Project[]> {

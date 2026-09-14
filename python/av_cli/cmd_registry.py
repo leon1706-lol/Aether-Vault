@@ -63,6 +63,14 @@ def _load_state(out_path, kind: str) -> dict:
         return {"completed_objects": [], "completed_commits": [], "completed_refs": []}
 
 
+def _sha256_streamed(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _save_state(out_path, kind: str, state: dict) -> None:
     atomic_write_json(_state_path(out_path, kind), state)
 
@@ -140,7 +148,17 @@ def export(out_dir: str, project_id: str | None, resume: bool) -> None:
             break
         offset += limit
 
-    refs = _get_json("/api/refs" + (f"?project_id={project_id}" if project_id else ""))
+    # /api/refs pages since V1.6.3 (max 5000 per call): an export must be complete, so
+    # walk offsets until a short page. Older servers return everything on the first call.
+    refs: dict = {}
+    ref_offset = 0
+    while True:
+        q = f"/api/refs?limit=5000&offset={ref_offset}" + (f"&project_id={project_id}" if project_id else "")
+        page = _get_json(q) or {}
+        refs.update(page)
+        if len(page) < 5000:
+            break
+        ref_offset += 5000
     manifest["refs"] = refs
 
     try:
@@ -169,19 +187,16 @@ def export(out_dir: str, project_id: str | None, resume: bool) -> None:
                 this_ok = True
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    resp = client.session.get(f"{client.server_url}/api/objects/{h}", timeout=120)
-                    resp.raise_for_status()
-                    data = resp.content
-                    if hashlib.sha256(data).hexdigest() != h:
-                        raise ValueError("hash mismatch during download")
-                    dest.write_bytes(data)
+                # Streamed (8 MiB chunks, hash verified as it lands, temp-file + rename)
+                # through the same code path `av fetch`/`clone` use -- an unsplit multi-GB
+                # blob never sits in RAM whole (V1.6.3; this used to be `resp.content`).
+                if client.download_object(h, dest):
                     ok += 1
                     this_ok = True
-                except Exception as exc:
+                else:
                     failed += 1
                     if not json_mode:
-                        click.secho(f"  object {h[:12]}… failed: {exc}", fg="yellow")
+                        click.secho(f"  object {h[:12]}… failed", fg="yellow")
             manifest["objects"].append({"hash": h, "ok": this_ok})
             if this_ok:
                 done_objects.add(h)
@@ -250,14 +265,16 @@ def restore(archive_dir: str, resume: bool) -> None:
                 if not json_mode:
                     click.secho(f"  missing shard {h[:12]}… skipped", fg="yellow")
                 continue
-            data = fpath.read_bytes()
-            if hashlib.sha256(data).hexdigest() != h:
+            # Verified and uploaded as a stream (V1.6.3): the shard is hashed in 8 MiB
+            # reads and handed to `requests` as an open file, never loaded whole.
+            if _sha256_streamed(fpath) != h:
                 failed += 1
                 if not json_mode:
                     click.secho(f"  CORRUPT archive shard {h[:12]}… skipped", fg="red")
                 continue
-            resp = client.session.post(f"{client.server_url}/api/objects/{h}", data=data,
-                                       timeout=120)
+            with open(fpath, "rb") as shard:
+                resp = client.session.post(f"{client.server_url}/api/objects/{h}", data=shard,
+                                           timeout=120)
             if resp.status_code in (201, 409):
                 ok += 1
                 if resp.status_code == 409:

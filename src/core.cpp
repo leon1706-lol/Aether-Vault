@@ -5,6 +5,7 @@
 #include <iostream>
 #include <algorithm>
 #include <array>
+#include <deque>
 #include "sha256.h"
 #include "thread_pool.h"
 #include "json.hpp"
@@ -144,44 +145,58 @@ std::string hash_file_parallel(const std::string& path, size_t chunk_size = 8 * 
     ThreadPool& pool = shared_pool(num_threads > 0 ? static_cast<size_t>(num_threads) : 0);
 
     size_t num_chunks = (file_size + chunk_size - 1) / chunk_size;
-    std::vector<std::future<std::string>> futures;
     auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
-    
-    for (size_t i = 0; i < num_chunks; ++i) {
-        futures.push_back(pool.enqueue([path, i, chunk_size, file_size, cancel_flag]() {
-            if (cancel_flag->load()) return std::string("");
-            std::ifstream file(to_path(path), std::ios::binary);
-            if (!file) {
-                cancel_flag->store(true);
-                throw std::runtime_error("Cannot open file: " + path);
-            }
-            
-            size_t offset = i * chunk_size;
-            size_t to_read = std::min(chunk_size, static_cast<size_t>(file_size - offset));
-            
-            file.seekg(offset);
-            std::vector<char> buffer(to_read);
-            if (!file.read(buffer.data(), to_read) || file.gcount() != to_read) {
-                cancel_flag->store(true);
-                throw std::runtime_error("Failed to read chunk at offset " + std::to_string(offset));
-            }
-            
-            SHA256 sha;
-            sha.update(reinterpret_cast<const uint8_t*>(buffer.data()), to_read);
-            return sha.hexdigest();
-        }));
-    }
-    
-    std::string concatenated_hashes = "";
-    for (auto& fut : futures) {
-        try {
-            concatenated_hashes += fut.get();
-        } catch (...) {
+
+    auto hash_chunk = [path, chunk_size, file_size, cancel_flag](size_t i) {
+        if (cancel_flag->load()) return std::string("");
+        std::ifstream file(to_path(path), std::ios::binary);
+        if (!file) {
             cancel_flag->store(true);
-            throw;
+            throw std::runtime_error("Cannot open file: " + path);
         }
+
+        size_t offset = i * chunk_size;
+        size_t to_read = std::min(chunk_size, static_cast<size_t>(file_size - offset));
+
+        file.seekg(offset);
+        std::vector<char> buffer(to_read);
+        if (!file.read(buffer.data(), to_read) || file.gcount() != to_read) {
+            cancel_flag->store(true);
+            throw std::runtime_error("Failed to read chunk at offset " + std::to_string(offset));
+        }
+
+        SHA256 sha;
+        sha.update(reinterpret_cast<const uint8_t*>(buffer.data()), to_read);
+        return sha.hexdigest();
+    };
+
+    // Bounded in-flight window (V1.6.3): every queued task used to be enqueued up front,
+    // so a 16-thread pool over an 8 MiB chunk size could hold 16 x 8 MiB of read buffers
+    // (plus every task's future) at once. At most `window` chunk tasks are outstanding;
+    // results are consumed oldest-first so the concatenation order -- and therefore the
+    // hash -- is unchanged.
+    const size_t window = std::min<size_t>(std::max<size_t>(pool.size(), 1), 4);
+    std::deque<std::future<std::string>> in_flight;
+    std::string concatenated_hashes;
+    concatenated_hashes.reserve(num_chunks * 64);
+    size_t next_chunk = 0;
+    try {
+        while (next_chunk < num_chunks || !in_flight.empty()) {
+            while (next_chunk < num_chunks && in_flight.size() < window) {
+                in_flight.push_back(pool.enqueue(hash_chunk, next_chunk));
+                ++next_chunk;
+            }
+            concatenated_hashes += in_flight.front().get();
+            in_flight.pop_front();
+        }
+    } catch (...) {
+        cancel_flag->store(true);
+        for (auto& fut : in_flight) {
+            try { fut.wait(); } catch (...) {}
+        }
+        throw;
     }
-    
+
     SHA256 final_sha;
     final_sha.update(concatenated_hashes);
     return final_sha.hexdigest();
@@ -303,8 +318,9 @@ std::vector<LayerResult> split_and_hash_safetensors_core(const std::string& path
     if (static_cast<uint64_t>(file.gcount()) != header_size)
         throw std::runtime_error("Failed to read JSON header");
 
-    std::string header_str(header_buf.begin(), header_buf.end());
-    json header = json::parse(header_str);
+    // Parsed straight from the read buffer -- no intermediate std::string copy (V1.6.3).
+    json header = json::parse(header_buf.begin(), header_buf.end());
+    std::vector<char>().swap(header_buf);
 
     uint64_t base_offset = 8 + header_size;
     
@@ -856,15 +872,21 @@ std::vector<StagedPart> stage_safetensors_core_parts_only(const std::string& pat
     if (header_size > total_size - 8)
         throw std::runtime_error("Invalid safetensors header size (exceeds file): " + path);
 
-    std::vector<char> header_buf(header_size);
-    file.read(header_buf.data(), header_size);
+    // The header is held ONCE (V1.6.3): the raw `8-byte length + JSON` bytes go straight
+    // into `header_raw` (the exact bytes the __header__ pseudo-layer hashes/publishes),
+    // the JSON is parsed in place from that buffer, and the parsed document is dropped as
+    // soon as the layer table is built. Previously the header existed three times at
+    // once (char buffer, std::string copy, raw copy) plus the DOM -- a 100 MB header
+    // (large multi-shard indexes) cost 400 MB before the first tensor byte was read.
+    uint64_t base_offset = 8 + header_size;
+    std::vector<uint8_t> header_raw(static_cast<size_t>(base_offset));
+    {
+        const uint8_t* len_bytes = reinterpret_cast<const uint8_t*>(&header_size);
+        std::copy(len_bytes, len_bytes + 8, header_raw.begin());
+    }
+    file.read(reinterpret_cast<char*>(header_raw.data() + 8), header_size);
     if (static_cast<uint64_t>(file.gcount()) != header_size)
         throw std::runtime_error("Failed to read JSON header");
-
-    std::string header_str(header_buf.begin(), header_buf.end());
-    json header = json::parse(header_str);
-
-    uint64_t base_offset = 8 + header_size;
 
     struct LayerSpec {
         std::string name;
@@ -874,22 +896,25 @@ std::vector<StagedPart> stage_safetensors_core_parts_only(const std::string& pat
     std::vector<LayerSpec> layers;
     layers.push_back({"__header__", 0, base_offset});
 
-    for (auto& el : header.items()) {
-        if (el.key() == "__metadata__") continue;
-        auto& val = el.value();
-        if (val.contains("data_offsets")) {
-            auto offsets = val["data_offsets"];
-            if (offsets.size() == 2) {
-                uint64_t start = offsets[0].get<uint64_t>();
-                uint64_t end = offsets[1].get<uint64_t>();
-                if (end < start)
-                    throw std::runtime_error("Invalid data_offsets (end < start) for layer '" + el.key() + "' in " + path);
-                if (base_offset + end > total_size)
-                    throw std::runtime_error("Layer '" + el.key() + "' data_offsets exceed file size in " + path);
-                layers.push_back({el.key(), base_offset + start, end - start});
+    {
+        json header = json::parse(header_raw.begin() + 8, header_raw.end());
+        for (auto& el : header.items()) {
+            if (el.key() == "__metadata__") continue;
+            auto& val = el.value();
+            if (val.contains("data_offsets")) {
+                auto offsets = val["data_offsets"];
+                if (offsets.size() == 2) {
+                    uint64_t start = offsets[0].get<uint64_t>();
+                    uint64_t end = offsets[1].get<uint64_t>();
+                    if (end < start)
+                        throw std::runtime_error("Invalid data_offsets (end < start) for layer '" + el.key() + "' in " + path);
+                    if (base_offset + end > total_size)
+                        throw std::runtime_error("Layer '" + el.key() + "' data_offsets exceed file size in " + path);
+                    layers.push_back({el.key(), base_offset + start, end - start});
+                }
             }
         }
-    }
+    }  // parsed header DOM freed here; only the raw bytes stay until published below
 
     std::sort(layers.begin(), layers.end(), [](const LayerSpec& a, const LayerSpec& b) {
         return a.abs_start < b.abs_start;
@@ -921,13 +946,6 @@ std::vector<StagedPart> stage_safetensors_core_parts_only(const std::string& pat
     // the only layer with abs_start == 0, since every real tensor's abs_start is
     // base_offset-or-later) with cursor initialized to base_offset, not 0.
     {
-        std::vector<uint8_t> header_raw;
-        header_raw.reserve(static_cast<size_t>(base_offset));
-        const uint8_t* len_bytes = reinterpret_cast<const uint8_t*>(&header_size);
-        header_raw.insert(header_raw.end(), len_bytes, len_bytes + 8);
-        header_raw.insert(header_raw.end(),
-                           reinterpret_cast<const uint8_t*>(header_buf.data()),
-                           reinterpret_cast<const uint8_t*>(header_buf.data()) + header_buf.size());
         whole_sha.update(header_raw.data(), header_raw.size());
         SHA256 header_sha;
         header_sha.update(header_raw.data(), header_raw.size());
@@ -941,6 +959,7 @@ std::vector<StagedPart> stage_safetensors_core_parts_only(const std::string& pat
         header_part.offset = 0;
         header_part.written = header_written;
         parts.push_back(std::move(header_part));
+        std::vector<uint8_t>().swap(header_raw);  // published: release before the layer walk
     }
 
     const size_t READ_BUF = 1 * 1024 * 1024;

@@ -46,12 +46,24 @@ def record_request(method: str, path_template: str, status_code: int,
 
 
 def render_prometheus_text(webhook_queue_depth: int | None = None,
-                          db_pool_stats: dict | None = None) -> str:
+                          db_pool_stats: dict | None = None,
+                          process_rss_bytes: int | None = None,
+                          process_peak_rss_bytes: int | None = None) -> str:
     lines: list[str] = []
 
     lines.append("# HELP av_uptime_seconds Seconds since this process started.")
     lines.append("# TYPE av_uptime_seconds gauge")
     lines.append(f"av_uptime_seconds {time.time() - _START_TIME:.3f}")
+
+    # V1.6.3: the one number the footprint phase is about, scrapeable per worker.
+    if process_rss_bytes is not None:
+        lines.append("# HELP av_process_rss_bytes Resident set size of this server process.")
+        lines.append("# TYPE av_process_rss_bytes gauge")
+        lines.append(f"av_process_rss_bytes {process_rss_bytes}")
+    if process_peak_rss_bytes is not None:
+        lines.append("# HELP av_process_peak_rss_bytes Peak resident set size of this server process since start.")
+        lines.append("# TYPE av_process_peak_rss_bytes gauge")
+        lines.append(f"av_process_peak_rss_bytes {process_peak_rss_bytes}")
 
     lines.append("# HELP av_http_requests_total Total HTTP requests by method, path template, and status class.")
     lines.append("# TYPE av_http_requests_total counter")

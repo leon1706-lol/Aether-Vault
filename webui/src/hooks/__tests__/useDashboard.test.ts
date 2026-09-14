@@ -101,4 +101,41 @@ describe("useDashboard", () => {
     });
     expect(mocked.fetchDashboardData).toHaveBeenCalledTimes(1); // no further calls
   });
+
+  // V1.6.3: polling pauses while hidden and backs off while the registry is failing.
+  it("backs off after consecutive errors and resets on success", async () => {
+    mocked.fetchDashboardData.mockResolvedValue(dashboardData({ error: "refs: boom" }));
+    const { result } = renderHook(() => useDashboard(1_000, null, { maxBackoffMs: 4_000 }));
+    await waitFor(() => expect(mocked.fetchDashboardData).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(result.current.nextDelayMs).toBe(2_000));
+
+    await act(async () => { vi.advanceTimersByTime(2_000); });
+    await waitFor(() => expect(mocked.fetchDashboardData).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.nextDelayMs).toBe(4_000));
+
+    mocked.fetchDashboardData.mockResolvedValue(dashboardData());
+    await act(async () => { vi.advanceTimersByTime(4_000); });
+    await waitFor(() => expect(mocked.fetchDashboardData).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(result.current.nextDelayMs).toBe(1_000));
+  });
+
+  it("does not poll while the document is hidden and refreshes on visibilitychange", async () => {
+    mocked.fetchDashboardData.mockResolvedValue(dashboardData());
+    const { result } = renderHook(() => useDashboard(1_000, null));
+    await waitFor(() => expect(mocked.fetchDashboardData).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await waitFor(() => expect(result.current.paused).toBe(true));
+    await act(async () => { vi.advanceTimersByTime(5_000); });
+    expect(mocked.fetchDashboardData).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await waitFor(() => expect(mocked.fetchDashboardData).toHaveBeenCalledTimes(2));
+  });
 });

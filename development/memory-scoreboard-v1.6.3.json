@@ -1,0 +1,153 @@
+{
+  "schema": "rss-scoreboard-1.0",
+  "captured": "2026-09-13T21:30:40+00:00",
+  "label": "v1.6.3-after",
+  "git_sha": "af3f0a6",
+  "machine": {
+    "os": "Windows 10",
+    "python": "3.14.7",
+    "total_ram_mb": 3990.2
+  },
+  "scenarios": {
+    "status_cold": {
+      "peak_rss_mb": 31.0,
+      "avg_peak_rss_mb": 30.9,
+      "elapsed_ms": 3685.3,
+      "runs": 3,
+      "source": "win32-peak-ws"
+    },
+    "add_small_files": {
+      "peak_rss_mb": 35.9,
+      "avg_peak_rss_mb": 35.7,
+      "elapsed_ms": 12929.5,
+      "runs": 3,
+      "source": "win32-peak-ws"
+    },
+    "add_safetensors": {
+      "peak_rss_mb": 63.5,
+      "avg_peak_rss_mb": 63.4,
+      "elapsed_ms": 24028.6,
+      "runs": 3,
+      "source": "win32-peak-ws"
+    },
+    "add_many_safetensors": {
+      "peak_rss_mb": 160.7,
+      "avg_peak_rss_mb": 160.3,
+      "elapsed_ms": 22936.1,
+      "runs": 2,
+      "source": "win32-peak-ws"
+    },
+    "commit": {
+      "peak_rss_mb": 45.0,
+      "avg_peak_rss_mb": 43.1,
+      "elapsed_ms": 15427.1,
+      "runs": 3,
+      "source": "win32-peak-ws"
+    },
+    "log_all": {
+      "peak_rss_mb": 29.9,
+      "avg_peak_rss_mb": 29.6,
+      "elapsed_ms": 3262.5,
+      "runs": 2,
+      "source": "win32-peak-ws"
+    },
+    "status_daemon_client": {
+      "peak_rss_mb": 21.9,
+      "avg_peak_rss_mb": 7.5,
+      "elapsed_ms": 356.9,
+      "runs": 5,
+      "source": "win32-peak-ws"
+    },
+    "status_daemon": {
+      "peak_rss_mb": 31.6,
+      "avg_peak_rss_mb": 31.6,
+      "elapsed_ms": null,
+      "runs": 5,
+      "source": "win32-peak-ws"
+    },
+    "daemon_after_add": {
+      "peak_rss_mb": 31.4,
+      "avg_peak_rss_mb": 31.4,
+      "elapsed_ms": 27850.8,
+      "runs": 1,
+      "source": "win32-peak-ws"
+    },
+    "daemon_idle_trimmed": {
+      "peak_rss_mb": 25.2,
+      "avg_peak_rss_mb": 25.2,
+      "elapsed_ms": null,
+      "runs": 1,
+      "source": "daemon-status"
+    },
+    "engine_idle": {
+      "peak_rss_mb": 207.9,
+      "avg_peak_rss_mb": 207.9,
+      "elapsed_ms": null,
+      "runs": 0,
+      "source": "docker-stats"
+    },
+    "server_idle": {
+      "peak_rss_mb": 114.5,
+      "avg_peak_rss_mb": 114.5,
+      "elapsed_ms": null,
+      "runs": 0,
+      "source": "docker-ps"
+    },
+    "webui_idle": {
+      "peak_rss_mb": 79.4,
+      "avg_peak_rss_mb": 79.4,
+      "elapsed_ms": null,
+      "runs": 0,
+      "source": "docker-ps"
+    },
+    "postgres_idle": {
+      "peak_rss_mb": 38.4,
+      "avg_peak_rss_mb": 38.4,
+      "elapsed_ms": null,
+      "runs": 0,
+      "source": "docker-stats"
+    },
+    "redis_idle": {
+      "peak_rss_mb": 19.4,
+      "avg_peak_rss_mb": 19.4,
+      "elapsed_ms": null,
+      "runs": 0,
+      "source": "docker-stats"
+    },
+    "pytest_test_server": {
+      "peak_rss_mb": 276.6,
+      "avg_peak_rss_mb": 276.6,
+      "elapsed_ms": 487344.1,
+      "runs": 1,
+      "source": "win32-peak-ws",
+      "returncode": 0,
+      "summary": "27 passed, 172 deselected, 126 warnings in 475.13s (0:07:55)"
+    },
+    "add_many_safetensors_workers2": {
+      "peak_rss_mb": 97.0,
+      "avg_peak_rss_mb": 95.7,
+      "elapsed_ms": 38081.1,
+      "runs": 2,
+      "source": "win32-peak-ws"
+    },
+    "add_many_safetensors_workers2_buf8": {
+      "peak_rss_mb": 33.3,
+      "avg_peak_rss_mb": 32.8,
+      "elapsed_ms": 35620.9,
+      "runs": 2,
+      "source": "win32-peak-ws"
+    }
+  },
+  "fixtures": {
+    "status_cold/add_small_files/commit": "2000 small files, 3 runs",
+    "add_safetensors": "one 256 MiB synthetic safetensors (8 x 32 MiB layers), 3 runs",
+    "add_many_safetensors": "8 x 64 MiB synthetic safetensors in one add, 2 runs (box has 4 logical cores -> 4 workers)",
+    "log_all": "60 commits, 100 files, 2 runs",
+    "daemon_*": "500 files, AV_DAEMON_TRIM_SECS=3, foreground daemon measured as a process tree",
+    "docker": "compose defaults, role=all, idle, docker stats / in-container ps",
+    "pytest_test_server": "tests/test_server.py -k \"push_commit or list_commits or get_ref or audit\" (25 tests), live db+redis",
+    "add_many_safetensors_workers2": "same fixture, AV_STAGE_WORKERS_MAX=2",
+    "add_many_safetensors_workers2_buf8": "same fixture, AV_STAGE_WORKERS_MAX=2 AV_STAGE_BUFFER_MB=8"
+  },
+  "notes": "Captured after every V1.6.3 code change (A-H). Docker rows captured on the REBUILT image with the new compose (memory limits, Postgres/Redis tuning, node heap cap, fork-free healthcheck) after `docker compose build && up -d`. pytest row: pool 2/3 barely moves the process peak; local runnability comes from scripts/run_tests_lowmem.py chunking (~170 MB per 40-test chunk)."
+}

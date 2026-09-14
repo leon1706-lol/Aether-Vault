@@ -25,6 +25,7 @@ from benchmarks.tool_runner import (  # noqa: E402
     Row,
     ToolStatus,
     detect_tools,
+    pop_rss_median,
     time_subprocess,
 )
 
@@ -70,7 +71,7 @@ def _bench_av() -> tuple[float | None, str | None]:
         clone_dest = root / "clone-workspace"
         clone_dest.mkdir()
         return time_subprocess(
-            [av_path, "clone", project_name], clone_dest
+            [av_path, "clone", project_name], clone_dest, rss_key="cold_clone:clone"
         ), None
 
 
@@ -167,7 +168,8 @@ def run(tool_order: list[str] | None = None) -> BenchmarkResult:
     statuses["mlflow"] = ToolStatus.NOT_APPLICABLE
     notes["mlflow"] = "no project-level clone/pull concept"
 
-    row = Row(operation="clone + pull (fresh checkout)", values=values, statuses=statuses, unit="ms", notes=notes)
+    row = Row(operation="clone + pull (fresh checkout)", values=values, statuses=statuses, unit="ms", notes=notes,
+              rss_mb={"av": pop_rss_median("cold_clone:clone")})
 
     return BenchmarkResult(
         name="cold_clone",

@@ -125,6 +125,17 @@ push_object_and_commit() {
 export -f push_object_and_commit
 export API PY
 
+# A real-sized object through the LB (V1.6.3, Probleme.md): nginx's default 1m
+# client_max_body_size silently returned 413 for every artifact bigger than a toy
+# string, so the tiny bodies above never exercised what a model shard actually hits.
+BIG_OBJ="$WORK/big-object.bin"
+head -c 5242880 /dev/urandom > "$BIG_OBJ"
+big_hash="$($PY -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$BIG_OBJ")"
+big_code="$(curl -s --connect-timeout 5 --max-time 60 -o /dev/null -w '%{http_code}' -X POST "$API/api/objects/$big_hash" \
+  -H "Content-Type: application/octet-stream" --data-binary "@$BIG_OBJ")"
+[[ "$big_code" == "201" || "$big_code" == "409" ]] || die "5 MiB object upload through the LB got HTTP $big_code (client_max_body_size regression?)"
+pass "5 MiB object upload streams through the LB (HTTP $big_code)"
+
 # The concurrent pass's own exit status is checked explicitly (not a bare `wait`, which
 # would block on any other long-lived background job and silently discard a signal-killed
 # push): output goes to a log file, checked empty, and each launched PID is waited on by name.

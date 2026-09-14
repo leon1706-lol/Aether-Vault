@@ -50,16 +50,11 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
     pid = proj["project_id"]
     refs = client.list_refs(project_id=pid)
     branch = sync.pick_default_branch(refs, pid)
-    commits = sync.fetch_project_commits(client, pid)
-    if not commits:
-        fail(ctx, "validation", f"Project '{proj.get('project_name')}' has no commits yet.")
-    if branch is None:
-        # No refs pushed (e.g. only queued/offline commits): fall back to the newest commit.
-        branch = "main"
-        tip_hash = commits[0]["hash"]
-    else:
-        tip_hash = refs[f"{pid}/{branch}"]
+    # No refs pushed (e.g. only queued/offline commits): fall back to the newest commit,
+    # which is the first row the (newest-first) listing yields.
+    tip_hash = refs[f"{pid}/{branch}"] if branch is not None else None
 
+    created_target = not target.exists()
     target.mkdir(parents=True, exist_ok=True)
     _init_repo_structure(target)
     cfg = load_config(target)
@@ -73,11 +68,31 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
         cfg["remote_api_token"] = api_token
     save_config(target, cfg)
 
-    # durable=False (WS4.8): a clone that's interrupted mid-write is simply redone -- the
-    # fsync `write_fetched_commit` normally does (~16 ms/file here, ~8 s for 500 commits)
-    # buys nothing a fresh clone attempt wouldn't already recover.
-    for c in commits:
+    # Commits are written as each page arrives (V1.6.3) -- only the tip's tree is kept in
+    # memory, never the whole history. durable=False (WS4.8): a clone that's interrupted
+    # mid-write is simply redone -- the fsync `write_fetched_commit` normally does
+    # (~16 ms/file here, ~8 s for 500 commits) buys nothing a fresh clone attempt wouldn't
+    # already recover.
+    count = 0
+    tip_tree: dict | None = None
+    for c in sync.iter_project_commits(client, pid):
+        if count == 0 and tip_hash is None:
+            tip_hash = c["hash"]
+        if c["hash"] == tip_hash:
+            tip_tree = c.get("tree", {})
         sync.write_fetched_commit(target, c, durable=False)
+        count += 1
+    if count == 0:
+        # Leave no half-initialized checkout behind: the "already exists and is not empty"
+        # guard above would otherwise block a retry once the project has commits.
+        import shutil
+
+        shutil.rmtree(target, ignore_errors=True) if created_target else shutil.rmtree(target / ".av", ignore_errors=True)
+        fail(ctx, "validation", f"Project '{proj.get('project_name')}' has no commits yet.")
+    if branch is None:
+        branch = "main"
+    if tip_tree is None:
+        tip_tree = {}
 
     heads_dir = target / ".av" / "refs" / "heads"
     atomic_write_text(heads_dir / branch, tip_hash)
@@ -86,7 +101,6 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
         if stale.name != branch and not stale.read_text().strip():
             stale.unlink()
 
-    tip_tree = next((c.get("tree", {}) for c in commits if c["hash"] == tip_hash), {})
     downloaded = sync.ensure_objects_local(target, client, tip_tree)
     _materialize_tree(target, client, tip_tree, Index(target))
 
@@ -94,10 +108,10 @@ def clone(project: str, directory: str | None, remote_url: str | None, token: st
         emit_json(ctx, "clone", data={
             "project_id": pid, "project_name": proj.get("project_name"),
             "directory": str(target), "branch": branch, "tip": tip_hash,
-            "commits": len(commits), "downloaded_objects": downloaded,
+            "commits": count, "downloaded_objects": downloaded,
         })
         return
-    msg = f"Cloned '{proj.get('project_name')}' ({len(commits)} commit(s)) into {target}"
+    msg = f"Cloned '{proj.get('project_name')}' ({count} commit(s)) into {target}"
     click.secho(msg, fg="green")
     detail = f"  branch {branch} @ [{tip_hash[:7]}]"
     if downloaded:

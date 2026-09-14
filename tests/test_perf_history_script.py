@@ -92,7 +92,61 @@ def test_update_benchmarks_md_replaces_only_the_marked_block_on_a_second_run(tmp
 def test_load_history_returns_an_empty_skeleton_when_the_file_is_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(aph, "PERF_HISTORY_PATH", tmp_path / "does-not-exist.json")
     history = aph.load_history()
-    assert history == {"schema": "perf-history-1.0", "entries": []}
+    assert history == {"schema": "perf-history-1.1", "entries": []}
+
+
+def test_load_history_upgrades_a_1_0_file_in_place(tmp_path, monkeypatch):
+    path = tmp_path / "perf-history.json"
+    path.write_text('{"schema": "perf-history-1.0", "entries": [{"version": "1.6.2", "probes": {}}]}',
+                    encoding="utf-8")
+    monkeypatch.setattr(aph, "PERF_HISTORY_PATH", path)
+    history = aph.load_history()
+    assert history["schema"] == "perf-history-1.1"
+    assert history["entries"][0]["version"] == "1.6.2"
+
+
+def test_load_history_rejects_an_unknown_schema(tmp_path, monkeypatch):
+    path = tmp_path / "perf-history.json"
+    path.write_text('{"schema": "perf-history-9.9", "entries": []}', encoding="utf-8")
+    monkeypatch.setattr(aph, "PERF_HISTORY_PATH", path)
+    with pytest.raises(SystemExit):
+        aph.load_history()
+
+
+def test_1_0_history_renders_without_rss_columns():
+    out = aph.render_trend_table({"schema": "perf-history-1.0", "entries": [_entry()]})
+    assert "RSS " not in out
+
+
+def test_1_1_entry_with_rss_renders_rss_columns():
+    entry = _entry(**{"Index.save() (500 entries)": 10.0})
+    entry["rss_mb"] = {"status_cold": 61.4, "add_safetensors": 120.0}
+    old = _entry(date="2026-08-01", version="1.6.2")
+    out = aph.render_trend_table({"schema": "perf-history-1.1", "entries": [old, entry]})
+    assert "RSS status_cold" in out and "RSS daemon_idle_trimmed" in out
+    assert "61 MB" in out and "120 MB" in out
+    # The older entry without RSS renders em dashes in the RSS columns, not KeyError.
+    old_row = [line for line in out.splitlines() if "2026-08-01" in line][0]
+    assert old_row.count("—") >= len(aph.TRACKED_RSS_LABELS)
+
+
+def test_rss_from_scoreboard_keeps_only_tracked_rows(tmp_path):
+    import json
+
+    doc = {
+        "schema": "rss-scoreboard-1.0",
+        "scenarios": {
+            "status_cold": {"peak_rss_mb": 60.0},
+            "commit": {"peak_rss_mb": 80.0},
+            "daemon_idle_trimmed": {"peak_rss_mb": None},
+        },
+    }
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    assert aph.rss_from_scoreboard(path) == {"status_cold": 60.0}
+    path.write_text(json.dumps({"schema": "other", "scenarios": {}}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        aph.rss_from_scoreboard(path)
 
 
 def test_project_version_prefers_the_live_generated_version_file(monkeypatch):

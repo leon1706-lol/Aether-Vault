@@ -31,6 +31,16 @@ spec:
               value: {{ .Values.engine.role | quote }}
             - name: AV_ENGINE_STOP_GRACE_SECS
               value: {{ .Values.engine.stopGraceSecs | quote }}
+            - name: AV_UVICORN_WORKERS
+              value: {{ .Values.engine.uvicornWorkers | quote }}
+            {{- if .Values.engine.limitConcurrency }}
+            - name: AV_UVICORN_LIMIT_CONCURRENCY
+              value: {{ .Values.engine.limitConcurrency | quote }}
+            {{- end }}
+            - name: AV_WEBUI_NODE_HEAP_MB
+              value: {{ .Values.engine.nodeHeapMb | quote }}
+            - name: AV_MAX_UPLOAD_BYTES
+              value: {{ .Values.engine.maxUploadBytes | quote }}
             - name: NEXT_PUBLIC_API_URL
               value: "http://localhost:{{ .Values.engine.port }}"
             - name: NODE_ENV
@@ -93,7 +103,11 @@ spec:
             periodSeconds: 5
             failureThreshold: 2
           resources:
+            {{- if .Values.resources }}
             {{- toYaml .Values.resources | nindent 12 }}
+            {{- else }}
+            {{- toYaml (index .Values.resourcesByRole .Values.engine.role) | nindent 12 }}
+            {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

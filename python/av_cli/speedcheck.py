@@ -60,6 +60,21 @@ _BUDGET_CLASS = {
 }
 
 
+# Peak-RSS budgets (MB, whole `av` process tree) for tests/test_memory_gate.py -- measured
+# V1.6.3 values x1.25, see development/MEMORY.md. Judged only when AV_MEMORY_GATE=1;
+# AV_MEMORY_BUDGET_MULTIPLIER (default 1.5) absorbs allocator/OS variance across CI runners.
+_MEMORY_BUDGETS_MB = {
+    "status_cold": 40.0,              # 300-file repo, AV_NO_DAEMON=1
+    "add_safetensors_64mib": 80.0,    # one 64 MiB file (2 x 32 MiB layers): single worker
+    "add_many_safetensors": 210.0,    # 4 x 32 MiB files in one add: workers x (32+2) + baseline
+    "commit": 70.0,                   # --no-upload over the same repo
+}
+
+
+def _memory_budget_for(label: str) -> float | None:
+    return _MEMORY_BUDGETS_MB.get(label)
+
+
 def _budget_for(label: str) -> float | None:
     for prefix, budget in _BUDGETS_MS.items():
         if label.startswith(prefix):

@@ -69,6 +69,13 @@ services:
       # sets this for its own run only, to prove the Redis backend enforces one global
       # limit across replicas rather than N independent ones.
       - AV_RATE_LIMIT_DEFAULT=${AV_RATE_LIMIT_DEFAULT:-}
+      # Footprint knobs (V1.6.3) -- see development/infrastructure.md for each.
+      - AV_UVICORN_WORKERS=${AV_UVICORN_WORKERS:-1}
+      - AV_UVICORN_LIMIT_CONCURRENCY=${AV_UVICORN_LIMIT_CONCURRENCY:-}
+      - AV_WEBUI_NODE_HEAP_MB=${AV_WEBUI_NODE_HEAP_MB:-256}
+      - AV_DB_POOL_SIZE=${AV_DB_POOL_SIZE:-10}
+      - AV_DB_MAX_OVERFLOW=${AV_DB_MAX_OVERFLOW:-20}
+      - AV_MAX_UPLOAD_BYTES=${AV_MAX_UPLOAD_BYTES:-0}
     depends_on:
       db-primary:
         condition: service_healthy
@@ -76,10 +83,16 @@ services:
         condition: service_healthy
     restart: unless-stopped
     stop_grace_period: 30s
+    deploy: &engine_deploy
+      resources:
+        limits:
+          memory: ${AV_ENGINE_MEM_LIMIT:-768M}
+    # Role-aware bash probe (docker/engine-healthcheck.sh, baked into the image): no
+    # python/node fork per tick.
     healthcheck: &engine_healthcheck
-      test: ['CMD-SHELL', 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/ready\").read()" && node -e "fetch(\"http://localhost:3000/\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
-      interval: 10s
-      timeout: 15s
+      test: ["CMD", "/engine-healthcheck.sh"]
+      interval: ${AV_HEALTHCHECK_INTERVAL:-30s}
+      timeout: 10s
       retries: 5
       start_period: 40s
 
@@ -94,9 +107,21 @@ services:
       POSTGRES_USER: av_user
       POSTGRES_PASSWORD: av_password
       POSTGRES_DB: aether_vault
+    # Memory tunables first (V1.6.3, same defaults as docker-compose.yml), then the
+    # replication flags this topology needs.
     command: >
-      postgres -c wal_level=replica -c max_wal_senders=10
-               -c max_replication_slots=10 -c hot_standby=on
+      postgres
+      -c shared_buffers=${AV_PG_SHARED_BUFFERS:-64MB}
+      -c work_mem=${AV_PG_WORK_MEM:-4MB}
+      -c maintenance_work_mem=${AV_PG_MAINT_WORK_MEM:-32MB}
+      -c effective_cache_size=${AV_PG_EFFECTIVE_CACHE:-256MB}
+      -c max_connections=${AV_PG_MAX_CONNECTIONS:-100}
+      -c wal_level=replica -c max_wal_senders=10
+      -c max_replication_slots=10 -c hot_standby=on
+    deploy:
+      resources:
+        limits:
+          memory: ${AV_DB_MEM_LIMIT:-256M}
     volumes:
       - ha_postgres_primary_data:/var/lib/postgresql/data
       - ./docker/ha/postgres-primary-init.sh:/docker-entrypoint-initdb.d/00-primary-init.sh:ro
@@ -111,6 +136,10 @@ services:
     image: postgres:15-alpine
     container_name: aether-vault-ha-db-replica
     entrypoint: ["/bin/bash", "/docker-ha/postgres-replica-entrypoint.sh"]
+    deploy:
+      resources:
+        limits:
+          memory: ${AV_DB_MEM_LIMIT:-256M}
     volumes:
       - ha_postgres_replica_data:/var/lib/postgresql/data
       - ./docker/ha/postgres-replica-entrypoint.sh:/docker-ha/postgres-replica-entrypoint.sh:ro
@@ -128,6 +157,14 @@ services:
   redis-primary:
     image: redis/redis-stack-server:latest
     container_name: aether-vault-ha-redis-primary
+    # volatile-lru: the Bloom filter key has no TTL and is never evicted; see
+    # docker-compose.yml's redis service for the full reasoning.
+    environment:
+      - REDIS_ARGS=--maxmemory ${AV_REDIS_MAXMEMORY:-128mb} --maxmemory-policy volatile-lru
+    deploy:
+      resources:
+        limits:
+          memory: ${AV_REDIS_MEM_LIMIT:-192M}
     volumes:
       - ha_redis_primary_data:/data
     healthcheck:
@@ -145,7 +182,11 @@ services:
     # entirely instead of passing arguments to it. REDIS_ARGS is the image's actual
     # supported extension point.
     environment:
-      - REDIS_ARGS=--replicaof redis-primary 6379
+      - REDIS_ARGS=--replicaof redis-primary 6379 --maxmemory ${AV_REDIS_MAXMEMORY:-128mb} --maxmemory-policy volatile-lru
+    deploy:
+      resources:
+        limits:
+          memory: ${AV_REDIS_MEM_LIMIT:-192M}
     volumes:
       - ha_redis_replica_data:/data
     depends_on:

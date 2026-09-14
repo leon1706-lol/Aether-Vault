@@ -221,18 +221,32 @@ class VaultClient:
             return None
 
     def list_refs(self, project_id: str | None = None) -> dict:
-        """{ref_name: commit_hash}, optionally scoped to one project's refs."""
+        """{ref_name: commit_hash}, optionally scoped to one project's refs. Complete:
+        the server pages this endpoint since V1.6.3 (default 1000, max 5000 per call),
+        so a registry with more refs than one page is walked with `offset` until a short
+        page comes back -- callers still get the whole mapping. An older server without
+        paging ignores the params and returns everything in the first call."""
         url = f"{self.server_url}/api/refs"
-        params = {"project_id": project_id} if project_id else None
+        page_size = 5000
+        merged: dict = {}
+        offset = 0
         try:
-            resp = self.session.get(url, params=params, timeout=self._timeout)
-            self._raise_for_auth(resp)
-            if resp.status_code == 200:
-                return resp.json()
-            return {}
+            while True:
+                params: dict = {"limit": page_size, "offset": offset}
+                if project_id:
+                    params["project_id"] = project_id
+                resp = self.session.get(url, params=params, timeout=self._timeout)
+                self._raise_for_auth(resp)
+                if resp.status_code != 200:
+                    return merged
+                page = resp.json() or {}
+                merged.update(page)
+                if len(page) < page_size:
+                    return merged
+                offset += page_size
         except requests.exceptions.RequestException as e:
             click.echo(f"Error listing refs: {e}", err=True)
-            return {}
+            return merged
 
     # V1.5.0: several real call sequences (a commit's own flush-then-check, and
     # materialize_file's per-shard reassembly loop) call server_available() several times

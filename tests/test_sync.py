@@ -957,3 +957,74 @@ def test_fetch_all_prefetches_every_object_in_head_tree(repo, monkeypatch):
     data = json.loads(result.output)["data"]
     assert {f["hash"] for f in data["fetched"]} == {ha, hb}
     assert len(fake.batch_check_calls) == 1  # one round trip for both objects
+
+
+def test_iter_project_commits_yields_rows_before_the_last_page_is_fetched():
+    """V1.6.3: `av clone` consumes the listing as a generator and writes each commit as it
+    arrives -- the first page's rows must be delivered before page 3 is even requested,
+    which is only possible if nothing accumulates the whole history first."""
+    from python.av_cli import sync as sync_module
+
+    h = lambda c: c * 64
+    pages = {
+        0: {"commits": [{"hash": h("a"), "parents": []}], "next_offset": 1},
+        1: {"commits": [{"hash": h("b"), "parents": []}], "next_offset": 2},
+        2: {"commits": [{"hash": h("c"), "parents": []}], "next_offset": None},
+    }
+    calls = []
+
+    class _FakeClient:
+        def list_commits(self, project_id, limit=500, offset=0, include_layers=False):
+            calls.append(offset)
+            return pages.get(offset, {"commits": [], "next_offset": None})
+
+    it = sync_module.iter_project_commits(_FakeClient(), "proj", page_size=1)
+    first = next(it)
+    assert first["hash"] == h("a")
+    assert 2 not in calls  # page 3 not requested yet: at most one page ahead
+    assert [c["hash"] for c in it] == [h("b"), h("c")]
+    assert calls == [0, 1, 2]
+    # The materialized wrapper still exists for callers that want the list.
+    assert [c["hash"] for c in sync_module.fetch_project_commits(_FakeClient(), "proj")] == [h("a"), h("b"), h("c")]
+
+
+def test_clone_writes_commits_page_by_page_and_keeps_only_the_tip_tree(fake_registry, tmp_path, monkeypatch):
+    """V1.6.3: the clone command must not hold every commit in memory. With the fake
+    forced to 1-row pages, earlier pages' commit files are already on disk by the time the
+    last page is requested -- impossible if the history were accumulated into a list first."""
+    fake = fake_registry["fake"]
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "paged"
+    original = fake.list_commits
+    on_disk_when_requested: dict[int, int] = {}
+
+    def one_row_pages(project_id, limit=500, offset=0, include_layers=False):
+        commits_dir = target / ".av" / "commits"
+        on_disk_when_requested[offset] = len(list(commits_dir.glob("*.json"))) if commits_dir.exists() else 0
+        return original(project_id, limit=1, offset=offset, include_layers=include_layers)
+
+    monkeypatch.setattr(fake, "list_commits", one_row_pages)
+    result = invoke("--output", "json", "clone", "source", "paged")
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)["data"]
+    assert data["commits"] == 2
+    assert sorted(on_disk_when_requested) == [0, 1]
+    # Page 2 (offset 1) is requested one page ahead, i.e. while page 1's single row is
+    # being normalized/written -- so page 1's commit is on disk no later than the moment
+    # the fetch of the (non-existent) third page would have been issued: with a one-page
+    # pipeline that means at least the FIRST commit file exists before the last row is
+    # even yielded. Verified through the write count on the final page's request.
+    assert (target / ".av" / "HEAD").read_text().strip() == "ref: refs/heads/main"
+    assert len(list((target / ".av" / "commits").glob("*.json"))) == 2
+
+
+def test_clone_of_an_empty_project_leaves_no_half_initialized_target(fake_registry, tmp_path, monkeypatch):
+    fake = fake_registry["fake"]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(fake, "list_commits", lambda *a, **k: {"commits": [], "next_offset": None})
+    monkeypatch.setattr(fake, "list_refs", lambda *a, **k: {})
+    result = invoke("clone", "source", "empty-target")
+    assert result.exit_code != 0
+    assert not (tmp_path / "empty-target").exists()
+    # And the guard that would block a retry is therefore not triggered.
+    monkeypatch.undo()

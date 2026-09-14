@@ -28,6 +28,7 @@ workflows:
     webui-e2e: 6                  # observed 3min + margin
     helm-lint: 3                  # observed <1min + margin
     ha-drill: 10                  # observed 5min + margin (post v1.3.3.14 fix)
+    memory-budget: 14             # estimated (gate ~5min locally + scoreboard ~5min; warn-only)
     ci-summary: 3                 # estimated (a single gh api call + a render)
 
   security.yml:

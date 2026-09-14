@@ -10,6 +10,7 @@ import {
   type RunSummary,
   type Run,
 } from "@/lib/api";
+import { usePolling } from "@/hooks/usePolling";
 import { commitMetricsRows, metricColumns } from "@/lib/runDetail";
 import { MetricsChart } from "@/components/MetricsChart";
 
@@ -51,14 +52,21 @@ export function RunsPanel({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const openedFromDeepLink = useRef(false);
 
-  useEffect(() => {
-    // fetchRunsPage below is defined with useCallback so this effect's own deps stay
-    // stable; runs list load is independent of which run (if any) is selected.
-    load();
-    const id = setInterval(load, runsPollMs);
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, runsPollMs]);
+  const load = useCallback(async () => {
+    try {
+      setRuns(await fetchRuns({ projectId, limit: 100 }));
+      setError(null);
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
+    }
+  }, [projectId]);
+
+  // Both timers pause while the tab is hidden and back off while the registry fails
+  // (V1.6.3, usePolling) -- this panel alone used to add ~10 requests/min from a
+  // backgrounded tab. The runs list reloads whenever projectId changes (new callback).
+  usePolling(load, runsPollMs);
 
   useEffect(() => {
     if (initialRunId && !openedFromDeepLink.current) {
@@ -67,27 +75,17 @@ export function RunsPanel({
     }
   }, [initialRunId]);
 
-  const load = useCallback(async () => {
+  const pollEvents = useCallback(async () => {
     try {
-      setRuns(await fetchRuns({ projectId, limit: 100 }));
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const latest = await fetchLatestEventId();
+      if (lastEventId.current && latest > lastEventId.current) setNewEvents(true);
+      lastEventId.current = Math.max(lastEventId.current, latest);
+      return true;
+    } catch {
+      return false; /* events endpoint optional -- just back off */
     }
-  }, [projectId]);
-
-  useEffect(() => {
-    const id = setInterval(async () => {
-      try {
-        const latest = await fetchLatestEventId();
-        if (lastEventId.current && latest > lastEventId.current) setNewEvents(true);
-        lastEventId.current = Math.max(lastEventId.current, latest);
-      } catch {
-        /* events endpoint optional */
-      }
-    }, eventsPollMs);
-    return () => clearInterval(id);
-  }, [eventsPollMs]);
+  }, []);
+  usePolling(pollEvents, eventsPollMs, { immediate: false });
 
   async function refresh() {
     await load();

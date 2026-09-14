@@ -105,15 +105,25 @@ def _run_av(args: list[str], cwd) -> subprocess.CompletedProcess:
         "    pass\n"
         "heavy = ('tempfile', 'urllib.parse', 'concurrent.futures', 'shutil', 'subprocess', 'uuid', 'datetime')\n"
         "print('HEAVY_LOADED=' + ','.join(sorted(m for m in heavy if m in sys.modules)))\n"
+        "ui = ('rich', 'questionary', 'prompt_toolkit', 'av_cli.ui', 'av_cli.repl')\n"
+        "print('UI_LOADED=' + ','.join(sorted(m for m in sys.modules if m in ui or m.startswith(tuple(u + '.' for u in ui)))))\n"
     )
     return subprocess.run([sys.executable, "-c", code], cwd=cwd, capture_output=True,
                            encoding="utf-8", errors="replace", timeout=60)
 
 
 def _heavy_loaded(result: subprocess.CompletedProcess) -> list[str]:
+    return _marker(result, "HEAVY_LOADED=")
+
+
+def _ui_loaded(result: subprocess.CompletedProcess) -> list[str]:
+    return _marker(result, "UI_LOADED=")
+
+
+def _marker(result: subprocess.CompletedProcess, prefix: str) -> list[str]:
     for line in result.stdout.splitlines():
-        if line.startswith("HEAVY_LOADED="):
-            rest = line[len("HEAVY_LOADED="):]
+        if line.startswith(prefix):
+            rest = line[len(prefix):]
             return rest.split(",") if rest else []
     raise AssertionError(f"marker line missing -- process failed?\n{result.stderr}")
 
@@ -184,6 +194,25 @@ def test_noop_add_does_not_load_heavy_stdlib_modules(tmp_path):
     assert noop_add.returncode == 0, noop_add.stderr
     loaded = [m for m in _heavy_loaded(noop_add) if m in _ACHIEVABLE_HEAVY]
     assert loaded == []
+
+
+def test_status_and_noop_add_do_not_load_rich_or_questionary(tmp_path):
+    """V1.6.3 (todo.md's `AV_NO_RICH` idea, delivered as a test rather than an env var):
+    the daemon-served hot paths must never pull in the TUI stacks -- rich/questionary/
+    prompt_toolkit are several MB of resident memory each and nothing on `status`/no-op
+    `add` needs them. Lazy-by-test beats lazy-by-flag: a flag nobody sets protects nothing."""
+    init_result = _run_av(["av", "init", "--mode", "local", "--yes", "--no-repl"], tmp_path)
+    assert init_result.returncode == 0, init_result.stderr
+    (tmp_path / "a.py").write_text("print('hi')\n")
+    assert _run_av(["av", "add", "."], tmp_path).returncode == 0
+
+    status_result = _run_av(["av", "status"], tmp_path)
+    assert status_result.returncode == 0, status_result.stderr
+    assert _ui_loaded(status_result) == []
+
+    noop_add = _run_av(["av", "add", "."], tmp_path)
+    assert noop_add.returncode == 0, noop_add.stderr
+    assert _ui_loaded(noop_add) == []
 
 
 def test_list_commands_matches_full_expected_surface_without_importing_anything():

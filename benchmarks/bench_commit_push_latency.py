@@ -21,6 +21,7 @@ from benchmarks.tool_runner import (  # noqa: E402
     Row,
     ToolStatus,
     detect_tools,
+    pop_rss_median,
     repeat_median,
     time_subprocess,
 )
@@ -46,7 +47,7 @@ def _bench_av() -> dict[str, float | None] | None:
             "add": speedcheck.probe_ms(probes, "av add ."),
             "commit": speedcheck.probe_ms(probes, "av commit"),
         }
-        push_ms = time_subprocess([av_path, "push"], root)
+        push_ms = time_subprocess([av_path, "push"], root, rss_key="commit_push_latency:push")
         result["push"] = push_ms
         subprocess.run([av_path, "daemon", "stop"], cwd=root)
         return result
@@ -158,7 +159,8 @@ def run(tool_order: list[str] | None = None, repeat: int = 1) -> BenchmarkResult
             else:
                 values[tool] = r[op]
                 statuses[tool] = ToolStatus.AVAILABLE
-        rows.append(Row(operation=label, values=values, statuses=statuses, unit="ms", notes=notes))
+        rows.append(Row(operation=label, values=values, statuses=statuses, unit="ms", notes=notes,
+                        rss_mb={"av": pop_rss_median(f"commit_push_latency:{op}")}))
 
     return BenchmarkResult(
         name="commit_push_latency",

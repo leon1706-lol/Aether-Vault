@@ -289,3 +289,73 @@ def test_result_to_markdown_marks_internal_benchmarks():
     result = _speed_result("a", av_value=10.0, competitor_value=10.0, claim_scope="internal")
     md = result_to_markdown(result)
     assert "internal-only" in md.lower()
+
+
+# --- V1.6.3: peak-RSS capture rides along with the timings --------------------------------
+
+def _result_with_rss(rss=None):
+    row = Row(operation="status", values={"av": 10.0, "dvc": 20.0},
+              statuses={"av": ToolStatus.AVAILABLE, "dvc": ToolStatus.AVAILABLE},
+              rss_mb={"av": rss} if rss is not None else {})
+    return BenchmarkResult(name="noop_status_speed", title="t", description="d", tool_order=["av", "dvc"], rows=[row])
+
+
+def test_time_subprocess_with_rss_key_records_a_sample(monkeypatch):
+    from benchmarks import tool_runner
+    from av_cli import sysres  # the same module object tool_runner imports (not python.av_cli)
+
+    recorded = []
+    monkeypatch.setattr(sysres, "run_measured",
+                        lambda args, **k: (recorded.append((args, k)), sysres.MeasuredRun(0, 5.0, 42.0))[1])
+    tool_runner._RSS_SAMPLES.clear()
+    result = time_subprocess(["av", "status"], Path("."), repeat=3, env={"X": "1"}, rss_key="k")
+    assert result == 5.0
+    assert len(recorded) == 3 and recorded[0][1]["env"]["X"] == "1"
+    assert tool_runner.pop_rss_median("k") == 42.0
+    assert tool_runner.pop_rss_median("k") is None  # drained
+
+
+def test_pop_rss_median_ignores_none_samples():
+    from benchmarks import tool_runner
+
+    tool_runner.record_rss("m", 10.0)
+    tool_runner.record_rss("m", None)
+    tool_runner.record_rss("m", 30.0)
+    assert tool_runner.pop_rss_median("m") == 20.0
+
+
+def test_markdown_and_table_add_rss_column_only_when_present():
+    from benchmarks.tool_runner import print_table
+
+    plain = result_to_markdown(_result_with_rss())
+    assert "av peak RSS" not in plain
+    with_rss = result_to_markdown(_result_with_rss(61.4))
+    assert "| av peak RSS |" in with_rss
+    assert "| 61 MB |" in with_rss
+    lines = []
+    print_table(_result_with_rss(61.4), echo=lines.append)
+    assert any("av peak RSS" in line for line in lines)
+    assert any("61 MB" in line for line in lines)
+
+
+def test_results_to_json_underscore_rss_key_does_not_break_compare():
+    with_rss = _result_with_rss(61.4)
+    snapshot = results_to_json([with_rss])
+    assert snapshot["_rss_mb"] == {"noop_status_speed": {"status": 61.4}}
+    assert "_rss_mb" not in results_to_json([_result_with_rss()])
+    # A baseline carrying `_rss_mb` compares exactly like one without it.
+    findings = compare_to_baseline([_result_with_rss()], snapshot)
+    assert [f["operation"] for f in findings] == ["status"]
+    assert findings[0]["ratio"] == 1.0
+
+
+def test_results_full_json_round_trip():
+    from benchmarks.tool_runner import results_from_json_full, results_to_json_full
+
+    row = Row(operation="fetch single layer", values={"av": 1.5, "dvc": None},
+              statuses={"av": ToolStatus.AVAILABLE, "dvc": ToolStatus.NOT_APPLICABLE},
+              unit="ms", notes={"dvc": "no layer primitive"}, claim_scope="unique", rss_mb={"av": 33.0})
+    original = BenchmarkResult(name="partial", title="P", description="D", tool_order=["av", "dvc"],
+                               rows=[row], claim_scope="speed")
+    restored = results_from_json_full(results_to_json_full([original]))
+    assert restored == [original]

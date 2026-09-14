@@ -88,8 +88,10 @@ def normalize_commit_row(row: dict) -> dict:
     return normalized
 
 
-def fetch_project_commits(client, project_id: str) -> list[dict]:
-    """Every commit of a project (metadata + resolved trees), newest first.
+def iter_project_commits(client, project_id: str, page_size: int = 500):
+    """Every commit of a project (metadata + resolved trees), newest first, yielded one at
+    a time as pages arrive -- `av clone` writes each to disk immediately instead of holding
+    the whole history (every tree included) in one list (V1.6.3).
 
     V1.6.0 (WS4.8): page N+1's request is submitted before page N's rows are normalized, so
     the network round trip for the next page overlaps with this page's (pure-CPU)
@@ -97,9 +99,8 @@ def fetch_project_commits(client, project_id: str) -> list[dict]:
     in flight ahead of the one being processed (two total), since the server is
     single-worker and a deeper pipeline would just queue without helping.
     """
-    commits: list[dict] = []
     with ThreadPoolExecutor(max_workers=1) as pool:
-        next_future = pool.submit(client.list_commits, project_id, limit=500, offset=0,
+        next_future = pool.submit(client.list_commits, project_id, limit=page_size, offset=0,
                                    include_layers=True)
         while next_future is not None:
             page = next_future.result()
@@ -109,12 +110,17 @@ def fetch_project_commits(client, project_id: str) -> list[dict]:
             rows = page.get("commits", [])
             next_offset = page.get("next_offset")
             if next_offset is not None and rows:
-                next_future = pool.submit(client.list_commits, project_id, limit=500,
+                next_future = pool.submit(client.list_commits, project_id, limit=page_size,
                                            offset=next_offset, include_layers=True)
-            commits.extend(normalize_commit_row(r) for r in rows)
+            for row in rows:
+                yield normalize_commit_row(row)
             if next_offset is None or not rows:
                 break
-    return commits
+
+
+def fetch_project_commits(client, project_id: str) -> list[dict]:
+    """`iter_project_commits` materialized -- for callers that genuinely need the list."""
+    return list(iter_project_commits(client, project_id))
 
 
 def pick_default_branch(project_refs: dict[str, str], project_id: str) -> str | None:

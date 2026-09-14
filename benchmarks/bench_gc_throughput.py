@@ -30,6 +30,7 @@ from benchmarks.tool_runner import (  # noqa: E402
     BenchmarkResult,
     Row,
     ToolStatus,
+    pop_rss_median,
     repeat_median,
     time_subprocess,
 )
@@ -65,7 +66,7 @@ def _bench_av() -> float | None:
         time_subprocess([av_path, "add", "."], root)
         time_subprocess([av_path, "commit", "-m", "bench gc fixture"], root)
         time_subprocess([av_path, "push"], root)
-        gc_ms = time_subprocess([av_path, "gc"], root)
+        gc_ms = time_subprocess([av_path, "gc"], root, rss_key="gc_throughput:gc")
         subprocess.run([av_path, "daemon", "stop"], cwd=root)
         return gc_ms
 
@@ -93,6 +94,7 @@ def run(tool_order: list[str] | None = None, repeat: int = 1) -> BenchmarkResult
         statuses=statuses,
         unit="ms",
         notes=notes,
+        rss_mb={"av": pop_rss_median("gc_throughput:gc")},
     )
 
     return BenchmarkResult(

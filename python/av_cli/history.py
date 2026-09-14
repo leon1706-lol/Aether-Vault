@@ -97,20 +97,34 @@ def walk_history(repo_root: Path, start: str, limit: int) -> list[dict]:
     return commits
 
 
+def load_commit_meta(commit_file: Path) -> dict | None:
+    """One commit's JSON with its `tree` dropped -- what `av log` consumes. The tree is
+    the bulk of a commit file (one entry per tracked path, chunk/layer lists included)
+    and `log` never shows it; dropping it at load time is what keeps `--all` over a long
+    history from holding every tree at once."""
+    try:
+        with open(commit_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    data.pop("tree", None)
+    return data
+
+
 def collect_all_commits(repo_root: Path, limit: int) -> list[dict]:
-    """Every local commit across all branches, newest first (timestamp-descending)."""
+    """Every local commit across all branches, newest first (timestamp-descending),
+    truncated to `limit`. V1.6.3: tree-less metadata only, and only the `limit` newest are
+    ever retained while scanning (a bounded heap), so peak memory is O(limit), not
+    O(history x tree size)."""
+    import heapq
+
     commits_dir = repo_root / ".av" / "commits"
-    if not commits_dir.exists():
+    if not commits_dir.exists() or limit <= 0:
         return []
-    commits: list[dict] = []
-    for commit_file in commits_dir.glob("*.json"):
-        try:
-            with open(commit_file, "r", encoding="utf-8") as f:
-                commits.append(json.load(f))
-        except Exception:
-            continue
-    commits.sort(key=lambda c: c.get("timestamp", ""), reverse=True)
-    return commits[:limit]
+    metas = (m for m in (load_commit_meta(p) for p in commits_dir.glob("*.json")) if m is not None)
+    return heapq.nlargest(limit, metas, key=lambda c: c.get("timestamp", ""))
 
 
 def head_branch(repo_root: Path) -> str | None:

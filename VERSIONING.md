@@ -505,6 +505,67 @@ purely additive status/JSON field).
   verified byte-identical output (`tests/test_signing.py`), so no existing commit hash or
   signature is affected.
 
+## v1.6.3 additive surfaces (see development/CHANGELOG.md Phase 71)
+
+The footprint / RAM phase. Everything below is additive — a caller that ignores every new
+flag, field, parameter and env var observes identical behavior, with one deliberate
+exception called out last (a request that was already outside the documented contract).
+
+- **CLI flags**: `av doctor --resources`; `av benchmark --lowmem` / `--min-free-mb N`
+  (plus a hidden internal `--dump-results PATH` the `--lowmem` parent uses on its own
+  children); `av test --lowmem` / `--min-free-mb N`.
+- **JSON envelope keys**: `doctor.resources` (object, `null` without the flag);
+  `daemon status.peak_rss_mb`; `test.lowmem` (per-file counts and peak RSS).
+- **HTTP**: `limit`/`offset` on every formerly unpaged list endpoint (`/api/eval/adapters`,
+  `/api/tasks`, `/api/plans`, `/api/budgets`, `/api/causal-links`, `/api/reviews`,
+  `/api/critiques`, `/api/blackboard`, `/api/action-logs`, `/api/webhooks`, `/api/tokens`,
+  `/api/users`, `/api/role-bindings`; default 500, max 2000, response shapes unchanged) and
+  on `/api/refs` (default 1000, max 5000, ordered by name; the flat `{name: hash}` shape
+  is unchanged, and `VaultClient.list_refs`/`av registry export` walk `offset` so callers
+  still receive the complete mapping). `POST /api/objects/{hash}` may return `413` when the
+  operator sets `AV_MAX_UPLOAD_BYTES` (default 0 = unlimited, i.e. off). `GET /api/metrics`
+  gained `av_process_rss_bytes` and `av_process_peak_rss_bytes`.
+- **Validation tightened on already-invalid input (the one visible change)**: every `limit`
+  query parameter now carries a maximum (`/api/commits` 500, `/api/runs` 1000, `/api/refs`
+  and `/api/sync/refs` 5000, the RSI lists 500, `/api/events?wait` 60 s) and returns `422`
+  above it. Previously such a value was honored and returned the whole table; no shipped
+  client (CLI, SDK, WebUI, export) ever sent one — `registry export` used 200/1000, `sync`
+  500, the dashboard ≤ 100 — so this is a contract *statement*, not a break.
+- **New env vars** (each documented in `development/infrastructure.md`): CLI —
+  `AV_STAGE_WORKERS_MAX`, `AV_STAGE_RESERVE_MB`, `AV_MEMORY_GATE`,
+  `AV_MEMORY_BUDGET_MULTIPLIER`, internal `AV_DAEMON_SERVING`; server —
+  `AV_MAX_UPLOAD_BYTES`, `AV_AUTH_CACHE_MAX_ENTRIES`, `AV_AUTH_SPIKE_MAX_KEYS`,
+  `AV_UVICORN_LIMIT_CONCURRENCY`, `AV_WEBUI_NODE_HEAP_MB`; compose interpolation —
+  `AV_ENGINE_ROLE` (default `all`, previously hard-coded), `AV_ENGINE_MEM_LIMIT`,
+  `AV_DB_MEM_LIMIT`, `AV_REDIS_MEM_LIMIT`, `AV_PG_SHARED_BUFFERS`, `AV_PG_WORK_MEM`,
+  `AV_PG_MAINT_WORK_MEM`, `AV_PG_EFFECTIVE_CACHE`, `AV_PG_MAX_CONNECTIONS`,
+  `AV_REDIS_MAXMEMORY`, `AV_HEALTHCHECK_INTERVAL`.
+- **Compose/image**: every service now has a `deploy.resources.limits.memory` cap, Postgres
+  runs with explicit `-c` memory settings, Redis with `--maxmemory … volatile-lru`, and the
+  engine healthcheck is `/engine-healthcheck.sh` (baked into all three image targets;
+  interval 30 s). A container started from a pre-V1.6.3 image with the new compose file
+  reports `unhealthy` (the script isn't in the old image) while serving normally — rebuild
+  or pull the image. `av doctor --compose` now writes `AV_ENGINE_ROLE=${AV_ENGINE_ROLE:-all}`
+  and an engine memory limit into the migrated file.
+- **Helm values**: `engine.uvicornWorkers`, `engine.limitConcurrency`, `engine.nodeHeapMb`,
+  `engine.maxUploadBytes`, `resourcesByRole.{all,server,webui}`; top-level `resources` is now
+  `{}` by default and, when non-empty, overrides the per-role preset (a chart user who set
+  `resources` explicitly sees no change).
+- **File schemas**: `rss-scoreboard-1.0` (`scripts/rss_scoreboard.py`), `perf-history-1.1`
+  (adds a per-entry `rss_mb` map; 1.0 files are read unchanged and rewritten as 1.1),
+  `benchmark-results-1.0` (internal to `av benchmark --lowmem`). `av benchmark --save-json`
+  snapshots gain a `_rss_mb` key that `--baseline` comparison ignores.
+- **Internal, not user-facing**: `fsutil.atomic_write_chunks`, `Index.iter_serialized/
+  serialize` (the on-disk index is byte-identical), `sync.iter_project_commits`,
+  `history.load_commit_meta`, `core.effective_stage_workers/stage_worker_budget_mb/
+  release_native_pool`, `av_cli.sysres`, `av_cli.lowmem_tests`, `av_cli.resources_report`,
+  `av_server.gc_mark`, `av_server.sysres`, `benchmarks.tool_runner.time_subprocess(rss_key=)`
+  and `Row.rss_mb`, `redis_cache.add_hashes` accepting any iterable.
+- **Not a contract change, but a fix**: `av watch` now re-commits a modified, already-tracked
+  file (it never did — see Probleme.md); `av clone` of a chunked artifact no longer prints a
+  progress line inside the `--output json` envelope; the HA nginx LB accepts uploads
+  larger than 1 MiB; the README benchmark-ratio sync only rewrites its own rows.
+
 ## Database schema compatibility
 
 The schema is owned by Alembic (`python/av_server/migrations/`). Server startup upgrades

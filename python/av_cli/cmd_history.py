@@ -90,6 +90,7 @@ def commit(
         repo_root, message, tags=tags, metrics=metrics,
         run_id=run_id, defer_upload=defer_upload,
         result_sink=json_sink, outcome_sink=sink_data.update,
+        idx=idx,  # the index loaded above for the staged check -- no second parse
     )
 
     if current_output_mode() == "json":

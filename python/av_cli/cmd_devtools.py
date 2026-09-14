@@ -10,6 +10,7 @@ import re
 import shutil  # V1.6.0 (WS2.1): core.py no longer re-exports this via `import *`.
 import subprocess
 import tempfile
+import time
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from . import main as _root
 
@@ -152,7 +153,18 @@ def _sync_readme_benchmark_table(results: list) -> None:
     else:
         ratio = av_value / lfs_value
         phrase = f"~{ratio:.0f}x slower than Git LFS"
-    updated, n = re.subn(r"~[\d.]+x (?:slower|faster) than Git LFS", phrase, text)
+    # Only the lines that describe THIS benchmark (the comparison-table row and the
+    # Known Limitations bullet). A bare subn over the whole file used to rewrite every
+    # "~Nx faster/slower than Git LFS" -- the Cold Clone row included -- with the no-op
+    # ratio (real bug, V1.6.3).
+    pattern = re.compile(r"~[\d.]+x (?:slower|faster) than Git LFS")
+    lines = text.split("\n")
+    n = 0
+    for i, line in enumerate(lines):
+        if "No-Op" in line or "no-op status/add" in line or "Perf #4" in line:
+            lines[i], k = pattern.subn(phrase, line)
+            n += k
+    updated = "\n".join(lines)
     if n and updated != text:
         atomic_write_text(readme_path, updated)
         click.secho(f"Updated README.md perf ratio: {phrase} (no-op status/add)", fg="cyan")
@@ -164,7 +176,13 @@ def _sync_readme_benchmark_table(results: list) -> None:
 @click.option("--webui", "run_webui", is_flag=True, default=False, help="Also run the webui/ Vitest suite (npm test) after the Python suite.")
 @click.option("--speed", "speed", is_flag=True, default=False,
               help="Also run a synthetic speed benchmark of av's hot paths (and the webui/ bench suite, with --webui).")
-def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -> None:
+@click.option("--lowmem", is_flag=True, default=False,
+              help="Run one pytest subprocess per test file with a free-RAM floor between them "
+                   "(resumable) -- for machines where a single full-suite process gets OOM-killed.")
+@click.option("--min-free-mb", type=int, default=350, show_default=True,
+              help="With --lowmem: free RAM required before each subprocess starts.")
+def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool, lowmem: bool,
+             min_free_mb: int) -> None:
     """(Development only) Run Aether-Vault's own pytest suite from source, and optionally the
     webui/ Vitest suite too.
 
@@ -184,6 +202,10 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
             fg="red",
         )
         sys.exit(1)
+
+    if lowmem:
+        _run_lowmem_suite(tests_dir, test_filter, min_free_mb, json_mode, run_webui, speed)
+        return
 
     args = [sys.executable, "-m", "pytest", str(tests_dir)]
     # Force color even though stdout is piped -- otherwise pytest auto-detects the pipe
@@ -280,6 +302,96 @@ def test_cmd(test_filter: str | None, cov: bool, run_webui: bool, speed: bool) -
     sys.exit(exit_code)
 
 
+def _run_lowmem_suite(tests_dir: Path, test_filter: str | None, min_free_mb: int, json_mode: bool,
+                      run_webui: bool, speed: bool) -> None:
+    """`av test --lowmem`: the same suite, one file per subprocess (see lowmem_tests.py).
+    Updates the README badge like a normal unfiltered run does; `--webui`/`--speed` are
+    not combined with it (they are separate, already-light steps -- run them without
+    --lowmem)."""
+    from . import lowmem_tests
+
+    if run_webui or speed:
+        msg = "--lowmem runs the Python suite only; run --webui/--speed in a separate `av test` call."
+        if json_mode:
+            fail(None, "validation", msg, command="test")
+        click.secho(msg, fg="red")
+        sys.exit(2)
+    lines: list[str] = []
+
+    def echo(line: str) -> None:
+        lines.append(line)
+        if not json_mode:
+            click.echo(line)
+
+    if not json_mode:
+        click.secho("=== Python test suite (low-memory mode: one subprocess per file) ===", bold=True, fg="cyan")
+    summary = lowmem_tests.run_lowmem(tests_dir, min_free_mb=min_free_mb, k_expr=test_filter, echo=echo)
+    if test_filter is None:
+        _root._update_readme_test_badge(summary.passed, summary.failed + summary.errors)
+    exit_code = 0 if summary.ok else 1
+    if json_mode:
+        emit_json(None, "test", data={
+            "exit_code": exit_code, "passed": summary.passed, "failed": summary.failed + summary.errors,
+            "webui_exit_code": None, "log": "\n".join(lines),
+            "lowmem": {**lowmem_tests.summary_to_dict(summary), "min_free_mb": min_free_mb},
+        })
+    sys.exit(exit_code)
+
+
+def _run_benchmark_in_subprocess(name: str, tool_order: list, repeat: int, no_daemon: bool,
+                                 min_free_mb: int, json_mode: bool, results_from_json_full):
+    """One benchmark in a fresh interpreter (V1.6.3, `--lowmem`): waits for `min_free_mb`
+    of free RAM first (up to 60 s), then re-invokes `av benchmark --only NAME
+    --dump-results` and reads the dataclasses back. A benchmark that can't start, or whose
+    child dies, comes back as a FAILED-cell result with a footnote -- a real row in the
+    report, never a silently missing one."""
+    from benchmarks.tool_runner import BenchmarkResult, Row, ToolStatus
+    from . import sysres
+
+    def failed(note: str):
+        return BenchmarkResult(
+            name=name, title=name.replace("_", " ").title(), description=f"Not captured: {note}",
+            tool_order=list(tool_order),
+            rows=[Row(operation="(not run)", values={t: None for t in tool_order},
+                      statuses={t: ToolStatus.FAILED for t in tool_order}, unit="ms",
+                      notes={"av": note})],
+            claim_scope="internal",
+        )
+
+    waited = 0.0
+    while True:
+        free = sysres.available_mb()
+        if free is None or free >= min_free_mb:
+            break
+        if waited >= 60.0:
+            return failed(f"skipped: free RAM {free:.0f} MB stayed below --min-free-mb {min_free_mb} for 60s")
+        if not json_mode and waited == 0.0:
+            click.secho(f"[lowmem] {name}: waiting for {min_free_mb} MB free (have {free:.0f})...", fg="yellow")
+        time.sleep(2.0)
+        waited += 2.0
+
+    with tempfile.TemporaryDirectory(prefix="av-bench-lowmem-") as tmp:
+        dump = Path(tmp) / f"{name}.json"
+        args = [sys.executable, "-m", "av_cli.main", "benchmark", "--only", name, "--repeat", str(repeat),
+                "--dump-results", str(dump)]
+        for tool in tool_order:
+            if tool != "av":
+                args += ["--vs", tool]
+        if no_daemon:
+            args.append("--no-daemon")
+        if not json_mode:
+            click.secho(f"[lowmem] running {name} in its own process...", fg="cyan")
+        run = sysres.run_measured(args, capture_output=json_mode, timeout=3600)
+        if run.returncode != 0 or not dump.exists():
+            return failed(f"child process exited {run.returncode} without results")
+        loaded = results_from_json_full(json.loads(dump.read_text(encoding="utf-8")))
+        if not loaded:
+            return failed("child process produced no results")
+        if not json_mode and run.peak_rss_mb is not None:
+            click.echo(f"[lowmem] {name}: child peak RSS {run.peak_rss_mb:.0f} MB")
+        return loaded[0]
+
+
 BENCHMARK_NAMES = [
     "hashing_throughput",
     "safetensors_dedup",
@@ -308,9 +420,18 @@ BENCHMARK_NAMES = [
               help="Run each benchmark this many times (each a fully independent run) and report the median -- lower per-benchmark noise than a single-shot timing.")
 @click.option("--no-daemon", "no_daemon", is_flag=True, default=False,
               help="Force AV_NO_DAEMON=1 for every av subprocess this run spawns, capturing the cold (no background daemon) numbers instead of the product default. Not the default methodology -- see METHODOLOGY_NOTES.")
+@click.option("--lowmem", "lowmem", is_flag=True, default=False,
+              help="Run each benchmark in its own fresh subprocess, sequentially, waiting for --min-free-mb of free RAM "
+                   "before each -- for machines where the combined run gets OOM-killed. Same report, same flags.")
+@click.option("--min-free-mb", "min_free_mb", type=int, default=400, show_default=True,
+              help="With --lowmem: free RAM required before a benchmark starts (a benchmark that never gets it is "
+                   "reported as failed, never skipped silently).")
+@click.option("--dump-results", "dump_results", type=click.Path(), default=None, hidden=True,
+              help="Internal (--lowmem child): write the full results to this JSON file instead of a report.")
 def benchmark(
     only: tuple, vs_tools: tuple, markdown_out: str | None, save_json_out: str | None,
-    baseline_path: str | None, repeat: int, no_daemon: bool,
+    baseline_path: str | None, repeat: int, no_daemon: bool, lowmem: bool, min_free_mb: int,
+    dump_results: str | None,
 ) -> None:
     """(Development only) Run cross-tool benchmark comparisons against DVC, Git LFS, and MLflow.
 
@@ -356,7 +477,9 @@ def benchmark(
         render_claim_summary,
         render_doc_header,
         result_to_markdown,
+        results_from_json_full,
         results_to_json,
+        results_to_json_full,
         METHODOLOGY_NOTES,
     )
 
@@ -373,17 +496,28 @@ def benchmark(
     results = []
     markdown_chunks = []
     for name in names:
-        module = importlib.import_module(f"benchmarks.bench_{name}")
-        try:
-            result = module.run(tool_order=tool_order, repeat=repeat)
-        except TypeError:
-            # A benchmark whose run() predates the `repeat` parameter (e.g. a
-            # storage-byte-count benchmark with nothing to average) -- call it the old way.
-            result = module.run(tool_order=tool_order)
-        if not json_mode:
+        if lowmem:
+            result = _run_benchmark_in_subprocess(name, tool_order, repeat, no_daemon, min_free_mb,
+                                                  json_mode, results_from_json_full)
+        else:
+            module = importlib.import_module(f"benchmarks.bench_{name}")
+            try:
+                result = module.run(tool_order=tool_order, repeat=repeat)
+            except TypeError:
+                # A benchmark whose run() predates the `repeat` parameter (e.g. a
+                # storage-byte-count benchmark with nothing to average) -- call it the old way.
+                result = module.run(tool_order=tool_order)
+        if dump_results is None and not json_mode:
             print_table(result)
         results.append(result)
         markdown_chunks.append(result_to_markdown(result))
+
+    if dump_results is not None:
+        # --lowmem child: hand the full dataclasses back to the parent and stop -- the
+        # parent renders/saves/compares once, over every benchmark, exactly as a combined
+        # run would, so there is one report path, not two.
+        Path(dump_results).write_text(json.dumps(results_to_json_full(results)), encoding="utf-8")
+        return
 
     if markdown_out:
         doc = (
@@ -394,7 +528,10 @@ def benchmark(
         Path(markdown_out).write_text(doc, encoding="utf-8")
         if not json_mode:
             click.echo(f"\nWrote {markdown_out}")
-        _sync_readme_benchmark_table(results)
+        # README's ratio only tracks a FULL default capture -- a `--only` subset is a
+        # scratch/diagnostic run and must not rewrite the published number.
+        if not only:
+            _sync_readme_benchmark_table(results)
 
     if save_json_out:
         Path(save_json_out).write_text(json.dumps(results_to_json(results), indent=2), encoding="utf-8")

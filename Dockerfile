@@ -101,7 +101,8 @@ COPY --from=web-builder /build/webui/.next/static /webui/.next/static
 COPY --from=web-builder /build/webui/public /webui/public
 
 COPY docker/engine-entrypoint.sh /engine-entrypoint.sh
-RUN chmod +x /engine-entrypoint.sh
+COPY docker/engine-healthcheck.sh /engine-healthcheck.sh
+RUN chmod +x /engine-entrypoint.sh /engine-healthcheck.sh
 
 # AV_ENGINE_ROLE is deliberately NOT defaulted here: a Dockerfile-level default would
 # make the entrypoint's runtime env var always non-empty, silently disabling its legacy
@@ -116,9 +117,11 @@ EXPOSE 8000 3000
 # docker-compose.yml runs into the image means a bare `docker run` still gets a real
 # health signal. `/api/ready`, not `/api/health`: a container whose DB/Redis/data-dir
 # isn't usable yet should show unhealthy, not just "the process is alive".
-HEALTHCHECK --interval=10s --timeout=10s --start-period=40s --retries=5 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/ready').read()" \
-      && node -e "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+# V1.6.3: /engine-healthcheck.sh probes over bash's /dev/tcp -- no python/node process
+# forked per tick (that was a permanent CPU/RSS blip on an otherwise idle container);
+# role-aware, so one script serves all three targets, and 30 s not 10 s.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=5 \
+  CMD /engine-healthcheck.sh
 ENTRYPOINT ["/engine-entrypoint.sh"]
 
 # ============================================================================
@@ -149,15 +152,16 @@ COPY --from=py-builder /wheels /wheels
 RUN pip install --no-cache-dir /wheels/*.whl \
     && mkdir -p /data && chmod 777 /data
 COPY docker/engine-entrypoint.sh /engine-entrypoint.sh
-RUN chmod +x /engine-entrypoint.sh
+COPY docker/engine-healthcheck.sh /engine-healthcheck.sh
+RUN chmod +x /engine-entrypoint.sh /engine-healthcheck.sh
 # Defaulted here (unlike the "all" image, which leaves it unset for legacy auto-detect)
 # because this image cannot run any other role -- failing obviously beats a silent
 # role-detection surprise.
 ENV AV_DATA_DIR=/data \
     AV_ENGINE_ROLE=server
 EXPOSE 8000
-HEALTHCHECK --interval=10s --timeout=10s --start-period=40s --retries=5 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/ready').read()"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=5 \
+  CMD /engine-healthcheck.sh
 ENTRYPOINT ["/engine-entrypoint.sh"]
 
 # ── Target: webui — Next.js standalone dashboard only, no Python ────────────
@@ -183,12 +187,13 @@ COPY --from=web-builder /build/webui/.next/standalone /webui
 COPY --from=web-builder /build/webui/.next/static /webui/.next/static
 COPY --from=web-builder /build/webui/public /webui/public
 COPY docker/engine-entrypoint.sh /engine-entrypoint.sh
-RUN chmod +x /engine-entrypoint.sh
+COPY docker/engine-healthcheck.sh /engine-healthcheck.sh
+RUN chmod +x /engine-entrypoint.sh /engine-healthcheck.sh
 ENV WEBUI_PORT=3000 \
     HOSTNAME=0.0.0.0 \
     NODE_ENV=production \
     AV_ENGINE_ROLE=webui
 EXPOSE 3000
-HEALTHCHECK --interval=10s --timeout=10s --start-period=40s --retries=5 \
-  CMD node -e "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=5 \
+  CMD /engine-healthcheck.sh
 ENTRYPOINT ["/engine-entrypoint.sh"]

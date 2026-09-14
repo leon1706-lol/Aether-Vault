@@ -3,9 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include <iomanip>
 #include <mutex>
-#include <sstream>
 
 namespace {
 // Resolved once per process (first SHA256 construction), or re-resolved on demand via
@@ -138,10 +136,15 @@ uint8_t* SHA256::digest() {
 }
 
 std::string SHA256::toString(const uint8_t * digest) {
-    std::stringstream s;
-    s << std::setfill('0') << std::hex;
-    for (int i = 0; i < 32; i++) s << std::setw(2) << (int)digest[i];
-    return s.str();
+    // Table lookup into a preallocated string: a std::stringstream per digest was a
+    // heap allocation + locale machinery on every chunk/layer hash (V1.6.3).
+    static const char kHex[] = "0123456789abcdef";
+    std::string out(64, '0');
+    for (int i = 0; i < 32; i++) {
+        out[2 * i] = kHex[digest[i] >> 4];
+        out[2 * i + 1] = kHex[digest[i] & 0x0f];
+    }
+    return out;
 }
 
 std::string SHA256::hexdigest() {

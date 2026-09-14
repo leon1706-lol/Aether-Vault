@@ -178,6 +178,51 @@ def python_pool_size(threads: int) -> int:
     return max(1, min(n, 8))
 
 
+#: Free RAM kept out of the automatic staging worker cap (`AV_STAGE_RESERVE_MB`), so a box
+#: at the edge doesn't get pushed into swap by `av add` itself.
+_DEFAULT_STAGE_RESERVE_MB = 256
+
+
+def _env_int(name: str, default: int | None) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def stage_worker_budget_mb() -> int:
+    """Worst-case resident memory one staging worker can hold: a 1 MiB read buffer plus a
+    layer buffer of up to `AV_STAGE_BUFFER_MB` (bigger layers stream through disk) plus the
+    header -- `AV_STAGE_BUFFER_MB + 2`. CDC files need ~9.5 MB, so this over-reserves for
+    them; the safetensors case is the one that matters. See development/MEMORY.md."""
+    return _stage_buffer_cap_bytes() // (1024 * 1024) + 2
+
+
+def effective_stage_workers(threads: int, available_mb: float | None = None) -> int:
+    """`python_pool_size()` further capped by what the box can actually hold (V1.6.3):
+    `(available_mb - AV_STAGE_RESERVE_MB) // stage_worker_budget_mb()`, then by
+    `AV_STAGE_WORKERS_MAX` when set; floor 1. `available_mb` None (no probe on this
+    platform) means no RAM cap -- never a guess."""
+    workers = python_pool_size(threads)
+    if threads == 1:
+        return 1
+    if available_mb is None:
+        from .sysres import available_mb as probe
+
+        available_mb = probe()
+    if available_mb is not None:
+        reserve = _env_int("AV_STAGE_RESERVE_MB", _DEFAULT_STAGE_RESERVE_MB) or 0
+        by_ram = int((available_mb - reserve) // stage_worker_budget_mb())
+        workers = min(workers, max(1, by_ram))
+    hard_max = _env_int("AV_STAGE_WORKERS_MAX", None)
+    if hard_max is not None and hard_max > 0:
+        workers = min(workers, hard_max)
+    return max(1, workers)
+
+
 def configure_native_threads(repo_root: Path | None, cli_threads: int | None = None) -> int:
     """Resolves the effective thread count and configures the C++ core's shared pool to
     match -- once per process (idempotent). Deliberately NOT called from every command's
@@ -185,15 +230,26 @@ def configure_native_threads(repo_root: Path | None, cli_threads: int | None = N
     (currently: `hash_file_safe`, right before its own `aether_core.hash_file` call) so a
     command that never hashes anything still never pays the extension's import cost.
     Returns the resolved count (0=auto) for the caller to also size a Python-side pool via
-    `python_pool_size()`."""
+    `python_pool_size()`. The C++ side always gets an explicit count: its own "auto" is a
+    raw `hardware_concurrency()`, blind to the cgroup/affinity quota
+    `cpu_count_for_threading()` honors, so a 2-CPU container would otherwise spin up 16
+    idle worker threads."""
     global _native_threads_configured
     threads = resolve_threads(repo_root, cli_threads)
     if not _native_threads_configured:
         aether_core = _get_aether_core()
         if aether_core is not None and hasattr(aether_core, "set_max_threads"):
-            aether_core.set_max_threads(threads)
+            aether_core.set_max_threads(threads if threads > 0 else min(cpu_count_for_threading(), 16))
         _native_threads_configured = True
     return threads
+
+
+def release_native_pool() -> None:
+    """Joins the C++ shared pool's worker threads (they are recreated on demand). Called
+    after a staging batch under the daemon, where the process outlives the command."""
+    aether_core = _get_aether_core()
+    if aether_core is not None and hasattr(aether_core, "release_pool"):
+        aether_core.release_pool()
 
 
 def setup_logging(verbose: bool, silent: bool) -> None:
@@ -1013,7 +1069,8 @@ def materialize_file(
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if layers:
-        click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
+        if current_output_mode() != "json":  # progress line; never inside a JSON envelope
+            click.echo(f"Reassembling {rel_path} from {len(layers)} layers...")
         try:
             with open(dest, "wb") as f_out:
                 for layer in layers:
@@ -1032,7 +1089,8 @@ def materialize_file(
             raise
     elif chunks:
         ordered = sorted(chunks, key=lambda c: c.get("offset", 0))
-        click.echo(f"Reassembling {rel_path} from {len(ordered)} chunks...")
+        if current_output_mode() != "json":
+            click.echo(f"Reassembling {rel_path} from {len(ordered)} chunks...")
         try:
             with open(dest, "wb") as f_out:
                 for chunk in ordered:
@@ -1877,12 +1935,14 @@ def commit_scoped_paths(
 
     Returns the new commit hash, or None when nothing changed.
     """
-    import copy
-
     from .attributes import flags_for, load_attributes
 
     idx = Index(repo_root)
-    saved = copy.deepcopy(idx.entries)
+    # Shallow snapshot, not a deepcopy (V1.6.3): `Index.add_entry` always binds a NEW dict
+    # for a re-staged path and `clear_staged()` below only ever runs on the scoped index
+    # (those new dicts), so the pre-existing entry objects referenced here are never
+    # mutated -- a second full copy of every layers/chunks list bought nothing.
+    saved = dict(idx.entries)
     baseline_keys = set(saved)
     # Staged-before-this-call set: lets the scoping step tell "this staging staged it"
     # apart from "the user had this staged long before" — both read staged=True after.

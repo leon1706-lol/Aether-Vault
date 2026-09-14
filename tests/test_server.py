@@ -14,6 +14,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import uuid
 import os
 import socket
 import tempfile
@@ -64,6 +65,12 @@ os.environ["AV_DATA_DIR"] = tempfile.mkdtemp(prefix="av-server-test-")
 # then and never re-reads it -- a huge value here means its tick never fires during any
 # realistic test session, so it can't race a test that manually drives delivery itself.
 os.environ["AV_WEBHOOK_RETRY_INTERVAL_SECS"] = "999999"
+# V1.6.3 footprint: database.py opens TWO engines (primary + av_app) at pool 10 /
+# overflow 20 each -- 60 potential connections for a single-threaded TestClient. Tiny
+# pools keep this process' baseline (and Postgres' per-backend memory) where a 3.9 GB dev
+# box can run the file at all; setdefault so CI can still override.
+os.environ.setdefault("AV_DB_POOL_SIZE", "2")
+os.environ.setdefault("AV_DB_MAX_OVERFLOW", "3")
 
 import python.av_server.server as server_module  # noqa: E402
 from python.av_server.server import app, validate_ref_name  # noqa: E402
@@ -162,6 +169,12 @@ def db(client):
     yield client
     asyncio.run(_truncate_all())
     _clear_storage_dirs()
+    # V1.6.3: drop the per-test garbage (response bodies, ORM identity maps, the metrics
+    # counters this test's requests grew) before the next test's baseline is measured.
+    server_module.metrics.reset()
+    import gc
+
+    gc.collect()
 
 
 @pytest.fixture
@@ -3961,3 +3974,112 @@ class TestDeviceFlow:
 
         result = self._run_with_isolated_redis_client(_body, monkeypatch)
         assert result == ("expired", None)
+
+
+# ---------------------------------------------------------------------------
+# V1.6.3 footprint: streamed audit export/verify, the upload cap, GC over column tuples,
+# paged refs -- live against real Postgres+Redis.
+# ---------------------------------------------------------------------------
+
+class TestFootprintV163:
+    def test_audit_export_streams_every_row_in_order(self, db):
+        for i in range(60):
+            db.post("/api/webhooks", json={"url": f"http://example.invalid/stream-{i}", "secret": "s"})
+        resp = db.get("/api/admin/audit/export", params={"format": "jsonl", "action": "webhook.create"})
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"].startswith("application/x-ndjson")
+        lines = [json.loads(line) for line in resp.text.strip().splitlines()]
+        assert len(lines) >= 60
+        ids = [row["id"] for row in lines]
+        assert ids == sorted(ids)  # oldest-first, exactly like before
+        csv_resp = db.get("/api/admin/audit/export", params={"format": "csv", "action": "webhook.create"})
+        assert csv_resp.status_code == 200
+        csv_lines = csv_resp.text.strip().splitlines()
+        assert csv_lines[0].startswith("id,ts,username,action")
+        assert len(csv_lines) - 1 == len(lines)
+
+    def test_audit_verify_walks_the_whole_chain_via_a_cursor(self, db):
+        for i in range(30):
+            db.post("/api/webhooks", json={"url": f"http://example.invalid/verify-{i}", "secret": "s"})
+        resp = db.get("/api/admin/audit/verify")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ok"] is True and body["checked"] >= 30
+        assert body["last_id"] is not None
+        limited = db.get("/api/admin/audit/verify", params={"limit": 5})
+        assert limited.json()["checked"] == 5
+
+    def test_upload_over_max_bytes_is_413_by_content_length_and_while_streaming(self, db, monkeypatch):
+        monkeypatch.setattr(server_module, "MAX_UPLOAD_BYTES", 1024)
+        content = b"z" * 4096
+        h = hashlib.sha256(content).hexdigest()
+        resp = db.post(f"/api/objects/{h}", content=content)
+        assert resp.status_code == 413, resp.text
+        assert db.head(f"/api/objects/{h}").status_code == 404
+
+        def chunks():
+            for _ in range(8):
+                yield b"z" * 512
+
+        streamed = db.post(f"/api/objects/{h}", content=chunks())
+        assert streamed.status_code == 413, streamed.text
+        assert db.head(f"/api/objects/{h}").status_code == 404
+        # No temp file left behind by the aborted stream.
+        assert not list(server_module.storage.objects_dir.glob("**/*.tmp.*"))
+
+        small = b"ok"
+        hs = hashlib.sha256(small).hexdigest()
+        assert db.post(f"/api/objects/{hs}", content=small).status_code == 201
+
+    def test_gc_marks_over_column_tuples_and_keeps_referenced_layers_and_chunks(self, db, monkeypatch):
+        """The rewritten mark phase must keep exactly what a commit references (object,
+        layer shards, CDC chunks) and sweep the rest -- same decisions as the ORM walk."""
+        monkeypatch.setattr(server_module, "GC_GRACE_SECONDS", 0)
+        blobs = {name: (f"gc-v163-{name}-{uuid.uuid4().hex}").encode() for name in
+                 ("whole", "layer", "chunk", "orphan")}
+        hashes = {name: hashlib.sha256(b).hexdigest() for name, b in blobs.items()}
+        for name, b in blobs.items():
+            assert db.post(f"/api/objects/{hashes[name]}", content=b).status_code in (201, 409)
+        commit_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        payload = {
+            "hash": commit_hash, "message": "gc v163", "root_tree_hash": commit_hash,
+            "project_id": "gc-v163", "project_name": "gc-v163",
+            "tree": {
+                "whole.bin": {"hash": hashes["whole"], "size": 1, "type": "artifact", "layers": [], "chunks": []},
+                "model.safetensors": {"hash": "f" * 64, "size": 1, "type": "artifact",
+                                      "layers": [{"name": "l0", "hash": hashes["layer"], "size": 1, "offset": 0}],
+                                      "chunks": []},
+                "data.bin": {"hash": "e" * 64, "size": 1, "type": "artifact", "layers": [],
+                             "chunks": [{"hash": hashes["chunk"], "size": 1, "offset": 0}]},
+            },
+        }
+        assert db.post("/api/commits", json=payload).status_code in (201, 409)
+        resp = db.post("/api/admin/gc")
+        assert resp.status_code == 200, resp.text
+        for name in ("whole", "layer", "chunk"):
+            assert db.head(f"/api/objects/{hashes[name]}").status_code == 200, name
+        assert db.head(f"/api/objects/{hashes['orphan']}").status_code == 404
+
+    def test_refs_are_paged_ordered_and_offset_aware(self, db):
+        commit_hash = hashlib.sha256(b"refs-page-commit").hexdigest()
+        assert db.post("/api/commits", json={
+            "hash": commit_hash, "message": "refs page", "root_tree_hash": commit_hash,
+            "project_id": "refs-page", "project_name": "refs-page", "tree": {},
+        }).status_code in (201, 409)
+        for i in range(5):
+            r = db.put(f"/api/refs/refs-page/b{i}", json={"commit_hash": commit_hash})
+            assert r.status_code in (200, 201), r.text
+        page1 = db.get("/api/refs", params={"project_id": "refs-page", "limit": 2}).json()
+        page2 = db.get("/api/refs", params={"project_id": "refs-page", "limit": 2, "offset": 2}).json()
+        page3 = db.get("/api/refs", params={"project_id": "refs-page", "limit": 2, "offset": 4}).json()
+        assert list(page1) == ["refs-page/b0", "refs-page/b1"]
+        assert list(page2) == ["refs-page/b2", "refs-page/b3"]
+        assert list(page3) == ["refs-page/b4"]
+        assert db.get("/api/refs", params={"project_id": "refs-page", "offset": 40}).json() == {}
+        assert db.get("/api/refs", params={"limit": 5001}).status_code == 422
+
+    def test_metrics_expose_process_rss(self, db):
+        resp = db.get("/api/metrics")
+        assert resp.status_code == 200
+        assert "av_process_rss_bytes " in resp.text
+        assert "av_process_peak_rss_bytes " in resp.text

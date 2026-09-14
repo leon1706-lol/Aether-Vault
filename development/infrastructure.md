@@ -35,7 +35,7 @@ curl http://localhost:8000/api/health   # registry leg
 curl -sf http://localhost:3000/ >/dev/null && echo webui-ok   # dashboard leg
 ```
 
-**Verified directly:** the engine healthcheck checks BOTH legs in one container — python-urllib against :8000 and node fetch against :3000 (both runtimes ship in-engine), `start_period: 40s`.
+**Verified directly:** the engine healthcheck checks BOTH legs in one container — since V1.6.3 through `/engine-healthcheck.sh` (bash `/dev/tcp` GETs against `:8000/api/ready` and `:3000/`, role-aware, no python/node process forked per tick; previously a python-urllib + node-fetch pair every 10 s), `start_period: 40s`, interval `${AV_HEALTHCHECK_INTERVAL:-30s}`.
 
 End users on Local mode never run any of this by hand — `av init` detects whether the backend is missing, unbuilt, or stopped and starts it automatically.
 
@@ -277,7 +277,74 @@ AV_UVICORN_WORKERS  1  (default, unchanged behavior; docker/engine-entrypoint.sh
                replicas, just within one container. `AV_RATE_LIMIT_BACKEND=redis`/
                `AV_AUTH_SPIKE_BACKEND=redis` exist specifically to make that state correct
                across workers/replicas either way.
+
+# --- V1.6.3 footprint knobs (see development/MEMORY.md for the measured envelope) ---
+AV_UVICORN_LIMIT_CONCURRENCY  (unset = uvicorn's unlimited; docker/engine-entrypoint.sh)
+               Passed as `--limit-concurrency`: requests beyond it get 503 instead of each
+               holding a 4 MiB upload buffer + a DB session. The low-memory .env sets 32.
+AV_MAX_UPLOAD_BYTES  0  (default = unlimited; server-side, server.py::upload_object)
+               Object upload cap. Enforced against Content-Length AND while streaming, so a
+               chunked body can't bypass it; 413 with the limit in the detail. Uploads already
+               stream to disk in 4 MiB pieces, so this bounds disk, not RAM.
+AV_AUTH_CACHE_MAX_ENTRIES  1024  (server-side, identity.py)
+               Cap on the principal cache; expired entries are evicted first, then the
+               soonest-to-expire. Previously unbounded: every distinct bad token a spraying
+               client sent stayed cached as a None principal.
+AV_AUTH_SPIKE_MAX_KEYS  4096  (server-side, server.py, memory backend only)
+               Cap on the in-process auth-failure window; stale hosts are pruned every 256
+               calls regardless. Previously unbounded.
+AV_STAGE_WORKERS_MAX  (unset; CLI-side, core.py::effective_stage_workers)
+               Hard cap on parallel staging workers. The automatic cap is
+               (available RAM - AV_STAGE_RESERVE_MB) // (AV_STAGE_BUFFER_MB + 2), then the
+               CPU-based python_pool_size(); this wins when lower. Measured 4 -> 2 workers:
+               161 -> 97 MB peak on 8 x 64 MiB safetensors.
+AV_STAGE_RESERVE_MB  256  (CLI-side, core.py)
+               Free RAM kept out of the automatic worker cap above, so `av add` itself
+               never pushes a box at the edge into swap.
+AV_DAEMON_SERVING  (internal; set to "1" by daemon.py in each request's env overlay)
+               Tells commands they run inside the long-lived daemon -- `add` releases the
+               C++ thread pool right after its batch instead of leaving idle threads until
+               the trim. Restored with the overlay; never set by hand.
+AV_MEMORY_GATE  (unset; tests/test_memory_gate.py)
+               "1" runs the peak-RSS gate (opt-in: peak RSS varies 10-20% across
+               allocators/runners). The `memory-budget` CI job sets it, warn-only.
+AV_MEMORY_BUDGET_MULTIPLIER  1.5  (tests/test_memory_gate.py)
+               Scales every budget in speedcheck._MEMORY_BUDGETS_MB for a noisy machine.
+
+# --- compose interpolation vars (all three compose files; put overrides in the .env
+# --- next to the file -- there is deliberately NO overlay file, since av's own
+# --- `docker compose -f <file>` calls (docker_runtime.py) would drop one) ---
+AV_ENGINE_ROLE  all  (compose; was hard-coded "all" before V1.6.3)
+               `server` = API only (no Next.js process), `webui` = the reverse.
+AV_ENGINE_MEM_LIMIT  768M / AV_DB_MEM_LIMIT  256M / AV_REDIS_MEM_LIMIT  192M
+               `deploy.resources.limits.memory` per service. Compose v2 honors these on a
+               plain `docker compose up` (no swarm, no --compatibility); docker-compose v1
+               ignored them without --compatibility. Caps, not reservations -- the engine
+               idles ~210 MB (role=all), Postgres ~95 MB, redis-stack ~22 MB.
+AV_PG_SHARED_BUFFERS  64MB / AV_PG_WORK_MEM  4MB / AV_PG_MAINT_WORK_MEM  32MB /
+AV_PG_EFFECTIVE_CACHE  256MB / AV_PG_MAX_CONNECTIONS  100
+               Passed as `postgres -c ...`. shared_buffers 64MB vs the image's 128MB
+               default: this registry's working set is small. max_connections stays at
+               Postgres' own 100 because ONE engine process opens two pools (10 + 20 each);
+               lower it together with AV_DB_POOL_SIZE/AV_DB_MAX_OVERFLOW.
+AV_REDIS_MAXMEMORY  128mb  (compose, via REDIS_ARGS; policy is always volatile-lru)
+               volatile-lru on purpose: the Bloom filter key (av:hash_filter, ~1.8 MB at
+               1M/0.1%) has no TTL and must never be evicted -- every upload would silently
+               fall back to a DB round trip until the next GC rebuild; the TTL'd
+               device-code / SAML-replay / rate-limit keys are what gets shed.
+AV_HEALTHCHECK_INTERVAL  30s  (compose; was 10s)
+               The probe is now /engine-healthcheck.sh (bash /dev/tcp GET, role-aware),
+               not a python + node fork per tick.
+AV_WEBUI_NODE_HEAP_MB  256  (docker/engine-entrypoint.sh)
+               `--max-old-space-size` for the Next.js standalone server; 0 = node's default
+               (which sizes the heap to the HOST's RAM and collects late). Measured idle
+               ~80 MB, so 256 is headroom, not pressure.
 ```
+
+**Windows / Docker Desktop:** the container limits above are not what bounds the memory
+Docker takes on a Windows host -- the WSL VM (`vmmem`) is. `%USERPROFILE%\.wslconfig` with
+`[wsl2]` / `memory=1200MB` / `swap=1024MB`, then `wsl --shutdown`, is the lever; the
+reference dev box (3.9 GB) runs the whole stack under it.
 
 **Caution:** `AV_DATA_DIR`'s `/data` default is container-oriented. Bare-metal uvicorn MUST point it at a writable directory, or every object upload fails with PermissionError while `/api/health` stays green — the most misleading failure mode in the project. This exact failure broke CI `webui-e2e` once: uploads 500ed, seed pushes queued offline, the dashboard rendered empty, Playwright failed on element-not-found. Documented in [CHANGELOG.md](CHANGELOG.md); the fix lives as explicit env vars on both uvicorn-starting CI jobs.
 
@@ -463,6 +530,7 @@ naming a job that no longer exists, both fail CI. Keep this table's job-id backt
 | WebUI browser E2E: dashboard, weight-diff, token gate | `webui-e2e` |
 | Helm chart schema verification: `helm template \| kubeconform -strict` across 4 value permutations — NOT a real cluster deploy | `helm-lint` |
 | HA drill: real 2-replica compose topology, killed replica mid-load, webhook double-delivery + rate-limit proofs | `ha-drill` (`scripts/ha_drill.sh`) |
+| Peak-RSS budgets (`AV_MEMORY_GATE=1 tests/test_memory_gate.py`) + `scripts/rss_scoreboard.py` capture as an artifact and run-summary table — warn-only (`continue-on-error`), never a merge gate | `memory-budget` |
 | CI duration/budget dashboard, `.github/ci-budgets.yml`-driven, posts a PR comment | `ci-summary` |
 
 **`security.yml`** — PR + `push: master` + weekly cron:

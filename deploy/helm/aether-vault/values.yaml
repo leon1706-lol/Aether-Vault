@@ -20,6 +20,12 @@ engine:
   # before SIGKILL), mirrored here so the chart and the compose files agree.
   stopGraceSecs: 25
   terminationGracePeriodSeconds: 30
+  # Footprint knobs (V1.6.3) -- the same env vars the compose files interpolate; see
+  # development/infrastructure.md. limitConcurrency "" = uvicorn's unlimited default.
+  uvicornWorkers: 1
+  limitConcurrency: ""
+  nodeHeapMb: 256
+  maxUploadBytes: 0
 
 service:
   type: ClusterIP
@@ -37,13 +43,32 @@ ingress:
           pathType: Prefix
   tls: []
 
-resources:
-  requests:
-    cpu: 250m
-    memory: 512Mi
-  limits:
-    cpu: "1"
-    memory: 1Gi
+# Explicit override; leave empty ({}) to use the per-role preset below (V1.6.3), which
+# sizes an API-only (`engine.role: server`) pod without the Next.js process at half.
+resources: {}
+
+resourcesByRole:
+  all:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  server:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  webui:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 384Mi
 
 autoscaling:
   enabled: false

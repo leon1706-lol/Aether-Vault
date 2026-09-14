@@ -178,6 +178,8 @@ def daemon_status() -> None:
         click.echo(f"  requests     : {status['requests_served']}")
     if "rss_mb" in status:
         click.echo(f"  rss_mb       : {status['rss_mb']}")
+    if "peak_rss_mb" in status:
+        click.echo(f"  peak_rss_mb  : {status['peak_rss_mb']}")
     if "trimmed" in status:
         click.echo(f"  trimmed      : {status['trimmed']}")
 

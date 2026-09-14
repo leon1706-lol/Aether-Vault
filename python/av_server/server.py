@@ -19,7 +19,7 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Respo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -480,10 +480,11 @@ async def collect_metrics(request: Request, call_next):
     duration = time.monotonic() - start
 
     # Starlette's router sets `scope["route"]` DURING route resolution, inside call_next()
-    # above. An early rejection (429/401 before routing) never sets it; falling back to
-    # the raw path there is an accepted, bounded cardinality risk.
+    # above. An early rejection (429/401 before routing) never sets it; those land on one
+    # constant label (V1.6.3) -- the raw path used to be the fallback, which let a
+    # path-scanning client mint one metrics series per probed URL for the process' life.
     route = request.scope.get("route")
-    path_template = route.path if route is not None else request.url.path
+    path_template = route.path if route is not None else "unmatched"
 
     principal = getattr(request.state, "principal", None)
     tenant_id = principal.tenant_id if principal is not None else None
@@ -519,6 +520,28 @@ MAX_METRICS = 1_000
 MAX_TAGS = 200
 MAX_MESSAGE_LEN = 20_000
 MAX_TAG_LEN = 200
+
+# Object upload cap in bytes (V1.6.3); 0 = unlimited (the default -- model shards are
+# routinely multi-GB). Enforced against Content-Length when present AND while streaming,
+# so a chunked body without a length can't bypass it. Uploads already stream to disk in
+# 4 MiB pieces (storage.store_object), so this bounds disk, not RAM.
+MAX_UPLOAD_BYTES = int(os.environ.get("AV_MAX_UPLOAD_BYTES", "0") or "0")
+
+
+class _UploadTooLarge(Exception):
+    pass
+
+
+async def _limited_stream(stream, max_bytes: int):
+    """Re-yields `stream`'s chunks, raising `_UploadTooLarge` the moment the running
+    total passes `max_bytes` -- the storage layer's `except Exception` cleanup then
+    removes the temp file it was writing."""
+    seen = 0
+    async for chunk in stream:
+        seen += len(chunk)
+        if seen > max_bytes:
+            raise _UploadTooLarge(seen)
+        yield chunk
 
 
 class RefUpdate(BaseModel):
@@ -693,7 +716,12 @@ async def get_metrics(db: AsyncSession = Depends(get_session)) -> Response:
         except Exception:
             pass
 
-    body = metrics.render_prometheus_text(webhook_queue_depth=queue_depth, db_pool_stats=pool_stats)
+    from . import sysres as _sysres
+
+    body = metrics.render_prometheus_text(
+        webhook_queue_depth=queue_depth, db_pool_stats=pool_stats,
+        process_rss_bytes=_sysres.current_rss_bytes(), process_peak_rss_bytes=_sysres.peak_rss_bytes(),
+    )
     return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
@@ -726,13 +754,23 @@ async def upload_object(
         if result.scalar_one_or_none():
             return Response(status_code=409, content="Object already exists")
 
+    if MAX_UPLOAD_BYTES > 0:
+        declared = request.headers.get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"object exceeds AV_MAX_UPLOAD_BYTES ({MAX_UPLOAD_BYTES})")
+        body = _limited_stream(request.stream(), MAX_UPLOAD_BYTES)
+    else:
+        body = request.stream()
+
     try:
-        path = await storage.store_object(hash, request.stream(), cas_tenant_id)
+        path = await storage.store_object(hash, body, cas_tenant_id)
         size = path.stat().st_size
         db.add(DBObject(hash=hash, size=size))
         await db.commit()
         await cache.add_hash(hash, cas_tenant_id)
         return Response(status_code=201)
+    except _UploadTooLarge:
+        raise HTTPException(status_code=413, detail=f"object exceeds AV_MAX_UPLOAD_BYTES ({MAX_UPLOAD_BYTES})")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except IntegrityError:
@@ -1187,20 +1225,28 @@ async def get_ref(
 
 
 @app.get("/api/refs")
-async def list_refs(project_id: Optional[str] = None, db: AsyncSession = Depends(get_session)) -> dict:
+async def list_refs(project_id: Optional[str] = None,
+                    limit: int = Query(1000, ge=1, le=5000), offset: int = Query(0, ge=0),
+                    db: AsyncSession = Depends(get_session)) -> dict:
     # Refs are namespaced "<project_id>/<branch>" by the client rather than via a DB
     # column, since the ref-name path parameter already supports slashes.
+    # V1.6.3: bounded (default 1000, ordered by name) -- the dashboard polls this every
+    # 15 s and it used to return the whole table. The flat {name: hash} shape is
+    # unchanged; a registry with more refs than `limit` pages with `offset`, or uses
+    # /api/sync/refs which already carries a paging envelope.
     query = select(DBRef)
     if project_id:
         query = query.where(DBRef.name.like(f"{project_id}/%"))
+    query = query.order_by(DBRef.name).limit(limit).offset(offset)
     result = await db.execute(query)
     refs = result.scalars().all()
     if refs:
         return {r.name: r.commit_hash for r in refs}
-    if project_id:
+    if project_id or offset:
         return {}
     # Fallback to legacy storage
-    return storage.list_refs()
+    legacy = storage.list_refs()
+    return dict(sorted(legacy.items())[offset:offset + limit])
 
 
 # ---------------------------------------------------------------------------
@@ -1240,38 +1286,6 @@ GC_GRACE_SECONDS = int(os.environ.get("AV_GC_GRACE_SECONDS", "3600"))
 _GC_DELETE_BATCH = 500
 
 
-def _collect_alive_in_memory(
-    root_hash: Optional[str], tree_map: Dict[str, list], visited: set, alive: set
-) -> None:
-    """Iteratively mark every object/layer/chunk hash reachable from a root tree as alive.
-
-    Operates over a pre-loaded {tree_hash: [entries]} map, so the whole GC mark phase costs
-    a single DBTree query instead of one query per tree node (was N+1 and recursive).
-    """
-    stack = [root_hash]
-    while stack:
-        th = stack.pop()
-        if not th or th in visited:
-            continue
-        visited.add(th)
-        for entry in tree_map.get(th, []):
-            if entry.child_tree_hash:
-                stack.append(entry.child_tree_hash)
-            if entry.object_hash:
-                alive.add(entry.object_hash)
-            if entry.layers:
-                for layer in entry.layers:
-                    if isinstance(layer, dict) and "hash" in layer:
-                        alive.add(layer["hash"])
-            # CDC chunk shards live as their own objects, like safetensors layer shards --
-            # unmarked here, GC would reap the pieces a chunked checkpoint needs to reassemble.
-            chunks = getattr(entry, "chunks", None) or []
-            for chunk in chunks:
-                if isinstance(chunk, dict) and "hash" in chunk:
-                    alive.add(chunk["hash"])
-
-
-
 @app.post("/api/admin/gc", dependencies=[Depends(require_scope("admin"))])
 async def run_garbage_collection(request: Request, db: AsyncSession = Depends(get_system_session)) -> dict:
     """
@@ -1292,47 +1306,54 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
         # isolation modes. `alive_hashes`/`visited_trees` (the union across every tenant)
         # is mathematically identical to a flat computation, since each tenant's commits
         # only ever reference trees that tenant fully wrote.
-        all_trees = (await db.execute(select(DBTree))).scalars().all()
-        trees_by_tenant: Dict[str, Dict[str, list]] = {}
-        for entry in all_trees:
-            trees_by_tenant.setdefault(entry.tenant_id, {}).setdefault(entry.tree_hash, []).append(entry)
+        #
+        # V1.6.3: trees and commits are streamed as column tuples (`yield_per`) into
+        # `gc_mark.mark_alive`, never materialized as ORM instances -- identical alive/
+        # visited sets (tests/test_gc_mark.py), a fraction of the resident memory.
+        from .gc_mark import TreeRow, mark_alive
 
-        alive_by_tenant: Dict[str, set] = {}
-        visited_by_tenant: Dict[str, set] = {}
-        for commit in (await db.execute(select(DBCommit))).scalars().all():
-            t_alive = alive_by_tenant.setdefault(commit.tenant_id, set())
-            t_visited = visited_by_tenant.setdefault(commit.tenant_id, set())
-            _collect_alive_in_memory(commit.root_tree_hash, trees_by_tenant.get(commit.tenant_id, {}),
-                                     t_visited, t_alive)
+        tree_stream = await db.stream(
+            select(DBTree.tenant_id, DBTree.tree_hash, DBTree.child_tree_hash, DBTree.object_hash,
+                   DBTree.layers, DBTree.chunks).execution_options(yield_per=2000)
+        )
+        tree_rows = [TreeRow(*row) async for row in tree_stream]
+        commit_stream = await db.stream(
+            select(DBCommit.tenant_id, DBCommit.root_tree_hash).execution_options(yield_per=2000)
+        )
+        roots = [(tenant_id, root) async for tenant_id, root in commit_stream]
+        alive_by_tenant, visited_by_tenant, all_tree_hashes = mark_alive(tree_rows, roots)
+        del tree_rows, roots
 
         alive_hashes: set = set().union(*alive_by_tenant.values()) if alive_by_tenant else set()
         visited_trees: set = set().union(*visited_by_tenant.values()) if visited_by_tenant else set()
-        all_tree_hashes = {th for tenant_map in trees_by_tenant.values() for th in tenant_map}
 
         # --- Sweep DB objects (protect recently-created rows via grace period) ---
-        obj_rows = (await db.execute(select(DBObject.tenant_id, DBObject.hash, DBObject.created_at))).all()
+        # Streamed too: only the DEAD rows are ever held, and deletes go out per batch.
+        obj_stream = await db.stream(
+            select(DBObject.tenant_id, DBObject.hash, DBObject.created_at).execution_options(yield_per=2000)
+        )
         if CAS_ISOLATION == "isolated":
             # Tenant-scoped: a row is dead only if ITS OWN tenant's commit history no
             # longer references it. The flat union would be WRONG here -- safe under
             # isolated mode precisely because uploads/dedup never cross the tenant boundary.
-            dead_pairs = {
-                (t, h) for (t, h, created_at) in obj_rows
-                if h not in alive_by_tenant.get(t, set()) and (created_at is None or created_at < gc_cutoff)
-            }
+            dead_pairs: set = set()
+            async for t, h, created_at in obj_stream:
+                if h not in alive_by_tenant.get(t, set()) and (created_at is None or created_at < gc_cutoff):
+                    dead_pairs.add((t, h))
             dead_pairs_list = list(dead_pairs)
             for i in range(0, len(dead_pairs_list), _GC_DELETE_BATCH):
                 batch = dead_pairs_list[i : i + _GC_DELETE_BATCH]
-                for t, h in batch:
-                    await db.execute(delete(DBObject).where(DBObject.tenant_id == t, DBObject.hash == h))
+                # One statement per batch (row-value IN), not one DELETE per pair.
+                await db.execute(delete(DBObject).where(tuple_(DBObject.tenant_id, DBObject.hash).in_(batch)))
         else:
             # Shared mode (default): a hash is dead only if NO tenant's commit history
             # references it anywhere -- a per-tenant check would be wrong here, since
             # tenant B can reference an object whose one DBObject row carries tenant A's
             # id (A uploaded it first; B's identical upload was rejected as a duplicate).
-            dead_hashes = {
-                h for (_t, h, created_at) in obj_rows
-                if h not in alive_hashes and (created_at is None or created_at < gc_cutoff)
-            }
+            dead_hashes: set = set()
+            async for _t, h, created_at in obj_stream:
+                if h not in alive_hashes and (created_at is None or created_at < gc_cutoff):
+                    dead_hashes.add(h)
             dead_list = list(dead_hashes)
             for i in range(0, len(dead_list), _GC_DELETE_BATCH):
                 batch = dead_list[i : i + _GC_DELETE_BATCH]
@@ -1399,8 +1420,8 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
                 for tenant_id, tenant_alive in alive_by_tenant.items():
                     await cache.reset_filter(tenant_id)
                     await cache.init_filter(tenant_id)
-                    await cache.add_hashes(list(tenant_alive), tenant_id)
-            await cache.add_hashes(list(alive_hashes))
+                    await cache.add_hashes(tenant_alive, tenant_id)
+            await cache.add_hashes(alive_hashes)
 
         # Retention sweeps: events (30d default), audit_log (90d default). Terminal-status
         # webhook deliveries ride the event window; stuck pending/failed rows are never
@@ -1446,7 +1467,8 @@ async def run_garbage_collection(request: Request, db: AsyncSession = Depends(ge
         raise HTTPException(status_code=500, detail=str(exc))
 
 @app.get("/api/sync/refs")
-async def sync_refs(limit: int = 1000, offset: int = 0, db: AsyncSession = Depends(get_session)):
+async def sync_refs(limit: int = Query(1000, ge=1, le=5000), offset: int = Query(0, ge=0),
+                    db: AsyncSession = Depends(get_session)):
     """Endpoint for remote teams to pull branch references with pagination."""
     result = await db.execute(select(DBRef).limit(limit).offset(offset))
     refs = result.scalars().all()
@@ -1504,8 +1526,8 @@ async def check_objects_batch(hashes: List[str], request: Request, db: AsyncSess
 @app.get("/api/commits")
 async def list_commits(
     request: Request,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     project_id: Optional[str] = None,
     include_layers: bool = False,
     db: AsyncSession = Depends(get_session)
@@ -1627,7 +1649,7 @@ async def dashboard_summary(db: AsyncSession = Depends(get_session)) -> dict:
     total_commits = total_commits_result.scalar_one()
 
     # Refs
-    ref_result = await db.execute(select(DBRef))
+    ref_result = await db.execute(select(DBRef).order_by(DBRef.name).limit(1000))
     refs = ref_result.scalars().all()
 
     # Objects count and size
@@ -1697,6 +1719,25 @@ AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS = float(os.environ.get("AV_ANOMALY_AUTH_SPIKE_
 # durable security record -- the audit log is already that. Resets after tripping so one
 # burst raises exactly one anomaly, not one per subsequent failure.
 _AUTH_FAILURE_WINDOW: dict[str, list[float]] = {}
+# V1.6.3: the window used to keep an entry for every client identifier that ever failed
+# (a host that fails fewer than threshold times leaves its list behind forever, and a
+# token-spraying client can mint unbounded keys). Stale keys are pruned every
+# _AUTH_FAILURE_PRUNE_EVERY calls and the map is hard-capped.
+_AUTH_FAILURE_PRUNE_EVERY = 256
+_AUTH_FAILURE_MAX_KEYS = int(os.environ.get("AV_AUTH_SPIKE_MAX_KEYS", "4096"))
+_auth_failure_calls = 0
+
+
+def _prune_auth_failure_window(now: float) -> None:
+    stale = [k for k, ts in _AUTH_FAILURE_WINDOW.items()
+             if not ts or now - ts[-1] >= AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS]
+    for k in stale:
+        _AUTH_FAILURE_WINDOW.pop(k, None)
+    overflow = len(_AUTH_FAILURE_WINDOW) - _AUTH_FAILURE_MAX_KEYS
+    if overflow > 0:
+        # Drop the keys whose newest failure is oldest -- the least likely to still burst.
+        for k, _ in sorted(_AUTH_FAILURE_WINDOW.items(), key=lambda kv: kv[1][-1] if kv[1] else 0.0)[:overflow]:
+            _AUTH_FAILURE_WINDOW.pop(k, None)
 
 
 # AV_AUTH_SPIKE_BACKEND=redis makes the burst count accurate across N replicas, reusing
@@ -1728,12 +1769,16 @@ async def _note_auth_failure(key: str) -> bool:
 
     import time as _time
 
+    global _auth_failure_calls
     now = _time.monotonic()
+    _auth_failure_calls += 1
+    if _auth_failure_calls % _AUTH_FAILURE_PRUNE_EVERY == 0 or len(_AUTH_FAILURE_WINDOW) > _AUTH_FAILURE_MAX_KEYS:
+        _prune_auth_failure_window(now)
     window = _AUTH_FAILURE_WINDOW.setdefault(key, [])
     window[:] = [t for t in window if now - t < AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS]
     window.append(now)
     if len(window) >= AV_ANOMALY_AUTH_SPIKE_THRESHOLD:
-        window.clear()
+        _AUTH_FAILURE_WINDOW.pop(key, None)  # one burst -> exactly one anomaly; no residue
         return True
     return False
 
@@ -2060,7 +2105,7 @@ async def list_events(
     kinds: Optional[str] = None,
     run_id: Optional[str] = None,
     limit: int = Query(100, ge=1, le=1000),
-    wait: int = 0,
+    wait: int = Query(0, ge=0, le=60),
     db: AsyncSession = Depends(get_session),
 ):
     """Resumable ordered event feed. wait=<secs> long-polls for at least one new row.
@@ -2163,7 +2208,7 @@ async def create_run(request: Request, run: Dict[str, Any] = Body(...),
 @app.get("/api/runs")
 async def list_runs(project_id: Optional[str] = None, status: Optional[str] = None,
                     parent_run_id: Optional[str] = None, kind: Optional[str] = None,
-                    limit: int = 50, offset: int = 0,
+                    limit: int = Query(50, ge=1, le=1000), offset: int = Query(0, ge=0),
                     db: AsyncSession = Depends(get_session)):
     stmt = select(DBRun).order_by(DBRun.created_at.desc())
     if project_id:
@@ -2695,8 +2740,8 @@ def _improver_to_dict(r: DBImproverVersion) -> dict:
 
 
 @app.get("/api/improvers")
-async def list_improver_versions(project_id: Optional[str] = None, limit: int = 50,
-                                 offset: int = 0, db: AsyncSession = Depends(get_session)):
+async def list_improver_versions(project_id: Optional[str] = None, limit: int = Query(50, ge=1, le=500),
+                                 offset: int = Query(0, ge=0), db: AsyncSession = Depends(get_session)):
     stmt = select(DBImproverVersion).order_by(DBImproverVersion.created_at.desc())
     if project_id:
         stmt = stmt.where(DBImproverVersion.project_id == project_id)
@@ -2801,7 +2846,8 @@ def _change_set_to_dict(r: DBChangeSet) -> dict:
 
 @app.get("/api/change-sets")
 async def list_change_sets(project_id: Optional[str] = None, status: Optional[str] = None,
-                           improver_id: Optional[str] = None, limit: int = 50, offset: int = 0,
+                           improver_id: Optional[str] = None, limit: int = Query(50, ge=1, le=500),
+                           offset: int = Query(0, ge=0),
                            db: AsyncSession = Depends(get_session)):
     stmt = select(DBChangeSet).order_by(DBChangeSet.created_at.desc())
     if project_id:
@@ -2923,7 +2969,8 @@ def _policy_pack_to_dict(r: DBPolicyPack) -> dict:
 
 
 @app.get("/api/policy-packs")
-async def list_policy_packs(project_id: Optional[str] = None, limit: int = 50, offset: int = 0,
+async def list_policy_packs(project_id: Optional[str] = None, limit: int = Query(50, ge=1, le=500),
+                            offset: int = Query(0, ge=0),
                             db: AsyncSession = Depends(get_session)):
     stmt = select(DBPolicyPack).order_by(DBPolicyPack.created_at.desc())
     if project_id:
@@ -2993,7 +3040,7 @@ def _canary_result_to_dict(r: DBCanaryResult) -> dict:
 
 @app.get("/api/canary-results")
 async def list_canary_results(project_id: Optional[str] = None, improver_id: Optional[str] = None,
-                              limit: int = 50, offset: int = 0,
+                              limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
                               db: AsyncSession = Depends(get_session)):
     stmt = select(DBCanaryResult).order_by(DBCanaryResult.created_at.desc())
     if project_id:
@@ -3096,7 +3143,8 @@ def _eval_suite_to_dict(r: DBEvalSuite) -> dict:
 
 
 @app.get("/api/eval/suites")
-async def list_eval_suites(project_id: Optional[str] = None, limit: int = 50, offset: int = 0,
+async def list_eval_suites(project_id: Optional[str] = None, limit: int = Query(50, ge=1, le=500),
+                           offset: int = Query(0, ge=0),
                            db: AsyncSession = Depends(get_session)):
     stmt = select(DBEvalSuite).order_by(DBEvalSuite.created_at.desc())
     if project_id:
@@ -3207,7 +3255,7 @@ def _eval_result_to_dict(r: DBEvalResult, redact: bool) -> dict:
 @app.get("/api/eval/results")
 async def list_eval_results(request: Request, project_id: Optional[str] = None,
                             suite_id: Optional[str] = None, run_id: Optional[str] = None,
-                            limit: int = 50, offset: int = 0,
+                            limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
                             db: AsyncSession = Depends(get_session)):
     stmt = select(DBEvalResult).order_by(DBEvalResult.created_at.desc())
     if project_id:
@@ -3265,11 +3313,12 @@ async def create_eval_adapter(request: Request, body: Dict[str, Any] = Body(...)
 
 
 @app.get("/api/eval/adapters")
-async def list_eval_adapters(project_id: Optional[str] = None, db: AsyncSession = Depends(get_session)):
-    stmt = select(DBEvalAdapter)
+async def list_eval_adapters(project_id: Optional[str] = None, limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
+                             db: AsyncSession = Depends(get_session)):
+    stmt = select(DBEvalAdapter).order_by(DBEvalAdapter.created_at.desc())
     if project_id:
         stmt = stmt.where(DBEvalAdapter.project_id == project_id)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"adapters": [{"id": r.id, "project_id": r.project_id, "name": r.name,
                           "command": r.command, "created_by": r.created_by,
                           "created_at": r.created_at.isoformat() if r.created_at else None}
@@ -3308,13 +3357,14 @@ def _task_to_dict(r: DBTask) -> dict:
 
 @app.get("/api/tasks")
 async def list_tasks(project_id: Optional[str] = None, status: Optional[str] = None,
+                     limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
                      db: AsyncSession = Depends(get_session)):
     stmt = select(DBTask).order_by(DBTask.created_at.desc())
     if project_id:
         stmt = stmt.where(DBTask.project_id == project_id)
     if status:
         stmt = stmt.where(DBTask.status == status)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"tasks": [_task_to_dict(r) for r in rows]}
 
 
@@ -3368,11 +3418,12 @@ def _plan_to_dict(r: DBPlan) -> dict:
 
 
 @app.get("/api/plans")
-async def list_plans(project_id: Optional[str] = None, db: AsyncSession = Depends(get_session)):
+async def list_plans(project_id: Optional[str] = None, limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
+                     db: AsyncSession = Depends(get_session)):
     stmt = select(DBPlan).order_by(DBPlan.created_at.desc())
     if project_id:
         stmt = stmt.where(DBPlan.project_id == project_id)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"plans": [_plan_to_dict(r) for r in rows]}
 
 
@@ -3432,13 +3483,14 @@ async def get_budget(budget_id: str, db: AsyncSession = Depends(get_session)):
 
 @app.get("/api/budgets")
 async def list_budgets(project_id: Optional[str] = None, scope_ref: Optional[str] = None,
+                       limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
                        db: AsyncSession = Depends(get_session)):
-    stmt = select(DBBudget)
+    stmt = select(DBBudget).order_by(DBBudget.created_at.desc())
     if project_id:
         stmt = stmt.where(DBBudget.project_id == project_id)
     if scope_ref:
         stmt = stmt.where(DBBudget.scope_ref == scope_ref)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"budgets": [_budget_to_dict(r) for r in rows]}
 
 
@@ -3499,7 +3551,7 @@ async def stop_run(run_id: str, request: Request, body: Dict[str, Any] = Body(de
 
 
 @app.get("/api/scheduler/queue")
-async def scheduler_queue(project_id: Optional[str] = None, limit: int = 100,
+async def scheduler_queue(project_id: Optional[str] = None, limit: int = Query(100, ge=1, le=500),
                           db: AsyncSession = Depends(get_session)):
     """The live set of running runs a scheduler can act on -- same fields as
     `GET /api/runs` but purpose-named for "what's currently in flight"."""
@@ -3540,13 +3592,14 @@ async def create_causal_link(request: Request, body: Dict[str, Any] = Body(...),
 
 @app.get("/api/causal-links")
 async def list_causal_links(project_id: Optional[str] = None, cause_ref: Optional[str] = None,
+                            limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
                             db: AsyncSession = Depends(get_session)):
     stmt = select(DBCausalLink).order_by(DBCausalLink.created_at.desc())
     if project_id:
         stmt = stmt.where(DBCausalLink.project_id == project_id)
     if cause_ref:
         stmt = stmt.where(DBCausalLink.cause_ref == cause_ref)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"causal_links": [
         {"id": r.id, "project_id": r.project_id, "cause_type": r.cause_type,
          "cause_ref": r.cause_ref, "effect_metric": r.effect_metric,
@@ -3589,7 +3642,7 @@ def _strategy_to_dict(r: DBStrategyEntry) -> dict:
 @app.get("/api/strategy")
 async def search_strategy(project_id: Optional[str] = None, technique: Optional[str] = None,
                           outcome: Optional[str] = None, q: Optional[str] = None,
-                          limit: int = 50, db: AsyncSession = Depends(get_session)):
+                          limit: int = Query(50, ge=1, le=500), db: AsyncSession = Depends(get_session)):
     """`q` does a simple case-insensitive substring match over `technique`, without
     pulling in a full-text engine for what is, in practice, a small table."""
     stmt = select(DBStrategyEntry).order_by(DBStrategyEntry.created_at.desc())
@@ -3705,13 +3758,14 @@ async def create_review(request: Request, body: Dict[str, Any] = Body(...),
 
 @app.get("/api/reviews")
 async def list_reviews(target_type: Optional[str] = None, target_id: Optional[str] = None,
+                       limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
                        db: AsyncSession = Depends(get_session)):
     stmt = select(DBReview).order_by(DBReview.created_at.desc())
     if target_type:
         stmt = stmt.where(DBReview.target_type == target_type)
     if target_id:
         stmt = stmt.where(DBReview.target_id == target_id)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"reviews": [
         {"id": r.id, "target_type": r.target_type, "target_id": r.target_id,
          "reviewer": r.reviewer, "decision": r.decision, "comment": r.comment,
@@ -3753,7 +3807,8 @@ def _critique_to_dict(r: DBCritique) -> dict:
 
 @app.get("/api/critiques")
 async def list_critiques(target_type: Optional[str] = None, target_id: Optional[str] = None,
-                         status: Optional[str] = None, db: AsyncSession = Depends(get_session)):
+                         status: Optional[str] = None, limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
+                         db: AsyncSession = Depends(get_session)):
     stmt = select(DBCritique).order_by(DBCritique.created_at.desc())
     if target_type:
         stmt = stmt.where(DBCritique.target_type == target_type)
@@ -3761,7 +3816,7 @@ async def list_critiques(target_type: Optional[str] = None, target_id: Optional[
         stmt = stmt.where(DBCritique.target_id == target_id)
     if status:
         stmt = stmt.where(DBCritique.status == status)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"critiques": [_critique_to_dict(r) for r in rows]}
 
 
@@ -3825,13 +3880,14 @@ def _blackboard_to_dict(r: DBBlackboardEntry) -> dict:
 
 @app.get("/api/blackboard")
 async def list_blackboard(project_id: Optional[str] = None, status: Optional[str] = None,
+                          limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
                           db: AsyncSession = Depends(get_session)):
     stmt = select(DBBlackboardEntry).order_by(DBBlackboardEntry.created_at.desc())
     if project_id:
         stmt = stmt.where(DBBlackboardEntry.project_id == project_id)
     if status:
         stmt = stmt.where(DBBlackboardEntry.status == status)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"entries": [_blackboard_to_dict(r) for r in rows]}
 
 
@@ -3855,7 +3911,7 @@ async def resolve_blackboard_entry(entry_id: str, request: Request,
 
 @app.get("/api/search/runs")
 async def search_runs(project_id: Optional[str] = None, metric: str = "",
-                      direction: str = "up", min_delta: float = 0.0, limit: int = 50,
+                      direction: str = "up", min_delta: float = 0.0, limit: int = Query(50, ge=1, le=500),
                       db: AsyncSession = Depends(get_session)):
     """A structured predicate: runs whose `metric` moved `direction` by at least
     `min_delta` relative to their PARENT run's latest value for that metric.
@@ -3959,7 +4015,7 @@ async def get_sandbox_job(job_id: str, db: AsyncSession = Depends(get_session)):
 
 @app.get("/api/sandbox/jobs")
 async def list_sandbox_jobs(project_id: Optional[str] = None, state: Optional[str] = None,
-                            limit: int = 50, db: AsyncSession = Depends(get_session)):
+                            limit: int = Query(50, ge=1, le=500), db: AsyncSession = Depends(get_session)):
     stmt = select(DBSandboxJob).order_by(DBSandboxJob.created_at.desc())
     if project_id:
         stmt = stmt.where(DBSandboxJob.project_id == project_id)
@@ -4073,13 +4129,14 @@ async def get_action_log(log_id: str, db: AsyncSession = Depends(get_session)):
 
 @app.get("/api/action-logs")
 async def list_action_logs(project_id: Optional[str] = None, run_id: Optional[str] = None,
+                           limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
                            db: AsyncSession = Depends(get_session)):
     stmt = select(DBActionLog).order_by(DBActionLog.created_at.desc())
     if project_id:
         stmt = stmt.where(DBActionLog.project_id == project_id)
     if run_id:
         stmt = stmt.where(DBActionLog.run_id == run_id)
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt.limit(limit).offset(offset))).scalars().all()
     return {"action_logs": [_action_log_to_dict(r) for r in rows]}
 
 
@@ -4214,7 +4271,12 @@ async def export_audit_log(
 ):
     """Streams the FILTERED set (same filters as the list endpoint, no pagination) as
     jsonl or csv for compliance export. Ordered oldest-first (unlike the list endpoint)
-    so the file reads as a natural timeline top to bottom."""
+    so the file reads as a natural timeline top to bottom.
+
+    V1.6.3: a real stream -- rows are fetched with `yield_per` and written to the
+    response as they arrive, so a multi-year audit trail never exists as one string in
+    the server process. The generator opens its OWN session: the request-scoped one can
+    be torn down before a streamed body finishes, depending on the FastAPI version."""
     import csv
     import io
     import json as _json
@@ -4222,30 +4284,42 @@ async def export_audit_log(
     stmt = _apply_audit_filters(
         select(DBAuditLog), project_id=project_id, action=action, action_prefix=action_prefix,
         username=username, status_code=status_code, outcome=outcome, since=since, until=until,
-    ).order_by(DBAuditLog.id.asc())
-    rows = (await db.execute(stmt)).scalars().all()
+    ).order_by(DBAuditLog.id.asc()).execution_options(yield_per=500)
+    tenant_id = db.info.get("tenant_id")
+    fieldnames = ["id", "ts", "username", "action", "project_id", "details",
+                  "status_code", "chain_hash", "signature"]
 
-    if format == "jsonl":
-        body = "\n".join(_json.dumps(_audit_row_dict(a)) for a in rows)
-        if body:
-            body += "\n"
-        media_type, filename = "application/x-ndjson", "audit-export.jsonl"
-    else:
+    async def _rows():
+        async with async_session_factory() as session:
+            session.info["tenant_id"] = tenant_id
+            result = await session.stream(stmt)
+            async for a in result.scalars():
+                yield a
+
+    async def _jsonl():
+        async for a in _rows():
+            yield _json.dumps(_audit_row_dict(a)) + "\n"
+
+    async def _csv():
         buf = io.StringIO()
-        writer = csv.DictWriter(
-            buf, fieldnames=["id", "ts", "username", "action", "project_id", "details",
-                            "status_code", "chain_hash", "signature"]
-        )
+        writer = csv.DictWriter(buf, fieldnames=fieldnames)
         writer.writeheader()
-        for a in rows:
+        yield buf.getvalue()
+        async for a in _rows():
+            buf.seek(0)
+            buf.truncate()
             d = _audit_row_dict(a)
             d["details"] = _json.dumps(d["details"]) if d["details"] is not None else ""
             writer.writerow(d)
-        body = buf.getvalue()
-        media_type, filename = "text/csv", "audit-export.csv"
+            yield buf.getvalue()
 
-    return Response(
-        content=body, media_type=media_type,
+    if format == "jsonl":
+        body, media_type, filename = _jsonl(), "application/x-ndjson", "audit-export.jsonl"
+    else:
+        body, media_type, filename = _csv(), "text/csv", "audit-export.csv"
+
+    return StreamingResponse(
+        body, media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -4296,12 +4370,16 @@ async def verify_audit_chain(
     stmt = select(DBAuditLog).where(DBAuditLog.id > since_id).order_by(DBAuditLog.id.asc())
     if limit:
         stmt = stmt.limit(limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    # limit=0 means "the whole chain": walked as a server-side cursor (V1.6.3), never
+    # materialized -- the chain check is strictly sequential anyway.
+    result = await db.stream(stmt.execution_options(yield_per=500))
 
     signature_checks = {"verified": 0, "failed": 0, "absent": 0}
     pub_key = audit_signing.public_key_hex()
     checked = 0
-    for row in rows:
+    last_id = None
+    async for row in result.scalars():
+        last_id = row.id
         expected = compute_chain_hash(
             prev_hash, row.ts, row.username, row.action, row.project_id,
             row.status_code, row.details,
@@ -4323,7 +4401,7 @@ async def verify_audit_chain(
 
     return {
         "ok": True, "checked": checked,
-        "last_id": rows[-1].id if rows else (since_id or None),
+        "last_id": last_id if last_id is not None else (since_id or None),
         "signature_checks": signature_checks,
     }
 
@@ -4360,8 +4438,11 @@ async def create_webhook(request: Request, wh: WebhookCreate,
 
 
 @app.get("/api/webhooks")
-async def list_webhooks(db: AsyncSession = Depends(get_session)):
-    rows = (await db.execute(select(DBWebhook))).scalars().all()
+async def list_webhooks(limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
+                        db: AsyncSession = Depends(get_session)):
+    rows = (await db.execute(
+        select(DBWebhook).order_by(DBWebhook.created_at.desc()).limit(limit).offset(offset)
+    )).scalars().all()
     return {"webhooks": [
         {"id": w.id, "url": w.url, "project_id": w.project_id,
          "kinds": w.kinds, "active": w.active,
@@ -4569,7 +4650,8 @@ async def create_api_token(request: Request, body: Dict[str, Any] = Body(...),
 
 
 @app.get("/api/tokens", dependencies=[Depends(require_scope("token:write"))])
-async def list_api_tokens(request: Request, db: AsyncSession = Depends(get_session)):
+async def list_api_tokens(request: Request, limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
+                          db: AsyncSession = Depends(get_session)):
     """Lists tokens for the CALLER's own tenant only -- never the token hash itself, only
     the display `prefix`. Anonymous-mode callers see the default tenant's tokens, the
     same fallback `create_api_token` uses to mint them."""
@@ -4577,7 +4659,7 @@ async def list_api_tokens(request: Request, db: AsyncSession = Depends(get_sessi
     tenant_id = principal.tenant_id or DEFAULT_TENANT_ID
     rows = (await db.execute(
         select(DBApiToken).where(DBApiToken.tenant_id == tenant_id)
-        .order_by(DBApiToken.created_at.desc())
+        .order_by(DBApiToken.created_at.desc()).limit(limit).offset(offset)
     )).scalars().all()
     return {"tokens": [_token_row_dict(r) for r in rows]}
 
@@ -4684,10 +4766,12 @@ async def create_user(request: Request, body: Dict[str, Any] = Body(...),
 
 
 @app.get("/api/users", dependencies=[Depends(require_scope("user:write"))])
-async def list_users(request: Request, db: AsyncSession = Depends(get_session)):
+async def list_users(request: Request, limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
+                     db: AsyncSession = Depends(get_session)):
     tenant_id = _effective_tenant_id(request)
     rows = (await db.execute(
         select(DBUser).where(DBUser.tenant_id == tenant_id).order_by(DBUser.created_at.desc())
+        .limit(limit).offset(offset)
     )).scalars().all()
     return {"users": [_user_row_dict(r) for r in rows]}
 
@@ -4773,12 +4857,13 @@ async def create_role_binding(request: Request, body: Dict[str, Any] = Body(...)
 
 @app.get("/api/role-bindings", dependencies=[Depends(require_scope("user:write"))])
 async def list_role_bindings(request: Request, subject_id: Optional[str] = None,
+                             limit: int = Query(500, ge=1, le=2000), offset: int = Query(0, ge=0),
                              db: AsyncSession = Depends(get_session)):
     tenant_id = _effective_tenant_id(request)
     stmt = select(DBRoleBinding).where(DBRoleBinding.tenant_id == tenant_id)
     if subject_id:
         stmt = stmt.where(DBRoleBinding.subject_id == subject_id)
-    rows = (await db.execute(stmt.order_by(DBRoleBinding.created_at.desc()))).scalars().all()
+    rows = (await db.execute(stmt.order_by(DBRoleBinding.created_at.desc()).limit(limit).offset(offset))).scalars().all()
     return {"bindings": [{"id": r.id, "subject_type": r.subject_type, "subject_id": r.subject_id,
                           "role_id": r.role_id, "scope_type": r.scope_type,
                           "scope_id": r.scope_id, "created_by": r.created_by} for r in rows]}

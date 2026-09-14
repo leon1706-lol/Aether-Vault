@@ -70,6 +70,45 @@ jobs:
           path: speedcheck-${{ matrix.python-version }}.json
           retention-days: 90
 
+  # Peak-RSS budgets (V1.6.3): the opt-in memory gate plus the scoreboard, as a warn-only
+  # job -- peak RSS varies 10-20% across allocators/runners, and a machine-dependent number
+  # on the hard path is exactly what test_perf_gate.py's docstring warns against. Read the
+  # uploaded scoreboard JSON, don't block a merge on it.
+  memory-budget:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Aether-Vault
+        run: pip install -e .[dev]
+
+      - name: Memory gate (opt-in, warn-only)
+        env:
+          AV_MEMORY_GATE: "1"
+        run: pytest tests/test_memory_gate.py -v -p no:cacheprovider
+
+      - name: RSS scoreboard
+        run: python scripts/rss_scoreboard.py --label ci-${{ github.sha }} --scenarios status_cold,add_safetensors,add_many_safetensors,commit,log_all --files 500 --commits 30 --runs 2 --out-json rss-scoreboard.json --out-md rss-scoreboard.md
+
+      - name: Scoreboard in the run summary
+        run: Get-Content rss-scoreboard.md | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload scoreboard artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rss-scoreboard-windows
+          path: |
+            rss-scoreboard.json
+            rss-scoreboard.md
+          retention-days: 90
+
   # The floor+ceiling Linux twin of `test` above (the platform this project actually
   # deploys containers on), plus the coverage gate and slowest-tests report.
   test-linux:
@@ -1209,6 +1248,7 @@ jobs:
       - webui-e2e
       - helm-lint
       - ha-drill
+      - memory-budget
     permissions:
       contents: read
       actions: read          # to read this run's own job list

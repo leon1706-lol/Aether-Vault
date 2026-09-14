@@ -50,8 +50,11 @@ In your compose file / pull command:
    `ghcr.io/leon1706-lol/aether-vault-webui` (wherever they appear, in whatever tag) with
    `ghcr.io/leon1706-lol/aether-vault-engine`.
 2. Collapse the two services into one, exposing both ports (`8000:8000` and `3000:3000`).
-3. Set `AV_ENGINE_ROLE=all` explicitly — don't rely on the old services' `DATABASE_URL`
-   (server) / `NEXT_PUBLIC_API_URL` (webui) environment markers to auto-detect a role;
+3. Set `AV_ENGINE_ROLE=${AV_ENGINE_ROLE:-all}` explicitly (`av doctor --compose` writes this
+   interpolated form since V1.6.3, so `AV_ENGINE_ROLE=server` in the neighbouring `.env`
+   later gives an API-only container without another edit) — don't rely on the old
+   services' `DATABASE_URL` (server) / `NEXT_PUBLIC_API_URL` (webui) environment markers
+   to auto-detect a role;
    with both env vars now present on one merged service, auto-detect would be ambiguous.
    (Auto-detect itself isn't removed — it still works for any already-pulled legacy-shaped
    *single-role* container; it's just not what you want for the new merged service.)

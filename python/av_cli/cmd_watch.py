@@ -137,26 +137,33 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
                 if prev is None or prev != sig:
                     pending_since[rel] = now          # (re)arm debounce timer
                 elif rel in pending_since and now - pending_since[rel] >= debounce:
+                    from .core import hash_file_safe
+
+                    fpath = repo_root / rel
+                    # One index load and one content hash per debounced file, both reused
+                    # below (this used to load the index three times per file). The skip
+                    # check compares the index against the FILE's current hash -- comparing
+                    # the index entry against itself, as this once did, meant a modified,
+                    # already-tracked checkpoint was never auto-committed at all.
+                    file_hash = hash_file_safe(str(fpath))
+                    if not file_hash:
+                        pending_since.pop(rel, None)
+                        continue
                     idx = Index(repo_root)
                     entry = idx.get_entry(rel)
-                    if entry and entry.get("hash") == _hash_of(repo_root, rel):
+                    if entry and entry.get("hash") == file_hash and not entry.get("staged"):
                         pending_since.pop(rel, None)  # already committed this content
                         continue
                     if not json_mode:
                         click.secho(f"[watch] new content: {rel}", fg="yellow")
                     # Stage through the REAL staging path (hashing/pointers/CDC/attributes),
                     # then commit through THE shared path (offline-queue semantics apply).
-                    from .core import commit_staged, get_file_meta_safe, hash_file_safe, stage_one_file
+                    from .core import stage_one_file
                     from . import attributes as attr_mod
 
-                    fpath = repo_root / rel
                     cfg = load_config(repo_root)
                     threshold = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
                     rules = attr_mod.load_attributes(repo_root)
-                    file_hash = hash_file_safe(str(fpath))
-                    if not file_hash:
-                        pending_since.pop(rel, None)
-                        continue
                     stage_one_file(repo_root, idx, threshold, fpath, rel,
                                    attr_mod.flags_for(rules, rel))
                     idx.save()
@@ -170,7 +177,7 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
                     json_sink = (lambda result: sink_data.update(result)) if json_mode else None
                     commit_hash = _commit(repo_root, f"watch: {rel} @ {time.strftime('%H:%M:%S')}",
                             run_id=resolve_run_id(repo_root), defer_upload=True,
-                            result_sink=json_sink, outcome_sink=sink_data.update)
+                            result_sink=json_sink, outcome_sink=sink_data.update, idx=idx)
                     commits_made += 1
                     pending_since.pop(rel, None)
                     if json_mode:
@@ -204,10 +211,3 @@ def watch(pattern: str, interval: float, debounce: float, max_commits: int) -> N
             observer, _ = watchdog_handle
             observer.stop()
             observer.join(timeout=5)
-
-
-def _hash_of(repo_root, rel_path: str) -> str | None:
-    """Content hash via the index when present, else None (forces first commit)."""
-    from .index import Index
-
-    return (Index(repo_root).get_entry(rel_path) or {}).get("hash")

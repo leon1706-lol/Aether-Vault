@@ -23,6 +23,7 @@ from benchmarks.tool_runner import (  # noqa: E402
     Row,
     ToolStatus,
     detect_tools,
+    pop_rss_median,
     repeat_median,
     time_subprocess,
 )
@@ -44,8 +45,8 @@ def _bench_av() -> dict[str, float] | None:
         time_subprocess([av_path, "commit", "-m", "bench", "--no-upload"], root)
         speedcheck.await_daemon(av_path, root)
         return {
-            "re-add": time_subprocess([av_path, "add", "."], root),
-            "status": time_subprocess([av_path, "status"], root),
+            "re-add": time_subprocess([av_path, "add", "."], root, rss_key="noop_status_speed:re-add"),
+            "status": time_subprocess([av_path, "status"], root, rss_key="noop_status_speed:status"),
         }
 
 
@@ -119,7 +120,8 @@ def run(tool_order: list[str] | None = None, repeat: int = 1) -> BenchmarkResult
             else:
                 values[tool] = raw[tool][op]
                 statuses[tool] = ToolStatus.AVAILABLE
-        rows.append(Row(operation=label, values=values, statuses=statuses, unit="ms", notes=notes))
+        rows.append(Row(operation=label, values=values, statuses=statuses, unit="ms", notes=notes,
+                        rss_mb={"av": pop_rss_median(f"noop_status_speed:{op}")}))
 
     return BenchmarkResult(
         name="noop_status_speed",

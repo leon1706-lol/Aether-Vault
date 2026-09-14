@@ -58,6 +58,14 @@ def atomic_write_text(path: Path, text: str, *, durable: bool = True) -> None:
     ~8 s for 500 commits) -- never for a local commit, whose fsync is the durability
     guarantee the whole product promises.
     """
+    atomic_write_chunks(path, (text,), durable=durable)
+
+
+def atomic_write_chunks(path: Path, chunks, *, durable: bool = True) -> None:
+    """`atomic_write_text` over an iterable of text fragments, written as they are produced
+    -- the whole document never has to exist as one string in memory (V1.6.3: `.av/index`
+    streams its entries this way instead of building a multi-MB JSON string first). Same
+    atomicity and `durable` semantics."""
     path.parent.mkdir(parents=True, exist_ok=True)
     # Short random suffix (not pid + full uuid4 hex): commit filenames are already a 64-char
     # hash, and on Windows the combined path can exceed the 260-char MAX_PATH once a long
@@ -66,7 +74,8 @@ def atomic_write_text(path: Path, text: str, *, durable: bool = True) -> None:
     tmp = path.with_name(f"{path.name}.tmp.{uuid.uuid4().hex[:8]}")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
+            for chunk in chunks:
+                f.write(chunk)
             if durable:
                 f.flush()
                 os.fsync(f.fileno())

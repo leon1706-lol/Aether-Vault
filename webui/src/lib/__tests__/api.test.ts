@@ -1,6 +1,32 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { formatBytes, shortHash } from "../api";
+import { fetchRefs, formatBytes, shortHash } from "../api";
+
+// V1.6.3: the dashboard polls /api/refs; it must ask for a bounded page.
+describe("fetchRefs", () => {
+  it("requests a bounded page (limit=200 by default) and scopes by project", async () => {
+    const calls: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ "p/main": "a".repeat(64) }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    try {
+      const refs = await fetchRefs("p");
+      expect(refs["p/main"]).toBe("a".repeat(64));
+      expect(calls[0]).toContain("/api/refs?");
+      expect(calls[0]).toContain("project_id=p");
+      expect(calls[0]).toContain("limit=200");
+      await fetchRefs(null, 50);
+      expect(calls[1]).toContain("limit=50");
+      expect(calls[1]).not.toContain("project_id");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
 
 describe("formatBytes", () => {
   it("formats zero bytes as '0 B'", () => {

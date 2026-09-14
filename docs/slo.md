@@ -28,6 +28,12 @@ printed numbers.
 | Backup restore time (RTO) | Measured per run, not a fixed promise | `scripts/e2e_scenario.sh` Phase U prints the actual wall-clock seconds — see `docs/dr.md` |
 | GC sweep correctness | Zero live objects deleted, orphans reclaimed within one grace window | `tests/test_server.py` GC tests + e2e Phase E |
 
+**Resource SLI (V1.6.3):** `GET /api/metrics` exposes `av_process_rss_bytes` and
+`av_process_peak_rss_bytes` per worker; the documented envelope and the compose-level
+caps (`AV_ENGINE_MEM_LIMIT` etc.) are in `development/MEMORY.md`. Alert on
+`av_process_rss_bytes` approaching the container limit rather than on the limit itself —
+a container OOM-kill shows up only as a restart.
+
 ## Error budget
 
 No SLI above has a tracked *historical* error-budget burn-down dashboard — `/api/metrics`

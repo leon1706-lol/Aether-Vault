@@ -1012,3 +1012,63 @@ def test_call_daemon_filters_env_before_sending_on_the_wire(repo, monkeypatch):
         "a non-allowlisted env var reached the wire -- client-side filtering regressed"
     )
     assert captured.get("env", {}).get("AV_THREADS") == "4"
+
+
+# --- V1.6.3 footprint additions ------------------------------------------------------------
+
+def test_daemon_request_sets_serving_marker_only_for_request_duration(repo, monkeypatch):
+    """`AV_DAEMON_SERVING=1` is visible to the command while it runs under the daemon and
+    gone afterwards -- `av add` uses it to release the C++ pool right after its batch."""
+    monkeypatch.delenv("AV_DAEMON_SERVING", raising=False)
+    server = daemon_module.DaemonServer(repo, "test-version")
+    seen = []
+
+    from python.av_cli import main as main_module
+
+    original_main = main_module.cli.main
+
+    def spy_main(*args, **kwargs):
+        seen.append(os.environ.get("AV_DAEMON_SERVING"))
+        return original_main(*args, **kwargs)
+
+    monkeypatch.setattr(main_module.cli, "main", spy_main)
+    monkeypatch.setattr(daemon_module, "cli", main_module.cli, raising=False)
+    resp = server.handle_request(_base_request(token=server.token, argv=["status"]))
+    assert resp.get("exit_code") == 0, resp
+    assert seen == ["1"]
+    assert os.environ.get("AV_DAEMON_SERVING") is None
+
+
+def test_trim_clears_config_cache(repo):
+    from python.av_cli import core
+
+    core._config_cache["fake-config-path"] = (1, 2, {"threads": 4})
+    server = daemon_module.DaemonServer(repo, "test-version")
+    server._trim_after_secs = 0.01
+    server._last_activity = time.monotonic() - 1.0
+    assert server.maybe_trim_idle() is True
+    assert "fake-config-path" not in core._config_cache
+
+
+def test_status_fields_include_peak_rss(repo):
+    server = daemon_module.DaemonServer(repo, "test-version")
+    fields = server._live_status_fields()
+    assert "rss_mb" in fields and "peak_rss_mb" in fields
+    assert fields["peak_rss_mb"] >= fields["rss_mb"] * 0.99
+
+
+def test_refresh_state_file_does_not_rewrite_unchanged_token(repo):
+    server = daemon_module.DaemonServer(repo, "test-version")
+    server.write_state_file("fake-endpoint")
+    path = daemon_common.state_file(server.repo_root, daemon_module.PROTOCOL_VERSION, "test-version")
+    key = path.with_suffix(".key")
+    before = key.stat().st_mtime_ns
+    time.sleep(0.05)
+    server.refresh_state_file()
+    server.refresh_state_file()
+    assert key.stat().st_mtime_ns == before
+    assert key.read_text(encoding="utf-8") == server.token
+    # A foreign/corrupted key file is still corrected on the next refresh.
+    key.write_text("stale-token", encoding="utf-8")
+    server.refresh_state_file()
+    assert key.read_text(encoding="utf-8") == server.token

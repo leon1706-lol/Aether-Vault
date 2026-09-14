@@ -155,6 +155,10 @@ class DaemonServer:
         argv = request["argv"]
         cwd = request.get("cwd") or str(self.repo_root)
         env_overlay = allowlisted_env(request.get("env") or {})
+        # Tells commands they run inside a long-lived process (e.g. `add` releases the C++
+        # pool right after its batch instead of leaving idle threads until the trim).
+        # Restored with the rest of the overlay below, so it never leaks past the request.
+        env_overlay["AV_DAEMON_SERVING"] = "1"
 
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
@@ -223,11 +227,18 @@ class DaemonServer:
         # written or about-to-be-replaced token and either fail spuriously or (worse) race
         # a stale one.
         token_path = path.with_suffix(".key")
-        tmp_key = token_path.with_suffix(".key.tmp")
-        tmp_key.write_text(self.token, encoding="utf-8")
-        os.replace(tmp_key, token_path)
+        # The token never changes for the life of the process, so the periodic
+        # refresh_state_file() only pays this write once -- but a missing/foreign key
+        # file is always corrected, keeping the ordering guarantee above intact.
+        current = None
         with contextlib.suppress(OSError):
-            os.chmod(token_path, 0o600)
+            current = token_path.read_text(encoding="utf-8")
+        if current != self.token:
+            tmp_key = token_path.with_suffix(".key.tmp")
+            tmp_key.write_text(self.token, encoding="utf-8")
+            os.replace(tmp_key, token_path)
+            with contextlib.suppress(OSError):
+                os.chmod(token_path, 0o600)
 
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
@@ -252,6 +263,9 @@ class DaemonServer:
         rss_mb = _process_rss_mb()
         if rss_mb is not None:
             fields["rss_mb"] = rss_mb
+        peak_mb = _process_peak_rss_mb()
+        if peak_mb is not None:
+            fields["peak_rss_mb"] = peak_mb
         return fields
 
     # -- idle trim --------------------------------------------------------------
@@ -275,6 +289,12 @@ class DaemonServer:
                 aether_core.release_pool()
             import gc
 
+            # The stat-validated config cache is re-populated on the next request; while
+            # idle it is just a deep copy of every config this daemon ever loaded.
+            with contextlib.suppress(ImportError, AttributeError):
+                from . import core
+
+                core._config_cache.clear()
             gc.collect()
             _malloc_trim()
             self._trimmed_at = time.monotonic()
@@ -305,61 +325,18 @@ def _malloc_trim() -> None:
 
 
 def _process_rss_mb() -> float | None:
-    """This process' resident set size in MiB, or None when it can't be determined --
-    `av daemon status`'s `rss_mb` field, and the number the idle trim exists to shrink."""
-    try:
-        if sys.platform == "win32":
-            import ctypes
-            from ctypes import wintypes
+    """This process' resident set size in MiB -- `av daemon status`'s `rss_mb` field, the
+    number the idle trim exists to shrink. Probes live in `sysres` (shared with doctor,
+    staging, benchmarks); this wrapper keeps the daemon's own import surface minimal."""
+    from .sysres import current_rss_mb
 
-            class _ProcessMemoryCounters(ctypes.Structure):
-                _fields_ = [
-                    ("cb", wintypes.DWORD),
-                    ("PageFaultCount", wintypes.DWORD),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                ]
+    return current_rss_mb()
 
-            # Real bug (found live, manual scratch-repo pass): without explicit
-            # argtypes/restype, ctypes marshals `GetCurrentProcess()`'s pseudo-handle
-            # (conceptually -1, i.e. all bits set) as a 32-bit int and zero-extends it to
-            # 64 bits instead of sign-extending -- `GetProcessMemoryInfo` then rejects that
-            # truncated value with ERROR_INVALID_HANDLE and this returned None on every
-            # single call. `wintypes.HANDLE` makes both calls marshal pointer-sized values.
-            kernel32 = ctypes.windll.kernel32
-            psapi = ctypes.windll.psapi
-            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-            kernel32.GetCurrentProcess.argtypes = []
-            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
-            psapi.GetProcessMemoryInfo.argtypes = [
-                wintypes.HANDLE, ctypes.POINTER(_ProcessMemoryCounters), wintypes.DWORD,
-            ]
 
-            counters = _ProcessMemoryCounters()
-            counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
-            handle = kernel32.GetCurrentProcess()
-            if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
-                return None
-            return round(counters.WorkingSetSize / (1024 * 1024), 1)
-        if sys.platform == "darwin":
-            import resource
+def _process_peak_rss_mb() -> float | None:
+    from .sysres import peak_rss_mb
 
-            # macOS reports ru_maxrss in bytes (Linux reports KiB -- irrelevant here since
-            # Linux takes the /proc/self/statm path below instead).
-            return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024), 1)
-        # Linux: resident set = field 2 (0-indexed 1) of /proc/self/statm, in pages.
-        with open("/proc/self/statm", encoding="ascii") as f:
-            resident_pages = int(f.read().split()[1])
-        page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
-        return round(resident_pages * page_size / (1024 * 1024), 1)
-    except Exception:
-        return None
+    return peak_rss_mb()
 
 
 # ---------------------------------------------------------------------------

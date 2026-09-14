@@ -78,7 +78,7 @@ class RedisCache:
             logger.error("Bloom Filter check failed, defaulting to True: %s", exc)
             return True
 
-    async def add_hashes(self, hashes: list[str], tenant_id: str | None = None) -> None:
+    async def add_hashes(self, hashes, tenant_id: str | None = None) -> None:
         """Batch form of `add_hash()` -- `BF.MADD` in 1000-hash chunks instead of one
         `BF.ADD` round trip per hash. Used by GC's post-sweep Bloom Filter rebuild
         (`server.py::run_gc`), which used to re-add every surviving hash one at a time --
@@ -92,8 +92,15 @@ class RedisCache:
         try:
             name = _filter_name(tenant_id)
             CHUNK = 1000
-            for i in range(0, len(hashes), CHUNK):
-                chunk = hashes[i:i + CHUNK]
+            # Any iterable (a set straight from GC's mark phase, V1.6.3) -- chunked
+            # without first copying it into a list.
+            chunk: list[str] = []
+            for h in hashes:
+                chunk.append(h)
+                if len(chunk) >= CHUNK:
+                    await self._client.execute_command("BF.MADD", name, *chunk)
+                    chunk = []
+            if chunk:
                 await self._client.execute_command("BF.MADD", name, *chunk)
         except Exception as exc:
             logger.error("Failed to batch-add hashes to Bloom Filter: %s", exc)

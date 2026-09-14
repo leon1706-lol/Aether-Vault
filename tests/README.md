@@ -1,8 +1,16 @@
 # tests
 
-Owns Aether-Vault's pytest suite: 1,622 tests across 83 files covering the CLI, the
+Owns Aether-Vault's pytest suite: 2,006 tests across 97 files covering the CLI, the
 C++ bindings, the live registry server, the plugins, and the webui logic. Run with
 `pytest tests/ -q` (or `av test`); the skip-summary hook prints WHY anything skipped.
+
+## Running the suite on a small machine
+
+One `pytest tests/` process gets OOM-killed on a ~4 GB box once the Docker stack is up.
+`python scripts/run_tests_lowmem.py` (or `av test --lowmem`) runs one pytest subprocess per
+test file — `test_server.py`/`test_daemon.py` in 40/60-test chunks — waiting for
+`--min-free-mb` of free RAM before each, resumable from a state file after a kill, and
+reports each file's peak RSS. It is how this project's own dev box gets a full green run.
 
 ## Layout
 
@@ -50,6 +58,23 @@ C++ bindings, the live registry server, the plugins, and the webui logic. Run wi
   `scripts/ci_summary.py`'s pure logic, `development/deprecations.yml`'s schema + overdue
   guard, the flake-quarantine policy, and the Helm chart's default image matching its
   real publisher.
+- V1.6.3 footprint suite - `test_sysres.py` (the dependency-free RSS/RAM probes and the
+  process-TREE child sampler every memory number rests on), `test_rss_scoreboard.py`,
+  `test_memory_gate.py` (opt-in, `AV_MEMORY_GATE=1`: peak-RSS budgets, median-of-3),
+  `test_stage_workers.py` (RAM-aware staging worker cap + cgroup-aware C++ thread count),
+  `test_index_loads.py` (one `Index` parse per command, streamed byte-identical
+  `Index.save`, and the `av watch` re-commit regression), `test_history_footprint.py`
+  (tree-less bounded `log --all`), `test_registry_export.py` (objects streamed, never
+  whole), `test_gc_mark.py` (the server's mark phase over compact tuples, differential
+  against the old ORM walk), `test_server_units.py` (stack-free: every GET `limit` has a
+  maximum, the bounded auth-failure/principal/metrics state, the upload cap, RSS gauges),
+  `test_compose_files.py` + `test_engine_healthcheck.py` (the three compose files' memory
+  knobs/limits and the fork-free `/dev/tcp` healthcheck script, driven for real against an
+  HTTP stub), `test_doctor_resources.py`, `test_benchmark_lowmem.py`, `test_lowmem_tests.py`
+  (the file-per-subprocess runner behind `scripts/run_tests_lowmem.py` / `av test --lowmem`,
+  exercised with real pytest children). `test_server.py`'s `TestFootprintV163` class holds
+  the live-stack half (streamed audit export/verify, 413 by length and mid-stream, GC
+  keeping layers/chunks, paged refs, metrics gauges).
 - `test_docs_commands.py` - parses every fenced `av ...` command out of `docs/*.md` and
   resolves it against the live Click tree, so documentation rot is a test failure.
 - `test_benchmark_docs_freshness.py` - guards README.md's/benchmarks/README.md's

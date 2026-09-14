@@ -122,42 +122,17 @@ def add(paths: tuple, threads: int | None) -> None:
         return
 
     resolved_threads = configure_native_threads(repo_root, threads)
-    pool_size = python_pool_size(resolved_threads)
-
-    results: list[dict | None]
-    if resolved_threads == 1 or len(work) < 2 or pool_size <= 1:
-        # AV_THREADS=1 (or a single/no file) takes the literal old sequential path -- not
-        # just "a pool of one" -- so a threading-suspected bug can be isolated by comparing
-        # against this exact code path.
-        results = [
-            _compute_stage_result(repo_root, threshold_bytes, fpath, rel_path, file_type, existing, flags)
-            for rel_path, fpath, file_type, existing, flags in work
-        ]
-    else:
-        # ThreadPoolExecutor.map returns results in INPUT order regardless of completion
-        # order -- exactly what makes the apply loop below deterministic across thread
-        # counts and runs. Workers only do _compute_stage_result's pure per-file work
-        # (hash/split/chunk/CAS-write); nothing here touches `idx` or prints until the
-        # serial apply loop below. Imported locally (V1.6.0, WS2.1): core.py no longer
-        # re-exports this via `import *`, and a module-level import here would cost every
-        # `status`/no-op-`add` invocation of this same file the real weight
-        # `concurrent.futures.__init__` pulls in (it imports both `.thread` and
-        # `.process`, the latter dragging in `multiprocessing`) for a code path only a
-        # genuinely multi-file threaded `add` ever reaches.
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=pool_size) as pool:
-            results = list(pool.map(
-                lambda item: _compute_stage_result(
-                    repo_root, threshold_bytes, item[1], item[0], item[2], item[3], item[4]
-                ),
-                work,
-            ))
+    # V1.6.3: the pool is also capped by free RAM / AV_STAGE_WORKERS_MAX -- each worker
+    # can hold a layer buffer of AV_STAGE_BUFFER_MB, see development/MEMORY.md.
+    pool_size = effective_stage_workers(resolved_threads)
 
     any_changed = False
     json_staged: list[dict] = []
-    for result in results:
+
+    def _apply(result: dict | None) -> None:
+        nonlocal any_changed
         if result is None:
-            continue
+            return
         any_changed = True
         apply_stage_result(idx, result)
         json_staged.append({
@@ -166,6 +141,40 @@ def add(paths: tuple, threads: int | None) -> None:
             "hash": result["hash"],
             "size": result["size"],
         })
+
+    if resolved_threads == 1 or len(work) < 2 or pool_size <= 1:
+        # AV_THREADS=1 (or a single/no file) takes the literal old sequential path -- not
+        # just "a pool of one" -- so a threading-suspected bug can be isolated by comparing
+        # against this exact code path.
+        for rel_path, fpath, file_type, existing, flags in work:
+            _apply(_compute_stage_result(repo_root, threshold_bytes, fpath, rel_path, file_type, existing, flags))
+    else:
+        # ThreadPoolExecutor.map returns results in INPUT order regardless of completion
+        # order -- exactly what makes the apply loop deterministic across thread counts
+        # and runs. Workers only do _compute_stage_result's pure per-file work
+        # (hash/split/chunk/CAS-write); nothing here touches `idx` or prints except the
+        # serial `_apply` on this thread. Results are consumed as `map` yields them
+        # (V1.6.3) rather than collected into a list first, so at most the in-flight
+        # results' layers/chunks lists are alive at once, not every file's. Imported
+        # locally (V1.6.0, WS2.1): core.py no longer re-exports this via `import *`, and
+        # a module-level import here would cost every `status`/no-op-`add` invocation of
+        # this same file the real weight `concurrent.futures.__init__` pulls in (it
+        # imports both `.thread` and `.process`, the latter dragging in
+        # `multiprocessing`) for a code path only a genuinely multi-file threaded `add`
+        # ever reaches.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=pool_size) as pool:
+            for result in pool.map(
+                lambda item: _compute_stage_result(
+                    repo_root, threshold_bytes, item[1], item[0], item[2], item[3], item[4]
+                ),
+                work,
+            ):
+                _apply(result)
+        if os.environ.get("AV_DAEMON_SERVING") == "1":
+            # Under the daemon the process outlives this command: don't leave the C++
+            # pool's idle worker threads (and their stacks) around until the idle trim.
+            release_native_pool()
 
     if any_changed:
         idx.save()

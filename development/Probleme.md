@@ -2150,3 +2150,53 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** updated README.md's badge (1824/1824 → 1622/1622), module-table row, and Test Suite prose, plus `tests/README.md`'s opening line, all to 1622/83.
 
 **Verification:** ran `scripts/check_readme_test_freshness.py` directly against the real failing CI job's saved log — now reports "test counts match this run. OK." Local `test_readme_test_count_freshness.py`/`test_benchmark_docs_freshness.py`/`test_docs_commands.py` (89 tests) still green.
+
+### 179. `av watch` never re-committed a modified, already-tracked file — its skip check compared the index entry against itself
+
+**Severity:** 7/10 (silent data loss for the command's core use case: a checkpoint that changes after its first auto-commit was never committed again; only brand-new files ever triggered a commit) · **Status:** 🟢 `fixed` (2026-09-13, V1.6.3).
+
+**Problem:** `cmd_watch.py`'s debounce path did `entry.get("hash") == _hash_of(repo_root, rel)`, but `_hash_of()` read the hash *from the index* — the same value as `entry["hash"]` — so for any tracked path the comparison was always true and the file was skipped as "already committed". Every existing `watch` test only ever created a new file, which has no index entry and so never hit the branch.
+
+**Fix:** the skip check now compares the index entry against the file's actual content hash (`hash_file_safe`, computed once and reused for staging), `_hash_of()` is gone, and the debounced path loads the index once instead of three times, passing it through to `commit_staged(idx=)`.
+
+**Verification:** `tests/test_index_loads.py::test_watch_recommits_a_modified_tracked_file` (two `watch --max-commits 1` sessions over the same path with changed bytes → two `watch:` commits; previously one) plus the existing new-file `watch` tests in `tests/test_v120.py` still green.
+
+### 180. `_materialize_tree` printed a "Reassembling …" progress line inside `--output json` envelopes
+
+**Severity:** 5/10 (contract violation: `av --output json clone`/`checkout` of any chunked or layer-split artifact produced unparseable stdout — a line of human text before the JSON envelope) · **Status:** 🟢 `fixed` (2026-09-13, V1.6.3).
+
+**Problem:** `core.py::materialize_file` unconditionally `click.echo`'d "Reassembling {path} from N layers/chunks..." while rebuilding a split artifact. `tests/test_contract_matrix.py`'s anti-leakage sweep never saw it because its fixture repos hold no chunked content; found live by the new page-by-page clone test whose fixture tip includes a CDC-chunked `model.bin`.
+
+**Fix:** both progress lines are gated on `current_output_mode() != "json"`.
+
+**Verification:** `tests/test_sync.py::test_clone_writes_commits_page_by_page_and_keeps_only_the_tip_tree` parses the JSON envelope of a clone whose tip contains a chunked file (failed with `JSONDecodeError` before the fix).
+
+### 181. The HA load balancer rejected every object upload larger than 1 MiB — nginx's default `client_max_body_size`
+
+**Severity:** 8/10 (the HA topology could not accept a real model shard through its own LB: HTTP 413 for anything above nginx's 1m default; only the drill's toy string bodies ever passed) · **Status:** 🟢 `fixed` (2026-09-13, V1.6.3).
+
+**Problem:** `docker/ha/nginx/nginx.conf` set no `client_max_body_size`, so the `:8000` server block inherited nginx's 1 MiB default. `scripts/ha_drill.sh` uploads ~20-byte bodies, so the drill was green while any real artifact was refused by the LB before reaching an engine.
+
+**Fix:** `client_max_body_size 0;` and `proxy_request_buffering off;` in the `:8000` server block (a shard streams straight through instead of being spooled to the LB's disk; the engine's own `AV_MAX_UPLOAD_BYTES` is the place for a real cap). The drill now uploads a 5 MiB random object through the LB and fails on anything but 201/409.
+
+**Verification:** by reading the config (no directive present) and nginx's documented default; the drill step is the live proof and runs in CI's `ha-drill` job — the HA stack was not brought up on this box (memory).
+
+### 182. `av benchmark --markdown` rewrote every "~Nx faster/slower than Git LFS" line in README with the no-op ratio — the Cold Clone row included
+
+**Severity:** 4/10 (README misinformation: one scratch run turned "Cold Clone ~3.6x faster than Git LFS" into "~2x slower") · **Status:** 🟢 `fixed` (2026-09-13, V1.6.3).
+
+**Problem:** `cmd_devtools._sync_readme_benchmark_table` did one `re.subn` over the whole README for the pattern `~[\d.]+x (slower|faster) than Git LFS`, which also matches the Cold Clone comparison row. Found live when a `--lowmem --only noop_status_speed` scratch capture rewrote README.
+
+**Fix:** the substitution is scoped to the lines that describe the no-op benchmark (the comparison-table row, the Known Limitations bullet), and the sync only runs for a full capture (no `--only`), never for a scoped/diagnostic run.
+
+**Verification:** `tests/test_cli.py::test_sync_readme_perf_ratio_never_touches_other_benchmarks_rows` plus the two existing sync tests; README's rows were restored to HEAD by hand.
+
+### 183. A CRLF `docker/engine-entrypoint.sh` in the working tree crash-looped the rebuilt engine — `exec /engine-entrypoint.sh: no such file or directory`
+
+**Severity:** 6/10 (every Windows checkout with `core.autocrlf=true` — the default Git-for-Windows setting — can produce an image whose entrypoint the kernel refuses to exec; the repo had no `.gitattributes` at all) · **Status:** 🟢 `fixed` (2026-09-14, V1.6.3).
+
+**Problem:** the Dockerfile `COPY`s shell scripts as raw working-tree bytes; git's own end-of-line normalization only protects the index. A script written on Windows through Python's text mode (`Path.write_text`, which emits CRLF) — or simply checked out fresh under `autocrlf=true` — carries `#!/bin/bash\r`, and the container dies on exec with a misleading "no such file or directory" (the interpreter path `/bin/bash\r` doesn't exist), restarting forever under `restart: unless-stopped`.
+
+**Fix:** `.gitattributes` pins `*.sh`, `Dockerfile`, `*.conf`, `*.yml`/`*.yaml` to `text eol=lf`; every file touched in V1.6.3 was normalized back to LF (binary-safe, only where the index stores LF). `tests/test_compose_files.py::test_scripts_copied_into_images_are_lf_and_pinned_by_gitattributes` asserts both the attribute rules and the actual bytes of the image-bound scripts.
+
+**Verification:** the rebuilt engine came up healthy with the LF scripts (`/engine-healthcheck.sh` probe exit 0, `/api/ready` 200); the guard test fails on a CRLF working copy.

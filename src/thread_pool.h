@@ -17,6 +17,7 @@ public:
     auto enqueue(F&& f, Args&&... args) 
         -> std::future<typename std::invoke_result<F, Args...>::type>;
     ~ThreadPool();
+    size_t size() const { return workers.size(); }
 private:
     std::vector< std::thread > workers;
     std::queue< std::function<void()> > tasks;

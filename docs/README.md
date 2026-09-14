@@ -11,6 +11,7 @@
 | [`dr.md`](dr.md) | Disaster recovery: `av admin backup create/verify/restore`, the real destroy-and-restore drill (Phase U), and the measured-RTO/stated-RPO distinction. |
 | [`enterprise-operator-guide.md`](enterprise-operator-guide.md) | Identity/RBAC/tenancy/DR continuous path: provision a tenant → create users → grant roles → mint a remote token → turn on tenant enforcement → back up and restore, plus SSO (OIDC/SAML) and SCIM provisioning. States plainly what's still NOT done (a live run against a real external IdP). |
 | [`support.md`](support.md) | Where to get help, `av support-bundle`, and links to `sla.md`/`slo.md`/`runbooks/`. |
+| [`../development/MEMORY.md`](../development/MEMORY.md) | The memory envelope (V1.6.3): how to measure it (`scripts/rss_scoreboard.py`), the before/after table with budgets, the staging-peak derivation, and every low-memory knob. |
 | [`slo.md`](slo.md) | Service level indicators/objectives and how each is actually measured today, including the live `GET /api/metrics` Prometheus endpoint. |
 | [`sla.md`](sla.md) | A support/SLA policy TEMPLATE — fill in real tiers/contacts before using it as a live commitment. |
 

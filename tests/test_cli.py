@@ -930,7 +930,8 @@ def test_doctor_compose_dry_run_previews_without_touching_the_file(tmp_path):
     services = rendered["services"]
     assert "aether-vault-server" not in services and "aether-vault-webui" not in services
     engine = services["aether-vault-engine"]
-    assert engine["environment"]["AV_ENGINE_ROLE"] == "all"
+    assert engine["environment"]["AV_ENGINE_ROLE"] == "${AV_ENGINE_ROLE:-all}"  # V1.6.3: .env-overridable
+    assert engine["deploy"]["resources"]["limits"]["memory"] == "${AV_ENGINE_MEM_LIMIT:-768M}"
     assert engine["environment"]["DATABASE_URL"].startswith("postgresql+asyncpg://")
     assert engine["environment"]["NEXT_PUBLIC_API_URL"] == "http://localhost:8000"
     assert sorted(engine["ports"]) == ["3000:3000", "8000:8000"]
@@ -962,7 +963,7 @@ def test_doctor_compose_json_mode_reports_the_rewrite(tmp_path):
     assert env["data"]["applied"] is False
     assert set(env["data"]["removed_services"]) == {"aether-vault-server", "aether-vault-webui"}
     assert env["data"]["added_service"] == "aether-vault-engine"
-    assert "AV_ENGINE_ROLE: all" in env["data"]["rendered"]
+    assert "AV_ENGINE_ROLE: ${AV_ENGINE_ROLE:-all}" in env["data"]["rendered"]
     # JSON dry-run must not touch the file either.
     assert "aether-vault-server" in path.read_text(encoding="utf-8")
 
@@ -2353,3 +2354,69 @@ def test_version_flag_prints_and_exits_clean():
     assert result.exit_code == 0, result.output
     out = result.output.strip()
     assert out.startswith("av ") and len(out) > 3
+
+
+# --- V1.6.3: av test --lowmem ---------------------------------------------------------------
+
+def test_test_command_lowmem_runs_the_file_per_process_runner_and_updates_the_badge(repo, monkeypatch):
+    import python.av_cli.main as main_module
+    from python.av_cli import lowmem_tests
+
+    badge_calls = []
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda p, f: badge_calls.append((p, f)))
+    captured = {}
+
+    def fake_run_lowmem(tests_dir, **kwargs):
+        captured.update(kwargs)
+        kwargs["echo"]("  tests/test_x.py   3 passed")
+        return lowmem_tests.LowmemSummary(passed=3, failed=1, errors=1, files=[
+            lowmem_tests.FileResult(path="tests/test_x.py", status="failed", passed=3, failed=1, errors=1, peak_rss_mb=88.0),
+        ])
+
+    monkeypatch.setattr(lowmem_tests, "run_lowmem", fake_run_lowmem)
+    result = invoke("--output", "json", "test", "--lowmem", "--min-free-mb", "123")
+    assert result.exit_code == 1, result.output
+    data = json.loads(result.output)["data"]
+    assert data["passed"] == 3 and data["failed"] == 2
+    assert data["lowmem"]["min_free_mb"] == 123
+    assert data["lowmem"]["files"][0]["peak_rss_mb"] == 88.0
+    assert captured["min_free_mb"] == 123 and captured["k_expr"] is None
+    assert badge_calls == [(3, 2)]
+
+
+def test_test_command_lowmem_with_k_does_not_touch_the_badge(repo, monkeypatch):
+    import python.av_cli.main as main_module
+    from python.av_cli import lowmem_tests
+
+    monkeypatch.setattr(main_module, "_update_readme_test_badge", lambda *a, **k: pytest.fail("badge touched"))
+    monkeypatch.setattr(lowmem_tests, "run_lowmem",
+                        lambda tests_dir, **kwargs: lowmem_tests.LowmemSummary(passed=1))
+    result = invoke("test", "--lowmem", "-k", "something")
+    assert result.exit_code == 0, result.output
+    assert "low-memory mode" in result.output
+
+
+def test_test_command_lowmem_rejects_webui_and_speed(repo):
+    result = invoke("test", "--lowmem", "--webui")
+    assert result.exit_code == 2
+    assert "separate" in result.output
+
+
+def test_sync_readme_perf_ratio_never_touches_other_benchmarks_rows(tmp_path, monkeypatch):
+    """Real bug (V1.6.3, found live): the whole-file substitution also rewrote the Cold
+    Clone row's '~3.6x faster than Git LFS' with the no-op ratio."""
+    import python.av_cli.main as main_module
+    from python.av_cli.cmd_devtools import _sync_readme_benchmark_table
+
+    (tmp_path / "README.md").write_text(
+        "| 4 | No-Op `status`/`add` | ~15x slower than Git LFS | open finding |\n"
+        "| 5 | Cold Clone / First Pull | ~3.6x faster than Git LFS, ~2.2x faster than DVC | fresh |\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_module, "_find_source_root", lambda: tmp_path)
+    row = type("Row", (), {"operation": "re-add unchanged (60 files)", "values": {"av": 400.0, "git-lfs": 200.0}})()
+    result = type("Result", (), {"name": "noop_status_speed", "rows": [row]})()
+    _sync_readme_benchmark_table([result])
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "| 4 | No-Op `status`/`add` | ~2x slower than Git LFS |" in text
+    assert "~3.6x faster than Git LFS, ~2.2x faster than DVC" in text

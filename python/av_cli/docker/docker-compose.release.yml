@@ -12,6 +12,11 @@
 #
 # Keep the image names/tags here in sync with `.github/workflows/release.yml` and
 # `.github/workflows/docker-edge.yml`, which publish exactly these images.
+#
+# Every memory knob is `${VAR:-default}` interpolation (V1.6.3), never a second overlay
+# file: `av auth set-token`/`av update` always run `docker compose -f <this file>` and
+# would drop an overlay. Overrides go in the `.env` next to this file -- README's
+# "Low-memory mode" has the block for a small machine.
 services:
   aether-vault-engine:
     image: ghcr.io/leon1706-lol/aether-vault-engine:latest
@@ -25,7 +30,8 @@ services:
       - AV_DATA_DIR=/data
       # Explicit role: with DATABASE_URL also set here, the entrypoint's legacy
       # auto-detect would pick "server"-only — pin "all" for one-container mode.
-      - AV_ENGINE_ROLE=all
+      # `AV_ENGINE_ROLE=server` in .env gives an API-only container (no Next.js process).
+      - AV_ENGINE_ROLE=${AV_ENGINE_ROLE:-all}
       - NEXT_PUBLIC_API_URL=http://localhost:8000
       - NODE_ENV=production
       - WEBUI_PORT=3000
@@ -45,6 +51,13 @@ services:
       # Optional per-user token map ({"username": "token", ...} JSON) managed by
       # `av auth add-user/list-users/remove-user` via the same .env + restart plumbing.
       - AV_AUTH_USERS=${AV_AUTH_USERS:-}
+      # Footprint knobs (V1.6.3) -- see development/infrastructure.md for each.
+      - AV_UVICORN_WORKERS=${AV_UVICORN_WORKERS:-1}
+      - AV_UVICORN_LIMIT_CONCURRENCY=${AV_UVICORN_LIMIT_CONCURRENCY:-}
+      - AV_WEBUI_NODE_HEAP_MB=${AV_WEBUI_NODE_HEAP_MB:-256}
+      - AV_DB_POOL_SIZE=${AV_DB_POOL_SIZE:-10}
+      - AV_DB_MAX_OVERFLOW=${AV_DB_MAX_OVERFLOW:-20}
+      - AV_MAX_UPLOAD_BYTES=${AV_MAX_UPLOAD_BYTES:-0}
     depends_on:
       db:
         condition: service_healthy
@@ -55,15 +68,21 @@ services:
     # up to 25s before SIGKILL) — Docker's own default stop-timeout (10s) would SIGKILL
     # before that drain window finishes.
     stop_grace_period: 30s
-    # Both runtimes exist in-engine (python + node): python-urllib checks :8000,
-    # node fetch checks :3000. No extra packages added for healthchecking. The server leg
-    # checks /api/ready (v1.2.5), not /api/health — health is liveness-only (DB-free,
-    # stays green even with an unwritable AV_DATA_DIR); ready also checks DB/Redis/data-dir
-    # writability, which is what "is this container actually usable" should mean here.
+    # Compose v2 honors deploy.resources.limits on plain `docker compose up`. A cap, not
+    # a reservation -- see development/MEMORY.md for what the engine actually idles at.
+    deploy:
+      resources:
+        limits:
+          memory: ${AV_ENGINE_MEM_LIMIT:-768M}
+    # Role-aware bash probe over /dev/tcp (baked into the image as /engine-healthcheck.sh):
+    # no python or node process forked every tick. The server leg checks /api/ready
+    # (v1.2.5), not /api/health — health is liveness-only (DB-free, stays green even with
+    # an unwritable AV_DATA_DIR); ready also checks DB/Redis/data-dir writability, which
+    # is what "is this container actually usable" should mean here.
     healthcheck:
-      test: ['CMD-SHELL', 'python -c "import urllib.request; urllib.request.urlopen(\"http://localhost:8000/api/ready\").read()" && node -e "fetch(\"http://localhost:3000/\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"']
-      interval: 10s
-      timeout: 15s
+      test: ["CMD", "/engine-healthcheck.sh"]
+      interval: ${AV_HEALTHCHECK_INTERVAL:-30s}
+      timeout: 10s
       retries: 5
       start_period: 40s
 
@@ -77,15 +96,29 @@ services:
   db:
     image: postgres:15-alpine
     container_name: aether-vault-db
+    # Memory tunables (V1.6.3): the image default shared_buffers=128MB is sized for a
+    # dedicated DB host; this registry's working set is small. max_connections stays at
+    # Postgres' own 100 because ONE engine process opens two pools (10+20 each).
+    command: >
+      postgres
+      -c shared_buffers=${AV_PG_SHARED_BUFFERS:-64MB}
+      -c work_mem=${AV_PG_WORK_MEM:-4MB}
+      -c maintenance_work_mem=${AV_PG_MAINT_WORK_MEM:-32MB}
+      -c effective_cache_size=${AV_PG_EFFECTIVE_CACHE:-256MB}
+      -c max_connections=${AV_PG_MAX_CONNECTIONS:-100}
     environment:
       POSTGRES_USER: av_user
       POSTGRES_PASSWORD: av_password
       POSTGRES_DB: aether_vault
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: ${AV_DB_MEM_LIMIT:-256M}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U av_user -d aether_vault"]
-      interval: 10s
+      interval: ${AV_HEALTHCHECK_INTERVAL:-30s}
       timeout: 5s
       retries: 5
     restart: unless-stopped
@@ -93,11 +126,20 @@ services:
   redis:
     image: redis/redis-stack-server:latest
     container_name: aether-vault-redis
+    # redis-stack reads REDIS_ARGS (its entrypoint owns CMD). volatile-lru on purpose:
+    # the Bloom filter key (av:hash_filter) has no TTL and must never be evicted; the
+    # TTL'd device-code / SAML-replay / rate-limit keys are the ones safe to shed.
+    environment:
+      - REDIS_ARGS=--maxmemory ${AV_REDIS_MAXMEMORY:-128mb} --maxmemory-policy volatile-lru
     volumes:
       - redis_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: ${AV_REDIS_MEM_LIMIT:-192M}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      interval: ${AV_HEALTHCHECK_INTERVAL:-30s}
       timeout: 5s
       retries: 5
     restart: unless-stopped

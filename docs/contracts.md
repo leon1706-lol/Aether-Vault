@@ -54,6 +54,16 @@ there.
   schema that no longer matches what the code actually emits is a test failure, not a
   silent drift.
 
+**V1.6.3 additions, all additive:** `doctor.resources` (object, `null` without
+`--resources`), `daemon status.peak_rss_mb`, `test.lowmem`; server `limit` maxima (a
+value above the maximum is a `422`, previously silently honored), `limit`/`offset` on the
+formerly unpaged list endpoints and on `/api/refs` (response shapes unchanged), `413`
+from `POST /api/objects/{hash}` under `AV_MAX_UPLOAD_BYTES`; Prometheus gauges
+`av_process_rss_bytes`/`av_process_peak_rss_bytes`; file schemas `rss-scoreboard-1.0`
+(`scripts/rss_scoreboard.py`), `perf-history-1.1` (adds `rss_mb`; 1.0 files read
+unchanged) and `benchmark-results-1.0` (`av benchmark --dump-results`, internal to
+`--lowmem`). See `VERSIONING.md` → "v1.6.3 additive surfaces".
+
 ## Where the underlying contracts are described in prose
 
 `development/architecture.md`'s per-subsystem contract sections (Commit, Merge, Runs,

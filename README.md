@@ -9,7 +9,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-FF8C00?style=flat-square&labelColor=1A1A1A&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-PolyForm%20NC-0097E8?style=flat-square&labelColor=1A1A1A" alt="PolyForm Noncommercial">
-  <img src="https://img.shields.io/badge/tests-1622%2F1622%20passing-brightgreen?style=flat-square&labelColor=1A1A1A" alt="1622 of 1622 tests passing">
+  <img src="https://img.shields.io/badge/tests-2005%2F2006%20passing-red?style=flat-square&labelColor=1A1A1A" alt="2005 of 2006 tests passing">
   <img src="https://img.shields.io/pypi/v/aether-vault?style=flat-square&labelColor=1A1A1A&label=pypi&logo=pypi&logoColor=white" alt="PyPI">
   <img src="https://img.shields.io/badge/docker-aether--vault--engine-2496ED?style=flat-square&labelColor=1A1A1A&logo=docker&logoColor=white" alt="Docker">
 </p>
@@ -31,7 +31,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 ## Known Limitations
 
 - **Perf #4 (no-op status/add)** — ~7x slower than Git LFS at interpreter startup. Open finding, tracked in `development/BENCHMARKS.md`.
-- **The benchmark suite can't currently be run on this project's own dev box** — it needs the live Docker registry stack up, git-lfs/DVC/MLflow all installed, and enough free RAM for the `av` subprocesses `av benchmark` itself spawns, and this box's memory has repeatedly not covered that combination even with Docker running and nothing else in flight. `.github/workflows/benchmarks.yml` runs it on a GitHub-hosted runner instead (weekly schedule + on-demand `workflow_dispatch`) — see [`benchmarks/README.md`](benchmarks/README.md#where-a-real-capture-actually-runs-v161) for where to download a capture.
+- **Benchmarks and the full test suite on a small machine need the low-memory runners** — `av benchmark --lowmem` and `python scripts/run_tests_lowmem.py` (V1.6.3) run one benchmark / one test file per fresh subprocess with a free-RAM floor, which is what makes both runnable on this project's own 3.9 GB dev box again; a single combined `av benchmark` or `pytest tests/` process still gets OOM-killed there. `.github/workflows/benchmarks.yml` remains the source of published captures — see [`benchmarks/README.md`](benchmarks/README.md). See [Low-memory mode](#low-memory-mode) for every knob.
 
 ## Table of Contents
 
@@ -45,6 +45,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 - [Framework Plugins](#framework-plugins)
 - [Benchmark Comparison](#benchmark-comparison)
 - [Test Suite](#test-suite)
+- [Low-memory mode](#low-memory-mode)
 - [For Agents (SDK, JSON, events, .avh)](#for-agents-sdk-json-events-avh)
 - [CLI Reference](#cli-reference)
   - [`av init`](#av-init)
@@ -208,7 +209,7 @@ and how it's wired in, this table is the index.
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
 | `python/av_plugins/` | Lightning / Transformers / MLflow / vanilla PyTorch auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
-| `tests/` | 1,622-test suite across 83 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
+| `tests/` | 2,006-test suite across 97 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
@@ -226,6 +227,7 @@ and how it's wired in, this table is the index.
 | [`threat-model.md`](development/threat-model.md) | Assets, actors, trust boundaries, threat→mitigation→residual-risk table |
 | [`CHANGELOG.md`](development/CHANGELOG.md) | Full build-phase history: what was built, when, and why |
 | [`Probleme.md`](development/Probleme.md) | Audit log of correctness, performance and security findings with severity ratings |
+| [`MEMORY.md`](development/MEMORY.md) | The memory envelope: how to measure it (`scripts/rss_scoreboard.py`), per-scenario budgets with the V1.6.2→V1.6.3 before/after numbers, the staging-peak derivation, and every low-memory knob |
 | [`todo.md`](todo.md) | **Owner's planning canvas** — the current objective(s) and personal notes for the next AI agent to pick up; not a generated backlog, expect it to be rewritten as priorities change |
 | [`VERSIONING.md`](VERSIONING.md) | SemVer per compatibility surface, deprecation policy, release runbook |
 | [`SECURITY.md`](SECURITY.md) | Threat model, signing trust chain, reporting process |
@@ -315,7 +317,7 @@ For full methodology, every raw number, and the rating legend, see [`development
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs 1,622 tests across 83 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
+The full suite (`av test` or `pytest tests/ -q`) runs 2,006 tests across 97 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
 
 ```bash
 av test                  # full suite
@@ -324,6 +326,60 @@ av test --cov            # with coverage
 av test --webui          # + webui/ Vitest suite
 av test --speed          # + synthetic speed benchmark
 av test --speed --webui  # + webui/ bench suite too
+av test --lowmem         # one subprocess per test file, free-RAM floor between them (small machines)
+```
+
+---
+
+## Low-memory mode
+
+V1.6.3 made every memory-relevant path bounded and gave each bound a knob. The measured
+envelope (before/after, budgets, the derivation) lives in
+[`development/MEMORY.md`](development/MEMORY.md); `av doctor --resources` prints the live
+picture for the machine you are on and recommends which of these to set. On the reference
+3.9 GB dev box: staging peak 160 MB → 97 MB → 33 MB with the first two knobs; a 1 GiB
+safetensors `add` peaks at 63 MB regardless of size.
+
+**CLI**
+
+| Knob | Effect |
+|---|---|
+| `AV_STAGE_WORKERS_MAX=2` | hard cap on parallel staging workers (each can hold one `AV_STAGE_BUFFER_MB` layer buffer); the automatic cap is `(free RAM − AV_STAGE_RESERVE_MB) ÷ (AV_STAGE_BUFFER_MB + 2)` |
+| `AV_STAGE_BUFFER_MB=8` | stream any safetensors layer larger than 8 MiB through a temp file instead of RAM (default 32 — a bf16 4096² matrix is exactly 32 MiB) |
+| `AV_STAGE_RESERVE_MB=512` | keep more free RAM out of the automatic worker cap (default 256) |
+| `AV_NO_DAEMON=1` | no resident daemon at all; `AV_DAEMON_TRIM_SECS=5` trims it sooner instead |
+
+**Registry stack** — every compose file interpolates these from the `.env` next to it (no
+overlay file: `av auth set-token`/`av update` always run `docker compose -f <that file>`
+and would drop one). A ready-made block for a small machine:
+
+```
+AV_ENGINE_ROLE=server            # API only, no Next.js process (WebUI off)
+AV_ENGINE_MEM_LIMIT=512M         # container caps (defaults 768M / 256M / 192M)
+AV_DB_MEM_LIMIT=192M
+AV_REDIS_MEM_LIMIT=128M
+AV_PG_SHARED_BUFFERS=32MB        # default 64MB (the postgres image's own default is 128MB)
+AV_PG_MAX_CONNECTIONS=40         # with AV_DB_POOL_SIZE=3 / AV_DB_MAX_OVERFLOW=5 below: 2 pools x 8 = 16
+AV_DB_POOL_SIZE=3
+AV_DB_MAX_OVERFLOW=5
+AV_REDIS_MAXMEMORY=64mb          # default 128mb, policy volatile-lru (the Bloom filter key has no TTL and is never evicted)
+AV_HEALTHCHECK_INTERVAL=60s      # default 30s; the probe is a bash /dev/tcp GET, no python/node fork
+AV_UVICORN_LIMIT_CONCURRENCY=32  # 503 beyond 32 in-flight requests per worker instead of N x 4 MiB upload buffers
+AV_WEBUI_NODE_HEAP_MB=192        # V8 old-space cap for the Next.js process (default 256)
+```
+
+On Windows the container limits are not what bounds Docker Desktop — its WSL VM (`vmmem`)
+is. Put `[wsl2]` / `memory=1200MB` / `swap=1024MB` in `%USERPROFILE%\.wslconfig` and run
+`wsl --shutdown` once.
+
+**Running the suite and the benchmarks on such a machine**
+
+```bash
+python scripts/run_tests_lowmem.py                   # one pytest subprocess per test file, resumable, free-RAM floor
+python scripts/run_tests_lowmem.py --files tests/test_server.py --chunk-size 40
+av test --lowmem                                     # same runner; also refreshes the README test badge
+av benchmark --lowmem --only hashing_throughput      # one benchmark per fresh process, same report/flags
+python scripts/rss_scoreboard.py --out-json out.json --out-md out.md   # measure your own machine
 ```
 
 ---
@@ -834,11 +890,12 @@ av doctor                    # diagnose only
 av doctor --fix              # repair what's safely recoverable
 av doctor --fix --dry-run    # preview what --fix would do, without changing anything
 av doctor --speed            # also print a read-only timing snapshot of this repo's hot paths
+av doctor --resources        # also report memory: this process/daemon RSS, free RAM, effective staging workers, low-memory recommendations
 av doctor --compose docker-compose.yml            # preview migrating a legacy two-container compose file to the consolidated engine image
 av doctor --compose docker-compose.yml --write    # apply that rewrite in place — see docs/migrate-engine-image.md
 ```
 
-`--fix` re-links orphaned/stale `.av-pointer` files back to their objects (downloading from the remote if needed), clears `*.tmp.*` leftovers, and clears pending-push entries whose commit no longer exists locally while retrying the rest. Anything it can't safely recover is left as `[WARN]` rather than fabricated or silently dropped. `--speed` times `Index.load()`, `load_config()`, a working-tree scan, and local object-store stats — a quick way to spot where a specific user's repo is actually slow, as opposed to `av test --speed`'s synthetic, cross-machine-comparable numbers.
+`--fix` re-links orphaned/stale `.av-pointer` files back to their objects (downloading from the remote if needed), clears `*.tmp.*` leftovers, and clears pending-push entries whose commit no longer exists locally while retrying the rest. Anything it can't safely recover is left as `[WARN]` rather than fabricated or silently dropped. `--speed` times `Index.load()`, `load_config()`, a working-tree scan, and local object-store stats — a quick way to spot where a specific user's repo is actually slow, as opposed to `av test --speed`'s synthetic, cross-machine-comparable numbers. `--resources` (V1.6.3) adds a `Resources` section (JSON: a `resources` object) with this process' and the daemon's RSS/peak, total/free RAM, the staging worker count and per-worker budget the automatic RAM cap resolved to, and a `recommended_profile` of `lowmem` or `default` with concrete knobs to set — see [Low-memory mode](#low-memory-mode).
 
 #### `av test`
 
@@ -851,7 +908,10 @@ av test --cov            # with a coverage report
 av test --webui          # also run the webui/ Vitest suite (npm test) after the Python suite
 av test --speed          # also run a synthetic speed benchmark of av's hot paths
 av test --speed --webui  # ...and the webui/ Vitest bench suite (npm run bench) too
+av test --lowmem         # one pytest subprocess per test file with a free-RAM floor (--min-free-mb, default 350)
 ```
+
+`--lowmem` (V1.6.3) runs the same suite through `python/av_cli/lowmem_tests.py` — one fresh interpreter per test file (the known-heavy files in 40–60-test chunks), waiting for `--min-free-mb` of free RAM before each, resumable from a state file after a kill — and still refreshes the badge below from the merged counts. It is the way to get a full green run on a machine where one `pytest tests/` process gets OOM-killed; `scripts/run_tests_lowmem.py` is the same runner as a standalone script with `--files`, `--chunk-size`, `--reset` and pytest passthrough after `--`. Not combinable with `--webui`/`--speed` (run those separately).
 
 `--speed` runs the same hot paths as `av doctor --speed` against disposable, fixed-size synthetic fixtures (so results are repeatable across machines and runs), plus `pytest --durations=20` to surface the slowest tests. Each probe prints next to a soft advisory budget — exceeding it only flags the row `SLOW`, it never fails the command. Combined with `--webui`, it also runs a small Vitest `bench()` suite covering the dashboard's graph-building and metrics-extraction logic.
 
@@ -876,9 +936,10 @@ av benchmark --only hashing_throughput                # scope to one benchmark (
 av benchmark --vs git-lfs --vs dvc                    # scope competitor columns (repeatable)
 av benchmark --markdown development/BENCHMARKS.md     # regenerate the full Markdown report
 av benchmark --baseline prior.json --save-json new.json   # regression-track av's own numbers
+av benchmark --lowmem --min-free-mb 300               # one benchmark per fresh subprocess, free-RAM floor between them
 ```
 
-Every result is a real measured number from a real subprocess/HTTP call — a tool that isn't on `PATH`, or whose primitive doesn't apply to a given benchmark, is shown as `not installed`/`N/A` with a footnote, never guessed at.
+Every result is a real measured number from a real subprocess/HTTP call — a tool that isn't on `PATH`, or whose primitive doesn't apply to a given benchmark, is shown as `not installed`/`N/A` with a footnote, never guessed at. Since V1.6.3 each `av` row also carries an `av peak RSS` column (peak resident memory of the timed `av` process tree; with the daemon warm that is the launcher client — the daemon's own RSS is in `av daemon status`), and `--lowmem` runs each benchmark in its own process so the whole suite fits a small machine; a benchmark that can't get `--min-free-mb` free within 60 s is reported as a `failed` row with a footnote, never dropped.
 
 #### `av daemon`
 
@@ -1041,7 +1102,7 @@ done from here):
 
 ## Roadmap
 
-No open items — shipped milestones (clone/pull, log, merge, chunk dedup, Alembic migrations, CORS + rate-limit hardening, cp310–cp314 wheels, per-user auth, merge visualization) live in the [CHANGELOG](development/CHANGELOG.md) and GitHub Releases.
+No open items — shipped milestones (clone/pull, log, merge, chunk dedup, Alembic migrations, CORS + rate-limit hardening, cp310–cp314 wheels, per-user auth, merge visualization, and the V1.6.3 footprint phase: bounded memory everywhere, `av doctor --resources`, low-memory runners — see [`development/MEMORY.md`](development/MEMORY.md)) live in the [CHANGELOG](development/CHANGELOG.md) and GitHub Releases.
 
 ---
 
