@@ -72,6 +72,10 @@ def test_auth_failure_window_prunes_stale_hosts(monkeypatch):
     monkeypatch.setattr(server_module, "AV_ANOMALY_AUTH_SPIKE_WINDOW_SECS", 10.0)
     monkeypatch.setattr(server_module, "AV_ANOMALY_AUTH_SPIKE_THRESHOLD", 100)
     monkeypatch.setattr(server_module, "_AUTH_FAILURE_PRUNE_EVERY", 4)
+    # The prune fires every Nth call of a PROCESS-GLOBAL counter; earlier tests in the
+    # session leave it at an arbitrary phase (CI's Linux order differs from a local run),
+    # so pin it -- otherwise the 4th call below may not be the Nth one.
+    monkeypatch.setattr(server_module, "_auth_failure_calls", 0)
     server_module._AUTH_FAILURE_WINDOW.clear()
     clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
@@ -87,6 +91,7 @@ def test_auth_failure_window_is_hard_capped(monkeypatch):
     monkeypatch.setattr(server_module, "_AUTH_SPIKE_BACKEND", "memory")
     monkeypatch.setattr(server_module, "AV_ANOMALY_AUTH_SPIKE_THRESHOLD", 100)
     monkeypatch.setattr(server_module, "_AUTH_FAILURE_MAX_KEYS", 50)
+    monkeypatch.setattr(server_module, "_auth_failure_calls", 0)
     server_module._AUTH_FAILURE_WINDOW.clear()
     for i in range(400):
         asyncio.run(server_module._note_auth_failure(f"host-{i}"))

@@ -72,9 +72,28 @@ wait_health() {
 }
 
 # ---------------------------------------------------------------------------
-OLD_TAG="${OLD_TAG:-$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null)}"
-[[ -n "$OLD_TAG" ]] || die "no OLD_TAG given and no tag reachable from HEAD (git fetch --tags first?)"
-log "old code: $OLD_TAG"
+# Highest-numbered migration file a git ref carries -- this repo numbers revisions
+# sequentially (0001_..., 0017_...), so the filename prefix IS the head. Cheap (no venv,
+# no import) and, crucially, evaluated against THAT ref's tree, not the installed code.
+migration_head_of() {
+  git -C "$REPO_ROOT" ls-tree -r --name-only "$1" -- python/av_server/migrations/versions/ 2>/dev/null \
+    | sed 's|.*/||' | grep -E '^[0-9]{4}_' | sort | tail -1 | cut -c1-4
+}
+CURRENT_FILE_HEAD="$(migration_head_of HEAD)"
+
+if [[ -z "${OLD_TAG:-}" ]]; then
+  # Newest tag whose migrations differ from HEAD's. The latest tag alone is not enough: a
+  # release that added no migration would leave the drill with nothing to prove, and that
+  # is exactly the case this used to die on every night.
+  for tag in $(git -C "$REPO_ROOT" tag --sort=-v:refname); do
+    if [[ -n "$(migration_head_of "$tag")" && "$(migration_head_of "$tag")" != "$CURRENT_FILE_HEAD" ]]; then
+      OLD_TAG="$tag"
+      break
+    fi
+  done
+fi
+[[ -n "${OLD_TAG:-}" ]] || die "no OLD_TAG given and no tag with a migration head different from HEAD's ($CURRENT_FILE_HEAD) -- git fetch --tags first?"
+log "old code: $OLD_TAG (migration files head $(migration_head_of "$OLD_TAG") vs HEAD's $CURRENT_FILE_HEAD)"
 
 log "phase 1: migrating a fresh database to CURRENT head with THIS checkout's code"
 DATABASE_URL="$DATABASE_URL" AV_DATA_DIR="$WORK/data-new" \
@@ -92,18 +111,24 @@ stop_server
 # ---------------------------------------------------------------------------
 log "phase 2: checking out $OLD_TAG into a throwaway worktree"
 git worktree add --detach "$WORKTREE" "$OLD_TAG" >/dev/null
-OLD_HEAD="$(cd "$WORKTREE" && "$PY" -c "
-from alembic.script import ScriptDirectory
-from av_server.database import _alembic_config
-print(ScriptDirectory.from_config(_alembic_config()).get_current_head())
-" 2>/dev/null || echo unknown)"
-log "old code's own migration head: $OLD_HEAD (repo currently at: $NEW_HEAD)"
-[[ "$OLD_HEAD" != "$NEW_HEAD" ]] || die "old tag $OLD_TAG's migration head equals the current head ($NEW_HEAD) -- this drill needs a REAL gap between them to prove anything; pick an older OLD_TAG"
 
 log "installing $OLD_TAG into a clean venv"
 "$PY" -m venv "$OLD_VENV"
 "$OLD_VENV/bin/pip" install -q "$WORKTREE"[dev] 2>>"$SERVER_LOG" \
   || die "could not install $OLD_TAG into a clean venv -- see $SERVER_LOG"
+
+# The old code's head must come from the OLD install. This used to run `$PY -c "from
+# av_server.database import ..."` -- the CURRENT venv, with the current code -- so "old
+# head" always equalled the new head and the drill died at the gap check every single
+# night (Sept 2026) without ever booting anything.
+OLD_HEAD="$("$OLD_VENV/bin/python" -c "
+from alembic.script import ScriptDirectory
+from av_server.database import _alembic_config
+print(ScriptDirectory.from_config(_alembic_config()).get_current_head())
+" 2>/dev/null || echo unknown)"
+log "old code's own migration head: $OLD_HEAD (repo currently at: $NEW_HEAD)"
+[[ "$OLD_HEAD" != "unknown" ]] || die "could not read $OLD_TAG's migration head from its own venv -- see $SERVER_LOG"
+[[ "$OLD_HEAD" != "$NEW_HEAD" ]] || die "old tag $OLD_TAG's migration head equals the current head ($NEW_HEAD) -- this drill needs a REAL gap between them to prove anything; pick an older OLD_TAG"
 
 # Does $OLD_TAG actually contain the fix? A tag that predates it is SUPPOSED to crash
 # here (the original bug, reproduced faithfully), not a regression in this script.

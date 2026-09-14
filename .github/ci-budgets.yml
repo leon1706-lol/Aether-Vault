@@ -16,7 +16,7 @@ workflows:
     plugin-tests: 8               # v1.4.0: +torch install cost (CPU-only wheel, cached)
     webui-tests: 4                # observed 1min + margin
     server-tests: 4               # observed 1min + margin
-    server-tests-windows: 18      # observed 15min + margin
+    server-tests-windows: 30      # observed 25min on 2026-09-14 (choco ~10min + 196 live tests) + margin
     e2e-suite: 5                  # observed 2min + margin
     chaos-drills: 5               # observed 2min + margin
     e2e-engine-smoke: 6           # observed 2min + margin
