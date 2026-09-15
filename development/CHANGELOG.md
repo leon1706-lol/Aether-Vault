@@ -587,3 +587,17 @@ The owner's brief: same features, much smaller steady-state and peak memory, mea
 - **Honest limits:** the memory gate is opt-in/warn-only by design (peak RSS varies 10–20 % across allocators and runners); the `ha-drill` 5 MiB upload step is verified in CI, not on this box; `AV_STAGE_BUFFER_MB` stays 32 by default (a bf16 4096² matrix is exactly 32 MiB — lowering it trades disk traffic on the hot path), the RAM cap and `av doctor --resources` are what a small box gets instead.
 
 Essential-Tasks: signed off
+
+## Phase 72 — v1.4.1: release + a stale doc-freshness guard fixed
+
+`v1.4.0` (2026-09-08, commit `a73ebde`) was the last real tag; every phase above this one
+(v1.5.0 through the "V1.6.3" work just above) landed on `master` and was written up as if
+released, but none of them were ever actually tagged or published. This phase closes that
+gap: it tags the current `master` — everything through Phase 71 — as `v1.4.1`, the next
+version after the last one that's genuinely live on PyPI, rather than retroactively claiming
+`v1.6.3` for a first real release since `v1.4.0`.
+
+- **Probleme-class bug found by the push's own CI, not by hand:** `tests/test_benchmark_docs_freshness.py::test_benchmarks_md_section_count_matches_the_real_benchmark_count` failed on every job that runs the stack-free suite (`test-linux` ×2, `test` ×2, plus the nightly `compat` matrix) — `development/BENCHMARKS.md` has carried a `## Claim status` summary section since `render_claim_summary` was added back in V1.6.0 (`03db2eb`), but the test's section-name skip-set was never updated to exclude it, so any regeneration via the current `av benchmark --markdown` tool (this phase re-ran it) trips a false "10 sections vs. 9 real benchmarks" failure. Dormant since V1.6.0 simply because `BENCHMARKS.md` hadn't been regenerated with the current tool until now. Fixed by adding `"Claim status"` to the skip set alongside `"Reference machine"`/`"Legend"`/`"Methodology notes..."`.
+- **Release note:** this is a PATCH release off `v1.4.0` (same `1.4` minor), so `scripts/release_gate.py`'s benchmark-freshness-on-MINOR and `VERSIONING.md` additive-surfaces checks don't apply — `development/BENCHMARKS.md`'s existing capture is still a valid ancestor of this tag.
+
+Essential-Tasks: signed off

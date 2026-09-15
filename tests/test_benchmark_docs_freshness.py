@@ -35,7 +35,7 @@ def _readme_benchmark_table_rows() -> list[str]:
 
 def _benchmarks_md_sections() -> list[str]:
     text = (REPO_ROOT / "development" / "BENCHMARKS.md").read_text(encoding="utf-8")
-    skip = {"Reference machine", "Legend", "Methodology notes (resolved open questions)"}
+    skip = {"Reference machine", "Legend", "Claim status", "Methodology notes (resolved open questions)"}
     return [
         h.strip() for h in re.findall(r"^## (.+)$", text, re.MULTILINE)
         if h.strip() not in skip and not h.strip().startswith("Perf history trend")
