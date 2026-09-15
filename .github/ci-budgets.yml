@@ -6,7 +6,7 @@
 
 workflows:
   tests.yml:
-    test: 22                      # observed 19min (both matrix legs) + margin
+    test: 32                      # observed 27-30min (both matrix legs, suite has grown) + margin
     test-linux: 12                # estimated
     flaky-quarantine: 6           # estimated (empty registry today — should be seconds)
     contract-matrix: 5            # estimated
@@ -16,7 +16,7 @@ workflows:
     plugin-tests: 8               # v1.4.0: +torch install cost (CPU-only wheel, cached)
     webui-tests: 4                # observed 1min + margin
     server-tests: 4               # observed 1min + margin
-    server-tests-windows: 20      # observed ~18-20min good case (choco ~10min + tests ~8-10min)
+    server-tests-windows: 30      # observed 25min (choco ~11min + tests ~14min, 199 items) + margin
     e2e-suite: 5                  # observed 2min + margin
     chaos-drills: 5               # observed 2min + margin
     e2e-engine-smoke: 6           # observed 2min + margin
