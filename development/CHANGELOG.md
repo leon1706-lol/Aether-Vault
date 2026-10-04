@@ -601,3 +601,26 @@ version after the last one that's genuinely live on PyPI, rather than retroactiv
 - **Release note:** this is a PATCH release off `v1.4.0` (same `1.4` minor), so `scripts/release_gate.py`'s benchmark-freshness-on-MINOR and `VERSIONING.md` additive-surfaces checks don't apply — `development/BENCHMARKS.md`'s existing capture is still a valid ancestor of this tag.
 
 Essential-Tasks: signed off
+
+## Phase 73 — HOL Guard integration: an external command-safety extension for `av`
+
+[hashgraph-online/hol-guard](https://github.com/hashgraph-online/hol-guard) — an open-source
+runtime guard that reviews risky shell commands before an AI coding agent runs them — asked
+for native command-safety coverage of `av`. Implemented `command.aether-vault` in a fork
+(`leon1706-lol/hol-guard`, branch `feat/aether-vault-command-extension`) and opened it as
+[PR #2935](https://github.com/hashgraph-online/hol-guard/pull/2935): reviews `av commit`,
+`push`, `gc`, `checkout --force`, `promote`, `stash drop`, and `audit prune`; every read-only
+command stays quiet. External/opt-in, mirroring hol-guard's existing repo2nb/Noodle extension
+pattern — entirely their-repo work, no Aether-Vault code or behavior changed.
+
+- **README**: added an `## Integrations` section (with a Table of Contents entry) after
+  Framework Plugins, pointing at the extension and linking the PR.
+
+(No "Essential-Tasks: signed off" line — this phase touched no Aether-Vault code; the wrap-up
+checklist's debug/tests/vault-regen cycle doesn't apply to a docs-only README addition plus
+external-repo work.)
+
+## Phase 74 — Nightly workflow fixed: SQLAlchemy 2.1 stopped installing `greenlet`
+
+- **Every nightly job that imports the server was red since SQLAlchemy 2.1 shipped (Probleme.md #186):** `compat` (3.11–3.13), `dr-drill`, and `compat-drill` all died with `ImportError: ... requires ... 'greenlet'` because 2.1 no longer pulls `greenlet` in by default. `sqlalchemy>=2.0.0` is now `sqlalchemy[asyncio]>=2.0.0` in `pyproject.toml` and `requirements.txt` (the Dockerfile builds from the latter), which also protects fresh PyPI/Docker installs and the push-triggered `tests.yml`, not just the nightly.
+- **Honest limit:** the macOS nightly legs were already green and are unchanged; the two Postgres drills have not been re-run on a runner yet, so any failure hiding behind the import error is still unseen until the next `workflow_dispatch`.

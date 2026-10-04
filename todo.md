@@ -9,23 +9,18 @@ are for — see `AGENTS.md`).
 
 -----
 
-# Main Objective: V1.#.#
+# Main Objektive Vx.x.x:
+
+ Optional later: `contributions/extension-listings/command.aether-vault.json` publisher sidecar
+   (needs numeric GitHub id; see `docs/guard/extensions/publisher-metadata.md`).
 
 -----
 
 ## Blocked by environment, not by choice
 
-- [x] ~~`tests/test_server.py`'s remaining tests~~ — the 22 "unconfirmed" names
-      (push_commit/list_commits/get_ref/audit cluster) **passed** this session in a real
-      run (25 tests, 279 MB peak, exit 0), and 57 more passed through
-      `scripts/run_tests_lowmem.py` in 40-test chunks. The runner is the way to run this
-      file here from now on; the never-reached remainder just needs one full
-      `python scripts/run_tests_lowmem.py --files tests/test_server.py --chunk-size 40`.
-- [ ] **The full `development/BENCHMARKS.md` re-capture** — now possible:
-      `av benchmark --lowmem --markdown development/BENCHMARKS.md` runs each benchmark in
-      its own process with a free-RAM floor (`hashing_throughput` and `noop_status_speed`
-      already verified on this box this session). Docker-dependent rows still need the
-      stack up. Not yet run as a full capture.
+-//-
+
+-----
 
 ### Future testing not in scope for current plans
 

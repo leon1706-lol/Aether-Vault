@@ -43,6 +43,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
 - [Development Documentation](#development-documentation)
 - [Open Source Files](#open-source-files)
 - [Framework Plugins](#framework-plugins)
+- [Integrations](#integrations)
 - [Benchmark Comparison](#benchmark-comparison)
 - [Test Suite](#test-suite)
 - [Low-memory mode](#low-memory-mode)
@@ -292,6 +293,12 @@ av import-transformers path/to/checkpoint-1000 --tag backfill
 av import-mlflow <run_id> --tag backfill   # requires: pip install aether-vault[mlflow]
 av import-pytorch path/to/epoch12.pt --tag backfill
 ```
+
+---
+
+## Integrations
+
+[HOL Guard](https://github.com/hashgraph-online/hol-guard) — an open-source runtime guard that reviews risky shell commands before an AI coding agent runs them — ships a native `command.aether-vault` extension covering `av commit`, `av push`, `av gc`, `av checkout --force`, `av promote`, `av stash drop`, and `av audit prune`; everything read-only (`status`, `diff`, `list-meta`, ...) stays quiet. It's external/opt-in on Guard's side and needs no changes here — enable it from Guard's Protection Center once the [pull request](https://github.com/hashgraph-online/hol-guard/pull/2935) lands.
 
 ---
 

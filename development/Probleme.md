@@ -2222,3 +2222,13 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** extracted the race-tolerant version of this exact operation into one shared helper, `_replace_or_accept_concurrent_publish(src, dest)`: calls `os.replace`, and on any `OSError` checks whether `dest` now exists (the other thread won the race) -- if so, discards `src` and returns normally; if `dest` genuinely never appeared, re-raises (a real, unrelated I/O failure). All three call sites now use it instead of their own duplicated, Windows-unsafe inline logic.
 
 **Verification:** `tests/test_staging_internals.py` gained three tests, one of which drives the ACTUAL race with two real threads synchronized past `_atomic_publish_object`'s own `exists()` fast-path check (via a barrier inside the write callback, since synchronizing before the call let one thread finish before the other was even scheduled) and a mocked `os.replace` that fails the losing thread exactly like Windows does -- fails without the fix, passes with it. `tests/test_staging_internals.py`'s full 16 tests and a `test_cli.py` subset covering add/stage/publish/object paths (26 tests) stay green.
+
+### 186. Nightly CI red for a week: SQLAlchemy 2.1 no longer installs `greenlet`, so `sqlalchemy.ext.asyncio` fails to import
+
+**Severity:** 8/10 (every fresh install of the server stack broke, not just CI) · **Status:** 🟢 fixed
+
+**Problem:** `sqlalchemy>=2.0.0` resolved to 2.1.3, which dropped `greenlet` as a default dependency; `from sqlalchemy.ext.asyncio import AsyncSession` then raises `ImportError`, failing `compat` (3.11–3.13) at collection of `tests/test_audit_coverage.py` and both Postgres drills at server import.
+
+**Fix:** depend on the `asyncio` extra (`sqlalchemy[asyncio]>=2.0.0`) in `pyproject.toml` and `requirements.txt`, which installs `greenlet` on every SQLAlchemy version.
+
+**Verification:** a clean venv installing only `sqlalchemy[asyncio]>=2.0.0` gets SQLAlchemy 2.1.3 + greenlet 3.5.6 and imports `AsyncSession`; full CI confirmation pending the next push / `workflow_dispatch` of the nightly.
