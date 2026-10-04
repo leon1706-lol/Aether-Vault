@@ -114,7 +114,9 @@ git worktree add --detach "$WORKTREE" "$OLD_TAG" >/dev/null
 
 log "installing $OLD_TAG into a clean venv"
 "$PY" -m venv "$OLD_VENV"
-"$OLD_VENV/bin/pip" install -q "$WORKTREE"[dev] 2>>"$SERVER_LOG" \
+# Tags before the greenlet fix declare plain `sqlalchemy`, and SQLAlchemy 2.1 no longer
+# pulls greenlet in, so the old code can't import without this extra.
+"$OLD_VENV/bin/pip" install -q "$WORKTREE"[dev] "sqlalchemy[asyncio]>=2.0.0" 2>>"$SERVER_LOG" \
   || die "could not install $OLD_TAG into a clean venv -- see $SERVER_LOG"
 
 # The old code's head must come from the OLD install. This used to run `$PY -c "from

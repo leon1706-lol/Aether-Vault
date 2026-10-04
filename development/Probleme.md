@@ -2231,4 +2231,24 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 **Fix:** depend on the `asyncio` extra (`sqlalchemy[asyncio]>=2.0.0`) in `pyproject.toml` and `requirements.txt`, which installs `greenlet` on every SQLAlchemy version.
 
-**Verification:** a clean venv installing only `sqlalchemy[asyncio]>=2.0.0` gets SQLAlchemy 2.1.3 + greenlet 3.5.6 and imports `AsyncSession`; full CI confirmation pending the next push / `workflow_dispatch` of the nightly.
+**Verification:** a clean venv installing only `sqlalchemy[asyncio]>=2.0.0` gets SQLAlchemy 2.1.3 + greenlet 3.5.6 and imports `AsyncSession`; a manual nightly run on the pushed fix turned `compat` (3.11–3.13) and `dr-drill` green.
+
+### 187. `compat-drill` could not read the old tag's migration head: the old tag has the same missing `greenlet`
+
+**Severity:** 5/10 (nightly-only; the drill never reached its actual check) · **Status:** 🟡 fixed, pending the next nightly
+
+**Problem:** the drill installs the previous release tag (v1.4.0) into a clean venv, where `sqlalchemy>=2.0.0` resolves to 2.1.3 without `greenlet`, so importing `av_server.database` fails and the script dies with "migration head: unknown" before booting anything.
+
+**Fix:** `scripts/compat_drill.sh` installs `sqlalchemy[asyncio]>=2.0.0` next to the old tag, since a published tag's own dependencies can't be changed.
+
+**Verification:** `bash -n` passes; the drill needs Postgres, so it was not run locally and is confirmed only by the next nightly.
+
+### 188. `next` 16.3.4 had a critical RCE advisory — `security` (npm audit + Trivy) and `Docker Edge Build` failed on every push
+
+**Severity:** 9/10 (critical advisory in a shipped production dependency; also blocked the `:edge` image from being pushed) · **Status:** 🟡 fixed, pending CI
+
+**Problem:** GHSA-vcvr-r3jv-pc5j (RCE in `next/og` `ImageResponse`) affects `next` 16.2.0–16.3.5; `webui/package.json` pinned 16.3.4 exactly, so `npm audit --omit=dev` and the Trivy image scans (`security.yml`, `docker-edge.yml`) exited 1.
+
+**Fix:** `next` and `eslint-config-next` bumped together to 16.3.8 (exact pins, as before); the lockfile diff is limited to the `next` package family.
+
+**Verification:** `npm install` completed and the lockfile diff shows only version/resolved/integrity changes for the `next` family; confirmation is the next push run of `security` and `Docker Edge Build`.
