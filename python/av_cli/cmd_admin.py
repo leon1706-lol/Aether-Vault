@@ -24,6 +24,33 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Settings a newer pg_dump writes that an older server doesn't know. pg_restore reports them
+# and carries on, exiting 1 ("errors ignored on restore"), so the data is intact.
+_BENIGN_PG_RESTORE_SETTINGS = ("transaction_timeout",)
+
+
+def _pg_restore_failed(returncode: int, stderr: str) -> bool:
+    if returncode == 0:
+        return False
+    errors = [line for line in stderr.splitlines() if "ERROR:" in line]
+    if not errors:
+        return True
+    return not all(
+        any(f'unrecognized configuration parameter "{name}"' in line for name in _BENIGN_PG_RESTORE_SETTINGS)
+        for line in errors
+    )
+
+
+def _run_pg_restore(command: list[str]) -> None:
+    result = subprocess.run(command, capture_output=True, text=True)
+    if _pg_restore_failed(result.returncode, result.stderr or ""):
+        fail(None, "validation", f"pg_restore failed (exit {result.returncode}): {(result.stderr or '').strip()[-2000:]}",
+             command="admin backup restore")
+    if result.returncode != 0:
+        click.secho("pg_restore skipped a setting this older server doesn't know; the data was restored.",
+                    fg="yellow", err=True)
+
+
 def _to_libpq_url(url: str) -> str:
     """pg_dump/pg_restore/psql don't know the `+asyncpg` SQLAlchemy dialect suffix."""
     return url.replace("postgresql+asyncpg://", "postgresql://")
@@ -315,22 +342,16 @@ def backup_restore(backup_dir, database_url, data_dir, db_container, engine_cont
     if db_container:
         remote_dump = f"/tmp/av-restore-db-{secrets.token_hex(8)}.dump"  # nosec B108 -- see backup_create's identical comment
         subprocess.run(["docker", "cp", str(db_dump_path), f"{db_container}:{remote_dump}"], check=True)
-        subprocess.run(
-            ["docker", "exec", db_container, "pg_restore", "-d", _to_libpq_url(database_url),
-             "--no-owner", "--clean", "--if-exists", remote_dump],
-            check=True,
-        )
+        _run_pg_restore(["docker", "exec", db_container, "pg_restore", "-d", _to_libpq_url(database_url),
+                         "--no-owner", "--clean", "--if-exists", remote_dump])
         subprocess.run(["docker", "exec", db_container, "rm", "-f", remote_dump], check=True)
     else:
         if not shutil.which("pg_restore"):
             fail(None, "validation",
                  "pg_restore not found on PATH -- install postgresql-client, or pass --db-container.",
                  command="admin backup restore")
-        subprocess.run(
-            ["pg_restore", "-d", _to_libpq_url(database_url), "--no-owner", "--clean", "--if-exists",
-             str(db_dump_path)],
-            check=True,
-        )
+        _run_pg_restore(["pg_restore", "-d", _to_libpq_url(database_url), "--no-owner", "--clean", "--if-exists",
+                         str(db_dump_path)])
 
     # --- Part 2: extract the objects tree.
     if engine_container:

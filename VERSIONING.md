@@ -582,6 +582,16 @@ origin (`http://localhost:3000`) instead of `*`, and `POST /api/admin/gc` is rat
 to 10/minute by default. Both pre-1.1.x behaviors remain available explicitly via
 `AV_CORS_ORIGINS="*"` and `AV_RATE_LIMIT_GC=off` for deployments that want them.
 
+## v1.7.0 additive surfaces (see development/CHANGELOG.md Phase 76)
+
+The first tag since v1.4.1, so it also carries everything from the v1.5.0-v1.6.3 sections above, which were never tagged.
+
+- **New commands:** `av restore --source <hash> PATH...` and `av rm [--cached] PATH...`.
+- **New `.av` state, additive:** `.av/lock` and `.av/queue.lock`; `.av/index` gains a `removed` list only while a deletion is staged, and an index without one keeps its exact bytes. An older binary reads both.
+- **New `error.data.reason` values on exit 15:** `corrupt_state`, `repo_locked`, `bad_metric`, `missing_object`, `path_outside_repo`. No new exit code.
+- **`av status --output json` and `Repo.status()` gain `removed`.** `av promote --output json` on a denial now says `ok:false` with `error.code: "policy_denied"`, as `docs/for-agents.md` always promised, and `data` keeps its fields.
+- **Behaviour that was a bug and now fails loudly:** a corrupt index or queue stops the command; `restore` and `checkout` exit 15 on a missing or corrupt object; `checkout` refuses to overwrite an untracked file unless `--force`; `--metric` refuses a malformed entry or a non-finite number; `av log --branch missing` exits 15 in text mode.
+
 ## How a release happens
 
 1. Merge work to `master`; CI (all `tests.yml` jobs — see `development/infrastructure.md`'s CI Job Map for the current list) must be green.

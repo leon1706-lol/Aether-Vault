@@ -99,7 +99,9 @@ class DaemonServer:
         return tuple(stamps)
 
     def _watched_files(self) -> list[Path]:
-        files = [Path(__file__).resolve().with_name("__init__.py")]
+        # Every CLI module: on an editable install, an edit to any of them would otherwise be
+        # served stale until the daemon's idle timeout.
+        files = sorted(Path(__file__).resolve().parent.glob("*.py"))
         try:
             import aether_core
 

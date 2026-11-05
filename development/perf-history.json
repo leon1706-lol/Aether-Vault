@@ -1,5 +1,5 @@
 {
-  "schema": "perf-history-1.0",
+  "schema": "perf-history-1.1",
   "entries": [
     {
       "date": "2026-09-02",
@@ -101,6 +101,23 @@
         "commit_staged() (300 entries)": 105.3,
         "compute_status() (2000 files)": 1311.22,
         "log() (150 commits)": 4126.74
+      }
+    },
+    {
+      "date": "2026-11-05",
+      "version": "1.7.0",
+      "os": "Windows-10-10.0.19045-SP0",
+      "python": "3.14.8",
+      "probes": {
+        "Index.save() (500 entries)": 21.78,
+        "Index.load() (500 entries)": 38.5,
+        "load_config()": 18.04,
+        "iter_working_files() (2000 files)": 59.12,
+        "Storage stats (1000 objs)": 810.23,
+        "semdiff.diff_trees() (500 entries)": 20.96,
+        "commit_staged() (300 entries)": 227.35,
+        "compute_status() (2000 files)": 1068.29,
+        "log() (150 commits)": 5399.9
       }
     }
   ]

@@ -87,7 +87,7 @@ class Repo:
         branch = self._head()[0]
         staged, modified, deleted, untracked = compute_status(self.path, idx)
         return {"branch": branch, "staged": sorted(staged), "modified": sorted(modified),
-                "deleted": sorted(deleted), "untracked": sorted(untracked)}
+                "deleted": sorted(deleted), "untracked": sorted(untracked), "removed": sorted(idx.removed)}
 
     # -- add ------------------------------------------------------------------
 

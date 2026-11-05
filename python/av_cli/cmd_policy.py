@@ -100,10 +100,14 @@ def evaluate(policy: dict, candidate_metrics: dict | None, baseline_metrics: dic
     cand = (candidate_metrics or {}).get(metric)
     if cand is None:
         return False, f"candidate has no metric '{metric}'"
+    if isinstance(cand, bool) or not isinstance(cand, (int, float)):
+        return False, f"candidate metric '{metric}' is not a number: {cand!r}"
     if base_ref:
         base = (baseline_metrics or {}).get(metric)
         if base is None:
             return False, f"baseline ref '{base_ref}' has no metric '{metric}'"
+        if isinstance(base, bool) or not isinstance(base, (int, float)):
+            return False, f"baseline ref '{base_ref}' metric '{metric}' is not a number: {base!r}"
         ok = _OPS[op](cand, base)
         return ok, f"{metric}: {cand} {op} {base} (baseline {base_ref}) → {'PASS' if ok else 'DENY'}"
     threshold = policy.get("threshold")
@@ -331,10 +335,9 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
         _report_policy_outcome(repo_root, "allow" if allowed else "deny", deciding_rule)
 
     if not allowed:
+        denial = {"allowed": False, "forced": bool(force and pol_entry), "reason": reason, "rule": deciding_rule}
         if current_output_mode() == "json":
-            emit_json(None, "promote", data={"allowed": False,
-                                             "forced": bool(force and pol_entry),
-                                             "reason": reason, "rule": deciding_rule})
+            click.echo(json.dumps(json_envelope("promote", data=denial, error_code="policy_denied", error_message=reason)))
         else:
             click.secho(f"DENIED: {reason}", fg="red", err=True)
         ctx_exit(EXIT_POLICY_DENIED)
@@ -349,7 +352,17 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
     from .cmd_sync import merge as merge_cmd
 
     if resolve_head(repo_root)[0] != into_branch:
-        ctx.invoke(checkout, target=into_branch)
+        if current_output_mode() != "json":
+            ctx.invoke(checkout, target=into_branch)
+        else:
+            # checkout emits its own envelope; promote prints exactly one.
+            checkout_output = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(checkout_output):
+                    ctx.invoke(checkout, target=into_branch)
+            except SystemExit:
+                click.echo(checkout_output.getvalue(), nl=False)
+                raise
 
     merge_kwargs = dict(
         target=cand_ref,

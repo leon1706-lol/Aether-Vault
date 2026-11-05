@@ -627,7 +627,7 @@ external-repo work.)
 - **`security` and `Docker Edge Build` were red on the same push for a different reason (Probleme.md #188):** `next` 16.3.4 carries a critical RCE advisory (GHSA-vcvr-r3jv-pc5j), failing `npm audit` and the image Trivy scans. `next` and `eslint-config-next` are now pinned to 16.3.8 in `webui/package.json` and the lockfile.
 - **Honest limit:** a manual nightly after the `greenlet` fix turned `compat` (3.11–3.13) and `dr-drill` green; the `compat-drill` fix and the `next` bump were pushed without a local CI-equivalent run (the drill needs Postgres; the image scans need a Docker build), so they are confirmed only by the next `security`/`Docker Edge Build` push run and nightly.
 
-## Phase 75 — Compatibility with Aether-quant's real usage (unreleased, not committed)
+## Phase 75 — Compatibility with Aether-quant's real usage
 
 - **Silent file loss in commits fixed (Probleme.md #189):** `.gitignore` globs are now matched per path segment like git, including `**`, so `ml/*.pkl` no longer drops `ml/versions/x/scaler.pkl`. This is why no Aether-quant candidate could have been committed whole.
 - **`av checkout` failures now exit non-zero in text mode (#190):** an ambiguous hash, unknown commit or dirty tree exits 15, as JSON mode already did. Scripts relying on the old text-mode exit 0 will see the change; a queued push stays exit 0 by design.
@@ -635,3 +635,14 @@ external-repo work.)
 - **`av promote` across branches fixed (#192):** a wrong keyword made it raise `TypeError`; a refused checkout now also stops the promotion before its merge.
 - **New `av restore --source <hash> PATH...` (#193):** an additive command that recovers selected paths without moving HEAD or touching other files.
 - **Release docs corrected (#194).**
+
+## Phase 76 — Data-integrity hardening, `av rm`, a green CI (v1.7.0)
+
+- **Silent success and silent loss removed (Probleme.md #195, #198, #199, #201):** `restore` and `checkout` fail on a missing or corrupt object before writing anything, a corrupt index or queue stops the command instead of reading as empty, `restore` no longer desyncs the index from HEAD, and `checkout` refuses to overwrite an untracked file.
+- **Commits can't be stranded or orphaned (#196, #197):** a commit is queued before its ref moves, and one OS file lock (released automatically if its holder dies) guards index, queue and ref writes, proved by 4 parallel writers.
+- **New `av rm [--cached] PATH...` (#200):** additive; the index's `removed` list appears only while a deletion is staged. `av restore` and `av rm` make this a MINOR release: v1.7.0, past the v1.5.0-v1.6.3 sections VERSIONING.md already holds, though the last tag is v1.4.1.
+- **Contract fixes (#202-#206, #208):** `promote` prints one envelope and a denial is now `ok:false` / `policy_denied` with `data` unchanged, `log --branch missing` exits non-zero, `--no-upload` never touches the network, metrics parse `1e-05` and refuse malformed or non-finite values, progress stays out of JSON output, and an outside path gets an envelope.
+- **Windows and speed (#207, #209, #210):** ignore files with a BOM, UTF-16 or trailing spaces work, the daemon notices edits to any CLI module, and cached patterns speed up the ignore walk.
+- **CI (#211, #212):** `next` 16.4.5 and `sharp` 0.35.5 clear the advisories that failed `security` and `Docker Edge Build`; `av admin backup restore` no longer crashes on a newer `pg_dump`'s `transaction_timeout`; `tests/test_import_graph.py` now lists `restore` and `rm`.
+
+Essential-Tasks: signed off

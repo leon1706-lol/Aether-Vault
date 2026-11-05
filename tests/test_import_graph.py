@@ -223,7 +223,7 @@ def test_list_commands_matches_full_expected_surface_without_importing_anything(
         "import-lightning", "import-mlflow", "import-pytorch", "import-transformers",
         "improver", "incident", "init", "lessons", "lineage", "list-meta", "list-users",
         "log", "login", "logout", "merge", "plan", "policy", "promote", "pull", "push",
-        "registry", "remove-user", "replay", "replay-actions", "review", "role", "run",
+        "registry", "remove-user", "replay", "replay-actions", "restore", "review", "rm", "role", "run",
         "sandbox", "scheduler", "scim", "search", "stash", "status", "strategy",
         "support-bundle", "task", "tenant", "test", "token", "tools", "unstage", "update",
         "user", "verify", "watch", "webhooks", "webui", "whoami",

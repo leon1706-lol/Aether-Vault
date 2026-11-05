@@ -58,6 +58,7 @@ Aether-Vault is not git for big files. It is version control purpose-built for m
   - [`av add`](#av-add)
   - [`av file`](#av-file)
   - [`av unstage`](#av-unstage)
+  - [`av rm`](#av-rm)
   - [`av commit`](#av-commit)
   - [`av push`](#av-push)
   - [`av clone`](#av-clone)
@@ -210,7 +211,7 @@ and how it's wired in, this table is the index.
 | `python/av_server/` | FastAPI CAS registry (PostgreSQL + RedisBloom) | [README](python/av_server/README.md) |
 | `python/av_plugins/` | Lightning / Transformers / MLflow / vanilla PyTorch auto-commit callbacks | [README](python/av_plugins/README.md) |
 | `src/` | C++17 performance core (`aether_core`): hashing, safetensors split, CDC chunker | [README](src/README.md) |
-| `tests/` | 1,765-test suite across 97 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
+| `tests/` | 1,765-test suite across 98 files (CLI, core, server, plugins, RSI control plane) | [README](tests/README.md) |
 | `webui/` | Next.js dashboard incl. Weight Diff, Playwright E2E | [README](webui/README.md) |
 | `benchmarks/` | Nine cross-tool benchmarks vs Git LFS / DVC / MLflow | [README](benchmarks/README.md) |
 | `scripts/` | Checkout-local developer utilities | [README](scripts/README.md) |
@@ -324,7 +325,7 @@ For full methodology, every raw number, and the rating legend, see [`development
 
 ## Test Suite
 
-The full suite (`av test` or `pytest tests/ -q`) runs 1,765 tests across 97 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
+The full suite (`av test` or `pytest tests/ -q`) runs 1,765 tests across 98 files covering the CLI, C++ bindings, live registry server, plugins, webui logic, and the RSI control plane. A plain `av test` (no `-k`) keeps this README's `tests-N/M passing` badge, this row's own counts, and `tests/README.md`'s opening line all in sync with the real result — it parses pytest's summary line and rewrites all of them (turning the badge red if anything failed) so none of these numbers is ever hand-typed. A `-k`-scoped run never touches any of them.
 
 ```bash
 av test                  # full suite
@@ -624,6 +625,16 @@ av checkout main
 Commits can be checked out by their full hash or any unique prefix of it — including the 7-character short form `av commit` itself prints (`av checkout a54a0b2`). An ambiguous prefix is rejected with an error asking for more characters. `checkout` refuses to run if you have uncommitted changes it would overwrite, unless you pass `--force` — `av stash` is the non-destructive alternative.
 
 Every refusal exits non-zero (15) in both text and JSON mode.
+
+#### `av rm`
+
+Stop tracking paths; the next commit records the deletion. A file already gone from disk is accepted, so a pruned path can leave the tree.
+
+```bash
+av rm old_weights.bin            # untrack and delete
+av rm --cached data/raw.csv      # untrack, keep the file on disk
+av rm models/                    # every tracked path below a directory
+```
 
 #### `av restore`
 

@@ -75,8 +75,12 @@ def add(paths: tuple, threads: int | None) -> None:
     threshold_bytes = cfg.get("lfs_threshold_mb", 50) * 1024 * 1024
 
     files_to_process: list[Path] = []
+    resolved_root = repo_root.resolve()
     for p in paths:
         path_obj = Path(p).resolve()
+        if not path_obj.is_relative_to(resolved_root):
+            fail(None, "validation", f"Path '{p}' is outside the repository.", command="add",
+                 data={"reason": "path_outside_repo"})
         if path_obj.is_file():
             files_to_process.append(path_obj)
         elif path_obj.is_dir():
@@ -177,10 +181,53 @@ def add(paths: tuple, threads: int | None) -> None:
             release_native_pool()
 
     if any_changed:
-        idx.save()
+        # Hashing can take long, so it runs unlocked; only these paths' entries are merged into
+        # the index as it is now, or a concurrent writer's work would be overwritten.
+        with RepoLock(repo_root):
+            current = Index(repo_root)
+            for item in json_staged:
+                current.add_entry(item["path"], item["hash"], item["size"], 0, item["type"], auto_save=False)
+                current.entries[item["path"]] = idx.entries[item["path"]]
+            current.save()
 
     if current_output_mode() == "json":
         emit_json(None, "add", data={"staged": json_staged, "count": len(json_staged)})
+
+
+@click.command()
+@click.option("--cached", is_flag=True, default=False, help="Stop tracking only; keep the file on disk.")
+@click.argument("paths", nargs=-1, required=True)
+def rm(paths: tuple, cached: bool) -> None:
+    """Stop tracking PATHS and delete them; the next commit records the deletion.
+
+    A file already gone from disk is accepted, so a pruned path can leave the tree. Directories
+    remove every tracked path below them. Nothing changes unless every PATH matches.
+    """
+    repo_root = ensure_repo()
+    resolved_root = repo_root.resolve()
+    with RepoLock(repo_root):
+        idx = Index(repo_root)
+        selected: set[str] = set()
+        for raw in paths:
+            resolved = Path(raw).resolve()
+            if not resolved.is_relative_to(resolved_root):
+                fail(None, "validation", f"Path '{raw}' is outside the repository.", command="rm",
+                     data={"reason": "path_outside_repo"})
+            prefix = resolved.relative_to(resolved_root).as_posix()
+            matches = {rel for rel in idx.entries if prefix == "." or rel == prefix or rel.startswith(prefix + "/")}
+            if not matches:
+                fail(None, "validation", f"Path '{raw}' is not tracked.", command="rm")
+            selected |= matches
+        for rel_path in sorted(selected):
+            idx.stage_removal(rel_path)
+            if not cached:
+                remove_file_and_pointer(repo_root, rel_path)
+        idx.save()
+
+    if current_output_mode() == "json":
+        emit_json(None, "rm", data={"removed": sorted(selected), "count": len(selected), "cached": cached})
+        return
+    click.secho(f"Removed {len(selected)} file(s) from tracking; commit to record it.", fg="green")
 
 
 _AVIGNORE_TEMPLATE = """\
@@ -259,6 +306,8 @@ def unstage(paths: tuple) -> None:
     restore --staged`, this only ever touches the index, never the working-tree files.
     """
     repo_root = ensure_repo()
+    repo_lock = RepoLock(repo_root).acquire()
+    click.get_current_context().call_on_close(repo_lock.release)
     idx = Index(repo_root)
     json_mode = current_output_mode() == "json"
 
@@ -352,16 +401,19 @@ def status() -> None:
                 "modified": sorted(modified),
                 "deleted": sorted(deleted),
                 "untracked": sorted(untracked),
+                "removed": sorted(idx.removed),
             },
         )
         return
 
     click.secho(f"On branch {branch}\n", bold=True)
 
-    if staged:
+    if staged or idx.removed:
         click.secho("Changes to be committed:", fg="green")
         for f in staged:
             click.echo(f"  modified: {f}")
+        for f in sorted(idx.removed):
+            click.echo(f"  removed:  {f}")
         click.echo("")
     if modified:
         click.secho("Changes not staged for commit:", fg="yellow")

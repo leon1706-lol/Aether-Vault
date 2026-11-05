@@ -2235,7 +2235,7 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 187. `compat-drill` could not read the old tag's migration head: the old tag has the same missing `greenlet`
 
-**Severity:** 5/10 (nightly-only; the drill never reached its actual check) · **Status:** 🟡 fixed, pending the next nightly
+**Severity:** 5/10 (nightly-only; the drill never reached its actual check) · **Status:** 🟡 fixed, pending the next nightly (still masked by #212 in the same workflow on 2026-11-05)
 
 **Problem:** the drill installs the previous release tag (v1.4.0) into a clean venv, where `sqlalchemy>=2.0.0` resolves to 2.1.3 without `greenlet`, so importing `av_server.database` fails and the script dies with "migration head: unknown" before booting anything.
 
@@ -2245,7 +2245,7 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 188. `next` 16.3.4 had a critical RCE advisory — `security` (npm audit + Trivy) and `Docker Edge Build` failed on every push
 
-**Severity:** 9/10 (critical advisory in a shipped production dependency; also blocked the `:edge` image from being pushed) · **Status:** 🟡 fixed, pending CI
+**Severity:** 9/10 (critical advisory in a shipped production dependency; also blocked the `:edge` image from being pushed) · **Status:** 🟢 `fixed` (superseded: 16.3.8 then met new advisories, #211)
 
 **Problem:** GHSA-vcvr-r3jv-pc5j (RCE in `next/og` `ImageResponse`) affects `next` 16.2.0–16.3.5; `webui/package.json` pinned 16.3.4 exactly, so `npm audit --omit=dev` and the Trivy image scans (`security.yml`, `docker-edge.yml`) exited 1.
 
@@ -2312,3 +2312,183 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** They now name `leon1706-lol/Aether-Vault` and `aether-vault-engine`.
 
 **Verification:** Read against the engine image name in the same README section.
+
+### 195. `av restore` and `av checkout` reported success with a missing object
+
+**Severity:** 8/10 (a corrupt file read as clean) · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** With no server and a missing whole-file object, nothing was written and nothing raised: exit 0, and `restore` then recorded the file already on disk against the commit's hash, so `status` read clean.
+
+**Fix:** `materialize_file` raises on a missing or corrupt object, `tree_missing_objects` checks before anything is written, and `restore`/`checkout` verify whole-file hashes. Failures exit 15 with `reason: missing_object`.
+
+**Verification:** `tests/test_integrity_hardening.py`; real-CLI repro in a scratch repo.
+
+### 196. A commit killed before its upload was stranded
+
+**Severity:** 8/10 (a commit never reached the server) · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** The ref moved and staging cleared before the commit entered `pending_push`, so a kill in that window left `av push` saying "Nothing pending". Later commits upload only their own changes, so those objects never arrived.
+
+**Fix:** The queue entry is written before the ref moves and removed only after delivery; entries are unique per commit.
+
+**Verification:** `test_commit_is_queued_before_the_ref_moves`, `test_a_commit_killed_before_upload_stays_queued`.
+
+### 197. No lock on the index, the queue or the ref
+
+**Severity:** 7/10 (a commit could vanish from history) · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** Two parallel commits could share a parent and overwrite each other's ref or queue entry; `flush_pending_push` also rewrote the queue from its own snapshot, dropping entries queued while it ran.
+
+**Fix:** `RepoLock`: an OS file lock, so a killed holder can't leave it stuck, with a timeout (`AV_LOCK_TIMEOUT`, 30 s) that exits 15 with `reason: repo_locked`. `commit_staged` holds it for local state and releases it before the network; `add` merges only its own paths under it; `flush_pending_push` removes delivered entries from the current queue.
+
+**Verification:** `test_parallel_writers_leave_a_linear_history_with_both` (4 processes), `test_lock_is_released_when_its_holder_dies`, `test_flush_keeps_an_entry_queued_while_it_ran`.
+
+### 198. A corrupt index or queue was read as empty
+
+**Severity:** 9/10 (silent loss of every tracked file or queued commit) · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** `Index.load` and `load_pending_push` swallowed parse and read errors and returned nothing, so the next `add` and `commit` wrote a tree holding only the new file, and the next queue write discarded the old entries.
+
+**Fix:** Both raise `CorruptStateError` (exit 15, `reason: corrupt_state`) and leave the file alone.
+
+**Verification:** `test_corrupt_index_stops_the_command_and_is_kept`, `test_corrupt_queue_stops_a_commit_and_is_kept`.
+
+### 199. `av restore` desynced the index from HEAD
+
+**Severity:** 7/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** `restore` wrote the old version's hash into the index with `staged: false`, so `status` read clean and the next unrelated commit silently carried the old file.
+
+**Fix:** `restore` no longer touches the index; the path reads as modified until it is added, like git. Rollback in Aether-quant verifies hashes itself and is unaffected.
+
+**Verification:** `test_restore_leaves_the_index_so_the_path_reads_as_modified`; Aether-quant's `tests/test_vault_contract.py`.
+
+### 200. Deletions could not be recorded
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** No command removed a tracked path. A pruned file stayed in every later tree, stayed dirty, and made `checkout` need `--force` from then on.
+
+**Fix:** New `av rm [--cached] PATH...`. The index gains a `removed` list, written only while non-empty, so an index without one keeps its exact bytes; `commit` accepts a removal with nothing else staged.
+
+**Verification:** `test_rm_*`; real-CLI repro.
+
+### 201. `av checkout` overwrote untracked files
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** The dirty check covered only indexed paths, so an untracked file the target tree contains was silently replaced.
+
+**Fix:** `_collect_dirty_paths` takes the target tree and refuses a different-content untracked file unless `--force`; a file already holding the target's content is fine.
+
+**Verification:** `test_checkout_refuses_to_overwrite_an_untracked_file`, `test_checkout_accepts_an_untracked_file_with_the_target_content`.
+
+### 202. `av promote` broke its JSON contract twice
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** Switching branch printed checkout's envelope before promote's, so `json.loads(stdout)` failed; #192 had made that path reachable. A denied promotion printed `ok: true` with exit 16, against the documented `ok:false` / `policy_denied`.
+
+**Fix:** The checkout runs inside the same redirect as the merge; a denial is now `ok:false` with `error.code: "policy_denied"`, and `data` keeps its old fields, so a script reading `data.allowed` still works.
+
+**Verification:** `test_promote_across_branches_prints_one_envelope`, `test_denied_promote_reports_policy_denied`.
+
+### 203. `av log --branch missing` exited 0 in text mode
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** Same bug class as #190: the error printed, then `return`.
+
+**Fix:** Goes through `fail` in both modes (exit 15).
+
+**Verification:** `test_log_of_a_missing_branch_exits_non_zero_in_text_mode`.
+
+### 204. `--no-upload` still touched the network
+
+**Severity:** 5/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** `_finalize_commit` drained the queue before checking `defer_upload`, against the flag's help text.
+
+**Fix:** The drain runs only when uploading.
+
+**Verification:** `test_no_upload_never_touches_the_network`, with a client that fails on any network call.
+
+### 205. Metric parsing dropped and mistyped values
+
+**Severity:** 6/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** `1e-05` and `nan` stayed strings and entries with no `=` were dropped. Python prints small floats as `1e-05`, so a metric policy on such a value raised an uncaught `TypeError` instead of exiting 16.
+
+**Fix:** `parse_metric_args` parses scientific notation and refuses a malformed entry or a non-finite number (`reason: bad_metric`). A non-numeric metric under a policy is a denial.
+
+**Verification:** `test_metric_values_parse`, `test_bad_metric_values_are_refused`, `test_metric_policy_on_a_text_value_denies_instead_of_crashing`.
+
+### 206. "Downloading..." printed inside JSON output
+
+**Severity:** 4/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** #180 guarded the layer and chunk paths but not the whole-file ones.
+
+**Fix:** The progress line is skipped in JSON mode on those paths too.
+
+**Verification:** `test_download_progress_stays_out_of_json_output`.
+
+### 207. Ignore files as Windows writes them
+
+**Severity:** 6/10 (a rule silently missed, or a crash) · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** A UTF-8 BOM or trailing spaces made a pattern miss, and a UTF-16 file, which PowerShell 5.1's `>` writes, raised `UnicodeDecodeError` on `add` and `status`.
+
+**Fix:** One reader, `read_ignore_lines`, handles BOMs and UTF-16 and never raises on bad bytes; trailing spaces follow git, including the escaped `\ `.
+
+**Verification:** `test_ignore_files_with_bom_utf16_or_trailing_spaces`, `test_avignore_in_utf16_does_not_crash`, compared with `git check-ignore`.
+
+### 208. `av add` of an outside path gave a raw traceback
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** An uncaught `ValueError`, in JSON mode too; a symlink pointing out of the repo hit the same path.
+
+**Fix:** Exit 15 with `reason: path_outside_repo`.
+
+**Verification:** `test_add_of_a_path_outside_the_repo_gives_an_envelope`.
+
+### 209. A stale daemon on editable installs
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** The daemon watched only `__init__.py` and the native extension, so an edit to `core.py` could be served stale for up to 15 minutes.
+
+**Fix:** It watches every `av_cli/*.py` module.
+
+**Verification:** `test_daemon_watches_the_cli_modules_for_staleness`.
+
+### 210. The ignore walk spent its time in `fnmatch`
+
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** About 552k `fnmatch` calls for 2,884 path checks on Aether-quant, each re-normalising its name, made `av status` take 5.4 s.
+
+**Fix:** Patterns and normalised names are cached (`_fn_match`), with the same results.
+
+**Verification:** `tests/test_ignore_rules.py` still agrees with `git check-ignore`; timing in the changelog.
+
+### 211. New advisories in `next` and `sharp` failed `security` and `Docker Edge Build`
+
+**Severity:** 9/10 (critical advisory in a shipped dependency) · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** GHSA-2464-fhr4-w9xw and GHSA-673q-mjm6-r5xr (RCE) and CVE-2026-94482 affect `next` 16.3.8; GHSA-wq5f-xc86-pv6w affects `sharp` 0.35.4; `source-map-js` 1.2.1 also had a high advisory.
+
+**Fix:** `next` and `eslint-config-next` 16.4.5, `sharp` 0.35.5 and `source-map-js` 1.2.2.
+
+**Verification:** `npm audit --omit=dev --audit-level=high` reports 0 vulnerabilities; confirmed by the next `security` and `Docker Edge Build` runs.
+
+### 212. `av admin backup restore` died on a newer `pg_dump`'s setting
+
+**Severity:** 5/10 (a good restore reported as a crash) · **Status:** 🟢 `fixed` (2026-11-05)
+
+**Problem:** A dump from a newer client carries `SET transaction_timeout`; an older server rejects it, `pg_restore` carries on and exits 1, and `check=True` turned that into a raw traceback, failing nightly `dr-drill`.
+
+**Fix:** `_run_pg_restore` tolerates only that known setting and reports any other failure as exit 15 with `pg_restore`'s message.
+
+**Verification:** `test_pg_restore_tolerates_only_a_newer_clients_unknown_setting`; confirmed by the next nightly.

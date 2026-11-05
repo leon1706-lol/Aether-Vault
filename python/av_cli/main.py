@@ -169,9 +169,9 @@ def _load_repo(group: click.Group) -> None:
 
 
 def _load_staging(group: click.Group) -> None:
-    from .cmd_staging import add, config, file, status, unstage
+    from .cmd_staging import add, config, file, rm, status, unstage
 
-    for cmd in (config, add, file, unstage, status):
+    for cmd in (config, add, file, rm, unstage, status):
         group.add_command(cmd)
 
 
@@ -451,7 +451,7 @@ def _load_daemon(group: click.Group) -> None:
 
 _LOADERS_BY_NAMES: list[tuple[tuple[str, ...], object]] = [
     (("init", "update"), _load_repo),
-    (("config", "add", "file", "unstage", "status"), _load_staging),
+    (("config", "add", "file", "rm", "unstage", "status"), _load_staging),
     (("commit", "branch", "checkout", "restore", "log", "stash", "list-meta", "push"), _load_history),
     (("clone", "pull", "merge", "fetch"), _load_sync),
     (("auth", "add-user", "list-users", "remove-user"), _load_auth),

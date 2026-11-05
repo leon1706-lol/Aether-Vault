@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 import uuid
 from pathlib import Path
 
-from .exceptions import AmbiguousCommitHash
+from .exceptions import AmbiguousCommitHash, RepoLockedError
 
 # User-level (not per-repo) config directory -- ~/.aether-vault. Lives here, not in
 # update_check.py, specifically so session_store.py (and anything else that just needs
@@ -79,10 +81,143 @@ def atomic_write_chunks(path: Path, chunks, *, durable: bool = True) -> None:
             if durable:
                 f.flush()
                 os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+def _replace_with_retry(source: Path, target: Path, attempts: int = 40, wait_seconds: float = 0.05) -> None:
+    """Windows refuses `os.replace` while another process has `target` open for reading, even
+    for the instant a concurrent reader needs."""
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(wait_seconds)
+
+
+def read_text_with_retry(path: Path, attempts: int = 40, wait_seconds: float = 0.05) -> str:
+    """Same reason as `_replace_with_retry`, from the reader's side."""
+    for attempt in range(attempts):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(wait_seconds)
+    raise AssertionError("unreachable")
+
+
+class _LockState:
+    __slots__ = ("guard", "depth", "handle")
+
+    def __init__(self) -> None:
+        self.guard = threading.RLock()
+        self.depth = 0
+        self.handle = None
+
+
+_lock_states: dict[str, _LockState] = {}
+_lock_states_guard = threading.Lock()
+DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+def _try_os_lock(handle) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _os_unlock(handle) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+class RepoLock:
+    """One writer at a time for a repository's local state. An OS file lock, so a killed
+    holder can never leave it stuck; re-entrant within a thread, so a caller already holding
+    it can reach `commit_staged`. `release()` is idempotent per instance, which lets
+    `commit_staged` drop the lock before its network step and still clean up in `finally`."""
+
+    def __init__(self, repo_root: Path, name: str = "lock") -> None:
+        self.path = Path(repo_root) / ".av" / name
+        self._held = False
+
+    def _state(self) -> _LockState:
+        key = str(self.path)
+        with _lock_states_guard:
+            return _lock_states.setdefault(key, _LockState())
+
+    def acquire(self) -> "RepoLock":
+        raw = os.environ.get("AV_LOCK_TIMEOUT", "").strip()
+        try:
+            timeout = float(raw) if raw else DEFAULT_LOCK_TIMEOUT_SECONDS
+        except ValueError:
+            timeout = DEFAULT_LOCK_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout
+        state = self._state()
+        if not state.guard.acquire(timeout=timeout):
+            raise RepoLockedError(f"Repository is locked by another writer in this process ({self.path.name}).")
+        try:
+            if state.depth == 0:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(self.path, "a+b")
+                while not _try_os_lock(handle):
+                    if time.monotonic() >= deadline:
+                        handle.close()
+                        raise RepoLockedError(
+                            f"Repository is locked by another writer ({self.path.name}); gave up after {timeout:g} s."
+                        )
+                    time.sleep(0.02)
+                state.handle = handle
+            state.depth += 1
+        except BaseException:
+            state.guard.release()
+            raise
+        self._held = True
+        return self
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        self._held = False
+        state = self._state()
+        state.depth -= 1
+        if state.depth == 0 and state.handle is not None:
+            _os_unlock(state.handle)
+            state.handle.close()
+            state.handle = None
+        state.guard.release()
+
+    def __enter__(self) -> "RepoLock":
+        return self.acquire()
+
+    def __exit__(self, *_exc) -> None:
+        self.release()
 
 
 def atomic_write_json(path: Path, data, *, durable: bool = True) -> None:

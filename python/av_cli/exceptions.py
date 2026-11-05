@@ -31,6 +31,37 @@ class AmbiguousCommitHash(ValidationError):
     pass
 
 
+class ReportedValidationError(ValidationError):
+    """A validation failure the root group turns into exit 15 plus `error.data.reason`."""
+
+    reason = "validation"
+
+
+class CorruptStateError(ReportedValidationError):
+    """`.av/index` or `.av/pending_push` can't be read. Never treated as empty: the next
+    write would silently drop every tracked file or queued commit."""
+
+    reason = "corrupt_state"
+
+
+class RepoLockedError(ReportedValidationError):
+    """Another writer held the repository lock past the timeout."""
+
+    reason = "repo_locked"
+
+
+class BadMetricError(ReportedValidationError):
+    """A `--metric` entry with no `=`, an empty key, or a non-finite number."""
+
+    reason = "bad_metric"
+
+
+class MissingObjectError(ReportedValidationError):
+    """A restore needs an object that is absent or whose bytes don't match its hash."""
+
+    reason = "missing_object"
+
+
 class StorageError(AetherVaultException):
     """Raised when local storage operations fail."""
     pass

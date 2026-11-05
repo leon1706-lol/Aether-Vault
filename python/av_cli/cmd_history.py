@@ -10,6 +10,7 @@ import uuid       # this module's own stash-id generation needs them explicitly.
 
 from .core import *  # noqa: F401,F403 -- shared prelude (stdlib + helpers)
 from .core import _collect_dirty_paths, _finalize_commit, _materialize_tree
+from .core import MissingObjectError, RepoLock, tree_missing_objects
 
 
 
@@ -41,11 +42,13 @@ def commit(
     # including `--no-upload`, paid `requests`' import cost (~1.5s on the reference
     # machine) for a client object that did nothing.
     repo_root = ensure_repo()
+    repo_lock = RepoLock(repo_root).acquire()
+    click.get_current_context().call_on_close(repo_lock.release)
     idx = Index(repo_root)
     cfg = load_config(repo_root)
 
     staged = idx.get_staged_entries()
-    if not staged:
+    if not staged and not idx.removed:
         # Exit 11 (nothing_to_commit) via fail(), matching the exit-code registry and
         # av_sdk.Repo.commit()'s SDKError("nothing_to_commit").
         fail(click.get_current_context(silent=True), "nothing_to_commit", "Nothing to commit",
@@ -90,7 +93,7 @@ def commit(
         repo_root, message, tags=tags, metrics=metrics,
         run_id=run_id, defer_upload=defer_upload,
         result_sink=json_sink, outcome_sink=sink_data.update,
-        idx=idx,  # the index loaded above for the staged check -- no second parse
+        idx=idx, repo_lock=repo_lock,  # the index loaded above for the staged check -- no second parse
     )
 
     if current_output_mode() == "json":
@@ -202,13 +205,16 @@ def checkout(target: str, force: bool) -> None:
     if not commit_data:
         fail(None, "validation", f"Commit '{target}' not found.", command="checkout")
 
+    repo_lock = RepoLock(repo_root).acquire()
+    click.get_current_context().call_on_close(repo_lock.release)
     idx = Index(repo_root)
 
     # Guard against silent data loss: checkout overwrites/deletes tracked working files.
     # Refuse to proceed if there are uncommitted changes (modified/deleted tracked files
-    # or staged-but-uncommitted edits) unless the user explicitly passes --force.
+    # or staged-but-uncommitted edits) or untracked files the target would overwrite, unless
+    # the user explicitly passes --force.
     if not force:
-        dirty = _collect_dirty_paths(repo_root, idx)
+        dirty = _collect_dirty_paths(repo_root, idx, commit_data.get("tree", {}))
         if dirty:
             if not json_mode:
                 click.secho(
@@ -225,7 +231,7 @@ def checkout(target: str, force: bool) -> None:
                  command="checkout", data={"dirty_paths": dirty[:20], "dirty_count": len(dirty)},
                  quiet_text=True)
 
-    _materialize_tree(repo_root, client, commit_data.get("tree", {}), idx)
+    _materialize_tree(repo_root, client, commit_data.get("tree", {}), idx, verify=True)
 
     head_path = repo_root / ".av" / "HEAD"
     with open(head_path, "w") as f:
@@ -247,8 +253,10 @@ def checkout(target: str, force: bool) -> None:
 def restore(source: str, paths: tuple) -> None:
     """Restore only PATHS (files or directories) from a commit.
 
-    Unlike checkout this leaves HEAD and every other file alone, so a caller can recover a
-    single artifact from a dirty tree. Nothing is written unless every PATH is in the commit.
+    Unlike checkout this leaves HEAD, the index and every other file alone, so a caller can
+    recover a single artifact from a dirty tree; the path reads as modified until it is added.
+    Nothing is written unless every PATH is in the commit and, with no server, all its objects
+    are here and intact. A missing or corrupt object fails with a non-zero exit.
     """
     from .client import VaultClient
 
@@ -280,28 +288,15 @@ def restore(source: str, paths: tuple) -> None:
                  command="restore")
         selected.update(matches)
 
-    idx = Index(repo_root)
+    if not client.server_available():
+        missing = tree_missing_objects(repo_root, selected, verify=True)
+        if missing:
+            raise MissingObjectError(
+                f"{len(missing)} file(s) can't be restored, their objects are missing or corrupt: "
+                f"{', '.join(sorted(missing)[:5])}. Nothing was written."
+            )
     for rel_path, info in selected.items():
-        layers = info.get("layers", [])
-        chunks = info.get("chunks", [])
-        materialize_file(repo_root, client, rel_path, info["hash"], layers, chunks)
-        fpath = repo_root / rel_path
-        if not fpath.exists():
-            fail(None, "validation", f"Object for '{rel_path}' is missing; restore is incomplete.",
-                 command="restore")
-        file_type = info.get("type", "file")
-        idx.add_entry(rel_path, info["hash"], info.get("size", 0), 0, file_type,
-                      rel_path + ".av-pointer" if file_type == "artifact" else None, auto_save=False)
-        entry = idx.entries[rel_path]
-        if layers:
-            entry["layers"] = layers
-        if chunks:
-            entry["chunks"] = chunks
-        meta = get_file_meta_safe(str(fpath))
-        entry["size"] = meta["size"]
-        entry["mtime_ns"] = meta["mtime_ns"]
-        entry["staged"] = False
-    idx.save()
+        materialize_file(repo_root, client, rel_path, info["hash"], info.get("layers", []), info.get("chunks", []), verify=True)
 
     if current_output_mode() == "json":
         emit_json(None, "restore", data={"source": commit_file.stem, "restored": sorted(selected),
@@ -340,10 +335,7 @@ def log(limit: int, branch: str | None, show_all: bool) -> None:
     else:
         start, err = history.resolve_start_hash(repo_root, branch)
         if err:
-            if json_mode:
-                fail(None, "validation", err, command="log")
-            click.secho(f"Error: {err}", fg="red")
-            return
+            fail(None, "validation", err, command="log")
         if start is None:
             if json_mode:
                 emit_json(None, "log", data={"commits": []})

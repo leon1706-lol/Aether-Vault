@@ -42,6 +42,7 @@ Contract section for that path.
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import fnmatch
 import json
@@ -61,7 +62,14 @@ from .exceptions import (
     StorageError,
     ValidationError,
 )
-from .fsutil import atomic_write_json, atomic_write_json_compact, atomic_write_text, find_commit_file
+from .fsutil import (
+    RepoLock,
+    atomic_write_json,
+    atomic_write_json_compact,
+    atomic_write_text,
+    find_commit_file,
+    read_text_with_retry,
+)
 from .index import Index
 from .pointer import (
     create_pointer,
@@ -78,7 +86,17 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from . import __version__
-from .exceptions import AetherVaultException, AmbiguousCommitHash, NetworkError, StorageError, ValidationError
+from .exceptions import (
+    AetherVaultException,
+    AmbiguousCommitHash,
+    BadMetricError,
+    CorruptStateError,
+    MissingObjectError,
+    NetworkError,
+    ReportedValidationError,
+    StorageError,
+    ValidationError,
+)
 from .index import Index
 from .pointer import create_pointer, get_pointer_path, is_pointer_file, parse_pointer
 
@@ -329,6 +347,43 @@ def _stage_buffer_cap_bytes() -> int:
         return 32 * 1024 * 1024
 
 
+def read_ignore_lines(path: Path) -> list[str]:
+    """Lines of an ignore file as an editor or PowerShell may have written it: a UTF-8 BOM,
+    UTF-16 (PowerShell 5.1's `>`), or stray non-UTF-8 bytes must not hide or crash a rule."""
+    import codecs
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return []
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        text = raw.decode("utf-16", errors="replace")
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
+    return text.splitlines()
+
+
+def _strip_ignore_trailing_spaces(line: str) -> str:
+    """Git ignores trailing spaces unless the last one is escaped with a backslash."""
+    while line.endswith(" ") and not line.endswith("\\ "):
+        line = line[:-1]
+    return line.replace("\\ ", " ")
+
+
+@functools.lru_cache(maxsize=4096)
+def _compiled_glob(pattern: str):
+    return _re.compile(fnmatch.translate(os.path.normcase(pattern))).match
+
+
+_normcase = functools.lru_cache(maxsize=65536)(os.path.normcase)
+
+
+def _fn_match(name: str, pattern: str) -> bool:
+    """`fnmatch.fnmatch` with its pattern and `normcase` cached: a status walk makes hundreds
+    of thousands of these calls."""
+    return _compiled_glob(pattern)(_normcase(name)) is not None
+
+
 def load_avignore_patterns(repo_root: Path) -> list[str]:
     """Reads `.avignore` from the repo root, if present.
 
@@ -338,11 +393,8 @@ def load_avignore_patterns(repo_root: Path) -> list[str]:
     (`/pattern`), or `**` double-glob — covers the stated use case (`venv`, `node_modules`,
     `*.log`) without the edge cases of a full gitignore parser.
     """
-    avignore_path = repo_root / ".avignore"
-    if not avignore_path.exists():
-        return []
     patterns = []
-    for line in avignore_path.read_text(encoding="utf-8").splitlines():
+    for line in read_ignore_lines(repo_root / ".avignore"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -351,7 +403,7 @@ def load_avignore_patterns(repo_root: Path) -> list[str]:
 
 
 def _matches_avignore(name: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+    return any(_fn_match(name, pattern) for pattern in patterns)
 
 
 class _GitignoreRule:
@@ -379,7 +431,7 @@ def _glob_segments_match(pattern: list[str], path: list[str]) -> bool:
         if len(pattern) == 1:
             return bool(path)
         return any(_glob_segments_match(pattern[1:], path[i:]) for i in range(len(path) + 1))
-    return bool(path) and fnmatch.fnmatch(path[0], head) and _glob_segments_match(pattern[1:], path[1:])
+    return bool(path) and _fn_match(path[0], head) and _glob_segments_match(pattern[1:], path[1:])
 
 
 def _parse_gitignore_lines(lines: list[str]) -> list[_GitignoreRule]:
@@ -392,7 +444,7 @@ def _parse_gitignore_lines(lines: list[str]) -> list[_GitignoreRule]:
     """
     rules: list[_GitignoreRule] = []
     for raw in lines:
-        line = raw.rstrip("\n").rstrip("\r")
+        line = _strip_ignore_trailing_spaces(raw.rstrip("\n").rstrip("\r"))
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         negate = line.startswith("!")
@@ -416,13 +468,7 @@ def load_gitignore_rules(repo_root: Path) -> list[_GitignoreRule]:
     files (real git supports one per subdirectory) are out of scope here -- a single
     root-level file covers the overwhelming majority of real repos and keeps this a
     bounded, testable piece of surface rather than a full gitignore engine."""
-    gi_path = repo_root / ".gitignore"
-    if not gi_path.exists():
-        return []
-    try:
-        return _parse_gitignore_lines(gi_path.read_text(encoding="utf-8").splitlines())
-    except OSError:
-        return []
+    return _parse_gitignore_lines(read_ignore_lines(repo_root / ".gitignore"))
 
 
 def _gitignore_rule_matches(rule: _GitignoreRule, rel_posix: str, name: str, is_dir: bool) -> bool:
@@ -432,7 +478,7 @@ def _gitignore_rule_matches(rule: _GitignoreRule, rel_posix: str, name: str, is_
         # Not fnmatch on the whole path: its `*` crosses `/`, so `ml/*.pkl` would also ignore
         # `ml/versions/x/scaler.pkl`, silently dropping it from a commit.
         return _glob_segments_match(rule.segments, rel_posix.split("/"))
-    return fnmatch.fnmatch(name, rule.pattern)
+    return _fn_match(name, rule.pattern)
 
 
 def _is_gitignored(rel_posix: str, name: str, is_dir: bool, rules: list[_GitignoreRule]) -> bool:
@@ -660,6 +706,8 @@ class _AuthRetryGroup(click.Group):
         # exception" without ever triggering the import ourselves.
         try:
             return super().invoke(ctx)
+        except ReportedValidationError as exc:
+            fail(ctx, "validation", exc.message, data={"reason": exc.reason})
         except Exception as exc:
             client_mod = sys.modules.get(f"{__name__.rsplit('.', 1)[0]}.client")
             auth_error_cls = getattr(client_mod, "AuthenticationError", None) if client_mod else None
@@ -778,13 +826,16 @@ def load_env_snapshot(repo_root: Path) -> tuple[str, dict] | None:
 def load_pending_push(repo_root: Path) -> list[dict]:
     """Load the queue of commits not yet pushed to the remote server."""
     path = repo_root / ".av" / "pending_push"
-    if path.exists():
-        try:
-            with open(path, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
-    return []
+    if not path.exists():
+        return []
+    try:
+        pending = json.loads(read_text_with_retry(path))
+        if not isinstance(pending, list):
+            raise ValueError("expected a list")
+    except (OSError, ValueError) as exc:
+        # Never read as empty: the next save would discard every queued commit for good.
+        raise CorruptStateError(f"{path} can't be read ({exc}); left as it is.") from exc
+    return pending
 
 
 def save_pending_push(repo_root: Path, pending: list[dict]) -> None:
@@ -797,10 +848,23 @@ def save_pending_push(repo_root: Path, pending: list[dict]) -> None:
 
 
 def queue_pending_push(repo_root: Path, commit_hash: str, ref_name: str | None) -> None:
-    """Append a commit/ref pair to the pending-push queue."""
-    pending = load_pending_push(repo_root)
-    pending.append({"commit_hash": commit_hash, "ref_name": ref_name})
-    save_pending_push(repo_root, pending)
+    """Append a commit/ref pair to the pending-push queue, once per commit: `_finalize_commit`
+    queues ahead of the ref move and its failure paths may queue again."""
+    with RepoLock(repo_root, "queue.lock"):
+        pending = load_pending_push(repo_root)
+        if any(entry.get("commit_hash") == commit_hash for entry in pending):
+            return
+        pending.append({"commit_hash": commit_hash, "ref_name": ref_name})
+        save_pending_push(repo_root, pending)
+
+
+def remove_pending_push(repo_root: Path, commit_hashes: set[str]) -> list[dict]:
+    """Drops delivered commits from whatever the queue holds now, so an entry another process
+    queued meanwhile survives. Returns what is left."""
+    with RepoLock(repo_root, "queue.lock"):
+        remaining = [entry for entry in load_pending_push(repo_root) if entry.get("commit_hash") not in commit_hashes]
+        save_pending_push(repo_root, remaining)
+    return remaining
 
 
 def upload_commit_objects(
@@ -885,22 +949,24 @@ def upload_commit_objects(
         return all(results)
 
 
-def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
+def flush_pending_push(repo_root: Path, client: "VaultClient", skip: set[str] | None = None) -> list[dict]:
     """Retry pushing queued commits to the remote server. Returns the entries still
     pending. `server_available()` only proves the server is up, not that this client's
     token is valid -- a bad token surfaces as AuthenticationError, caught here and treated
     like "server unreachable" (queue and retry later), stopping the rest of the queue
-    since the same bad token would fail identically for every remaining entry."""
-    pending = load_pending_push(repo_root)
+    since the same bad token would fail identically for every remaining entry. `skip` holds
+    commits a caller is about to push itself."""
+    pending = [entry for entry in load_pending_push(repo_root) if entry.get("commit_hash") not in (skip or set())]
     if not pending or not client.server_available():
-        return pending
+        return load_pending_push(repo_root)
 
     from .client import AuthenticationError, RefRaceError
 
-    still_pending: list[dict] = []
-    for i, entry in enumerate(pending):
+    delivered: set[str] = set()
+    for entry in pending:
         commit_path = repo_root / ".av" / "commits" / f"{entry['commit_hash']}.json"
         if not commit_path.exists():
+            delivered.add(entry["commit_hash"])
             continue
         with open(commit_path, "r") as f:
             commit_data = json.load(f)
@@ -922,15 +988,12 @@ def flush_pending_push(repo_root: Path, client: "VaultClient") -> list[dict]:
                         # draining the rest, since unlike AuthenticationError this isn't systemic.
                         ref_ok = False
                 if ref_ok:
-                    continue
+                    delivered.add(entry["commit_hash"])
         except AuthenticationError:
-            still_pending.extend(pending[i:])  # this entry + everything not yet attempted
-            save_pending_push(repo_root, still_pending)
+            remove_pending_push(repo_root, delivered)  # everything not yet attempted stays queued
             raise
-        still_pending.append(entry)
 
-    save_pending_push(repo_root, still_pending)
-    return still_pending
+    return remove_pending_push(repo_root, delivered)
 
 
 def hash_file_safe(path: str) -> str:
@@ -1055,6 +1118,8 @@ def materialize_file(
     h: str,
     layers: list | None = None,
     chunks: list | None = None,
+    *,
+    verify: bool = False,
 ) -> None:
     """Writes a tracked path's content to the working tree from the CAS -- whole-object,
     reassembled from safetensors layers, or reassembled from CDC chunks, downloading
@@ -1121,12 +1186,46 @@ def materialize_file(
             raise
     else:
         if obj_path.exists():
+            if verify and hash_file_safe(str(obj_path)) != h:
+                raise MissingObjectError(f"Object {h} for {rel_path} is corrupt; {rel_path} was not touched.")
             shutil.copy2(obj_path, dest)
-        elif client.server_available():
-            click.echo(f"Downloading {rel_path}...")
-            if client.download_object(h, dest):
-                obj_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, obj_path)
+            return
+        downloaded = False
+        if client.server_available():
+            if current_output_mode() != "json":  # progress line; never inside a JSON envelope
+                click.echo(f"Downloading {rel_path}...")
+            downloaded = client.download_object(h, dest)
+        if not downloaded:
+            raise MissingObjectError(f"Object {h} for {rel_path} is missing; {rel_path} was not restored.")
+        obj_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dest, obj_path)
+        return
+
+    if verify and hash_file_safe(str(dest)) != h:
+        dest.unlink(missing_ok=True)
+        raise MissingObjectError(f"Reassembled {rel_path} does not match its hash {h}.")
+
+
+def tree_missing_objects(repo_root: Path, tree: dict, *, verify: bool = False) -> list[str]:
+    """Paths of a flat tree whose bytes aren't all in the local object store, checked before
+    anything is written so a failure leaves the working tree as it was. `verify` also hashes
+    whole-file objects. A split entry's shards are verified when it is reassembled."""
+    objects = repo_root / ".av" / "objects"
+
+    def local(digest: str) -> Path:
+        return objects / digest[:2] / digest[2:]
+
+    missing = []
+    for rel_path, info in tree.items():
+        parts = [item["hash"] for item in (info.get("layers") or info.get("chunks") or [])]
+        if parts:
+            if not all(local(digest).exists() for digest in parts):
+                missing.append(rel_path)
+            continue
+        path = local(info["hash"])
+        if not path.exists() or (verify and hash_file_safe(str(path)) != info["hash"]):
+            missing.append(rel_path)
+    return missing
 
 
 def remove_file_and_pointer(repo_root: Path, rel_path: str) -> None:
@@ -1552,6 +1651,7 @@ def _finalize_commit(
     defer_upload: bool = False,
     outcome_sink=None,
     changed_paths: set[str] | None = None,
+    on_persisted=None,
 ) -> str:
     """Everything `av commit` does after its tree snapshot and parents are resolved: hash
     the payload deterministically over sorted JSON, persist atomically (commit object
@@ -1568,6 +1668,11 @@ def _finalize_commit(
     fresh from disk with nothing staged by the time it reaches this function). Leave this
     None for any caller that can't state its own changed set with full confidence --
     `upload_commit_objects` then falls back to its safe, if slower, full-tree scan.
+
+    The commit is queued BEFORE its ref moves and leaves the queue only once delivered, so a
+    process killed at any point never strands it: a ref pointing at a commit `av push` doesn't
+    know about would never reach the server, and later commits upload only their own changes.
+    `on_persisted` runs once the local state is durable, before any network call.
     """
     metrics = metrics or {}
     message = commit_data.get("message", "")
@@ -1595,15 +1700,23 @@ def _finalize_commit(
     except Exception as exc:  # pragma: no cover - defensive; sign_payload swallows its own
         logger.warning("commit signing skipped: %s", exc)
 
+    # Refs are namespaced as "<project_id>/<branch>" on the shared registry so two projects
+    # can each have a branch named "main" without overwriting each other's ref.
+    remote_ref_name = f"{cfg['project_id']}/{ref_path.name}" if ref_path else None
+
     # --- Persist locally ---
-    atomic_write_json(repo_root / ".av" / "commits" / f"{commit_hash}.json", commit_data)
+    with RepoLock(repo_root):
+        atomic_write_json(repo_root / ".av" / "commits" / f"{commit_hash}.json", commit_data)
+        queue_pending_push(repo_root, commit_hash, remote_ref_name)
 
-    if ref_path:
-        atomic_write_text(ref_path, commit_hash)
-    else:
-        atomic_write_text(head_path, commit_hash)
+        if ref_path:
+            atomic_write_text(ref_path, commit_hash)
+        else:
+            atomic_write_text(head_path, commit_hash)
 
-    idx.clear_staged()
+        idx.clear_staged()
+    if on_persisted is not None:
+        on_persisted()
     result = {
         "hash": commit_hash,
         "short": commit_hash[:7],
@@ -1629,9 +1742,6 @@ def _finalize_commit(
     # defaults for every machine caller.
 
     # --- Push to remote if available ---
-    # Refs are namespaced as "<project_id>/<branch>" on the shared registry so two projects
-    # can each have a branch named "main" without overwriting each other's ref.
-    remote_ref_name = f"{cfg['project_id']}/{ref_path.name}" if ref_path else None
     # The parent this commit advances the ref FROM -- None for a ref's first-ever commit.
     # Passed as expected_hash below so a losing compare-and-swap race is detectable
     # instead of silently overwriting a concurrent agent's ref update.
@@ -1651,10 +1761,11 @@ def _finalize_commit(
 
     from .client import AuthenticationError, RefRaceError
 
-    try:
-        flush_pending_push(repo_root, client)
-    except AuthenticationError:
-        pass  # already re-queued by flush_pending_push itself; this commit's own push attempt below still needs to happen
+    if not defer_upload:  # deferred means no network at all, not even for older commits
+        try:
+            flush_pending_push(repo_root, client, skip={commit_hash})
+        except AuthenticationError:
+            pass  # still queued; this commit's own push attempt below still needs to happen
 
     if defer_upload:
         # High-frequency mode: skip every network attempt, queue directly. The commit is
@@ -1707,7 +1818,9 @@ def _finalize_commit(
                     ]
                     if len(remaining) != len(still_pending):
                         save_pending_push(repo_root, remaining)
-                if not ref_ok:
+                if ref_ok:
+                    remove_pending_push(repo_root, {commit_hash})
+                else:
                     queue_pending_push(repo_root, commit_hash, remote_ref_name)
                     _queued("ref_race" if "ref_race" in result else "ref_update_failed")
                     if result_sink is None:
@@ -1771,6 +1884,7 @@ def commit_staged(
     result_sink=None,
     outcome_sink=None,
     idx: "Index | None" = None,
+    repo_lock: "RepoLock | None" = None,
 ) -> str | None:
     """Commit whatever is currently staged — THE shared entry point.
 
@@ -1789,16 +1903,32 @@ def commit_staged(
     """
     from .client import VaultClient
 
+    # Index, parents and ref are read and written under one lock, or two writers could share a
+    # parent and one commit would vanish from history. Released before the network step. A caller
+    # that read `idx` under its own `repo_lock` hands the lock over with it.
+    lock = repo_lock or RepoLock(repo_root).acquire()
+    try:
+        return _commit_staged_locked(
+            repo_root, lock, message, tags, metrics, run_id, defer_upload, result_sink, outcome_sink, idx,
+            VaultClient,
+        )
+    finally:
+        lock.release()
+
+
+def _commit_staged_locked(
+    repo_root, lock, message, tags, metrics, run_id, defer_upload, result_sink, outcome_sink, idx, client_class,
+) -> str | None:
     if idx is None:
         idx = Index(repo_root)
     staged_entries = idx.get_staged_entries()
-    if not staged_entries:
+    if not staged_entries and not idx.removed:
         return None
     # Captured here, not inside _finalize_commit -- see its changed_paths docstring for why
     # that would be unsafe for other callers (e.g. merge) sharing the same function.
     changed_paths = set(staged_entries.keys())
     cfg = load_config(repo_root)
-    client = VaultClient(*resolve_remote(repo_root, cfg))
+    client = client_class(*resolve_remote(repo_root, cfg))
 
     tree: dict = {}
     for rel_path, e in idx.entries.items():
@@ -1857,21 +1987,35 @@ def commit_staged(
         commit_data=commit_data, tree=tree, ref_path=ref_path, head_path=head_path,
         idx=idx, tags=tags, metrics=metrics or {},
         result_sink=result_sink, defer_upload=defer_upload, outcome_sink=outcome_sink,
-        changed_paths=changed_paths,
+        changed_paths=changed_paths, on_persisted=lock.release,
     )
 
 
 def parse_metric_args(raw_metrics: tuple) -> dict:
-    """THE shared `--metric key=value` parser. Values with a literal `.` parse as float,
-    else int, else fall back to the raw string; entries without an `=` are skipped."""
+    """THE shared `--metric key=value` parser: int, else float (`1e-05` included), else the raw
+    string. A malformed entry or a non-finite number is refused, never silently dropped or kept
+    as text a metric policy can't compare."""
+    import math
+
     metrics: dict = {}
     for raw in raw_metrics:
-        if "=" in raw:
-            k, v = raw.split("=", 1)
-            try:
-                metrics[k.strip()] = float(v) if "." in v else int(v)
-            except ValueError:
-                metrics[k.strip()] = v
+        key, separator, value = raw.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            raise BadMetricError(f"--metric '{raw}' is not key=value.")
+        try:
+            metrics[key] = int(value)
+            continue
+        except ValueError:
+            pass
+        try:
+            number = float(value)
+        except ValueError:
+            metrics[key] = value
+            continue
+        if not math.isfinite(number):
+            raise BadMetricError(f"--metric '{raw}' is not a finite number.")
+        metrics[key] = number
     return metrics
 
 
@@ -2044,13 +2188,18 @@ def commit_scoped_paths(
         idx.save()
 
 
-def _collect_dirty_paths(repo_root: Path, idx: Index) -> list[str]:
+def _collect_dirty_paths(repo_root: Path, idx: Index, target_tree: dict | None = None) -> list[str]:
     """Tracked paths whose working-tree state would be lost by a tree switch — deleted from
     disk, staged-but-uncommitted, or stat-different from the index. Shared by `checkout`,
     `av pull`, and `av merge` so all three refuse destructive switches under exactly the
-    same conditions.
+    same conditions. Given `target_tree`, also lists untracked files that tree would overwrite
+    with different content.
     """
     dirty: list[str] = []
+    for rel_path, info in (target_tree or {}).items():
+        fpath = repo_root / rel_path
+        if rel_path not in idx.entries and fpath.is_file() and hash_file_safe(str(fpath)) != info.get("hash"):
+            dirty.append(rel_path)
     for rel_path, entry in idx.entries.items():
         fpath = repo_root / rel_path
         if not fpath.exists():
@@ -2062,14 +2211,25 @@ def _collect_dirty_paths(repo_root: Path, idx: Index) -> list[str]:
     return dirty
 
 
-def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: Index) -> None:
+def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: Index, verify: bool = False) -> None:
     """Makes the index and the working tree match a flat commit tree. The one shared
     restore path behind `checkout`, `av clone`, and `av pull`: replaces idx.entries,
     deletes working files the tree no longer contains, then re-stats every entry and
     clears its staged flag so `av status` reads clean immediately after."""
     import shutil  # V1.6.0 (WS2.1): checkout/clone/pull-only -- never status/add.
+    server_up = None
+    if "code" not in tree and "artifacts" not in tree:
+        server_up = client.server_available()
+        if not server_up:
+            missing = tree_missing_objects(repo_root, tree, verify=verify)
+            if missing:
+                raise MissingObjectError(
+                    f"{len(missing)} file(s) can't be restored, their objects are missing or corrupt and the "
+                    f"server is unreachable: {', '.join(sorted(missing)[:5])}. The working tree was not touched."
+                )
     old_entries = dict(idx.entries)
     idx.entries.clear()
+    idx.removed = []
 
     if "code" in tree or "artifacts" in tree:
         for rel_path, h in tree.get("code", {}).items():
@@ -2086,7 +2246,8 @@ def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: I
                 if obj_path.exists():
                     shutil.copy2(obj_path, dest)
                 elif client.server_available():
-                    click.echo(f"Downloading {rel_path}...")
+                    if current_output_mode() != "json":  # progress line; never inside a JSON envelope
+                        click.echo(f"Downloading {rel_path}...")
                     if client.download_object(h, dest):
                         obj_path.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(dest, obj_path)
@@ -2098,7 +2259,7 @@ def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: I
         # round trips when everything is local (the common re-checkout/merge case), so this
         # is never worse than before, only better on a real cold fetch (clone/pull already
         # called this themselves earlier in their own flow -- here it's a no-op for them).
-        if client.server_available():
+        if server_up:
             from . import sync as _sync
 
             try:
@@ -2123,7 +2284,7 @@ def _materialize_tree(repo_root: Path, client: "VaultClient", tree: dict, idx: I
             # Restore every tracked file's content from the CAS, not just artifacts --
             # `code` files are written to .av/objects by `add()` too, so an older commit's
             # code must be materialized here the same way.
-            materialize_file(repo_root, client, rel_path, h, layers, chunks)
+            materialize_file(repo_root, client, rel_path, h, layers, chunks, verify=verify)
 
     for rel_path in old_entries:
         if rel_path not in idx.entries:
