@@ -2252,3 +2252,63 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** `next` and `eslint-config-next` bumped together to 16.3.8 (exact pins, as before); the lockfile diff is limited to the `next` package family.
 
 **Verification:** `npm install` completed and the lockfile diff shows only version/resolved/integrity changes for the `next` family; confirmation is the next push run of `security` and `Docker Edge Build`.
+
+### 189. `.gitignore` globs crossed directories, silently dropping files from commits
+
+**Severity:** 8/10 (data silently missing from a commit) · **Status:** 🟢 `fixed` (2026-11-04)
+
+**Problem:** Anchored patterns were matched with `fnmatch` on the whole path, whose `*` crosses `/`, so `ml/*.pkl` also ignored `ml/versions/x/scaler.pkl`. An `av add` of that directory dropped the file with no message, unlike git.
+
+**Fix:** Patterns are matched per path segment (`_glob_segments_match`), including `**`; a bare name matches the basename only.
+
+**Verification:** `tests/test_ignore_rules.py` compares a pattern table with real `git check-ignore`; a real-CLI scratch repo using Aether-quant's `.gitignore` commits every candidate file.
+
+### 190. `av checkout` exited 0 on failure in text mode
+
+**Severity:** 7/10 (scripts took a refused checkout for a success) · **Status:** 🟢 `fixed` (2026-11-04)
+
+**Problem:** An ambiguous hash, an unknown commit and a dirty tree printed an error and returned 0; only `--output json` used the documented exit code. A refused checkout inside `av promote` would also have let its merge continue on the wrong branch.
+
+**Fix:** All three now go through `fail()` in both output modes (exit 15). A push queued because the server is unreachable stays exit 0, per non-negotiable #3.
+
+**Verification:** New tests in `tests/test_cli.py`; the ambiguous-hash test had pinned the old exit 0 and was corrected. Real-CLI repro shows exit 15 for an unknown commit and a dirty tree.
+
+### 191. `av status` reported files under a gitignored directory as deleted
+
+**Severity:** 5/10 (false "deleted", and a false dirty tree for `checkout`) · **Status:** 🟢 `fixed` (2026-11-04)
+
+**Problem:** A file added explicitly from under an ignored directory is pruned from the status walk, and absence from the walk was read as absence from disk.
+
+**Fix:** `compute_status` checks the disk before reporting a tracked file as deleted.
+
+**Verification:** `test_status_keeps_a_tracked_file_under_a_gitignored_directory`; real-CLI repro shows an empty `deleted` list.
+
+### 192. `av promote` from another branch crashed with a `TypeError`
+
+**Severity:** 7/10 (promotion unusable across branches) · **Status:** 🟢 `fixed` (2026-11-04)
+
+**Problem:** `cmd_policy.py` called `ctx.invoke(checkout, name=...)`, but the parameter is `target`, so promoting from any branch other than the target raised `TypeError: checkout() got an unexpected keyword argument 'name'`.
+
+**Fix:** The call passes `target=`.
+
+**Verification:** `test_promote_from_another_branch_switches_to_the_target_and_lands`; the `TypeError` was reproduced against the old call.
+
+### 193. No way to restore one path without a repo-wide checkout
+
+**Severity:** 6/10 (a caller recovering one artifact had to overwrite and delete everything else) · **Status:** 🟢 `fixed` (2026-11-04)
+
+**Problem:** `av checkout` is repo-wide and refuses a dirty tree, so an integrator such as Aether-quant's rollback could not recover a single candidate directory safely.
+
+**Fix:** New `av restore --source <hash> PATH...`: writes only the named paths through `materialize_file`, leaves HEAD alone, and writes nothing unless every path is in the commit.
+
+**Verification:** New tests in `tests/test_cli.py`; real-CLI repro restored a corrupted file while a dirty sibling survived.
+
+### 194. README release setup named the wrong repository and package
+
+**Severity:** 2/10 (docs) · **Status:** 🟢 `fixed` (2026-11-04)
+
+**Problem:** The Trusted Publisher instructions pointed at `leon1706-lol/Aether-quant` and an `aether-quant` package.
+
+**Fix:** They now name `leon1706-lol/Aether-Vault` and `aether-vault-engine`.
+
+**Verification:** Read against the engine image name in the same README section.

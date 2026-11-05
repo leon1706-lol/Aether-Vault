@@ -19,6 +19,70 @@ def _touch(path, content="x"):
     path.write_text(content)
 
 
+@pytest.mark.parametrize("pattern,path,is_dir", [
+    ("ml/*.pkl", "ml/scaler.pkl", False),
+    ("ml/*.pkl", "ml/versions/x/scaler.pkl", False),
+    ("ml/*.pt", "ml/versions/x/model.pt", False),
+    ("ml/*.pt", "ml/model.pt", False),
+    ("ml/versions/", "ml/versions", True),
+    ("ml/versions/", "ml/versions/x/model.pt", False),
+    ("*.log", "a/b/c.log", False),
+    ("*.log", "c.log", False),
+    ("/top.txt", "top.txt", False),
+    ("/top.txt", "a/top.txt", False),
+    ("a/**/z.txt", "a/z.txt", False),
+    ("a/**/z.txt", "a/b/c/z.txt", False),
+    ("**/z.txt", "a/b/z.txt", False),
+    ("a/**", "a/b/c.txt", False),
+    ("docs/*.md", "docs/a.md", False),
+    ("docs/*.md", "docs/sub/a.md", False),
+])
+def test_gitignore_matching_agrees_with_git(tmp_path, pattern, path, is_dir):
+    import shutil
+    import subprocess
+
+    from python.av_cli.core import _gitignore_rule_matches, _parse_gitignore_lines
+
+    if not shutil.which("git"):
+        pytest.skip("git not available")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text(pattern + "\n")
+    target = tmp_path / path
+    if is_dir:
+        target.mkdir(parents=True)
+        (target / "keep").write_text("x")
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x")
+    # --no-index: git's own answer for the pattern, with no tracked-file exemption.
+    git_ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "--no-index", path], cwd=tmp_path
+    ).returncode == 0
+
+    rule = _parse_gitignore_lines([pattern])[0]
+    ours = _gitignore_rule_matches(rule, path, path.rsplit("/", 1)[-1], is_dir)
+    # `ml/versions/` also ignores what's below it for git; the walk gets that by pruning the
+    # directory, so the per-path rule only has to answer for the directory itself.
+    if pattern == "ml/versions/" and not is_dir:
+        assert git_ignored and not ours
+    else:
+        assert ours == git_ignored
+
+
+def test_explicit_add_keeps_candidate_files_a_parent_glob_must_not_catch(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".av").mkdir()
+    (tmp_path / ".gitignore").write_text("ml/*.pkl\nml/*.pt\nml/versions/\n")
+    _touch(tmp_path / "ml" / "versions" / "x" / "scaler.pkl")
+    _touch(tmp_path / "ml" / "versions" / "x" / "model.pt")
+    _touch(tmp_path / "ml" / "scaler.pkl")
+    found = {
+        str(p.relative_to(tmp_path)).replace("\\", "/")
+        for p in iter_working_files(tmp_path / "ml" / "versions" / "x", repo_root=tmp_path)
+    }
+    assert found == {"ml/versions/x/scaler.pkl", "ml/versions/x/model.pt"}
+
+
 def test_default_ignored_dirs_are_pruned(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _touch(tmp_path / "src" / "main.py")

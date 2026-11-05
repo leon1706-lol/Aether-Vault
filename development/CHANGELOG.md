@@ -626,3 +626,12 @@ external-repo work.)
 - **The `compat-drill` job needed its own fix (Probleme.md #187):** it installs the old tag (v1.4.0) into a clean venv, and that tag has the same unpinned `sqlalchemy`, so it hit the same missing `greenlet` and reported its migration head as "unknown". `scripts/compat_drill.sh` now installs `sqlalchemy[asyncio]` alongside the old code.
 - **`security` and `Docker Edge Build` were red on the same push for a different reason (Probleme.md #188):** `next` 16.3.4 carries a critical RCE advisory (GHSA-vcvr-r3jv-pc5j), failing `npm audit` and the image Trivy scans. `next` and `eslint-config-next` are now pinned to 16.3.8 in `webui/package.json` and the lockfile.
 - **Honest limit:** a manual nightly after the `greenlet` fix turned `compat` (3.11–3.13) and `dr-drill` green; the `compat-drill` fix and the `next` bump were pushed without a local CI-equivalent run (the drill needs Postgres; the image scans need a Docker build), so they are confirmed only by the next `security`/`Docker Edge Build` push run and nightly.
+
+## Phase 75 — Compatibility with Aether-quant's real usage (unreleased, not committed)
+
+- **Silent file loss in commits fixed (Probleme.md #189):** `.gitignore` globs are now matched per path segment like git, including `**`, so `ml/*.pkl` no longer drops `ml/versions/x/scaler.pkl`. This is why no Aether-quant candidate could have been committed whole.
+- **`av checkout` failures now exit non-zero in text mode (#190):** an ambiguous hash, unknown commit or dirty tree exits 15, as JSON mode already did. Scripts relying on the old text-mode exit 0 will see the change; a queued push stays exit 0 by design.
+- **`av status` false "deleted" fixed (#191):** tracked files under a gitignored directory are checked on disk before being reported as deleted.
+- **`av promote` across branches fixed (#192):** a wrong keyword made it raise `TypeError`; a refused checkout now also stops the promotion before its merge.
+- **New `av restore --source <hash> PATH...` (#193):** an additive command that recovers selected paths without moving HEAD or touching other files.
+- **Release docs corrected (#194).**

@@ -623,6 +623,16 @@ av checkout main
 
 Commits can be checked out by their full hash or any unique prefix of it — including the 7-character short form `av commit` itself prints (`av checkout a54a0b2`). An ambiguous prefix is rejected with an error asking for more characters. `checkout` refuses to run if you have uncommitted changes it would overwrite, unless you pass `--force` — `av stash` is the non-destructive alternative.
 
+Every refusal exits non-zero (15) in both text and JSON mode.
+
+#### `av restore`
+
+Recover selected files or directories from a commit without moving HEAD or touching anything else, even in a dirty tree. Nothing is written unless every path is in the commit.
+
+```bash
+av restore --source a54a0b2 ml/versions/v12
+```
+
 #### `av merge`
 
 Merge another branch or commit into the current branch — tree-level three-way merge against the nearest common ancestor. Per file, whichever side changed wins; if BOTH sides changed the same file differently the merge aborts cleanly (nothing touched) and lists the conflicts.
@@ -1102,8 +1112,8 @@ This then automatically runs (no manual version bump anywhere in the repo,
 done from here):
 
 
-- Create a "Trusted Publisher" on pypi.org for this project (pointing at `leon1706-lol/Aether-quant` + the `release.yml` workflow file).
-- After the very first tag push: check the **Packages** tab of this repo to see whether the new `aether-quant` package is private, and switch it to public if needed so `docker pull` works for everyone.
+- Create a "Trusted Publisher" on pypi.org for this project (pointing at `leon1706-lol/Aether-Vault` + the `release.yml` workflow file).
+- After the very first tag push: check the **Packages** tab of this repo to see whether the new `aether-vault-engine` package is private, and switch it to public if needed so `docker pull` works for everyone.
 
 ---
 

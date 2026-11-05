@@ -359,22 +359,36 @@ class _GitignoreRule:
     character (git: match only from the `.gitignore`'s own directory down, not at any
     depth). `dir_only` = pattern ended in `/` (only matches directories)."""
 
-    __slots__ = ("pattern", "negate", "dir_only", "anchored")
+    __slots__ = ("pattern", "negate", "dir_only", "anchored", "segments")
 
     def __init__(self, pattern: str, negate: bool, dir_only: bool, anchored: bool):
         self.pattern = pattern
         self.negate = negate
         self.dir_only = dir_only
         self.anchored = anchored
+        self.segments = pattern.split("/")
+
+
+def _glob_segments_match(pattern: list[str], path: list[str]) -> bool:
+    """`*`/`?` stay inside one path segment; `**` spans any number of them. A trailing `**`
+    needs at least one segment left (git: `a/**` matches what is inside `a`, not `a` itself)."""
+    if not pattern:
+        return not path
+    head = pattern[0]
+    if head == "**":
+        if len(pattern) == 1:
+            return bool(path)
+        return any(_glob_segments_match(pattern[1:], path[i:]) for i in range(len(path) + 1))
+    return bool(path) and fnmatch.fnmatch(path[0], head) and _glob_segments_match(pattern[1:], path[1:])
 
 
 def _parse_gitignore_lines(lines: list[str]) -> list[_GitignoreRule]:
     """Real (if partial) gitignore semantics: `#` comments, blank lines, `!` negation,
-    leading-`/` anchoring, trailing-`/` directory-only. Deliberately doesn't implement `**`
-    cross-directory globs or escaped `\\#`/`\\!` -- documented gap, same spirit as
-    `.avignore`'s own "gitignore-lite" scope note. A pattern's own directory component (if
-    any, e.g. `build/output`) is matched against the full relative path; a bare name (e.g.
-    `*.log`) matches at any depth, exactly like real git.
+    leading-`/` anchoring, trailing-`/` directory-only, `**`. Escaped `\\#`/`\\!` are not
+    implemented -- documented gap, same spirit as `.avignore`'s own "gitignore-lite" scope
+    note. A pattern's own directory component (if any, e.g. `build/output`) is matched
+    against the full relative path; a bare name (e.g. `*.log`) matches at any depth, exactly
+    like real git.
     """
     rules: list[_GitignoreRule] = []
     for raw in lines:
@@ -415,8 +429,10 @@ def _gitignore_rule_matches(rule: _GitignoreRule, rel_posix: str, name: str, is_
     if rule.dir_only and not is_dir:
         return False
     if rule.anchored:
-        return fnmatch.fnmatch(rel_posix, rule.pattern)
-    return fnmatch.fnmatch(name, rule.pattern) or fnmatch.fnmatch(rel_posix, rule.pattern)
+        # Not fnmatch on the whole path: its `*` crosses `/`, so `ml/*.pkl` would also ignore
+        # `ml/versions/x/scaler.pkl`, silently dropping it from a commit.
+        return _glob_segments_match(rule.segments, rel_posix.split("/"))
+    return fnmatch.fnmatch(name, rule.pattern)
 
 
 def _is_gitignored(rel_posix: str, name: str, is_dir: bool, rules: list[_GitignoreRule]) -> bool:
@@ -1504,7 +1520,9 @@ def compute_status(repo_root: Path, idx: Index) -> tuple[list[str], list[str], l
         disk_files.add(str(fpath.relative_to(repo_root)).replace("\\", "/"))
 
     for rel_path, entry in idx.entries.items():
-        if rel_path not in disk_files:
+        # The walk prunes ignored directories, so absence from it doesn't mean absence from
+        # disk: a file added explicitly from under one (`av add ml/versions/x`) is still there.
+        if rel_path not in disk_files and not (repo_root / rel_path).exists():
             deleted.append(rel_path)
         elif entry.get("staged"):
             staged.append(rel_path)

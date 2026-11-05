@@ -660,8 +660,75 @@ def test_checkout_rejects_ambiguous_short_hash_prefix(repo):
     (commits_dir / ("deadbeef" + "1" * 56 + ".json")).write_text(real_commit.read_text())
 
     result = invoke("checkout", "deadbeef")
-    assert result.exit_code == 0, result.output
+    assert result.exit_code != 0, result.output
     assert "ambiguous" in result.output.lower(), result.output
+
+
+def test_checkout_of_unknown_commit_exits_non_zero(repo):
+    result = invoke("checkout", "0" * 64)
+    assert result.exit_code != 0, result.output
+
+
+def test_checkout_refused_for_dirty_tree_exits_non_zero(repo):
+    (repo / "model.txt").write_text("version 1")
+    invoke("add", "model.txt")
+    invoke("commit", "-m", "v1")
+    commit1 = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+    (repo / "model.txt").write_text("dirty")
+    assert invoke("checkout", commit1).exit_code != 0
+
+
+def test_restore_writes_only_the_named_paths_and_keeps_head(repo):
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "weights.txt").write_text("v1")
+    (repo / "other.txt").write_text("v1")
+    invoke("add", "pkg", "other.txt")
+    invoke("commit", "-m", "v1")
+    commit1 = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+
+    (repo / "pkg" / "weights.txt").write_text("v2")
+    (repo / "other.txt").write_text("v2")
+    invoke("add", "pkg", "other.txt")
+    invoke("commit", "-m", "v2")
+    head_before = (repo / ".av" / "refs" / "heads" / "main").read_text()
+    (repo / "other.txt").write_text("dirty, must survive")
+
+    result = invoke("restore", "--source", commit1[:7], "pkg")
+    assert result.exit_code == 0, result.output
+    assert (repo / "pkg" / "weights.txt").read_text() == "v1"
+    assert (repo / "other.txt").read_text() == "dirty, must survive"
+    assert (repo / ".av" / "refs" / "heads" / "main").read_text() == head_before
+
+
+def test_restore_of_a_path_missing_from_the_commit_writes_nothing(repo):
+    (repo / "a.txt").write_text("v1")
+    invoke("add", "a.txt")
+    invoke("commit", "-m", "v1")
+    commit1 = (repo / ".av" / "refs" / "heads" / "main").read_text().strip()
+    (repo / "a.txt").write_text("v2")
+
+    result = invoke("restore", "--source", commit1, "a.txt", "absent.txt")
+    assert result.exit_code != 0, result.output
+    assert (repo / "a.txt").read_text() == "v2"
+
+
+def test_restore_of_unknown_commit_exits_non_zero(repo):
+    (repo / "a.txt").write_text("v1")
+    assert invoke("restore", "--source", "0" * 64, "a.txt").exit_code != 0
+
+
+def test_status_keeps_a_tracked_file_under_a_gitignored_directory(repo):
+    (repo / ".gitignore").write_text("ml/versions/\n")
+    (repo / "ml" / "versions" / "x").mkdir(parents=True)
+    (repo / "ml" / "versions" / "x" / "scaler.pkl").write_text("s")
+    invoke("add", "ml/versions/x")
+    invoke("commit", "-m", "candidate")
+
+    from python.av_cli.core import Index, compute_status
+
+    _, _, deleted, _ = compute_status(repo, Index(repo))
+    assert "ml/versions/x/scaler.pkl" not in deleted
+    assert (repo / ".av" / "index").exists()
 
 
 

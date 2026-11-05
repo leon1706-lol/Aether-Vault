@@ -183,10 +183,7 @@ def checkout(target: str, force: bool) -> None:
     try:
         commit_file = find_commit_file(repo_root, commit_hash)
     except AmbiguousCommitHash as exc:
-        if json_mode:
-            fail(None, "validation", exc.message, command="checkout")
-        click.secho(f"Error: {exc.message}", fg="red")
-        return
+        fail(None, "validation", exc.message, command="checkout")
     except FileNotFoundError:
         pass
     commit_data = None
@@ -203,10 +200,7 @@ def checkout(target: str, force: bool) -> None:
                 json.dump(commit_data, f)
 
     if not commit_data:
-        if json_mode:
-            fail(None, "validation", f"Commit '{target}' not found.", command="checkout")
-        click.secho(f"Error: Commit '{target}' not found.", fg="red")
-        return
+        fail(None, "validation", f"Commit '{target}' not found.", command="checkout")
 
     idx = Index(repo_root)
 
@@ -216,21 +210,20 @@ def checkout(target: str, force: bool) -> None:
     if not force:
         dirty = _collect_dirty_paths(repo_root, idx)
         if dirty:
-            if json_mode:
-                fail(None, "validation",
-                     "You have uncommitted changes that would be overwritten by checkout.",
-                     command="checkout", data={"dirty_paths": dirty[:20],
-                                               "dirty_count": len(dirty)})
-            click.secho(
-                "Error: You have uncommitted changes that would be overwritten by checkout:",
-                fg="red",
-            )
-            for d in dirty[:20]:
-                click.echo(f"  {d}")
-            if len(dirty) > 20:
-                click.echo(f"  … and {len(dirty) - 20} more")
-            click.secho("Commit them, or re-run with --force to discard.", fg="yellow")
-            return
+            if not json_mode:
+                click.secho(
+                    "Error: You have uncommitted changes that would be overwritten by checkout:",
+                    fg="red",
+                )
+                for d in dirty[:20]:
+                    click.echo(f"  {d}")
+                if len(dirty) > 20:
+                    click.echo(f"  … and {len(dirty) - 20} more")
+                click.secho("Commit them, or re-run with --force to discard.", fg="yellow")
+            fail(None, "validation",
+                 "You have uncommitted changes that would be overwritten by checkout.",
+                 command="checkout", data={"dirty_paths": dirty[:20], "dirty_count": len(dirty)},
+                 quiet_text=True)
 
     _materialize_tree(repo_root, client, commit_data.get("tree", {}), idx)
 
@@ -246,6 +239,75 @@ def checkout(target: str, force: bool) -> None:
                                           "branch": ref_name})
         return
     click.secho(f"Checked out '{target}'", fg="green")
+
+
+@click.command()
+@click.option("--source", required=True, help="Commit hash (or unique prefix) to restore from.")
+@click.argument("paths", nargs=-1, required=True)
+def restore(source: str, paths: tuple) -> None:
+    """Restore only PATHS (files or directories) from a commit.
+
+    Unlike checkout this leaves HEAD and every other file alone, so a caller can recover a
+    single artifact from a dirty tree. Nothing is written unless every PATH is in the commit.
+    """
+    from .client import VaultClient
+
+    repo_root = ensure_repo()
+    cfg = load_config(repo_root)
+    client = VaultClient(cfg.get("remote_url", "http://localhost:8000"), cfg.get("remote_api_token"))
+
+    try:
+        commit_file = find_commit_file(repo_root, source)
+    except AmbiguousCommitHash as exc:
+        fail(None, "validation", exc.message, command="restore")
+    except FileNotFoundError:
+        fail(None, "validation", f"Commit '{source}' not found.", command="restore")
+    with open(commit_file, "r") as f:
+        tree = json.load(f).get("tree", {})
+
+    selected: dict[str, dict] = {}
+    for raw in paths:
+        try:
+            prefix = Path(raw).resolve().relative_to(repo_root.resolve()).as_posix()
+        except ValueError:
+            fail(None, "validation", f"Path '{raw}' is outside the repository.", command="restore")
+        matches = {
+            rel: info for rel, info in tree.items()
+            if prefix == "." or rel == prefix or rel.startswith(prefix + "/")
+        }
+        if not matches:
+            fail(None, "validation", f"Path '{raw}' is not in commit {commit_file.stem[:7]}.",
+                 command="restore")
+        selected.update(matches)
+
+    idx = Index(repo_root)
+    for rel_path, info in selected.items():
+        layers = info.get("layers", [])
+        chunks = info.get("chunks", [])
+        materialize_file(repo_root, client, rel_path, info["hash"], layers, chunks)
+        fpath = repo_root / rel_path
+        if not fpath.exists():
+            fail(None, "validation", f"Object for '{rel_path}' is missing; restore is incomplete.",
+                 command="restore")
+        file_type = info.get("type", "file")
+        idx.add_entry(rel_path, info["hash"], info.get("size", 0), 0, file_type,
+                      rel_path + ".av-pointer" if file_type == "artifact" else None, auto_save=False)
+        entry = idx.entries[rel_path]
+        if layers:
+            entry["layers"] = layers
+        if chunks:
+            entry["chunks"] = chunks
+        meta = get_file_meta_safe(str(fpath))
+        entry["size"] = meta["size"]
+        entry["mtime_ns"] = meta["mtime_ns"]
+        entry["staged"] = False
+    idx.save()
+
+    if current_output_mode() == "json":
+        emit_json(None, "restore", data={"source": commit_file.stem, "restored": sorted(selected),
+                                         "count": len(selected)})
+        return
+    click.secho(f"Restored {len(selected)} file(s) from {commit_file.stem[:7]}", fg="green")
 
 
 # ---------------------------------------------------------------------------

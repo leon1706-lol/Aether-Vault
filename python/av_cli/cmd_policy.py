@@ -349,7 +349,7 @@ def promote(ctx, candidate: str | None, into_branch: str, force: bool, dry_run: 
     from .cmd_sync import merge as merge_cmd
 
     if resolve_head(repo_root)[0] != into_branch:
-        ctx.invoke(checkout, name=into_branch)
+        ctx.invoke(checkout, target=into_branch)
 
     merge_kwargs = dict(
         target=cand_ref,

@@ -223,6 +223,23 @@ def test_policy_denied_exits_16_json(repo):
     assert env["data"]["allowed"] is False
 
 
+def test_promote_from_another_branch_switches_to_the_target_and_lands(repo):
+    (repo / "m.txt").write_text("v1")
+    invoke("add", "m.txt")
+    invoke("commit", "-m", "baseline", "--metric", "val_loss=1.0")
+    invoke("branch", "cand")
+    assert invoke("checkout", "cand").exit_code == 0
+
+    (repo / "m.txt").write_text("v2")
+    invoke("add", "m.txt")
+    invoke("commit", "-m", "better", "--metric", "val_loss=0.5")
+
+    result = invoke("promote", "--into", "main")
+    assert result.exit_code == 0, result.output
+    assert (repo / ".av" / "HEAD").read_text().strip() == "ref: refs/heads/main"
+    assert (repo / "m.txt").read_text() == "v2"
+
+
 # ---------------------------------------------------------------------------
 # promote --dry-run: exits 0 for both decisions, touches nothing either way — a script
 # branches on data.decision, not the exit code.
