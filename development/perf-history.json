@@ -109,15 +109,15 @@
       "os": "Windows-10-10.0.19045-SP0",
       "python": "3.14.8",
       "probes": {
-        "Index.save() (500 entries)": 21.78,
-        "Index.load() (500 entries)": 38.5,
-        "load_config()": 18.04,
-        "iter_working_files() (2000 files)": 59.12,
-        "Storage stats (1000 objs)": 810.23,
-        "semdiff.diff_trees() (500 entries)": 20.96,
-        "commit_staged() (300 entries)": 227.35,
-        "compute_status() (2000 files)": 1068.29,
-        "log() (150 commits)": 5399.9
+        "Index.save() (500 entries)": 12.64,
+        "Index.load() (500 entries)": 20.4,
+        "load_config()": 13.0,
+        "iter_working_files() (2000 files)": 14.32,
+        "Storage stats (1000 objs)": 245.26,
+        "semdiff.diff_trees() (500 entries)": 5.0,
+        "commit_staged() (300 entries)": 89.93,
+        "compute_status() (2000 files)": 283.01,
+        "log() (150 commits)": 1802.07
       }
     }
   ]
