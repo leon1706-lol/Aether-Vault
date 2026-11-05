@@ -157,7 +157,7 @@ def test_backup_restore_proceeds_on_an_empty_database(tmp_path, monkeypatch):
     def _fake_run(cmd, **kw):
         calls.append(cmd)
         text_mode = bool(kw.get("text") or kw.get("universal_newlines") or kw.get("encoding"))
-        return type("R", (), {"returncode": 0, "stdout": "" if text_mode else b""})()
+        return type("R", (), {"returncode": 0, "stdout": "" if text_mode else b"", "stderr": "" if text_mode else b""})()
 
     monkeypatch.setattr(cmd_admin.subprocess, "run", _fake_run)
     monkeypatch.setattr(cmd_admin.shutil, "which", lambda name: f"/usr/bin/{name}")
