@@ -1,3 +1,5 @@
+import threading
+import sys
 import os
 import tempfile
 
@@ -69,3 +71,26 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     note = format_skip_note(buckets)
     if note:
         terminalreporter.write_line("\n" + note + "\n")
+
+
+TEARDOWN_WATCHDOG_SECONDS = 120.0
+
+
+def teardown_watchdog(exitstatus: int, *, seconds: float = TEARDOWN_WATCHDOG_SECONDS, exit_process=os._exit) -> threading.Timer:
+    """After the last test: if the process hasn't gone in `seconds`, say so and leave with pytest's own result. On Windows CI a shutdown hang at pool close
+    (Probleme.md #184, #214) outlives every passing test until the job's timeout, and reads as a cancelled run."""
+
+    def leave() -> None:
+        print(f"\nteardown watchdog: still alive {seconds:.0f}s after the last test, a shutdown hang; leaving with pytest's exit status {int(exitstatus)}", file=sys.stderr, flush=True)
+        exit_process(int(exitstatus))
+
+    timer = threading.Timer(seconds, leave)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if os.environ.get("CI") and sys.platform == "win32":
+        teardown_watchdog(exitstatus)
+

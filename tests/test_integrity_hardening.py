@@ -572,3 +572,31 @@ def test_a_real_race_stays_queued(tmp_path, monkeypatch):
     core, hashes = _queued_chain(tmp_path, monkeypatch)
     left = core.flush_pending_push(tmp_path, _RaceClient("f" * 64))
     assert [entry["commit_hash"] for entry in left] == hashes
+
+
+def test_the_teardown_watchdog_leaves_with_pytests_own_result(capsys):
+    import threading
+
+    from conftest import teardown_watchdog
+
+    left = []
+    done = threading.Event()
+
+    def exit_process(status):
+        left.append(status)
+        done.set()
+
+    teardown_watchdog(3, seconds=0.01, exit_process=exit_process)
+    assert done.wait(5.0) and left == [3]
+    assert "shutdown hang" in capsys.readouterr().err
+
+
+def test_a_stopped_teardown_watchdog_never_fires():
+    import time
+
+    from conftest import teardown_watchdog
+
+    left = []
+    teardown_watchdog(0, seconds=0.2, exit_process=left.append).cancel()
+    time.sleep(0.3)
+    assert left == []

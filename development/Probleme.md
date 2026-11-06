@@ -2505,3 +2505,13 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 **Verification:** `tests/test_integrity_hardening.py` (the ref at the commit, past it, and a real race), failing before the fix. Not in the 1.7.0 release; it ships with the next one.
 
+### 214. `server-tests-windows` still hangs at exit on some runs, after every test passed
+
+**Severity:** 4/10 (CI only so far; a rerun passes) · **Status:** 🟡 `partial` (the false cancel is handled; the hang itself is undiagnosed)
+
+**Problem:** About a third of recent runs reach 100% and then never exit until the 40-minute timeout (7e005b0, 7c999e8, 999f11d, and c7782bd before this phase), the same symptom #184 fixed for one cause. It reads as a cancelled run, and it can't be reproduced without a Windows runner with Postgres.
+
+**Fix:** A watchdog in `tests/conftest.py`, on Windows CI only: 120 s after the last test it logs the hang and exits with pytest's own status. A failing test still fails the job, and a hang now shows as a line in the log.
+
+**Verification:** `tests/test_integrity_hardening.py`. Next step when it appears in the log: find which thread holds the exit, since a real server's shutdown could share it.
+
