@@ -2511,7 +2511,7 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 **Problem:** About a third of recent runs reach 100% and then never exit until the 40-minute timeout (7e005b0, 7c999e8, 999f11d, and c7782bd before this phase), the same symptom #184 fixed for one cause. It reads as a cancelled run, and it can't be reproduced without a Windows runner with Postgres.
 
-**Fix:** A watchdog in `tests/conftest.py`, on Windows CI only: 120 s after the last test it logs the hang and exits with pytest's own status. A failing test still fails the job, and a hang now shows as a line in the log.
+**Fix:** A watchdog in `tests/conftest.py`, on Windows CI only: 120 s after the last test's teardown begins it logs the hang and exits 1 if any test failed, else 0. A failing test still fails the job, and a hang now shows as a line in the log. A first version started in `pytest_sessionfinish` and missed it: session fixtures are torn down before that hook, and that is where the job stops.
 
 **Verification:** `tests/test_integrity_hardening.py`. Next step when it appears in the log: find which thread holds the exit, since a real server's shutdown could share it.
 

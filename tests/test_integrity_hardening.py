@@ -586,9 +586,13 @@ def test_the_teardown_watchdog_leaves_with_pytests_own_result(capsys):
         left.append(status)
         done.set()
 
-    teardown_watchdog(3, seconds=0.01, exit_process=exit_process)
-    assert done.wait(5.0) and left == [3]
+    teardown_watchdog(lambda: True, seconds=0.01, exit_process=exit_process)
+    assert done.wait(5.0) and left == [1]
     assert "shutdown hang" in capsys.readouterr().err
+
+    done.clear()
+    teardown_watchdog(lambda: False, seconds=0.01, exit_process=exit_process)
+    assert done.wait(5.0) and left == [1, 0]
 
 
 def test_a_stopped_teardown_watchdog_never_fires():
@@ -597,6 +601,6 @@ def test_a_stopped_teardown_watchdog_never_fires():
     from conftest import teardown_watchdog
 
     left = []
-    teardown_watchdog(0, seconds=0.2, exit_process=left.append).cancel()
+    teardown_watchdog(lambda: False, seconds=0.2, exit_process=left.append).cancel()
     time.sleep(0.3)
     assert left == []

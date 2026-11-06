@@ -76,13 +76,14 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 TEARDOWN_WATCHDOG_SECONDS = 120.0
 
 
-def teardown_watchdog(exitstatus: int, *, seconds: float = TEARDOWN_WATCHDOG_SECONDS, exit_process=os._exit) -> threading.Timer:
-    """After the last test: if the process hasn't gone in `seconds`, say so and leave with pytest's own result. On Windows CI a shutdown hang at pool close
-    (Probleme.md #184, #214) outlives every passing test until the job's timeout, and reads as a cancelled run."""
+def teardown_watchdog(tests_failed, *, seconds: float = TEARDOWN_WATCHDOG_SECONDS, exit_process=os._exit) -> threading.Timer:
+    """After the last test: if the process hasn't gone in `seconds`, say so and leave with what the tests decided. On Windows CI a shutdown hang at pool close
+    (Probleme.md #184, #214) outlives every passing test until the job's timeout, and reads as a cancelled run. `tests_failed` is read when it fires."""
 
     def leave() -> None:
-        print(f"\nteardown watchdog: still alive {seconds:.0f}s after the last test, a shutdown hang; leaving with pytest's exit status {int(exitstatus)}", file=sys.stderr, flush=True)
-        exit_process(int(exitstatus))
+        status = 1 if tests_failed() else 0
+        print(f"\nteardown watchdog: still alive {seconds:.0f}s after the last test, a shutdown hang; leaving with status {status}", file=sys.stderr, flush=True)
+        exit_process(status)
 
     timer = threading.Timer(seconds, leave)
     timer.daemon = True
@@ -90,7 +91,8 @@ def teardown_watchdog(exitstatus: int, *, seconds: float = TEARDOWN_WATCHDOG_SEC
     return timer
 
 
-def pytest_sessionfinish(session, exitstatus):
-    if os.environ.get("CI") and sys.platform == "win32":
-        teardown_watchdog(exitstatus)
+def pytest_runtest_teardown(item, nextitem):
+    # Session fixtures are torn down inside the last test's teardown, which is where it hangs, so `pytest_sessionfinish` would be too late.
+    if nextitem is None and os.environ.get("CI") and sys.platform == "win32":
+        teardown_watchdog(lambda: item.session.testsfailed > 0)
 
