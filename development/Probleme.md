@@ -1733,13 +1733,13 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 144. `av daemon start`'s detached spawn found a real Windows job-object escape gap — and this dev sandbox has a second, unfixable layer on top of it
 
-**Severity:** 3/10 · **Status:** 🟡 `partial` (2026-09-08) — code fix shipped and verified where it applies; the sandbox-level constraint is a documented environment limitation, not something further code can close.
+**Severity:** 3/10 · **Status:** 🟢 `fixed` (2026-11-06)
 
 **Problem:** `av daemon start`'s detached child (spawned with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) died within seconds when launched from inside the real `av.exe` console-script binary, even though the identical spawn call survived indefinitely when run from a plain `python.exe` process. Root cause: pip/distlib's Windows launcher stub wraps its own child in a Job Object with kill-on-close semantics (a real, general Windows console-script issue, not sandbox-specific).
 
 **Fix:** `_spawn_detached()` now tries `CREATE_BREAKAWAY_FROM_JOB` first, falling back to the plain flags only if that raises `PermissionError` (a job that itself disallows breakaway) — the standard, correct handling for this class of problem.
 
-**Verification, and the second layer found while verifying:** Confirmed via `Get-CimInstance Win32_Process` polling every second that even `schtasks /run` (Windows Task Scheduler, which launches under `schedsvc`'s own process tree and normally escapes any job object, breakaway-permitting or not) got killed on the same ~5s timeline as the plain detached spawn in this specific dev/CI sandbox. Since Task Scheduler's child has no job-object relationship to the calling process at all, this rules out a job-object cause for that second death and points to sandbox-level process-lifetime supervision outside any Win32 mechanism this codebase can address. **Not fixed further, deliberately**: the daemon's server/protocol correctness is independently proven by `tests/test_daemon.py`'s 28 tests (including real named-pipe/socket transport round trips via a thread-hosted server, which sidesteps process-spawning entirely); `--foreground` plus an external supervisor is the documented correct pattern for such environments.
+**Verification, and the second layer found while verifying:** Confirmed via `Get-CimInstance Win32_Process` polling every second that even `schtasks /run` (Windows Task Scheduler, which launches under `schedsvc`'s own process tree and normally escapes any job object, breakaway-permitting or not) got killed on the same ~5s timeline as the plain detached spawn in this specific dev/CI sandbox. Since Task Scheduler's child has no job-object relationship to the calling process at all, this rules out a job-object cause for that second death and points to sandbox-level process-lifetime supervision outside any Win32 mechanism this codebase can address. **Not fixed further, deliberately**: the daemon's server/protocol correctness is independently proven by `tests/test_daemon.py`'s 28 tests (including real named-pipe/socket transport round trips via a thread-hosted server, which sidesteps process-spawning entirely); `--foreground` plus an external supervisor is the documented correct pattern for such environments. **2026-11-06:** `av daemon start` on the owner's PC, outside any sandbox: the daemon was still reporting status after 35 s, then stopped cleanly, so the earlier deaths were the sandbox's job object alone.
 
 ---
 
@@ -2235,13 +2235,13 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 ### 187. `compat-drill` could not read the old tag's migration head: the old tag has the same missing `greenlet`
 
-**Severity:** 5/10 (nightly-only; the drill never reached its actual check) · **Status:** 🟡 fixed, pending the next nightly (still masked by #212 in the same workflow on 2026-11-05)
+**Severity:** 5/10 (nightly-only; the drill never reached its actual check) · **Status:** 🟢 `fixed` (2026-11-06)
 
 **Problem:** the drill installs the previous release tag (v1.4.0) into a clean venv, where `sqlalchemy>=2.0.0` resolves to 2.1.3 without `greenlet`, so importing `av_server.database` fails and the script dies with "migration head: unknown" before booting anything.
 
 **Fix:** `scripts/compat_drill.sh` installs `sqlalchemy[asyncio]>=2.0.0` next to the old tag, since a published tag's own dependencies can't be changed.
 
-**Verification:** `bash -n` passes; the drill needs Postgres, so it was not run locally and is confirmed only by the next nightly.
+**Verification:** `bash -n` passes; the drill needs Postgres, so it was not run locally and is confirmed only by the next nightly. **2026-11-06:** Nightly Compatibility passed on master at 2e98996 (run 42142073488), the first run with #212's fix in.
 
 ### 188. `next` 16.3.4 had a critical RCE advisory — `security` (npm audit + Trivy) and `Docker Edge Build` failed on every push
 
