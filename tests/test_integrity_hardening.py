@@ -515,3 +515,60 @@ def test_pg_restore_tolerates_only_a_newer_clients_unknown_setting(code, stderr,
     from python.av_cli.cmd_admin import _pg_restore_failed
 
     assert _pg_restore_failed(code, stderr) is failed
+
+
+def _queued_chain(tmp_path, monkeypatch):
+    """Three commits on main, each queued, with a parent chain like a real one."""
+    import json
+
+    from av_cli import core
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".av" / "commits").mkdir(parents=True)
+    hashes = ["a" * 64, "b" * 64, "c" * 64]
+    for index, commit_hash in enumerate(hashes):
+        parents = [hashes[index - 1]] if index else []
+        (tmp_path / ".av" / "commits" / f"{commit_hash}.json").write_text(json.dumps({"hash": commit_hash, "parents": parents, "tree": {}}), encoding="utf-8")
+    (tmp_path / ".av" / "pending_push").write_text(json.dumps([{"commit_hash": commit_hash, "ref_name": "main"} for commit_hash in hashes]), encoding="utf-8")
+    monkeypatch.setattr(core, "upload_commit_objects", lambda repo_root, client, tree: True)
+    return core, hashes
+
+
+class _RaceClient:
+    """A server whose ref is already at `current`, so every compare-and-swap below it loses."""
+
+    def __init__(self, current):
+        self.current = current
+
+    def server_available(self):
+        return True
+
+    def push_commit(self, commit):
+        return True
+
+    def update_ref(self, ref_name, commit_hash, expected_hash=None):
+        from av_cli.client import RefRaceError
+
+        if expected_hash == self.current:
+            self.current = commit_hash
+            return True
+        raise RefRaceError(ref_name, self.current, expected_hash or "")
+
+
+def test_a_commit_the_server_took_before_it_died_leaves_the_queue_on_the_retry(tmp_path, monkeypatch):
+    # The ref moved to a, and the server died before the answer arrived: a's own retry loses to its own earlier write.
+    core, hashes = _queued_chain(tmp_path, monkeypatch)
+    assert core.flush_pending_push(tmp_path, _RaceClient(hashes[0])) == []
+
+
+def test_commits_the_server_has_passed_leave_the_queue_too(tmp_path, monkeypatch):
+    # A client killed mid-flush: the ref is already at b, and a and b were never taken off the queue.
+    core, hashes = _queued_chain(tmp_path, monkeypatch)
+    assert core.flush_pending_push(tmp_path, _RaceClient(hashes[1])) == []
+
+
+def test_a_real_race_stays_queued(tmp_path, monkeypatch):
+    # Someone else's commit holds the ref, and it isn't in this repo's history: nothing here was delivered.
+    core, hashes = _queued_chain(tmp_path, monkeypatch)
+    left = core.flush_pending_push(tmp_path, _RaceClient("f" * 64))
+    assert [entry["commit_hash"] for entry in left] == hashes

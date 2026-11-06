@@ -949,6 +949,22 @@ def upload_commit_objects(
         return all(results)
 
 
+def _ref_contains(repo_root: Path, ref_hash: str | None, commit_hash: str) -> bool:
+    """Is `commit_hash` `ref_hash` or one of its ancestors, by this repo's own commit files? A commit this repo doesn't hold reads as not containing it."""
+    stack, seen = [ref_hash] if ref_hash else [], set()
+    while stack:
+        current = stack.pop()
+        if current == commit_hash:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        commit_path = repo_root / ".av" / "commits" / f"{current}.json"
+        if commit_path.exists():
+            stack.extend(json.loads(read_text_with_retry(commit_path)).get("parents") or [])
+    return False
+
+
 def flush_pending_push(repo_root: Path, client: "VaultClient", skip: set[str] | None = None) -> list[dict]:
     """Retry pushing queued commits to the remote server. Returns the entries still
     pending. `server_available()` only proves the server is up, not that this client's
@@ -983,10 +999,11 @@ def flush_pending_push(repo_root: Path, client: "VaultClient", skip: set[str] | 
                             entry["ref_name"], entry["commit_hash"],
                             expected_hash=_parents[0] if _parents else None,
                         )
-                    except RefRaceError:
-                        # Lost the compare-and-swap race again -- keep it queued and keep
-                        # draining the rest, since unlike AuthenticationError this isn't systemic.
-                        ref_ok = False
+                    except RefRaceError as race:
+                        # The server took this commit before dying and the answer never came: the swap loses to its own earlier
+                        # write, and retrying can't ever win. Otherwise it's a real race -- keep it queued and keep draining the
+                        # rest, since unlike AuthenticationError this isn't systemic.
+                        ref_ok = _ref_contains(repo_root, race.current, entry["commit_hash"])
                 if ref_ok:
                     delivered.add(entry["commit_hash"])
         except AuthenticationError:

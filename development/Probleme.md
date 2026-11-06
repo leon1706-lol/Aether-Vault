@@ -2492,3 +2492,16 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 **Fix:** `_run_pg_restore` tolerates only that known setting and reports any other failure as exit 15 with `pg_restore`'s message.
 
 **Verification:** `test_pg_restore_tolerates_only_a_newer_clients_unknown_setting`; confirmed by the next nightly.
+
+---
+
+### 213. A commit the server took before it died stayed queued forever
+
+**Severity:** 5/10 (no work is lost: the commit is on the server, but the queue never empties) · **Status:** 🟢 `fixed`
+
+**Problem:** `chaos-drills` Phase N failed once on master at 2e98996, a README-only commit, and passed on the runs either side. When the server applied a ref update and was killed before answering, the retry's compare-and-swap lost to its own earlier write, so `flush_pending_push` kept that commit queued on every later push, with exit 0.
+
+**Fix:** On a lost race, `_ref_contains` walks this repo's commit files: a commit that is the ref or an ancestor of it counts as delivered. A commit the repo can't find in that history is a real race and stays queued.
+
+**Verification:** `tests/test_integrity_hardening.py` (the ref at the commit, past it, and a real race), failing before the fix. Not in the 1.7.0 release; it ships with the next one.
+

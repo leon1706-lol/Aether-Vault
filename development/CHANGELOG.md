@@ -646,3 +646,4 @@ external-repo work.)
 - **CI (#211, #212):** `next` 16.4.5 and `sharp` 0.35.5 clear the advisories that failed `security` and `Docker Edge Build`; `av admin backup restore` no longer crashes on a newer `pg_dump`'s `transaction_timeout`; `tests/test_import_graph.py` now lists `restore` and `rm`.
 
 Essential-Tasks: signed off
+- **After the tag, not in 1.7.0 (#213):** a commit the server took before dying stayed queued forever, because its retry lost a compare-and-swap to its own earlier write. A chaos drill caught it once; a lost race now checks the ref's history.
