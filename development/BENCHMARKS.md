@@ -7,7 +7,7 @@ calls to each tool — never fabricated. A tool that genuinely can't run a given
 (not installed, or the benchmark's primitive doesn't map onto it) is shown as such, not
 guessed at.
 
-**Captured:** 2026-11-05, on Windows. Aether-Vault @ `4582dec`, git-lfs 3.8.0, dvc 3.67.1, mlflow unknown version, Python 3.14.8.
+**Captured:** 2026-11-06, on Windows. Aether-Vault @ `aa8ff1f`, git-lfs 3.8.0, dvc 3.67.1, mlflow unknown version, Python 3.14.8.
 **av daemon:** warm (default). **Timing:** each number is the median of 3 runs.
 **Memory:** an `av peak RSS` column, where present, is the peak resident set of the timed
 `av` process tree (Windows: the kernel's exact PeakWorkingSet; POSIX: sampled every 20 ms),
@@ -108,10 +108,10 @@ SHA-256 (or each tool's equivalent content hash) over a single file at increasin
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| hash 10MB file | 125.5 ms | 1,545.6 ms | 4,708.3 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 50MB file | 632.6 ms | 2,124.8 ms | 5,147.2 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 100MB file | 1,226.9 ms | 3,420.8 ms | 7,556.6 ms | N/A (no exposed file-hashing primitive) | GOOD |
-| hash 200MB file | 2,040.3 ms | 4,866.1 ms | 9,929.9 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 10MB file | 236.5 ms | 4,088.7 ms | 7,891.0 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 50MB file | 805.0 ms | 4,067.8 ms | 7,923.9 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 100MB file | 2,105.9 ms | 5,035.8 ms | 9,642.5 ms | N/A (no exposed file-hashing primitive) | GOOD |
+| hash 200MB file | 3,454.9 ms | 7,962.7 ms | 12,559.4 ms | N/A (no exposed file-hashing primitive) | GOOD |
 
 ## Safetensors Layer-Dedup Storage Savings
 
@@ -127,10 +127,10 @@ init/add/commit/push on the same 60-file mixed fixture, across all four tools.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict | av peak RSS |
 |---|---:|---:|---:|---:|---|---:|
-| init | 1,654.5 ms | 4,508.5 ms | 3,440.5 ms | 4,227.5 ms | GOOD | — |
-| add (60 files) | 1,277.4 ms | 1,775.3 ms | 6,709.8 ms | 0.0 ms | OK | — |
-| commit | 455.3 ms | 1,810.0 ms | 360.1 ms | 248.0 ms | BAD | — |
-| push | 4,104.7 ms | 5,155.5 ms | 3,366.9 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | OK | 4 MB |
+| init | 2,518.7 ms | 8,041.8 ms | 5,826.3 ms | 5,497.0 ms | GOOD | — |
+| add (60 files) | 1,575.1 ms | 3,563.7 ms | 10,949.8 ms | 0.0 ms | OK | — |
+| commit | 697.0 ms | 3,035.2 ms | 755.2 ms | 360.1 ms | BAD | — |
+| push | 4,126.5 ms | 7,958.0 ms | 5,755.7 ms | N/A (no separate push step — log_artifacts() writes directly to the store) | OK | 4 MB |
 
 ## No-Op status/add Speed at Scale
 
@@ -138,8 +138,8 @@ Re-running the staging step, and a plain `status`, a second time with nothing ch
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict | av peak RSS |
 |---|---:|---:|---:|---:|---|---:|
-| re-add unchanged (60 files) | 98.2 ms | 96.5 ms | 5,808.5 ms | N/A (no incremental staging/status primitive) | OK | 4 MB |
-| status (clean tree, 60 files) | 66.3 ms | 109.5 ms | 4,205.0 ms | N/A (no incremental staging/status primitive) | GOOD | 4 MB |
+| re-add unchanged (60 files) | 189.3 ms | 150.8 ms | 9,467.6 ms | N/A (no incremental staging/status primitive) | OK | 4 MB |
+| status (clean tree, 60 files) | 147.1 ms | 179.5 ms | 6,243.6 ms | N/A (no incremental staging/status primitive) | OK | 4 MB |
 
 ## Cold Clone / First Pull Time
 
@@ -147,7 +147,7 @@ Fresh, empty-directory checkout of a project someone else already pushed.
 
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
-| clone + pull (fresh checkout) | available (registry unreachable at http://localhost:8000 — start the docker compose stack) | 5,486.5 ms | 5,171.6 ms | N/A (no project-level clone/pull concept) | OK |
+| clone + pull (fresh checkout) | available (registry unreachable at http://localhost:8000 — start the docker compose stack) | 13,092.3 ms | 9,171.8 ms | N/A (no project-level clone/pull concept) | OK |
 
 ## Partial-Checkpoint Fetch (Layer-Level Pull)
 
@@ -156,7 +156,7 @@ Fetching one 5MB layer of a 20MB checkpoint vs the whole thing, from a real remo
 | Operation | av | git-lfs | dvc | mlflow | Verdict |
 |---|---:|---:|---:|---:|---|
 | fetch single layer | not installed | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | N/A (no sub-file granularity — always fetches the whole file) | OK |
-| fetch whole checkpoint | not installed | 1,692.9 ms | 3,938.9 ms | available | OK |
+| fetch whole checkpoint | not installed | 3,146.1 ms | 8,969.5 ms | available | OK |
 
 ## Storage Footprint Over N Versions
 
@@ -201,6 +201,7 @@ Time to run `av gc` on the remote CAS server after committing and pushing 20 sma
 | 2026-09-07 | 1.4.0 | 14.8 ms | 29.5 ms | 16.2 ms | 72.0 ms | 970.2 ms | 18.9 ms | 135.0 ms | 1264.6 ms | 5314.9 ms |
 | 2026-09-11 | 1.4.1.dev0+ga73ebdeb2.d20260911 | 14.2 ms | 29.7 ms | 16.4 ms | 661.1 ms | 619.8 ms | 20.4 ms | 105.3 ms | 1311.2 ms | 4126.7 ms |
 | 2026-11-05 | 1.7.0 | 12.6 ms | 20.4 ms | 13.0 ms | 14.3 ms | 245.3 ms | 5.0 ms | 89.9 ms | 283.0 ms | 1802.1 ms |
+| 2026-11-06 | 1.7.1 | 16.3 ms | 22.1 ms | 13.4 ms | 32.1 ms | 459.2 ms | 13.6 ms | 134.4 ms | 604.2 ms | 3101.8 ms |
 
 8 capture(s) total, showing the most recent 8. Machine varies across captures (see each entry's `os`/`python` in `development/perf-history.json`) — read this as a rough trend, not an apples-to-apples benchmark; `av test --speed` / the perf gate (`tests/test_perf_gate.py`) are the authoritative regression check for a single machine.
 

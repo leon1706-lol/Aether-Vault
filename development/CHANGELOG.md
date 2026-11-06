@@ -647,3 +647,11 @@ external-repo work.)
 
 Essential-Tasks: signed off
 - **After the tag, not in 1.7.0 (#213):** a commit the server took before dying stayed queued forever, because its retry lost a compare-and-swap to its own earlier write. A chaos drill caught it once; a lost race now checks the ref's history.
+
+## Phase 77 — A queue that can't empty, and a CI job that can't end (v1.7.1)
+
+- **A commit the server took before dying no longer stays queued forever (Probleme.md #213):** its retry lost the ref's compare-and-swap to its own earlier write, so `av push` left it queued on every later run and exited 0. A lost race now checks whether the commit is the ref or one of its ancestors in this repo's own history; a commit not found there is a real race and stays queued. A hand-built registry that applies the second commit's ref update and drops the answer shows 1.7.0 stuck with the queue at 1 and this build draining it to 0, through the real `av`.
+- **The Windows server-tests job can't read as cancelled (#214):** a shutdown hang after every test passes, about a third of recent runs, now ends 120 s after the last test with pytest's own result and a line in the log. The hang's cause is still unknown.
+- **Docs:** README and tests/README count 1,839 tests.
+
+Essential-Tasks: signed off

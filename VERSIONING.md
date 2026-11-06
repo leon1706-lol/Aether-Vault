@@ -632,3 +632,7 @@ The first tag since v1.4.1, so it also carries everything from the v1.5.0-v1.6.3
 Security/correctness regressions may be released as a PATCH off the current `master`
 (there are no long-lived maintenance branches yet); they skip the grace-window rules but
 never reintroduce removed surfaces.
+
+## v1.7.1 (PATCH, see development/CHANGELOG.md Phase 77)
+
+No new command, flag, state file, JSON field or exit code. `flush_pending_push` treats a lost ref compare-and-swap as delivered when the commit is the server's ref or one of its ancestors in the local history.

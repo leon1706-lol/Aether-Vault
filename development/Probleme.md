@@ -2503,7 +2503,7 @@ Every entry follows **Problem** → **Fix** → **Verification** (real CLI runs 
 
 **Fix:** On a lost race, `_ref_contains` walks this repo's commit files: a commit that is the ref or an ancestor of it counts as delivered. A commit the repo can't find in that history is a real race and stays queued.
 
-**Verification:** `tests/test_integrity_hardening.py` (the ref at the commit, past it, and a real race), failing before the fix. Not in the 1.7.0 release; it ships with the next one.
+**Verification:** `tests/test_integrity_hardening.py` (the ref at the commit, past it, and a real race), failing before the fix; and the real `av` against a hand-built registry that drops the second ref update's answer: 1.7.0 stays at 1 queued, this build drains to 0. Released in v1.7.1.
 
 ### 214. `server-tests-windows` still hangs at exit on some runs, after every test passed
 
